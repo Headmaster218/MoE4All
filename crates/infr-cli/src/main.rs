@@ -1224,7 +1224,10 @@ fn enrich_manual_from_raw(
     let rows = raw
         .as_array()
         .context("manual benchmark output is not an array")?;
-    anyhow::ensure!(rows.len() == 1, "manual benchmark output must contain one row");
+    anyhow::ensure!(
+        rows.len() == 1,
+        "manual benchmark output must contain one row"
+    );
     let row = &rows[0];
     if let Some(metadata) = row.get("benchmark_metadata") {
         benchmark_hardware::enrich_manual(report, metadata);
@@ -1236,9 +1239,12 @@ fn enrich_manual_from_raw(
     Ok(())
 }
 
-fn read_prepared_manual_benchmark(input: &Path, raw_benchmark: &Path) -> anyhow::Result<serde_json::Value> {
-    let bytes = std::fs::read(input)
-        .with_context(|| format!("read benchmark JSON {}", input.display()))?;
+fn read_prepared_manual_benchmark(
+    input: &Path,
+    raw_benchmark: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let bytes =
+        std::fs::read(input).with_context(|| format!("read benchmark JSON {}", input.display()))?;
     let mut value = submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
     let raw = submission_validation::parse_json(&std::fs::read(raw_benchmark)?)?;
     enrich_manual_from_raw(&mut value, &raw)?;

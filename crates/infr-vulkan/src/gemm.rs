@@ -4235,10 +4235,12 @@ pub(crate) fn gpu_owned_prepare_topk_fused_two_row_overlap_spv() -> &'static [u3
 
 pub(crate) fn gpu_owned_prepare_topk_fused_many_row_spv(overlap: bool) -> &'static [u32] {
     const SERIAL: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row.spv"
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_many_row.spv"
     ));
     const OVERLAP: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"), "/gpu_owned_prepare_topk_fused_many_row_overlap.spv"
+        env!("OUT_DIR"),
+        "/gpu_owned_prepare_topk_fused_many_row_overlap.spv"
     ));
     static SERIAL_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     static OVERLAP_WORDS: OnceLock<Vec<u32>> = OnceLock::new();
@@ -4252,7 +4254,8 @@ pub(crate) fn gpu_owned_prepare_topk_fused_many_row_spv(overlap: bool) -> &'stat
 #[cfg(test)]
 pub(crate) fn gpu_owned_topk_many_row_classify_probe_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"), "/gpu_owned_topk_many_row_classify_probe.spv"
+        env!("OUT_DIR"),
+        "/gpu_owned_topk_many_row_classify_probe.spv"
     ));
     static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
     WORDS.get_or_init(|| spv_words(BYTES))
@@ -4328,9 +4331,18 @@ pub(crate) fn gpu_owned_miss_gu_tree64_spv(
     macro_rules! variant {
         ($file:literal) => {{
             static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
-                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_", $file, ".spv"
-            )))).as_slice())
+            Some(
+                WORDS
+                    .get_or_init(|| {
+                        spv_words(include_bytes!(concat!(
+                            env!("OUT_DIR"),
+                            "/gpu_owned_miss_gu_tree64_",
+                            $file,
+                            ".spv"
+                        )))
+                    })
+                    .as_slice(),
+            )
         }};
     }
     #[cfg(not(test))]
@@ -4405,9 +4417,18 @@ pub(crate) fn gpu_owned_miss_gu_tree64_grid_buffer_spv(
     macro_rules! variant {
         ($file:literal) => {{
             static WORDS: OnceLock<Vec<u32>> = OnceLock::new();
-            Some(WORDS.get_or_init(|| spv_words(include_bytes!(concat!(
-                env!("OUT_DIR"), "/gpu_owned_miss_gu_tree64_grid_buffer_", $file, ".spv"
-            )))).as_slice())
+            Some(
+                WORDS
+                    .get_or_init(|| {
+                        spv_words(include_bytes!(concat!(
+                            env!("OUT_DIR"),
+                            "/gpu_owned_miss_gu_tree64_grid_buffer_",
+                            $file,
+                            ".spv"
+                        )))
+                    })
+                    .as_slice(),
+            )
         }};
     }
     match (dtype, local, nr) {

@@ -96,16 +96,12 @@ fn exact_native_gu(nr: usize) {
                 names.iter().all(|name| !name.contains("_sg")),
                 "non-Tree64 native SG path selected for {p:?}, rows={rows}: {names:?}; no tolerance or oracle substitution permitted"
             );
-            assert!(
-                expected[expected.len() - GUARD..]
-                    .iter()
-                    .all(|&v| v == POISON)
-            );
-            assert!(
-                expected[..expected.len() - GUARD]
-                    .chunks_exact(4)
-                    .all(|word| f32::from_le_bytes(word.try_into().unwrap()).is_finite())
-            );
+            assert!(expected[expected.len() - GUARD..]
+                .iter()
+                .all(|&v| v == POISON));
+            assert!(expected[..expected.len() - GUARD]
+                .chunks_exact(4)
+                .all(|word| f32::from_le_bytes(word.try_into().unwrap()).is_finite()));
             for kernels in variants {
                 fixture.inner.prepare(&source, bank, true);
                 let f = &fixture.inner;

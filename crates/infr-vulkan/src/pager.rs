@@ -2116,7 +2116,11 @@ impl MoePagerSession {
                     .snapshot_for_handoff()
                     .map_err(|error| be(format!("test LRU snapshot: {error:?}")))?;
                 Ok((
-                    snapshot.resident_lru().iter().map(|&(block, _)| block).collect(),
+                    snapshot
+                        .resident_lru()
+                        .iter()
+                        .map(|&(block, _)| block)
+                        .collect(),
                     snapshot.free().len(),
                 ))
             })

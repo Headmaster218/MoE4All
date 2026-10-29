@@ -609,15 +609,13 @@ struct ActivationTrace;
 impl ActivationTrace {
     fn begin() -> Self {
         STAGED_ACTIVATION_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(StagedActivationTestState {
-                        events: Vec::new(),
-                        setup_failure: None,
-                        retirement_failure: None,
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(StagedActivationTestState {
+                    events: Vec::new(),
+                    setup_failure: None,
+                    retirement_failure: None,
+                }))
+                .is_none());
         });
         OWNED_RECOVERY_TEST_COUNTS.with(|state| assert!(state.replace(Some([0; 3])).is_none()));
         Self
@@ -664,13 +662,11 @@ fn gpu_owned_role_pipeline_adapter_prepared_mapped_miss() {
         let _off = pipeline::test_scope(&fixture.backend, false);
         execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
         assert_eq!(counts.counts(), [0, 0]);
-        assert!(
-            !fixture
-                .backend
-                .built_kernel_names()
-                .iter()
-                .any(|name| name.starts_with("owned_role_"))
-        );
+        assert!(!fixture
+            .backend
+            .built_kernel_names()
+            .iter()
+            .any(|name| name.starts_with("owned_role_")));
         let output = fixture.read(fixture.buffer(fixture.output), NE);
         let activation = fixture.activation();
         assert!(output.iter().all(|x| x.is_finite()) && output.iter().any(|x| x.abs() > 1e-7));
@@ -841,13 +837,11 @@ fn exercise_auto(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>,
         let _old = pipeline::test_scope(&fixture.backend, false);
         execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
         assert_eq!(counts.counts(), [0, 0]);
-        assert!(
-            !fixture
-                .backend
-                .built_kernel_names()
-                .iter()
-                .any(|name| name.starts_with("owned_role_"))
-        );
+        assert!(!fixture
+            .backend
+            .built_kernel_names()
+            .iter()
+            .any(|name| name.starts_with("owned_role_")));
         (
             fixture.read(fixture.buffer(fixture.output), fixture.rows * fixture.ne),
             fixture.activation(),

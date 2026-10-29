@@ -848,22 +848,18 @@ mod tests {
             assert!(!p.many_row_general(true));
             assert_eq!(p.candidate_mode(true, true), None);
         }
-        assert!(
-            TopkParams {
-                experts: 1,
-                used: 16,
-                ..good
-            }
-            .many_row_general(true)
-        );
-        assert!(
-            TopkParams {
-                groups: 2,
-                groups_used: 0,
-                ..good
-            }
-            .many_row_general(true)
-        );
+        assert!(TopkParams {
+            experts: 1,
+            used: 16,
+            ..good
+        }
+        .many_row_general(true));
+        assert!(TopkParams {
+            groups: 2,
+            groups_used: 0,
+            ..good
+        }
+        .many_row_general(true));
         assert!(many_row_device_limits(256, 256, 20 * 1024));
         assert!(!many_row_device_limits(255, 256, 20 * 1024));
         assert!(!many_row_device_limits(256, 255, 20 * 1024));

@@ -17,6 +17,8 @@ mod cpu_miss;
 pub mod ep;
 mod gemm;
 #[cfg(test)]
+mod host_ready_combined_test_support;
+#[cfg(test)]
 pub(crate) mod indirect_copy;
 pub mod linear;
 mod matmul;
@@ -31,8 +33,6 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 mod transfer;
-#[cfg(test)]
-mod host_ready_combined_test_support;
 pub mod unified;
 mod vkext;
 
@@ -1293,10 +1293,11 @@ impl VulkanShared {
                     .store(false, Ordering::Release);
                 return;
             }
-            let completed = match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
-                Ok(value) => value,
-                Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
-            };
+            let completed =
+                match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
+                    Ok(value) => value,
+                    Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
+                };
             let retired = queue.take_completed_keepalive(completed);
             self.dedicated_transfer_keepalive_pending
                 .store(queue.has_pending_keepalive(), Ordering::Release);
@@ -3837,11 +3838,15 @@ impl VulkanBackend {
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
         #[cfg(test)]
-        let test_aux_compute =
-            std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE").ok().as_deref() == Some("1");
+        let test_aux_compute = std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE")
+            .ok()
+            .as_deref()
+            == Some("1");
         #[cfg(test)]
         if test_aux_compute && qf_props[queue_family_index as usize].queue_count < 2 {
-            return Err(be("test auxiliary compute queue requires main-family queue_count >= 2"));
+            return Err(be(
+                "test auxiliary compute queue requires main-family queue_count >= 2",
+            ));
         }
         let dedicated_transfer_family_index = qf_props
             .iter()
@@ -3875,8 +3880,8 @@ impl VulkanBackend {
             )
         };
         #[cfg(test)]
-        let enable_indirect_copy = indirect_copy_support
-            .supports_queue(qf_props[queue_family_index as usize].queue_flags);
+        let enable_indirect_copy =
+            indirect_copy_support.supports_queue(qf_props[queue_family_index as usize].queue_flags);
 
         #[cfg(test)]
         let test_shader_clock =
@@ -4050,7 +4055,9 @@ impl VulkanBackend {
         let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
         #[cfg(test)]
         if test_aux_compute && timeline_feat.timeline_semaphore == 0 {
-            return Err(be("test auxiliary compute queue requires timeline semaphores"));
+            return Err(be(
+                "test auxiliary compute queue requires timeline semaphores",
+            ));
         }
         #[cfg(test)]
         let timeline_enabled = timeline_enabled || test_aux_compute;

@@ -17,11 +17,10 @@ struct RecoveryKernels {
 
 impl RecoveryKernels {
     fn new(be: &VulkanBackend) -> Self {
-        assert!(
-            be.shared
-                .compute_subgroup_operations
-                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC)
-        );
+        assert!(be
+            .shared
+            .compute_subgroup_operations
+            .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC));
         Self {
             fast: be.kernel_sg(
                 "recovery_candidate_split_fast",

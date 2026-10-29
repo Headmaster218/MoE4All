@@ -217,11 +217,10 @@ fn backend() -> VulkanBackend {
     let mut cfg = infr_core::config::Config::default();
     cfg.device.dev = Some(std::env::var("MOE4ALL_TEST_DEVICE").expect("explicit idle device"));
     let be = VulkanBackend::new_with(Arc::new(cfg)).unwrap();
-    assert!(
-        be.shared
-            .compute_subgroup_operations
-            .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC)
-    );
+    assert!(be
+        .shared
+        .compute_subgroup_operations
+        .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC));
     be
 }
 

@@ -1176,7 +1176,11 @@ fn main() {
         (
             "gpu_owned_prepare_fused",
             "gpu_owned_prepare_topk_fused_many_row_overlap",
-            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_MANY_ROW", "-DCOPY_OVERLAP"],
+            &[
+                "-DOWNER_TOPK_FUSED",
+                "-DOWNER_TOPK_MANY_ROW",
+                "-DCOPY_OVERLAP",
+            ],
         ),
         (
             "gpu_owned_prepare_fused",
@@ -1195,7 +1199,11 @@ fn main() {
         (
             "gpu_owned_prepare_fused",
             "gpu_owned_prepare_topk_fused_two_row_overlap",
-            &["-DOWNER_TOPK_FUSED", "-DOWNER_TOPK_TWO_ROW", "-DCOPY_OVERLAP"],
+            &[
+                "-DOWNER_TOPK_FUSED",
+                "-DOWNER_TOPK_TWO_ROW",
+                "-DCOPY_OVERLAP",
+            ],
         ),
         (
             "gpu_owned_prepare_fused",
@@ -4603,7 +4611,10 @@ fn main() {
             "gpu_owned_hit_splitk_iq3s_32",
             vec!["-DFMT_IQ3S", "-DDOWN_IQ4NL", "-DUSE_GRID"],
         ),
-        ("gpu_owned_hit_splitk_reduce_32", vec!["-DSPLITK_REDUCE", "-DTREE32_REDUCE"]),
+        (
+            "gpu_owned_hit_splitk_reduce_32",
+            vec!["-DSPLITK_REDUCE", "-DTREE32_REDUCE"],
+        ),
     ] {
         let mut defines: Vec<String> = defines.into_iter().map(str::to_owned).collect();
         defines.extend(["-DLOCAL_SIZE=128".to_owned(), "-DSPLIT_K=32".to_owned()]);

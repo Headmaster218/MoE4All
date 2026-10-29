@@ -140,11 +140,9 @@ fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
     assert!(expected.iter().all(|x| x.is_finite()));
     assert!(expected.iter().any(|x| x.abs() > 1e-7));
     assert!(expected_act.iter().all(|x| x.is_finite()));
-    assert!(
-        expected_act[fixture.nff..3 * fixture.nff]
-            .iter()
-            .any(|x| x.abs() > 1e-7)
-    );
+    assert!(expected_act[fixture.nff..3 * fixture.nff]
+        .iter()
+        .any(|x| x.abs() > 1e-7));
 
     // Keep this Arc through completion/next request/handoff: it owns the retained
     // imported source leases even though CPU uploads now use an unimported plan.
@@ -201,15 +199,13 @@ fn gpu_owned_role_pipeline_adapter_auto_mixed_status5_host_ready_success() {
         &expected,
     );
     assert_exact(&fixture.activation(), &expected_act);
-    assert!(
-        !backend
-            .moe_pager()
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .gpu_decode_in_forward()
-    );
+    assert!(!backend
+        .moe_pager()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .gpu_decode_in_forward());
 
     // Execute has drained GPU and CPU work. Recovery resets JobCount but does not
     // rewrite the job array. Inspect only now, never while a host wait is in flight.

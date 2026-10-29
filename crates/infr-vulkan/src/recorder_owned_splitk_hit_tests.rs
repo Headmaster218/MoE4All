@@ -77,9 +77,7 @@ impl SplitKernels {
         assert!(CHUNKS.contains(&chunk));
         assert!(matches!(
             (p.gate_up, p.down),
-            (DType::Q5K, DType::Q5K)
-                | (DType::Iq2S, DType::Iq4Nl)
-                | (DType::Iq3S, DType::Iq4Nl)
+            (DType::Q5K, DType::Q5K) | (DType::Iq2S, DType::Iq4Nl) | (DType::Iq3S, DType::Iq4Nl)
         ));
         let suffix = if shared { "-shared" } else { "" };
         Self {

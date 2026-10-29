@@ -120,7 +120,11 @@ pub(super) fn test_finish_preparation_scope(
     failed: bool,
     experimental_end_cancel: bool,
 ) {
-    finish_preparation_scope(next_cancelled, continuation_cancelled, failed || experimental_end_cancel);
+    finish_preparation_scope(
+        next_cancelled,
+        continuation_cancelled,
+        failed || experimental_end_cancel,
+    );
 }
 
 #[cfg(test)]
@@ -1177,7 +1181,9 @@ pub(super) fn copy_binding_matches(
 impl PreparedPrefix {
     #[cfg(test)]
     pub(super) fn coalesced_test_parts(&self) -> Vec<usize> {
-        std::iter::once(self.head_layers).chain(self.parts.iter().map(|part| part.layers)).collect()
+        std::iter::once(self.head_layers)
+            .chain(self.parts.iter().map(|part| part.layers))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1327,7 +1333,10 @@ impl PreparedPrefix {
             }) {
                 return reject("decode_packet_reject_role_params");
             }
-            if prepared.chunk.pure_mapped_schedule.as_ref()
+            if prepared
+                .chunk
+                .pure_mapped_schedule
+                .as_ref()
                 .is_some_and(|schedule| !schedule.resources_current(be_, &prepared.chunk, pool))
             {
                 return reject("decode_packet_reject_coalescing_policy");
@@ -1418,7 +1427,9 @@ pub(super) fn record(
     pool: ScratchPool,
     resident: Option<ResidentChunk>,
 ) -> Result<PreparedPrefix> {
-    record_inner(be_, plan, scratch, bindings, positions, pool, resident, None)
+    record_inner(
+        be_, plan, scratch, bindings, positions, pool, resident, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1434,7 +1445,14 @@ pub(super) fn record_cancellable(
 ) -> Result<Option<PreparedPrefix>> {
     cancellable_recording(cancelled, || {
         record_inner(
-            be_, plan, scratch, bindings, positions, pool, resident, Some(cancelled),
+            be_,
+            plan,
+            scratch,
+            bindings,
+            positions,
+            pool,
+            resident,
+            Some(cancelled),
         )
     })
 }
@@ -1607,7 +1625,10 @@ fn record_with_horizon(
         let (reads, writes) = op.io_inline();
         ids.extend(reads.into_iter().chain(writes));
     }
-    if let Some(schedule) = resident.as_ref().and_then(|chunk| chunk.pure_mapped_schedule.as_ref()) {
+    if let Some(schedule) = resident
+        .as_ref()
+        .and_then(|chunk| chunk.pure_mapped_schedule.as_ref())
+    {
         // Classification may look past the recording horizon solely to stop before a
         // future host entry. Its complete physical binding proof belongs to this ACK too.
         ids.extend(schedule.bank_tensors.iter().copied());
@@ -1804,10 +1825,19 @@ fn record_with_horizon(
             let chunk = resident.as_ref().unwrap();
             let submitted = parts.last().map_or(0, |part: &PreparedPart| part.layers);
             if owned_batch {
-                chunk.preserve_coalesced_boundary(recorder.as_ref().unwrap(), submitted, true, true);
+                chunk.preserve_coalesced_boundary(
+                    recorder.as_ref().unwrap(),
+                    submitted,
+                    true,
+                    true,
+                );
             }
             if owned_batch
-                && chunk.pure_group_due(parts.last().map_or(0, |part: &PreparedPart| part.layers), true, true)
+                && chunk.pure_group_due(
+                    parts.last().map_or(0, |part: &PreparedPart| part.layers),
+                    true,
+                    true,
+                )
                 && index + 1 < end
             {
                 parts.push(PreparedPart {

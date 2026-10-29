@@ -6,30 +6,26 @@
 use crate::linear::{
     native_dense_supported, native_id_paged_kernel_name, native_idm_paged_kernel_name,
 };
-use crate::recorder::{QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES, Recorder};
-use crate::{VulkanBackend, be};
+use crate::recorder::{Recorder, QSA_TOPK_PARALLEL_MIN_BLOCKS, QSA_TOPK_PARALLEL_WORK_BYTES};
+use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::config::VulkanCfg;
 use infr_core::error::{Error, Result};
 use infr_core::graph::{
-    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, QSA_MAX_TOP_BLOCKS,
-    SequenceSpan, TensorKind,
+    Activation, AttnMask, Dsv4CacheFormat, Graph, MoePrefetchHint, Op, SequenceSpan, TensorKind,
+    QSA_MAX_TOP_BLOCKS,
 };
 use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use crate::recorder::RecordedCmd;
 
 #[path = "adapter_prefix.rs"]
 mod command_prefix;
-#[path = "adapter_pure_mapped_coalesce.rs"]
-mod pure_mapped_coalesce;
-#[path = "adapter_qsa_workspace.rs"]
-mod qsa_workspace;
 #[cfg(test)]
 #[path = "adapter_copy_policy_tests.rs"]
 mod copy_policy_tests;
@@ -38,24 +34,28 @@ mod copy_policy_tests;
 mod deferred_prepare_tests;
 #[path = "adapter_verify_pair.rs"]
 mod pair_admission;
+#[path = "adapter_pure_mapped_coalesce.rs"]
+mod pure_mapped_coalesce;
+#[path = "adapter_qsa_workspace.rs"]
+mod qsa_workspace;
 #[cfg(test)]
 #[path = "adapter_resident_ahead_tests.rs"]
 mod resident_ahead_tests;
 #[cfg(test)]
 pub(crate) use resident_ahead_tests::promotion_isolation_tests::note as promotion_isolation_note;
 #[cfg(test)]
-#[path = "adapter_serial_copy_recovery_tests.rs"]
-mod serial_copy_recovery_tests;
-#[cfg(test)]
 #[path = "adapter_owned_role_pipeline_tests.rs"]
 mod owned_role_pipeline_tests;
+#[cfg(test)]
+#[path = "adapter_serial_copy_recovery_tests.rs"]
+mod serial_copy_recovery_tests;
 #[path = "adapter_stages.rs"]
 pub(crate) mod stages;
 #[path = "verify_pair.rs"]
 pub(crate) mod verify_pair;
-use command_prefix::PreparedPrefix;
 pub(crate) use command_prefix::preparing_commands;
 pub(crate) use command_prefix::supported as command_recording_supported;
+use command_prefix::PreparedPrefix;
 
 /// Vulkan-specific compiled plan. Carries the cloned graph (like the old `GraphPlan`) plus, for an
 /// eligible single-token decode graph, a lazily-built record-once replay (see [`DecodeReplay`]). An
@@ -1486,7 +1486,7 @@ fn mmv_int8_decode_dtypes(
     _caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
 ) -> &'static [infr_core::DType] {
-    use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4_0, Q4_1, Q4K, Q5_0, Q5_1, Q5K, Q6K, Q8_0};
+    use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
     // §10.3: `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
     // string `"0"`, `Some(true)` any other value, and `None` (unset) the unified default below.
     match vk.mmv_mw {
@@ -1551,7 +1551,7 @@ fn mmv_int8_decode_dtypes(
 /// therefore safe to ship unconditionally; Q3_K's DECODE default stays off (its own accuracy
 /// question is still open — this only clears prefill).
 fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
-    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4_0, Q4_1, Q4K, Q5_0, Q5_1, Q5K, Q6K, Q8_0};
+    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
     matches!(
         dt,
         Q2K | Q3K | Q4K | Q5K | Q6K | Iq4Xs | Q8_0 | Q4_0 | Q5_0 | Q4_1 | Q5_1 | Iq4Nl
@@ -1884,7 +1884,11 @@ fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<([usize; 4], [infr
         || graph.prefill_next_chunk
         || !graph.independent_rows
         || graph.sequence_spans.len() != 4
-        || !graph.sequence_spans.iter().enumerate().all(|(row, span)| span.rows == 1 && span.row_start as usize == row)
+        || !graph
+            .sequence_spans
+            .iter()
+            .enumerate()
+            .all(|(row, span)| span.rows == 1 && span.row_start as usize == row)
         || *fused_gate_up
         || *weight_before
         || *act != Activation::Silu
@@ -1899,14 +1903,23 @@ fn owned_splitk_graph_shape(graph: &Graph, op: &Op) -> Option<([usize; 4], [infr
         || graph.desc(*x).dtype != infr_core::DType::F32
         || graph.desc(*dst).dtype != infr_core::DType::F32
         || graph.desc(*x).numel() != 4 * *ne as usize
-        || !matches!(graph.desc(*gate_exps).dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
+        || !matches!(
+            graph.desc(*gate_exps).dtype,
+            infr_core::DType::Iq2S | infr_core::DType::Iq3S
+        )
         || graph.desc(*up_exps).dtype != graph.desc(*gate_exps).dtype
         || graph.desc(*down_exps).dtype != infr_core::DType::Iq4Nl
     {
         return None;
     }
-    Some(([*ne as usize, *n_ff_exp as usize, 4, *n_used as usize],
-        [graph.desc(*gate_exps).dtype, graph.desc(*up_exps).dtype, graph.desc(*down_exps).dtype]))
+    Some((
+        [*ne as usize, *n_ff_exp as usize, 4, *n_used as usize],
+        [
+            graph.desc(*gate_exps).dtype,
+            graph.desc(*up_exps).dtype,
+            graph.desc(*down_exps).dtype,
+        ],
+    ))
 }
 
 fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<usize> {
@@ -1915,20 +1928,14 @@ fn owned_splitk_request(be_: &VulkanBackend, graph: &Graph, op: &Op) -> Option<u
         || !be_.cfg().kernels.vulkan.decode_gpu_resident_copy_overlap
         || be_.cfg().kernels.vulkan.decode_gpu_resident_copy == Some(false)
         || !be_.cfg().device.decode_command_resident
-        || be_.cfg().spec.mtp {
+        || be_.cfg().spec.mtp
+    {
         return None;
     }
     let ([ne, nff, rows, used], dtypes) = owned_splitk_graph_shape(graph, op)?;
-    crate::recorder::owned_splitk_hit::enabled_for_shape(
-        be_,
-        dtypes,
-        ne,
-        nff,
-        rows,
-        used,
-    )
-    .then(|| crate::recorder::owned_splitk_hit::partial_bytes(ne, nff, rows, used))
-    .flatten()
+    crate::recorder::owned_splitk_hit::enabled_for_shape(be_, dtypes, ne, nff, rows, used)
+        .then(|| crate::recorder::owned_splitk_hit::partial_bytes(ne, nff, rows, used))
+        .flatten()
 }
 
 fn owned_splitk_scratch_requests(be_: &VulkanBackend, graph: &Graph) -> Vec<(&'static str, usize)> {
@@ -2930,14 +2937,8 @@ fn ple_gate_norm_buffers(
         pair.normed,
     ];
     let lens = [wide, wide, pair.rows as usize * 2560 * 4, 40960, wide, wide];
-    let [
-        Some(key),
-        Some(query),
-        Some(value),
-        Some(norm),
-        Some(gated),
-        Some(normed),
-    ] = ids.map(|id| resolve(scratch, bindings, id).ok())
+    let [Some(key), Some(query), Some(value), Some(norm), Some(gated), Some(normed)] =
+        ids.map(|id| resolve(scratch, bindings, id).ok())
     else {
         return false;
     };
@@ -3398,7 +3399,7 @@ mod q8_segmented_fusion_contract {
 
     #[test]
     fn coupled_peer_rejects_extra_observers_or_intervening_write() {
-        use infr_core::{DType, tensor::TensorDesc};
+        use infr_core::{tensor::TensorDesc, DType};
         let mut g = Graph::new();
         let k = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
         let v = g.input(TensorDesc::new([32768, 512], DType::Q8_0));
@@ -5998,14 +5999,26 @@ fn lower_op(
                 if spans.iter().all(|span| span.rows == 1) {
                     let row_elems = *n_kv as usize * *head_dim as usize;
                     let workspace = qsa_workspace::geometry(
-                        spans, ratio_safe, *top_blocks, *n_head, *n_kv, *head_dim,
+                        spans,
+                        ratio_safe,
+                        *top_blocks,
+                        *n_head,
+                        *n_kv,
+                        *head_dim,
                     )?;
                     let scratch = pooled_batch(pool, be_, &workspace.requests)?;
                     let (gather_k, gather_v, pm, pl, pacc) =
                         (scratch[0], scratch[1], scratch[2], scratch[3], scratch[4]);
 
                     for (lane, (span, geometry)) in spans.iter().zip(&workspace.rows).enumerate() {
-                        let qsa_workspace::Row { complete, tail, selected, keys, chunk, chunks: n_chunks } = *geometry;
+                        let qsa_workspace::Row {
+                            complete,
+                            tail,
+                            selected,
+                            keys,
+                            chunk,
+                            chunks: n_chunks,
+                        } = *geometry;
                         let (k_binding, v_binding, segment_shift) = match (
                             segmented_kv_view(k_rows[lane]),
                             segmented_kv_view(v_rows[lane]),
@@ -6710,7 +6723,7 @@ fn lower_op(
             let k_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
             let v_q8 = matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0);
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
-            // Planar Q8 scales region base = total cache elements (K and V caches share numel).
+                                      // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
             // A QsaGather in an independent-row graph produces one compact, graph-internal K/V
             // prefix. That prefix is already contiguous and no longer has per-session bindings;
@@ -12384,7 +12397,13 @@ fn execute_static_walk(
     }
     if let Some(chunk) = resident_chunk.as_mut() {
         chunk.install_pure_mapped_schedule(
-            be_, compiled, scratch, bindings, pool, using_phase_arena, cap,
+            be_,
+            compiled,
+            scratch,
+            bindings,
+            pool,
+            using_phase_arena,
+            cap,
             prepared_layers != 0,
         );
     }
@@ -12677,7 +12696,10 @@ fn execute_static_walk(
                         if prepared_parts.is_empty() {
                             if let Some(chunk) = resident_chunk.as_mut() {
                                 chunk.confirm_before_pure_group(
-                                    be_, pstream, segments.back(), None,
+                                    be_,
+                                    pstream,
+                                    segments.back(),
+                                    None,
                                 )?;
                             }
                         }
@@ -12699,7 +12721,9 @@ fn execute_static_walk(
                                 .expect("resident prepared packet batch");
                             chunk.poll_notices(be_, pstream, None)?;
                             chunk.confirm_before_pure_group(
-                                be_, pstream, segments.back(),
+                                be_,
+                                pstream,
+                                segments.back(),
                                 prepared_parts.front().map(|part| part.layers),
                             )?;
                             if chunk.notice_resume.is_some() || chunk.notice_stop {
@@ -12906,9 +12930,16 @@ fn execute_static_walk(
                                 let guarded_safe_run = !mapped_safe_run
                                     && segments.len() + 1 > inflight
                                     && guarded_owner_admission.check(
-                                        be_, compiled, pool, pstream, chunk,
-                                        rolling_same_window, using_phase_arena,
-                                        resident_banks_supported, cap, segments.len() + 1,
+                                        be_,
+                                        compiled,
+                                        pool,
+                                        pstream,
+                                        chunk,
+                                        rolling_same_window,
+                                        using_phase_arena,
+                                        resident_banks_supported,
+                                        cap,
+                                        segments.len() + 1,
                                     );
                                 let mut segment = rec
                                     .take()
@@ -12936,7 +12967,10 @@ fn execute_static_walk(
                                 })?;
                                 #[cfg(test)]
                                 guarded_owner_run::tests::checkpoint(
-                                    be_, chunk, segments.len(), guarded_safe_run,
+                                    be_,
+                                    chunk,
+                                    segments.len(),
+                                    guarded_safe_run,
                                 )?;
                                 if guarded_safe_run {
                                     let _bypass = infr_core::timeline::span(
@@ -13185,13 +13219,15 @@ fn execute_static_walk(
                                     paged_moe_shared.get(&op_idx).copied(),
                                 )?;
                                 if pstream.guarded_retire_after_submit.is_none() {
-                                    if let Some(chunk) = resident_chunk.as_ref()
+                                    if let Some(chunk) = resident_chunk
+                                        .as_ref()
                                         .filter(|chunk| chunk.pure_mapped_schedule.is_some())
                                     {
                                         chunk.preserve_coalesced_boundary(
                                             rec.as_ref().expect("ambient resident recorder"),
                                             chunk.submitted_entries,
-                                            chunk.coalescing_allowed(be_, pool, pstream), false,
+                                            chunk.coalescing_allowed(be_, pool, pstream),
+                                            false,
                                         );
                                     }
                                 }
@@ -13291,7 +13327,9 @@ fn execute_static_walk(
                                     // Keep submitted GPU work leased even if later host bookkeeping fails.
                                     segments.push_back(pending);
                                     #[cfg(test)]
-                                    if crate::host_ready_combined_test_support::after_queued(&be_.shared) {
+                                    if crate::host_ready_combined_test_support::after_queued(
+                                        &be_.shared,
+                                    ) {
                                         return Err(Error::Aborted);
                                     }
                                     // Before any new notice reader or mutable epoch bookkeeping:
@@ -14541,7 +14579,8 @@ impl DeferredOwnedNotices {
                 }
                 #[cfg(test)]
                 guarded_owner_run::tests::retired_skip(
-                    Arc::as_ptr(&self.notices.shared) as usize, ordinal,
+                    Arc::as_ptr(&self.notices.shared) as usize,
+                    ordinal,
                 );
             }
             Ok(())
@@ -14752,7 +14791,9 @@ impl ResidentNoticeProducer {
         started_output: &std::sync::mpsc::Sender<(usize, Result<ProducedNotice>)>,
         host_ready_enabled: bool,
         mut upload_worker: Option<
-            &mut owned_upload_worker::OwnedUploadWorker<crate::transfer::BackgroundTransferExecutor>,
+            &mut owned_upload_worker::OwnedUploadWorker<
+                crate::transfer::BackgroundTransferExecutor,
+            >,
         >,
         acknowledgement: Option<&Arc<NoticeProducerAck>>,
     ) -> Result<Option<ProducedNotice>> {
@@ -14931,7 +14972,9 @@ impl ResidentNoticeProducer {
                                 drain_owned_upload(&executor, transfer_value, leases)
                             },
                             completed,
-                            Arc::clone(acknowledgement.expect("upload worker has a shared job ACK")),
+                            Arc::clone(
+                                acknowledgement.expect("upload worker has a shared job ACK"),
+                            ),
                             trace_context,
                         );
                         return Ok(None); // Started owns the sole result for this ordinal.
@@ -15838,7 +15881,9 @@ impl ResidentChunk {
     }
 
     fn push_entry(&mut self, be_: &VulkanBackend, mut entry: ResidentJournalEntry) -> Result<()> {
-        if let Some(notice) = self.pure_mapped_schedule.as_ref()
+        if let Some(notice) = self
+            .pure_mapped_schedule
+            .as_ref()
             .and_then(|schedule| schedule.notice(be_, self.gpu_copy.as_ref(), &entry))
         {
             entry.host_notice = notice;
@@ -16084,7 +16129,8 @@ impl ResidentChunk {
                 producer: if cfg.decode_gpu_resident_notice_thread
                     && cfg.decode_gpu_resident_hit_first
                 {
-                    ResidentNoticeProducer::new(be_, ordinary_owner && copy_requested)?.map(Arc::new)
+                    ResidentNoticeProducer::new(be_, ordinary_owner && copy_requested)?
+                        .map(Arc::new)
                 } else {
                     None
                 },
@@ -16559,11 +16605,10 @@ impl ResidentChunk {
         graph_end: bool,
         prepare_tail: &mut dyn FnMut(),
     ) -> Result<Option<(usize, Vec<u32>)>> {
-        assert!(
-            self.gpu_copy
-                .as_ref()
-                .is_some_and(|copy| copy.owned_self_service())
-        );
+        assert!(self
+            .gpu_copy
+            .as_ref()
+            .is_some_and(|copy| copy.owned_self_service()));
         assert!(self.producer.is_none() && self.notices_sent == 0);
         ps.gpu_route = None;
         let recorder = rec
@@ -21193,10 +21238,11 @@ mod tests {
                 n_used: 17,
             },
         ] {
-            assert!(
-                super::resident_notice_slots(&[0; crate::recorder::RESIDENT_JOURNAL_WORDS], layout)
-                    .is_err()
-            );
+            assert!(super::resident_notice_slots(
+                &[0; crate::recorder::RESIDENT_JOURNAL_WORDS],
+                layout
+            )
+            .is_err());
         }
     }
 
@@ -21278,7 +21324,7 @@ mod tests {
     #[test]
     fn resident_mtp_binding_check_uses_actual_buffers_and_exact_roles() {
         use super::*;
-        use crate::pager::{Role, buffer_identity};
+        use crate::pager::{buffer_identity, Role};
         let graph = resident_layout_graph(1, 256, 256, 4, 2, DType::Q4K, false, false);
         let Op::MoeFfn {
             gate_exps,
@@ -21354,7 +21400,7 @@ mod tests {
     #[test]
     fn resident_mtp_binding_check_rejects_mixed_and_unrolled_private_banks() {
         use super::*;
-        use crate::pager::{Role, buffer_identity};
+        use crate::pager::{buffer_identity, Role};
         use infr_core::TensorDesc;
         let mut graph = resident_layout_graph(1, 256, 256, 4, 2, DType::Q4K, false, false);
         let main_op = graph.ops[0].clone();
@@ -21407,9 +21453,13 @@ mod tests {
         use infr_core::DType;
         let mut graph = resident_layout_graph(4, 2560, 640, 40, 10, DType::Iq2S, false, false);
         graph.independent_rows = true;
-        graph.sequence_spans = (0..4).map(|row| infr_core::graph::SequenceSpan {
-            row_start: row, rows: 1, start_pos: 0,
-        }).collect();
+        graph.sequence_spans = (0..4)
+            .map(|row| infr_core::graph::SequenceSpan {
+                row_start: row,
+                rows: 1,
+                start_pos: 0,
+            })
+            .collect();
         let Op::MoeFfn { down_exps, .. } = graph.ops[0] else {
             unreachable!()
         };
@@ -21419,12 +21469,19 @@ mod tests {
             Some(([2560, 640, 4, 10], [DType::Iq2S, DType::Iq2S, DType::Iq4Nl]))
         );
         let mut iq3 = graph.clone();
-        let Op::MoeFfn { gate_exps, up_exps, .. } = iq3.ops[0] else { unreachable!() };
+        let Op::MoeFfn {
+            gate_exps, up_exps, ..
+        } = iq3.ops[0]
+        else {
+            unreachable!()
+        };
         for id in [gate_exps, up_exps] {
             iq3.tensors[id.0 as usize].desc.dtype = DType::Iq3S;
         }
-        assert_eq!(owned_splitk_graph_shape(&iq3, &iq3.ops[0]),
-            Some(([2560, 640, 4, 10], [DType::Iq3S, DType::Iq3S, DType::Iq4Nl])));
+        assert_eq!(
+            owned_splitk_graph_shape(&iq3, &iq3.ops[0]),
+            Some(([2560, 640, 4, 10], [DType::Iq3S, DType::Iq3S, DType::Iq4Nl]))
+        );
         iq3.tensors[up_exps.0 as usize].desc.dtype = DType::Iq2S;
         assert!(owned_splitk_graph_shape(&iq3, &iq3.ops[0]).is_none());
         for reason in 0..7 {
@@ -22150,11 +22207,9 @@ mod tests {
                             let mut prefill = graph.clone();
                             prefill.prefill_next_chunk = next_chunk;
                             prefill.prefill_target_tokens = target_tokens;
-                            assert!(
-                                ResidentChunk::new(&backend, &prefill, true, &mut None)
-                                    .unwrap()
-                                    .is_none()
-                            );
+                            assert!(ResidentChunk::new(&backend, &prefill, true, &mut None)
+                                .unwrap()
+                                .is_none());
                         }
                     }
                     let plan = backend.compile(&graph).unwrap();
@@ -22265,11 +22320,9 @@ mod tests {
                                     directory.len_bytes(),
                                 );
                             }
-                            assert!(
-                                original
-                                    .chunks_exact(4)
-                                    .any(|word| word[0] != 0 || word[1] != 0)
-                            );
+                            assert!(original
+                                .chunks_exact(4)
+                                .any(|word| word[0] != 0 || word[1] != 0));
                             let mut hidden = original.clone();
                             for word in hidden.chunks_exact_mut(4) {
                                 word[..2].fill(0);
@@ -22569,16 +22622,12 @@ mod tests {
                     );
                 }
                 let previous = cursor;
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[0])
-                        .is_err()
-                );
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[2])
-                        .is_err()
-                );
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
                 assert_eq!(cursor, previous);
                 session
                     .routed_lut_window(&mut cursor, role, 2, &[])
@@ -22693,16 +22742,12 @@ mod tests {
                     );
                 }
                 let previous = cursor;
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[0])
-                        .is_err()
-                );
-                assert!(
-                    session
-                        .routed_lut_window(&mut cursor, role, 2, &[2])
-                        .is_err()
-                );
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[0])
+                    .is_err());
+                assert!(session
+                    .routed_lut_window(&mut cursor, role, 2, &[2])
+                    .is_err());
                 assert_eq!(cursor, previous);
                 session
                     .routed_lut_window(&mut cursor, role, 2, &[])
@@ -22877,9 +22922,9 @@ mod tests {
         }
     }
     use super::*;
-    use infr_core::DType;
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
+    use infr_core::DType;
 
     #[test]
     fn independent_one_row_sequences_are_decode_token_rows() {
@@ -23371,11 +23416,9 @@ mod tests {
         for (lane, blocks) in selected.chunks_exact(top_blocks).enumerate() {
             let complete_blocks = (spans[lane].start_pos + 1) as usize / ratio;
             let selected_blocks = top_blocks.min(complete_blocks);
-            assert!(
-                blocks[..selected_blocks]
-                    .iter()
-                    .all(|&block| block < complete_blocks as u32)
-            );
+            assert!(blocks[..selected_blocks]
+                .iter()
+                .all(|&block| block < complete_blocks as u32));
             if complete_blocks <= top_blocks {
                 assert_eq!(
                     &blocks[..selected_blocks],
@@ -23993,10 +24036,9 @@ mod tests {
             .unwrap();
         pool.finish_execute();
         pool.begin_execute();
-        assert!(
-            pool.acquire("workspace", 16, |_| Err(be("test allocation failure")))
-                .is_err()
-        );
+        assert!(pool
+            .acquire("workspace", 16, |_| Err(be("test allocation failure")))
+            .is_err());
         assert!(pool.needs_compaction);
         assert!(pool.buffers.is_empty());
         assert!(pool.in_use.is_empty());
@@ -24026,13 +24068,12 @@ mod tests {
         pool.acquire("active", 8, |_| panic!("active capacity must be retained"))
             .unwrap();
         let requests = [("active", 16), ("replace", 16)];
-        assert!(
-            pool.acquire_batch(&requests, |capacities| {
+        assert!(pool
+            .acquire_batch(&requests, |capacities| {
                 assert_eq!(capacities, &[16, 16]);
                 Err(be("test batch allocation failure"))
             })
-            .is_err()
-        );
+            .is_err());
         assert!(pool.needs_compaction);
         assert_eq!(pool.in_use.len(), 1);
         assert!(pool.in_use.contains(&("active", 8)));
@@ -24062,10 +24103,9 @@ mod tests {
     fn scratch_pool_lazy_compaction_recovers_after_invalid_batch_result() {
         let mut pool = ScratchPool::default();
         let keys = [("workspace", 16)];
-        assert!(
-            pool.finish_planned_batch(&keys, keys.to_vec(), Vec::new())
-                .is_err()
-        );
+        assert!(pool
+            .finish_planned_batch(&keys, keys.to_vec(), Vec::new())
+            .is_err());
         assert!(pool.needs_compaction);
         assert!(pool.buffers.is_empty());
         assert!(pool.in_use.is_empty());
@@ -24505,7 +24545,7 @@ mod tests {
     /// (m, out_f) either could see. A band edit that changes a routing decision fails here.
     #[test]
     fn mrow_bands_match_inline_formula() {
-        use infr_core::tier::{LinearTier, linear_tier};
+        use infr_core::tier::{linear_tier, LinearTier};
         // The pre-extraction expressions, verbatim.
         let old_mrow = |m: usize, out_f: usize| {
             (2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192)
@@ -25678,7 +25718,7 @@ mod tests {
         let w: Vec<f32> = (0..hd).map(|i| 1.0 + i as f32 * 0.05).collect(); // NOT ones — general
         let xb16 = to_f16(&x_f32);
         let x = deq(&xb16); // the f16-rounded input the GPU shader actually reads
-        // host reference: per-head rmsnorm(x) * w, on the SAME f16-rounded input.
+                            // host reference: per-head rmsnorm(x) * w, on the SAME f16-rounded input.
         let mut want = vec![0f32; nh * hd];
         for h in 0..nh {
             let b = h * hd;
@@ -25804,7 +25844,7 @@ mod tests {
             .collect();
         let (qf, kf, vf) = (to_f16(&q), to_f16(&k), to_f16(&v));
         let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf)); // host uses the same f16-rounded values
-        // host GQA softmax attention
+                                                           // host GQA softmax attention
         let mut want = vec![0f32; nh * hd];
         for h in 0..nh {
             let kvh = h / group;
@@ -27001,7 +27041,7 @@ mod tests {
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
         let scale = 1.3f32;
         let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5; // deterministic weight/act filler
-        // Distinct per-expert router rows so top-k selection is unambiguous.
+                                                               // Distinct per-expert router rows so top-k selection is unambiguous.
         let router: Vec<f32> = (0..n_expert * ne)
             .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
             .collect();
@@ -27290,12 +27330,12 @@ mod tests {
 
             let got1 = run_ep(&[d0], &x, rows); // world=1: single-device (identity band, no reduce)
             let got2 = run_ep(&[d0, d1], &x, rows); // world=2: real 2-device expert split
-            // THE EP correctness bar: the 2-device expert split reproduces the single-device MoE
-            // (same runner path; world=1 is the identity lowering). Holds for BOTH the small-m
-            // id-GEMV path (rows=1/4) and the batched dp4a path (rows=16), so it validates the
-            // per-band compute + `moe_ep_band_remap` local-id rewrite + the P2P/all-reduce combine
-            // on both. Reduction-order tolerance (the cross-rank sum reassociates the weighted
-            // accumulate).
+                                                    // THE EP correctness bar: the 2-device expert split reproduces the single-device MoE
+                                                    // (same runner path; world=1 is the identity lowering). Holds for BOTH the small-m
+                                                    // id-GEMV path (rows=1/4) and the batched dp4a path (rows=16), so it validates the
+                                                    // per-band compute + `moe_ep_band_remap` local-id rewrite + the P2P/all-reduce combine
+                                                    // on both. Reduction-order tolerance (the cross-rank sum reassociates the weighted
+                                                    // accumulate).
             for i in 0..rows * ne {
                 assert!(
                     (got2[i] - got1[i]).abs() < 3e-3,

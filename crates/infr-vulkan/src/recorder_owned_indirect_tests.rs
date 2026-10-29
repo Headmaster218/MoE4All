@@ -67,9 +67,16 @@ struct CopyReadyEvent {
 
 impl CopyReadyEvent {
     fn new(be: &VulkanBackend) -> Self {
-        let event = unsafe { be.shared.device.create_event(&vk::EventCreateInfo::default(), None) }
-            .unwrap();
-        Self { shared: Arc::clone(&be.shared), event }
+        let event = unsafe {
+            be.shared
+                .device
+                .create_event(&vk::EventCreateInfo::default(), None)
+        }
+        .unwrap();
+        Self {
+            shared: Arc::clone(&be.shared),
+            event,
+        }
     }
 }
 
@@ -474,32 +481,58 @@ impl Fixture {
     fn record(&self, rec: &Recorder<'_>, variant: Variant, hit_only: bool) {
         if matches!(variant, Variant::KhrPipeline) {
             rec.begin_owned_indirect_copy_phase(
-                self.journal.as_ref(), self.jobs.as_ref(), self.commands.as_ref(),
-                self.dummy.as_ref(), ORDINAL as u32, (3 * self.rows * self.p.used) as u32,
+                self.journal.as_ref(),
+                self.jobs.as_ref(),
+                self.commands.as_ref(),
+                self.dummy.as_ref(),
+                ORDINAL as u32,
+                (3 * self.rows * self.p.used) as u32,
                 [1, 0, self.p.used as u32, self.p.used as u32],
-            ).unwrap();
+            )
+            .unwrap();
             rec.mark_owned_indirect_copy_ready(self.early_ready.event);
             rec.wait_owned_indirect_copy_ready(self.early_ready.event, true);
             rec.begin_owned_indirect_copy_phase(
-                self.journal.as_ref(), self.jobs.as_ref(), self.commands_late.as_ref(),
-                self.dummy.as_ref(), ORDINAL as u32, (3 * self.rows * self.p.used) as u32,
+                self.journal.as_ref(),
+                self.jobs.as_ref(),
+                self.commands_late.as_ref(),
+                self.dummy.as_ref(),
+                ORDINAL as u32,
+                (3 * self.rows * self.p.used) as u32,
                 [2, 0, self.p.used as u32, self.p.used as u32],
-            ).unwrap();
+            )
+            .unwrap();
             self.projections(rec, 1, 0);
             self.tail(rec, 1, 0);
             rec.wait_owned_indirect_copy_ready(self.early_ready.event, false);
             if !hit_only {
                 self.projections(rec, 2, 0);
-                rec.silu_mul(self.gate.as_ref(), self.up.as_ref(), self.activation.as_ref(),
-                    self.rows * self.p.used * self.p.nff, None);
+                rec.silu_mul(
+                    self.gate.as_ref(),
+                    self.up.as_ref(),
+                    self.activation.as_ref(),
+                    self.rows * self.p.used * self.p.nff,
+                    None,
+                );
             }
             rec.global_barrier();
             if !hit_only {
                 rec.linear_native_id_multi_paged(
-                    self.p.down, self.weights.device_addr().unwrap(), 0,
-                    self.tape.as_ref(), self.ids.as_ref(), self.p.used, 2 * self.p.used,
-                    self.activation.as_ref(), true, self.output.as_ref(), self.p.nff, self.p.ne,
-                    self.rows, 0, 2,
+                    self.p.down,
+                    self.weights.device_addr().unwrap(),
+                    0,
+                    self.tape.as_ref(),
+                    self.ids.as_ref(),
+                    self.p.used,
+                    2 * self.p.used,
+                    self.activation.as_ref(),
+                    true,
+                    self.output.as_ref(),
+                    self.p.nff,
+                    self.p.ne,
+                    self.rows,
+                    0,
+                    2,
                 );
             }
             return;
@@ -740,7 +773,12 @@ fn paired_profiles(rows_set: &[usize]) {
                 let candidates: &[Variant] = if all_hit {
                     &[Variant::KhrFull]
                 } else {
-                    &[Variant::CuPartial, Variant::KhrFull, Variant::KhrSerial, Variant::KhrPipeline]
+                    &[
+                        Variant::CuPartial,
+                        Variant::KhrFull,
+                        Variant::KhrSerial,
+                        Variant::KhrPipeline,
+                    ]
                 };
                 for &candidate in candidates {
                     let mut base_times = Vec::new();
@@ -840,21 +878,28 @@ fn gpu_owned_indirect_continuous_frames() {
                 fixtures.push(fixture);
             }
             assert!(source.banks * source.miss_bytes > 128 * 1024 * 1024);
-            let variants = [Variant::CuPartial, Variant::CuSerial,
-                Variant::KhrFull, Variant::KhrPipeline];
-            let recordings: Vec<_> = variants.iter().map(|&variant| {
-                let rec = be.recorder_persistent().unwrap();
-                rec.seed_barrier();
-                rec.global_barrier();
-                query.begin(&rec);
-                for fixture in &fixtures {
-                    fixture.record(&rec, variant, false);
+            let variants = [
+                Variant::CuPartial,
+                Variant::CuSerial,
+                Variant::KhrFull,
+                Variant::KhrPipeline,
+            ];
+            let recordings: Vec<_> = variants
+                .iter()
+                .map(|&variant| {
+                    let rec = be.recorder_persistent().unwrap();
+                    rec.seed_barrier();
                     rec.global_barrier();
-                }
-                query.end(&rec);
-                rec.publish_host_reads();
-                rec.finish_record().unwrap()
-            }).collect();
+                    query.begin(&rec);
+                    for fixture in &fixtures {
+                        fixture.record(&rec, variant, false);
+                        rec.global_barrier();
+                    }
+                    query.end(&rec);
+                    rec.publish_host_reads();
+                    rec.finish_record().unwrap()
+                })
+                .collect();
             let reset_events = || {
                 for fixture in &fixtures {
                     unsafe { be.shared.device.reset_event(fixture.early_ready.event) }.unwrap();
@@ -872,20 +917,33 @@ fn gpu_owned_indirect_continuous_frames() {
                 let mut baseline_us = Vec::new();
                 let mut candidate_us = Vec::new();
                 for pair in 0..6 {
-                    let order = if pair % 2 == 0 { [0, candidate] } else { [candidate, 0] };
+                    let order = if pair % 2 == 0 {
+                        [0, candidate]
+                    } else {
+                        [candidate, 0]
+                    };
                     for index in order {
                         reset_events();
                         recordings[index].replay().unwrap();
                         let us = query.elapsed(&be) / fixtures.len() as f64;
-                        if index == 0 { baseline_us.push(us); } else { candidate_us.push(us); }
+                        if index == 0 {
+                            baseline_us.push(us);
+                        } else {
+                            candidate_us.push(us);
+                        }
                     }
                 }
                 // Payload byte-for-byte correctness is covered separately for all variants.
                 // Here verify every row/expert output after sustained frames, without putting
                 // a full BAR readback between the timed arms and idling the GPU for milliseconds.
                 for (fixture, reference) in fixtures.iter().zip(&expected) {
-                    assert_eq!(read(fixture.output.as_ref()), *reference,
-                        "continuous output profile={} rows={rows} candidate={:?}", p.name, variants[candidate]);
+                    assert_eq!(
+                        read(fixture.output.as_ref()),
+                        *reference,
+                        "continuous output profile={} rows={rows} candidate={:?}",
+                        p.name,
+                        variants[candidate]
+                    );
                 }
                 println!("OWNED_INDIRECT_CONTINUOUS profile={} rows={rows} layers={} source_bytes={} payload_bytes_per_frame={} baseline=CuPartial candidate={:?} baseline_us_per_layer={baseline_us:?} candidate_us_per_layer={candidate_us:?} baseline_median_us={} candidate_median_us={} verified=true",
                     p.name, fixtures.len(), source.span * source.banks,

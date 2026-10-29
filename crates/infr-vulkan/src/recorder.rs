@@ -2126,7 +2126,9 @@ impl<'a> Recorder<'a> {
         #[cfg(test)]
         if result.is_ok() {
             crate::host_ready_combined_test_support::submitted(
-                &self.be.shared, host_ready.as_ref(), fence,
+                &self.be.shared,
+                host_ready.as_ref(),
+                fence,
             );
         }
         result

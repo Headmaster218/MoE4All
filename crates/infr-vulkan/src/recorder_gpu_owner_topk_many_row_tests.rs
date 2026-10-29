@@ -321,8 +321,7 @@ impl Probe {
                 .iter()
                 .copied()
                 .filter(|&block| {
-                    pool_of(block) == pool
-                        && (!shape.mixed || (block % EXPERTS).is_multiple_of(2))
+                    pool_of(block) == pool && (!shape.mixed || (block % EXPERTS).is_multiple_of(2))
                 })
                 .collect();
             residents.sort_unstable();

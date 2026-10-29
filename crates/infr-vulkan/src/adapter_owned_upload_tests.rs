@@ -603,10 +603,7 @@ fn run_owned_upload_two_cpu_misses_outcome(
         );
         OWNED_HOST_READY_TEST_ARMS.with(|arms| assert_eq!(arms.get(), 1));
         for output in fixture.outputs {
-            assert_eq!(
-                fixture.read(fixture.buffer(output)),
-                vec![-777.0f32; NE]
-            );
+            assert_eq!(fixture.read(fixture.buffer(output)), vec![-777.0f32; NE]);
         }
         fixture.reset_frontend();
         fixture

@@ -249,10 +249,7 @@ fn copy_scale_probe(
             }
             Op::Scale { x, dst, s, n } => {
                 let source = data[x.0 as usize].clone();
-                for (target, value) in data[dst.0 as usize]
-                    .iter_mut()
-                    .zip(source)
-                    .take(n as usize)
+                for (target, value) in data[dst.0 as usize].iter_mut().zip(source).take(n as usize)
                 {
                     *target = value * s;
                 }

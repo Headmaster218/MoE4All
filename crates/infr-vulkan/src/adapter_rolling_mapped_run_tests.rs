@@ -164,9 +164,9 @@ fn ordinary_case(pattern: &[usize]) -> (Fixture, VkDecodePlan, Vec<(TensorId, Ve
         .enumerate()
         .filter(|(layer, _)| pattern.contains(layer))
         .map(|(_, &id)| {
-                let values = fixture.read(fixture.buffer(id));
-                assert!(values.iter().all(|value| value.is_finite() && *value > 0.0));
-                (id, values)
+            let values = fixture.read(fixture.buffer(id));
+            assert!(values.iter().all(|value| value.is_finite() && *value > 0.0));
+            (id, values)
         })
         .collect();
     prepared_mapped_run_tests::install_mixed_owner(&fixture);

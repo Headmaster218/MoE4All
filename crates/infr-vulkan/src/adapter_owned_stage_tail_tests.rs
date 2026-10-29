@@ -141,16 +141,14 @@ struct TraceGuard;
 impl TraceGuard {
     fn begin(disable_merge: bool, corrupt_guard: bool, failure: Option<(usize, u8)>) -> Self {
         OWNED_STAGE_TAIL_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(OwnedStageTailTestState {
-                        disable_merge,
-                        corrupt_guard,
-                        failure,
-                        ..Default::default()
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(OwnedStageTailTestState {
+                    disable_merge,
+                    corrupt_guard,
+                    failure,
+                    ..Default::default()
+                }))
+                .is_none());
         });
         OWNED_RECOVERY_TEST_COUNTS.with(|state| assert!(state.replace(Some([0; 3])).is_none()));
         Self
@@ -573,14 +571,12 @@ fn gpu_owned_stage_tail_only_copy_is_never_zero_dispatch_discarded() {
     assert_eq!((trace.counts().1, trace.counts().2), (0, 1));
     OWNED_STAGE_TAIL_TEST_STATE.with(|state| {
         let state = state.borrow();
-        assert!(
-            state
-                .as_ref()
-                .unwrap()
-                .standalone_tail_dispatches
-                .iter()
-                .all(|&n| n > 0)
-        );
+        assert!(state
+            .as_ref()
+            .unwrap()
+            .standalone_tail_dispatches
+            .iter()
+            .all(|&n| n > 0));
     });
     assert_eq!(fixture.read(fixture.buffer(fixture.outputs[1])), expected);
     fixture.assert_frontend(fixture.buffer(fixture.frontend), 1.0);
@@ -620,13 +616,11 @@ fn gpu_owned_stage_tail_error_cancel_unwind_never_resubmits_l0() {
             execute_static(&fixture.backend, &plan, &fixture.bindings())
         }));
         match failure {
-            0 => assert!(
-                result
-                    .unwrap()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("stage-tail lowering error")
-            ),
+            0 => assert!(result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("stage-tail lowering error")),
             1 => assert!(matches!(result.unwrap(), Err(Error::Aborted))),
             _ => assert!(result.is_err()),
         }
@@ -661,37 +655,31 @@ struct InheritedTraceGuard;
 impl InheritedTraceGuard {
     fn begin(retirement_failure: Option<u8>) -> Self {
         STAGED_ACTIVATION_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(StagedActivationTestState {
-                        events: Vec::new(),
-                        setup_failure: None,
-                        retirement_failure,
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(StagedActivationTestState {
+                    events: Vec::new(),
+                    setup_failure: None,
+                    retirement_failure,
+                }))
+                .is_none());
         });
         ROLLING_MAPPED_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(RollingMappedTestState {
-                        decisions: Vec::new(),
-                        admission_proofs: 0,
-                        fail_after_layers: None,
-                        confirm_recovery: false,
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(RollingMappedTestState {
+                    decisions: Vec::new(),
+                    admission_proofs: 0,
+                    fail_after_layers: None,
+                    confirm_recovery: false,
+                }))
+                .is_none());
         });
         PREPARED_MAPPED_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(PreparedMappedTestState {
-                        decisions: Vec::new(),
-                        fail_after_layers: None,
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(PreparedMappedTestState {
+                    decisions: Vec::new(),
+                    fail_after_layers: None,
+                }))
+                .is_none());
         });
         Self
     }
@@ -864,13 +852,11 @@ fn gpu_owned_staged_inherited_pending_retires_after_prefix_and_restores_zero_rec
                         expected.iter().map(|x| x + 3.0).collect::<Vec<_>>()
                     );
                 }
-                Some(0) => assert!(
-                    result
-                        .unwrap()
-                        .unwrap_err()
-                        .to_string()
-                        .contains("inherited stage retirement error")
-                ),
+                Some(0) => assert!(result
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inherited stage retirement error")),
                 Some(1) => assert!(matches!(result.unwrap(), Err(Error::Aborted))),
                 _ => assert!(result.is_err()),
             }
@@ -999,13 +985,11 @@ fn gpu_owned_staged_tail_independent_input_and_failure_preserve_forward_lifetime
                     expected.iter().map(|x| x + 3.0).collect::<Vec<_>>()
                 );
             }
-            2 => assert!(
-                result
-                    .unwrap()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("independent input failed")
-            ),
+            2 => assert!(result
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("independent input failed")),
             3 => assert!(matches!(result.unwrap(), Err(Error::Aborted))),
             _ => assert!(result.is_err()),
         }

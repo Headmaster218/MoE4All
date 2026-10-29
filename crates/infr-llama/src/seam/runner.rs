@@ -11238,7 +11238,8 @@ fn generate_dense_backend_inner(
                     );
                     drop(timeline_output);
                     if c.qwen4exp && !should_stop && step + 1 < max_new {
-                        let _timeline_ple_submit = infr_core::timeline::span("decode_next_ple_submit");
+                        let _timeline_ple_submit =
+                            infr_core::timeline::span("decode_next_ple_submit");
                         // All lane ACKs are resolved; only host gathering runs ahead of the next step.
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             step + 1,
@@ -13449,7 +13450,8 @@ fn generate_dense_backend_inner(
                         out.len(),
                         max_new,
                     ) {
-                        let _timeline_ple_submit = infr_core::timeline::span("decode_next_ple_submit");
+                        let _timeline_ple_submit =
+                            infr_core::timeline::span("decode_next_ple_submit");
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             next_pos,
                             submit_ple_token(

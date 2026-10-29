@@ -75,14 +75,22 @@ fn ordinary_decode_pipeline_defaults_preserve_explicit_fallbacks() {
 
 #[test]
 fn owned_role_pipeline_defaults_on_with_explicit_fallback() {
-    assert!(Config::default().kernels.vulkan.decode_gpu_resident_role_pipeline);
+    assert!(
+        Config::default()
+            .kernels
+            .vulkan
+            .decode_gpu_resident_role_pipeline
+    );
     let path = "kernels.vulkan.decode_gpu_resident_role_pipeline";
     for enabled in [false, true] {
         let setting = format!("{path}={enabled}");
         let toml = format!("[kernels.vulkan]\ndecode_gpu_resident_role_pipeline={enabled}\n");
         for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
             let cfg = Config::load_from_layers(&[layer]);
-            assert_eq!(cfg.kernels.vulkan.decode_gpu_resident_role_pipeline, enabled);
+            assert_eq!(
+                cfg.kernels.vulkan.decode_gpu_resident_role_pipeline,
+                enabled
+            );
         }
     }
 }
@@ -1202,9 +1210,15 @@ fn timeline_selective_sampling_is_opt_in_and_cli_configured() {
         "prof.timeline_device_layer=3",
         "prof.timeline_host_select=queue_submit,PLE_",
     ])]);
-    assert_eq!(cfg.prof.timeline_device_select.as_deref(), Some("resident_,argmax"));
+    assert_eq!(
+        cfg.prof.timeline_device_select.as_deref(),
+        Some("resident_,argmax")
+    );
     assert_eq!(cfg.prof.timeline_device_layer, Some(3));
-    assert_eq!(cfg.prof.timeline_host_select.as_deref(), Some("queue_submit,PLE_"));
+    assert_eq!(
+        cfg.prof.timeline_host_select.as_deref(),
+        Some("queue_submit,PLE_")
+    );
 }
 
 // ── §8.8 — every key is read ─────────────────────────────────────────────────

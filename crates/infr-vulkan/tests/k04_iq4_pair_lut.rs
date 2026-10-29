@@ -53,8 +53,11 @@ fn shader_codebook_words() -> [u32; 4] {
     values
         .split(',')
         .map(|value| {
-            u32::from_str_radix(value.trim().trim_end_matches('u').trim_start_matches("0x"), 16)
-                .unwrap()
+            u32::from_str_radix(
+                value.trim().trim_end_matches('u').trim_start_matches("0x"),
+                16,
+            )
+            .unwrap()
         })
         .collect::<Vec<_>>()
         .try_into()
@@ -138,10 +141,7 @@ fn eighteen_byte_block_reads_and_signed_dots_match() {
             let mut reference = 0;
             for p in 0..8 {
                 let qb = bd + 2 + (p & 3) * 4;
-                let q = rb(qb)
-                    | (rb(qb + 1) << 8)
-                    | (rb(qb + 2) << 16)
-                    | (rb(qb + 3) << 24);
+                let q = rb(qb) | (rb(qb + 1) << 8) | (rb(qb + 2) << 16) | (rb(qb + 3) << 24);
                 let mut pairs = (q >> ((p >> 2) * 4)) & 0x0f0f0f0f;
                 pairs |= pairs >> 4;
                 let packed =
