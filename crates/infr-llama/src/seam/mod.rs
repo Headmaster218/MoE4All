@@ -2787,6 +2787,16 @@ fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
         .next_multiple_of(BLOCK)
 }
 
+/// Expert bytes required by the all-resident path after the dense-only packing margin has already
+/// been withheld from the memory plan. Paged experts live in an explicitly sized arena and do not
+/// need this BDA block-tail allowance.
+fn resident_expert_required_bytes(dense_weight_bytes: u64, expert_weight_bytes: u64) -> u64 {
+    let all_weight_bytes = dense_weight_bytes.saturating_add(expert_weight_bytes);
+    let incremental_packing = resident_weight_packing_margin(all_weight_bytes)
+        .saturating_sub(resident_weight_packing_margin(dense_weight_bytes));
+    expert_weight_bytes.saturating_add(incremental_packing)
+}
+
 /// Extra room withheld from the expert arena while a DeepSeek V4 model is still loading. V4's
 /// unusually large resident dense set and tensor/pipeline count leave substantially more live
 /// device/driver memory than the logical tensor footprint describes. On the 24 GiB Windows AMD
@@ -3965,9 +3975,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         };
         let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
         requested_cache_bytes = requested_cache;
+        let resident_expert_bytes = resident_expert_required_bytes(fp.dense, fp.expert);
         let paged_target_at = |candidate: ModelMemoryPlan| match requested_cache {
             Some(requested) => Some(requested.min(candidate.expert_cache_bytes)),
-            None if candidate.expert_cache_bytes < fp.expert => Some(candidate.expert_cache_bytes),
+            None if candidate.expert_cache_bytes < resident_expert_bytes => {
+                Some(candidate.expert_cache_bytes)
+            }
             None => None,
         };
         let prefill_floor = moe_prefill_floor_bytes(g, cfg);
@@ -4033,7 +4046,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     );
                 }
             }
-            None if auto_budget < fp.expert => {
+            None if auto_budget < resident_expert_bytes => {
                 // Page EVERY expert layer with the WHOLE remainder. A shared LRU arena keeps hot
                 // experts from every layer and is strictly more flexible than pinning a prefix of
                 // complete layers.
@@ -8934,6 +8947,27 @@ mod seam_helper_tests {
         const GIB: u64 = 1024 * MIB;
         assert_eq!(super::resident_weight_packing_margin(1), 256 * MIB);
         assert_eq!(super::resident_weight_packing_margin(16 * GIB), 512 * MIB);
+        assert_eq!(
+            super::resident_expert_required_bytes(4 * GIB, 16 * GIB),
+            16 * GIB + 384 * MIB
+        );
+
+        let logical_experts_only_fit = super::ModelMemoryPlan::new_with_reserves(
+            20 * GIB + 256 * MIB,
+            4 * GIB,
+            0,
+            0,
+            super::resident_weight_packing_margin(4 * GIB),
+            0,
+            0,
+        )
+        .expect("logical Expert fit plan");
+        assert_eq!(logical_experts_only_fit.expert_cache_bytes, 16 * GIB);
+        assert!(
+            logical_experts_only_fit.expert_cache_bytes
+                < super::resident_expert_required_bytes(4 * GIB, 16 * GIB),
+            "logical Expert bytes fitting exactly must still page when resident BDA packing does not"
+        );
 
         let plan = super::ModelMemoryPlan::new_with_reserves(
             20 * GIB,
