@@ -42,12 +42,25 @@ class HardwareTests(unittest.TestCase):
         self.pci = self.sys / "bus/pci/devices"
         self.pci.mkdir(parents=True)
         self.ids = self.root / "pci.ids"
-        self.ids.write_text('1234  Fixture Vendor\n\t5678  Fixture GPU\n')
-        for bdf in ("0000:01:00.0", "0000:02:00.0"):
-            directory = self.pci / bdf
+        self.ids.write_text('1234  Fixture Vendor\n\t5678  Fixture GPU\n\t5679  Fixture GPU\n')
+        topology = self.sys / "devices/pci0000:00"
+        topology.mkdir(parents=True)
+        self.physical_gpu = {}
+        for bdf, bridge_bdf, device in (("0000:01:00.0", "0000:00:01.0", "0x5678"), ("0000:02:00.0", "0000:00:02.0", "0x5679")):
+            endpoint_fields = {"class": "0x030000", "vendor": "0x1234", "device": device, "current_link_speed": "16.0 GT/s PCIe", "current_link_width": "8", "max_link_speed": "32.0 GT/s PCIe", "max_link_width": "16"}
+            bus_directory = self.pci / bdf
+            bus_directory.mkdir()
+            for name, value in endpoint_fields.items():
+                (bus_directory / name).write_text(value + "\n")
+            bridge = topology / bridge_bdf
+            bridge.mkdir()
+            for name, value in {"class": "0x060400", "vendor": "0x1234", "device": "0x9000", "current_link_speed": "8.0 GT/s PCIe", "current_link_width": "4", "max_link_speed": "16.0 GT/s PCIe", "max_link_width": "4"}.items():
+                (bridge / name).write_text(value + "\n")
+            directory = bridge / bdf
             directory.mkdir()
-            for name, value in {"class": "0x030000", "vendor": "0x1234", "device": "0x5678", "current_link_speed": "16.0 GT/s PCIe", "current_link_width": "8", "max_link_speed": "32.0 GT/s PCIe", "max_link_width": "16"}.items():
+            for name, value in endpoint_fields.items():
                 (directory / name).write_text(value + "\n")
+            self.physical_gpu[bdf] = directory
         raw = self.sys / "firmware/dmi/entries/17-0/raw"
         raw.parent.mkdir(parents=True)
         memory = bytearray(40)
@@ -83,8 +96,8 @@ class HardwareTests(unittest.TestCase):
             self.assertNotIn(forbidden, result.stdout)
         return value
 
-    def collect_fixture(self, gpu_name="Fixture GPU", bdf="", model=None, extra=""):
-        bindings = {"os": "Linux", "proc_root": str(self.proc), "sys_root": str(self.sys), "pci_ids": str(self.ids), "model_path": str(self.model if model is None else model), "gpu_name": gpu_name, "pci_address": bdf}
+    def collect_fixture(self, gpu_name="Fixture GPU", bdf="", model=None, extra="", vendor="", device=""):
+        bindings = {"os": "Linux", "backend": "vulkan", "proc_root": str(self.proc), "sys_root": str(self.sys), "pci_ids": str(self.ids), "model_path": str(self.model if model is None else model), "gpu_name": gpu_name, "pci_address": bdf, "gpu_vendor_id": vendor, "gpu_device_id": device, "vulkan_index": "0"}
         setup = "\n".join(f"{key}={shlex.quote(value)}" for key, value in bindings.items())
         return self.run_script(LIBRARY + '\ndiagnostics=; diagnostic_separator=\n' + setup + '\n' + extra + '\nlinux_memory\nlinux_gpu\nmodel_storage\nemit_result\n')
 
@@ -101,6 +114,13 @@ class HardwareTests(unittest.TestCase):
         self.assertEqual(gpu["pci_address"], "0000:02:00.0")
         self.assertEqual((gpu["pcie_generation"], gpu["pcie_width"]), (4, 8))
         self.assertEqual(gpu["pcie_theoretical_one_way_gb_per_second"], 15.752)
+        self.assertEqual((gpu["pcie_endpoint_current_generation"], gpu["pcie_endpoint_current_width"]), (4, 8))
+        self.assertEqual((gpu["pcie_endpoint_max_generation"], gpu["pcie_endpoint_max_width"]), (5, 16))
+        self.assertEqual(gpu["pcie_max_scope"], "selected_gpu_endpoint_capability_not_slot")
+        self.assertEqual((gpu["pcie_end_to_end_current_generation"], gpu["pcie_end_to_end_current_width"]), (3, 4))
+        self.assertEqual(gpu["pcie_end_to_end_current_theoretical_one_way_gb_per_second"], 3.940)
+        self.assertIsNone(gpu["pcie_end_to_end_unknown_reason"])
+        self.assertEqual(len(gpu["pcie_path"]), 2)
         ram = value["hardware"]["ram"]
         self.assertEqual(ram["memory_generation"], "DDR5")
         self.assertEqual(ram["modules"][0]["capacity_bytes"], 17179869184)
@@ -120,11 +140,16 @@ class HardwareTests(unittest.TestCase):
             self.assertIsNone(value["hardware"]["gpu"])
             self.assertEqual(value["collection"]["probes"]["gpu.selection"]["reason"], reason)
 
+    def test_pci_identity_disambiguates_duplicate_marketing_names(self):
+        value = self.collect_fixture(vendor="1234", device="5679", model="")
+        self.assertEqual(value["hardware"]["gpu"]["pci_address"], "0000:02:00.0")
+        self.assertEqual(value["collection"]["probes"]["gpu.selection"]["status"], "ok")
+
     def test_exact_name_and_missing_link_property(self):
         value = self.collect_fixture("fixture gpu", model="")
         self.assertIsNone(value["hardware"]["gpu"])
         (self.pci / "0000:02:00.0/class").write_text("0x020000\n")
-        (self.pci / "0000:01:00.0/current_link_speed").unlink()
+        (self.physical_gpu["0000:01:00.0"] / "current_link_speed").unlink()
         value = self.collect_fixture(model="")
         self.assertEqual(value["hardware"]["gpu"]["name"], "Fixture GPU")
         self.assertIsNone(value["hardware"]["gpu"]["pcie_generation"])
@@ -145,7 +170,7 @@ class HardwareTests(unittest.TestCase):
         self.model.write_bytes(b"small")
         value = self.collect_fixture()
         self.assertEqual(value["collection"]["probes"]["model_storage.sequential"]["status"], "not_applicable")
-        for args in (["--model"], ["--unknown"], ["--pci-address"]):
+        for args in (["--model"], ["--unknown"], ["--pci-address"], ["--gpu-vendor-id", "not-hex"]):
             value = self.run_script(SOURCE, args)
             self.assertEqual(value["collection"]["probes"]["arguments"]["status"], "failed")
 
@@ -156,7 +181,7 @@ sysctl() { case $2 in machdep.cpu.brand_string) printf 'Apple Fixture\\n' ;; hw.
 uname() { case $1 in -s) printf 'Darwin\\n' ;; -m) printf 'arm64\\n' ;; esac; }
 ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRET_SERIAL"\\n'; }
 '''
-        value = self.run_script(LIBRARY + mocks + '\nmain --gpu-name "Apple Fixture GPU"\n')
+        value = self.run_script(LIBRARY + mocks + '\nmain --backend Metal\n')
         self.assertTrue(value["hardware"]["ram"]["unified_memory"])
         self.assertTrue(value["hardware"]["gpu"]["unified_memory"])
         self.assertNotIn("vram_total_bytes", value["hardware"]["gpu"])

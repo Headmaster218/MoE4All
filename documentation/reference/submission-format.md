@@ -67,7 +67,7 @@ python3 scripts/validate-error-submission.py <file.m4e>
 
 Benchmark 保留模型、硬件、配置、上下文与原始测量。自动 suite 与三平台手动结果都使用 .m4b；手动结果须明确 prefill 或 decode，不上传旧裸 JSON。每份最多 64 个不同上下文，每上下文最多 64 种不同并发，每并发最多 100 轮；需包含 overall、三个计分段和与并发一致的 lane 矩阵。128 KiB 总限额同时生效，不保证最大矩阵都能容纳。
 
-Windows 向导生成后补全内存、所选 GPU 当前／最大 PCIe 链路和模型盘信息，并重新封装。直接运行引擎不能保证这些 Windows 补全字段；其他平台不可靠或不适用的字段保留未知，不推测。PCIe 理论带宽不同于实测速度，文件缓存命中也不能当作物理 SSD 吞吐量。
+自动 suite、直接 `infr bench` 和三平台手动向导都在 warmup 前调用同一硬件 collector。报告保留 RAM 容量／预算与可用量快照、所选 GPU 的 Vulkan/PCI 身份、PCIe 物理父链与可取得的固件插槽标识，以及模型所在盘的介质信息和有界顺序／随机读取探测。`pcie_endpoint_current_*`（兼容别名 `pcie_current_*`）只描述显卡端点到紧邻上游端口的当前协商链路；`pcie_endpoint_max_*` 是显卡端点能力，**不是主板插槽、交换芯片上行口或整条主机路径能力**。`pcie_path` 逐级记录端点和上游 PCI bridge，`pcie_physical_slot` 只保留 ACPI/sysfs 与 SMBIOS 可核对的固件插槽归属；插槽名里的宽度最多是 connector hint，不是协商宽度。只有每一级当前链路属性都可用时，`pcie_end_to_end_current_*` 才给出全路径最窄链路，否则必须为 null 并保留 `pcie_end_to_end_unknown_reason`，不得拿显卡支持值或插槽名称冒充实际物理链路。平台不公开、权限不足或设备无法唯一匹配的字段同样保留 probe status/reason，不推测。PCIe 理论带宽不同于实测速度，buffered 文件读取也不能当作纯物理 SSD 吞吐量；统一内存设备的 RAM/VRAM 不能相加。
 
 错误报告描述非空、最多 4096 code point，可在向导返回修改。诊断最多 220 行启动日志、12 行最近日志，两部分合计最多 32 KiB，附必要环境、最终错误及错误链。禁止速度表、prompt、response、图片、密钥、主机名、用户名、序列号及未脱敏绝对路径；隐私声明不能代替内容检查。原始滚动证据不整体嵌入报告。
 

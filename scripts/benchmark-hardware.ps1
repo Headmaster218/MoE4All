@@ -1,7 +1,11 @@
 # Standalone PS 5.1 collector, also suitable for embedding as script text.
 # Call before benchmark warmup. No wizard, engine, GPU API or output file is used.
 [CmdletBinding()]
-param([string]$ModelPath = '', [string]$SelectedGpuName = '', [string]$PciAddress = '')
+param(
+    [string]$ModelPath = '', [string]$Backend = '', [string]$SelectedGpuName = '',
+    [string]$PciAddress = '', [string]$VendorId = '', [string]$DeviceId = '',
+    [string]$VulkanIndex = ''
+)
 
 $ErrorActionPreference = 'Stop'
 $WarningPreference = 'SilentlyContinue'
@@ -81,6 +85,14 @@ function ConvertTo-PciAddress {
     return $null
 }
 
+function ConvertTo-PciId {
+    param([string]$Value)
+    if (-not $Value) { return $null }
+    $text = $Value.Trim()
+    if ($text -notmatch '^(?:0x)?([0-9a-fA-F]{1,8})$') { return $null }
+    return $Matches[1].PadLeft(4, '0').ToUpperInvariant()
+}
+
 function Get-NativePciAddress {
     param([string]$InstanceId)
     $properties = @(Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName @(
@@ -97,21 +109,136 @@ function Get-NativePciAddress {
     return '0000:{0:x2}:{1:x2}.{2:x1}' -f [uint32]$bus[0].Data, $device, $function
 }
 
+function Get-PnpPropertyData {
+    param($Properties, [string]$KeyName)
+    $entry = @($Properties | Where-Object KeyName -eq $KeyName)
+    if ($entry.Count -eq 1 -and $null -ne $entry[0].Data) { return $entry[0].Data }
+    return $null
+}
+
+function Get-PositivePnpInteger {
+    param($Properties, [string]$KeyName)
+    $value = Get-PnpPropertyData $Properties $KeyName
+    if ($null -ne $value -and [int]$value -gt 0) { return [int]$value }
+    return $null
+}
+
+function Get-WindowsPciePath {
+    param([string]$EndpointInstanceId)
+    $nodes = @()
+    $instanceId = $EndpointInstanceId
+    $topologyComplete = $false
+    for ($depth = 0; $depth -lt 16; $depth++) {
+        if ($instanceId -notlike 'PCI\*') { $topologyComplete = $true; break }
+        $properties = @(Get-PnpDeviceProperty -InstanceId $instanceId -KeyName @(
+            'DEVPKEY_Device_Parent',
+            'DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth',
+            'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth'
+        ) -ErrorAction Stop)
+        $currentGeneration = Get-PositivePnpInteger $properties 'DEVPKEY_PciDevice_CurrentLinkSpeed'
+        $currentWidth = Get-PositivePnpInteger $properties 'DEVPKEY_PciDevice_CurrentLinkWidth'
+        $maximumGeneration = Get-PositivePnpInteger $properties 'DEVPKEY_PciDevice_MaxLinkSpeed'
+        $maximumWidth = Get-PositivePnpInteger $properties 'DEVPKEY_PciDevice_MaxLinkWidth'
+        $nodes += [pscustomobject][ordered]@{
+            depth = $depth
+            role = if ($depth -eq 0) { 'selected_gpu_endpoint' } else { 'upstream_pci_bridge' }
+            pci_address = Get-NativePciAddress $instanceId
+            current_generation = $currentGeneration
+            current_width = $currentWidth
+            current_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps $currentGeneration $currentWidth
+            max_generation = $maximumGeneration
+            max_width = $maximumWidth
+        }
+        $parent = Get-PnpPropertyData $properties 'DEVPKEY_Device_Parent'
+        if (-not $parent -or [string]$parent -eq $instanceId) { break }
+        $instanceId = [string]$parent
+    }
+    $missingCurrent = @($nodes | Where-Object {
+        $null -eq $_.current_generation -or $null -eq $_.current_width -or
+        $null -eq $_.current_theoretical_one_way_gb_per_second
+    })
+    $unknownReason = if (-not $topologyComplete) { 'pci_parent_chain_incomplete' }
+        elseif ($nodes.Count -eq 0 -or $null -eq $nodes[0].current_generation -or $null -eq $nodes[0].current_width) { 'endpoint_link_properties_unavailable' }
+        elseif ($missingCurrent.Count -gt 0) { 'upstream_link_properties_unavailable' }
+        else { $null }
+    $bottleneck = if ($null -eq $unknownReason) {
+        $nodes | Sort-Object current_theoretical_one_way_gb_per_second | Select-Object -First 1
+    } else { $null }
+    return [pscustomobject]@{
+        nodes = @($nodes)
+        topology_complete_to_root = $topologyComplete
+        unknown_reason = $unknownReason
+        bottleneck = $bottleneck
+    }
+}
+
+function Get-WindowsPcieSlot {
+    param([string]$EndpointInstanceId)
+    $properties = @(Get-PnpDeviceProperty -InstanceId $EndpointInstanceId -KeyName @(
+        'DEVPKEY_Device_LocationPaths'
+    ) -ErrorAction Stop)
+    $locationPaths = @(Get-PnpPropertyData $properties 'DEVPKEY_Device_LocationPaths')
+    $tokens = @()
+    foreach ($locationPath in $locationPaths) {
+        foreach ($match in [regex]::Matches([string]$locationPath, '(?i)ACPI\(([^)]+)\)')) {
+            $token = ([string]$match.Groups[1].Value -replace '[^A-Za-z0-9]', '').ToUpperInvariant()
+            if ($token) { $tokens += $token }
+        }
+    }
+    if (-not $tokens.Count) {
+        Set-ProbeStatus 'gpu.pcie_slot' 'unsupported' 'firmware_location_path_unavailable' 'windows_pnp_smbios'
+        return $null
+    }
+    $slots = @(Get-CimInstance Win32_SystemSlot -OperationTimeoutSec 3 -ErrorAction Stop | Select-Object -First 64)
+    $matches = @($slots | Where-Object {
+        $designation = (([string]$_.SlotDesignation -replace '[^A-Za-z0-9]', '').ToUpperInvariant())
+        if ($designation.StartsWith('PCIE')) { $designation = $designation.Substring(4) }
+        elseif ($designation.StartsWith('PCI')) { $designation = $designation.Substring(3) }
+        $tokens -contains $designation
+    })
+    if ($matches.Count -ne 1) {
+        $reason = if ($matches.Count -gt 1) { 'ambiguous_firmware_slot_match' } else { 'firmware_slot_not_matched' }
+        Set-ProbeStatus 'gpu.pcie_slot' 'unsupported' $reason 'windows_pnp_smbios'
+        return $null
+    }
+    $slot = $matches[0]
+    $designation = Get-SafeHardwareText $slot.SlotDesignation
+    $widthHint = $null
+    if ($designation -match '(?i)^(?:PCIE|PCI)X(1|2|4|8|12|16|32)(?:_|$)') {
+        $widthHint = [int]$Matches[1]
+    }
+    Set-ProbeStatus 'gpu.pcie_slot' 'ok' 'acpi_location_matched_to_smbios_slot' 'windows_pnp_smbios'
+    return [pscustomobject][ordered]@{
+        designation = $designation
+        connector_width_hint = $widthHint
+        connector_width_hint_source = if ($null -ne $widthHint) { 'firmware_slot_designation' } else { $null }
+        current_usage = switch ([int]$slot.CurrentUsage) { 3 { 'available' } 4 { 'in_use' } default { 'unknown' } }
+    }
+}
+
 function Get-WindowsSelectedGpu {
-    param([string]$Name, [string]$Address)
-    if (-not $Name -and -not $Address) {
+    param([string]$Name, [string]$Address, [string]$Vendor, [string]$Device, [string]$Index)
+    if (-not $Name -and -not $Address -and -not $Vendor -and -not $Device) {
         Set-ProbeStatus 'gpu.selection' 'not_applicable' 'no_selected_gpu' 'windows_pnp'; return $null
     }
     $bdf = ConvertTo-PciAddress $Address
     if ($Address -and -not $bdf) {
         Set-ProbeStatus 'gpu.selection' 'failed' 'invalid_pci_address' 'windows_pnp'; return $null
     }
+    $vendorKey = ConvertTo-PciId $Vendor
+    $deviceKey = ConvertTo-PciId $Device
+    if (($Vendor -and -not $vendorKey) -or ($Device -and -not $deviceKey)) {
+        Set-ProbeStatus 'gpu.selection' 'failed' 'invalid_pci_identity' 'windows_pnp'; return $null
+    }
     $candidates = @(Get-CimInstance Win32_VideoController -OperationTimeoutSec 3 -ErrorAction Stop | Select-Object -First 64)
     $found = @()
     foreach ($candidate in $candidates) {
+        $instanceId = [string]$candidate.PNPDeviceID
+        if ($vendorKey -and $instanceId -notmatch "(?i)(?:\\|&)VEN_$vendorKey(?:&|$)") { continue }
+        if ($deviceKey -and $instanceId -notmatch "(?i)(?:\\|&)DEV_$deviceKey(?:&|$)") { continue }
         if ($bdf) {
-            if ([string]$candidate.PNPDeviceID -notlike 'PCI\*') { continue }
-            $native = Get-NativePciAddress ([string]$candidate.PNPDeviceID)
+            if ($instanceId -notlike 'PCI\*') { continue }
+            $native = Get-NativePciAddress $instanceId
             if ($native -ceq $bdf) { $found += [pscustomobject]@{ device = $candidate; bdf = $native } }
         } elseif ([string]$candidate.Name -ceq $Name) {
             $found += [pscustomobject]@{ device = $candidate; bdf = $null }
@@ -124,28 +251,66 @@ function Get-WindowsSelectedGpu {
     Set-ProbeStatus 'gpu.selection' 'ok' 'unique_native_match' 'windows_pnp'
     $selected = $found[0]
     $gpu = [ordered]@{ name = Get-SafeHardwareText $selected.device.Name; pci_address = $selected.bdf }
+    if ($Vendor) { $gpu.vendor_id = [Convert]::ToUInt32($vendorKey, 16) }
+    if ($Device) { $gpu.device_id = [Convert]::ToUInt32($deviceKey, 16) }
+    if ($Index -match '^[0-9]+$') { $gpu.vulkan_index = [uint32]$Index }
     if ([string]$selected.device.PNPDeviceID -notlike 'PCI\*') {
         Set-ProbeStatus 'gpu.pcie' 'not_applicable' 'non_pci_device' 'windows_pnp'; return $gpu
     }
     try {
-        $properties = @(Get-PnpDeviceProperty -InstanceId $selected.device.PNPDeviceID -KeyName @(
-            'DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth',
-            'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth'
-        ) -ErrorAction Stop)
-        $fields = [ordered]@{ CurrentLinkSpeed = 'pcie_generation'; CurrentLinkWidth = 'pcie_width'; MaxLinkSpeed = 'pcie_max_generation'; MaxLinkWidth = 'pcie_max_width' }
-        $complete = $true
-        foreach ($key in $fields.Keys) {
-            $entry = @($properties | Where-Object KeyName -eq "DEVPKEY_PciDevice_$key")
-            $value = if ($entry.Count -eq 1 -and $null -ne $entry[0].Data -and [int]$entry[0].Data -gt 0) { [int]$entry[0].Data } else { $null }
-            $gpu[$fields[$key]] = $value
-            if ($null -eq $value) { $complete = $false }
+        $path = Get-WindowsPciePath ([string]$selected.device.PNPDeviceID)
+        $slot = $null
+        try { $slot = Get-WindowsPcieSlot ([string]$selected.device.PNPDeviceID) }
+        catch { Set-ProbeError 'gpu.pcie_slot' $_ 'windows_pnp_smbios' }
+        $endpoint = @($path.nodes)[0]
+        $gpu.pcie_endpoint_current_generation = $endpoint.current_generation
+        $gpu.pcie_endpoint_current_width = $endpoint.current_width
+        $gpu.pcie_endpoint_current_theoretical_one_way_gb_per_second = $endpoint.current_theoretical_one_way_gb_per_second
+        $gpu.pcie_endpoint_max_generation = $endpoint.max_generation
+        $gpu.pcie_endpoint_max_width = $endpoint.max_width
+        $gpu.pcie_endpoint_max_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps $endpoint.max_generation $endpoint.max_width
+        # Compatibility aliases retain the benchmark/1 schema. They describe only the endpoint's
+        # local link and must never be interpreted as the slot, switch uplink, or host path.
+        $gpu.pcie_current_generation = $gpu.pcie_endpoint_current_generation
+        $gpu.pcie_current_width = $gpu.pcie_endpoint_current_width
+        $gpu.pcie_generation = $gpu.pcie_endpoint_current_generation
+        $gpu.pcie_width = $gpu.pcie_endpoint_current_width
+        $gpu.pcie_max_generation = $gpu.pcie_endpoint_max_generation
+        $gpu.pcie_max_width = $gpu.pcie_endpoint_max_width
+        $gpu.pcie_current_theoretical_one_way_gb_per_second = $gpu.pcie_endpoint_current_theoretical_one_way_gb_per_second
+        $gpu.pcie_theoretical_one_way_gb_per_second = $gpu.pcie_endpoint_current_theoretical_one_way_gb_per_second
+        $gpu.pcie_max_theoretical_one_way_gb_per_second = $gpu.pcie_endpoint_max_theoretical_one_way_gb_per_second
+        $gpu.pcie_current_scope = 'selected_gpu_endpoint_local_link_only'
+        $gpu.pcie_max_scope = 'selected_gpu_endpoint_capability_not_slot'
+        $gpu.pcie_path = @($path.nodes)
+        $gpu.pcie_path_complete_to_root = [bool]$path.topology_complete_to_root
+        $gpu.pcie_upstream_pci_bridge_count = [Math]::Max(0, @($path.nodes).Count - 1)
+        $gpu.pcie_attachment = if ($gpu.pcie_upstream_pci_bridge_count -gt 1) { 'multi_bridge_path' }
+            elseif ($gpu.pcie_upstream_pci_bridge_count -eq 1) { 'single_upstream_pci_bridge' }
+            else { 'endpoint_only_parent_unknown' }
+        $gpu.pcie_physical_slot = $slot
+        $gpu.pcie_end_to_end_unknown_reason = $path.unknown_reason
+        if ($null -ne $path.bottleneck) {
+            $gpu.pcie_end_to_end_current_generation = $path.bottleneck.current_generation
+            $gpu.pcie_end_to_end_current_width = $path.bottleneck.current_width
+            $gpu.pcie_end_to_end_current_theoretical_one_way_gb_per_second = $path.bottleneck.current_theoretical_one_way_gb_per_second
+            $gpu.pcie_end_to_end_scope = 'minimum_negotiated_bandwidth_across_complete_pci_path'
+            Set-ProbeStatus 'gpu.pcie_path' 'ok' 'complete_native_path' 'windows_pnp'
+        } else {
+            $gpu.pcie_end_to_end_current_generation = $null
+            $gpu.pcie_end_to_end_current_width = $null
+            $gpu.pcie_end_to_end_current_theoretical_one_way_gb_per_second = $null
+            Set-ProbeStatus 'gpu.pcie_path' 'unsupported' $path.unknown_reason 'windows_pnp'
         }
-        $gpu.pcie_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps $gpu.pcie_generation $gpu.pcie_width
-        $gpu.pcie_max_theoretical_one_way_gb_per_second = Get-PcieTheoreticalBandwidthGbps $gpu.pcie_max_generation $gpu.pcie_max_width
         $gpu.pcie_source = 'windows_pnp'
-        if ($complete) { Set-ProbeStatus 'gpu.pcie' 'ok' 'native_link_properties' 'windows_pnp' }
-        else { Set-ProbeStatus 'gpu.pcie' 'unsupported' 'link_properties_unavailable' 'windows_pnp' }
-    } catch { Set-ProbeError 'gpu.pcie' $_ 'windows_pnp' }
+        if ($null -ne $endpoint.current_generation -and $null -ne $endpoint.current_width -and
+            $null -ne $endpoint.max_generation -and $null -ne $endpoint.max_width) {
+            Set-ProbeStatus 'gpu.pcie' 'ok' 'native_endpoint_link_properties' 'windows_pnp'
+        } else { Set-ProbeStatus 'gpu.pcie' 'unsupported' 'endpoint_link_properties_unavailable' 'windows_pnp' }
+    } catch {
+        Set-ProbeError 'gpu.pcie' $_ 'windows_pnp'
+        Set-ProbeError 'gpu.pcie_path' $_ 'windows_pnp'
+    }
     return $gpu
 }
 
@@ -249,9 +414,12 @@ function Get-WindowsBenchmarkModelStorageDetails {
 }
 
 function Invoke-BenchmarkHardwareCollector {
-    param([string]$Path, [string]$GpuName, [string]$Address)
+    param(
+        [string]$Path, [string]$BackendName, [string]$GpuName, [string]$Address,
+        [string]$GpuVendorId, [string]$GpuDeviceId, [string]$GpuVulkanIndex
+    )
     $script:diagnostics = [ordered]@{}
-    foreach ($probe in @('cpu', 'ram.total', 'ram.modules', 'gpu.selection', 'gpu.pcie', 'model_storage.metadata', 'model_storage.media', 'model_storage.sequential', 'model_storage.random_64k', 'model_storage.physical_reads')) {
+    foreach ($probe in @('cpu', 'ram.total', 'ram.modules', 'gpu.selection', 'gpu.pcie', 'gpu.pcie_path', 'gpu.pcie_slot', 'model_storage.metadata', 'model_storage.media', 'model_storage.sequential', 'model_storage.random_64k', 'model_storage.physical_reads')) {
         Set-ProbeStatus $probe 'unsupported' 'native_data_unavailable' 'windows_native'
     }
     $hardware = [ordered]@{ cpu = $null; ram = [ordered]@{}; gpu = $null; model_storage = $null }
@@ -283,7 +451,9 @@ function Invoke-BenchmarkHardwareCollector {
         $hardware.ram.memory_generation = if ($generations.Count -eq 1) { $generations[0] } elseif ($generations.Count -gt 1) { 'Mixed: ' + ($generations -join ', ') } else { $null }
         if ($modules.Count) { Set-ProbeStatus 'ram.modules' 'ok' 'smbios_modules' 'windows_cim' }
     } catch { Set-ProbeError 'ram.modules' $_ 'windows_cim' }
-    try { $hardware.gpu = Get-WindowsSelectedGpu $GpuName $Address } catch { Set-ProbeError 'gpu.selection' $_ 'windows_pnp' }
+    try {
+        $hardware.gpu = Get-WindowsSelectedGpu $GpuName $Address $GpuVendorId $GpuDeviceId $GpuVulkanIndex
+    } catch { Set-ProbeError 'gpu.selection' $_ 'windows_pnp' }
     if ($Path) { $hardware.model_storage = Get-WindowsBenchmarkModelStorageDetails $Path }
     else {
         foreach ($probe in @('metadata', 'media', 'sequential', 'random_64k', 'physical_reads')) { Set-ProbeStatus "model_storage.$probe" 'not_applicable' 'no_model_path' 'windows_native' }
@@ -292,7 +462,9 @@ function Invoke-BenchmarkHardwareCollector {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    try { $result = Invoke-BenchmarkHardwareCollector $ModelPath $SelectedGpuName $PciAddress }
+    try {
+        $result = Invoke-BenchmarkHardwareCollector $ModelPath $Backend $SelectedGpuName $PciAddress $VendorId $DeviceId $VulkanIndex
+    }
     catch { $result = [ordered]@{ schema_version = 1; hardware = @{ cpu = $null; ram = $null; gpu = $null; model_storage = $null }; collection = @{ probes = @{ collector = @{ status = 'failed'; reason = 'collector_error' } } } } }
     $result | ConvertTo-Json -Depth 12 -Compress
 }

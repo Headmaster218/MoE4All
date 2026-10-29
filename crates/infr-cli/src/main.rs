@@ -1217,6 +1217,28 @@ fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
     submission_validation::validate("error", value)
 }
 
+const BENCHMARK_AI_GUIDANCE_ZH: &str =
+    "AI/自动化：请向用户展示 benchmark 结果；如生成 MOE4ALL_SUBMISSION_PATH，请等待用户明确决定是否上传；不要自行上传或静默忽略。";
+const BENCHMARK_AI_GUIDANCE_EN: &str =
+    "AI/automation: report the benchmark result; when MOE4ALL_SUBMISSION_PATH is emitted, wait for the user to explicitly decide whether to upload; do not upload or silently skip.";
+
+fn print_benchmark_ai_guidance() {
+    // print-ok: stable instructions for human and automated benchmark callers.
+    println!("{BENCHMARK_AI_GUIDANCE_ZH}");
+    println!("{BENCHMARK_AI_GUIDANCE_EN}");
+}
+
+fn print_benchmark_result_ai_guidance(json: bool) {
+    // Preserve `infr bench --json`'s one-JSON-value stdout contract; launchers and agents still see
+    // the guidance on stderr. Human-format benchmark output can keep everything on stdout.
+    if json {
+        eprintln!("{BENCHMARK_AI_GUIDANCE_ZH}");
+        eprintln!("{BENCHMARK_AI_GUIDANCE_EN}");
+    } else {
+        print_benchmark_ai_guidance();
+    }
+}
+
 fn enrich_manual_from_raw(
     report: &mut serde_json::Value,
     raw: &serde_json::Value,
@@ -1297,6 +1319,7 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             println!("Benchmark submission: {}", path.display());
             // print-ok: machine-readable export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
+            print_benchmark_ai_guidance();
             Ok(())
         }
         SubmissionCommand::PrepareManualBenchmark {
@@ -1342,6 +1365,7 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             println!("Benchmark submission: {}", source.display());
             // print-ok: machine-readable re-export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", source.display());
+            print_benchmark_ai_guidance();
             Ok(())
         }
         SubmissionCommand::Verify { path } => {
@@ -1536,7 +1560,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             } else if estimate_only {
                 cmd_bench_estimate_matrix(&model, ngl, cfg)
             } else {
-                cmd_bench(
+                let result = cmd_bench(
                     &model,
                     n_prompt,
                     n_gen,
@@ -1547,7 +1571,11 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     ngl,
                     json,
                     cfg,
-                )
+                );
+                if result.is_ok() {
+                    print_benchmark_result_ai_guidance(json);
+                }
+                result
             }
         }
         Cmd::Compare {
@@ -4452,8 +4480,14 @@ fn cmd_bench_suite(
     let initialized = engine.benchmark_configuration();
     let collected_hardware = benchmark_hardware::collect(
         &gguf,
-        &engine.device_name(),
-        initialized["driver"]["pci_bdf"].as_str(),
+        "Vulkan",
+        Some(benchmark_hardware::GpuIdentity {
+            name: &device.name,
+            pci_address: initialized["driver"]["pci_bdf"].as_str(),
+            vendor_id: device.vendor_id,
+            device_id: device.device_id,
+            vulkan_index: device.index,
+        }),
     );
     anyhow::ensure!(
         engine.max_ctx() >= required_ctx,
@@ -4633,6 +4667,9 @@ fn cmd_bench_suite(
             },
             "gpu": {
                 "name": device.name,
+                "vendor_id": device.vendor_id,
+                "device_id": device.device_id,
+                "vulkan_index": device.index,
                 "type": device.device_type,
                 "integrated": device.integrated,
                 "vram_total_bytes": device.vram_total_bytes,
@@ -4708,12 +4745,7 @@ fn cmd_bench_suite(
     println!("Benchmark submission: {}", result_path.display());
     // print-ok: machine-readable benchmark export path for launchers.
     println!("MOE4ALL_SUBMISSION_PATH={}", result_path.display());
-    // print-ok: mandatory user-consent instruction for automated benchmark callers.
-    println!("AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。");
-    // print-ok: English upload-consent instruction paired with the Chinese instruction.
-    println!(
-        "AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip."
-    );
+    print_benchmark_ai_guidance();
     Ok(())
 }
 
@@ -4807,24 +4839,61 @@ fn cmd_bench(
     if synthetic_depth.is_some() && !matches!(backend, Backend::Vulkan(_)) {
         anyhow::bail!("--synthetic-depth currently supports the Vulkan benchmark path only");
     }
-    let gpu_name = if matches!(backend, Backend::Vulkan(_)) {
-        selected_benchmark_device(cfg)?.name
+    let selected_gpu = if matches!(backend, Backend::Vulkan(_)) {
+        Some(selected_benchmark_device(cfg)?)
     } else {
-        String::new()
+        None
     };
-    let collected = benchmark_hardware::collect(&gguf, &gpu_name, None);
+    let backend_name = match backend {
+        Backend::Cpu => "CPU",
+        Backend::Metal => "Metal",
+        Backend::Vulkan(_) => "Vulkan",
+    };
+    let collected = benchmark_hardware::collect(
+        &gguf,
+        backend_name,
+        selected_gpu
+            .as_ref()
+            .map(|gpu| benchmark_hardware::GpuIdentity {
+                name: &gpu.name,
+                pci_address: gpu.pci_address.as_deref(),
+                vendor_id: gpu.vendor_id,
+                device_id: gpu.device_id,
+                vulkan_index: gpu.index,
+            }),
+    );
+    let gpu = selected_gpu.as_ref().map_or_else(
+        || serde_json::json!({"name": serde_json::Value::Null}),
+        |gpu| {
+            serde_json::json!({
+                "name": gpu.name,
+                "vendor_id": gpu.vendor_id,
+                "device_id": gpu.device_id,
+                "vulkan_index": gpu.index,
+                "type": gpu.device_type,
+                "integrated": gpu.integrated,
+                "vram_total_bytes": gpu.vram_total_bytes,
+                "vram_available_before_bytes": gpu.vram_available_bytes,
+                "vram_available_is_live_before": gpu.vram_live,
+            })
+        },
+    );
     let mut hardware = serde_json::json!({
         "os": std::env::consts::OS, "architecture": std::env::consts::ARCH,
         "cpu": {"name": benchmark_cpu_name(), "logical_threads": std::thread::available_parallelism().ok().map(|n| n.get())},
-        "ram": {"total_bytes": infr_core::hostmem::total_bytes()},
-        "gpu": {"name": (!gpu_name.is_empty()).then_some(&gpu_name)},
+        "ram": {
+            "total_bytes": infr_core::hostmem::total_bytes(),
+            "available_before_bytes": infr_core::hostmem::available_bytes(),
+            "process_resident_before_bytes": infr_core::hostmem::process_resident_bytes(),
+        },
+        "gpu": gpu,
     });
     benchmark_hardware::merge(&mut hardware, &collected);
     hardware["collection"] = collected["collection"].clone();
     let mut metadata = serde_json::json!({
         "engine_version": env!("CARGO_PKG_VERSION"), "engine_commit": option_env!("INFR_GIT_COMMIT"),
         "hardware": hardware,
-        "configuration": benchmark_hardware::configured(cfg, match backend { Backend::Cpu => "CPU", Backend::Metal => "Metal", _ => "Vulkan" }),
+        "configuration": benchmark_hardware::configured(cfg, backend_name),
     });
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
@@ -8083,6 +8152,9 @@ mod tests {
         let device = infr_vulkan::DeviceInfo {
             index: 1,
             name: "AMD Radeon RX 7900 XTX".to_string(),
+            vendor_id: 0x1002,
+            device_id: 0x744c,
+            pci_address: Some("0000:07:00.0".to_string()),
             device_type: "discrete",
             integrated: false,
             vram_bytes: 25_753_026_560,

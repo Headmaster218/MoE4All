@@ -2579,6 +2579,13 @@ fn preferred_device_index(devices: &[(vk::PhysicalDeviceType, u64)]) -> usize {
 pub struct DeviceInfo {
     pub index: usize,
     pub name: String,
+    /// Vulkan's PCI vendor/device identity. These stay available even when the driver does not
+    /// expose `VK_EXT_pci_bus_info`, so platform benchmark collectors can disambiguate adapters.
+    pub vendor_id: u32,
+    pub device_id: u32,
+    /// PCI BDF from `VK_EXT_pci_bus_info`, when the driver exposes it. This identifies the
+    /// physical endpoint; it says nothing by itself about the upstream slot/switch path.
+    pub pci_address: Option<String>,
     pub device_type: &'static str,
     pub integrated: bool,
     /// Physical DEVICE_LOCAL capacity used for device selection. Windows NVIDIA discrete GPUs
@@ -3582,6 +3589,15 @@ impl VulkanBackend {
                     exts.iter()
                         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
                 };
+                let pci_address = has(c"VK_EXT_pci_bus_info").then(|| {
+                    let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+                    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+                    unsafe { instance.get_physical_device_properties2(pd, &mut props) };
+                    format!(
+                        "{:04x}:{:02x}:{:02x}.{:x}",
+                        pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function
+                    )
+                });
                 let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
                 let vram = physical_vram_info(
                     &instance,
@@ -3606,6 +3622,9 @@ impl VulkanBackend {
                 out.push(DeviceInfo {
                     index,
                     name,
+                    vendor_id: p.vendor_id,
+                    device_id: p.device_id,
+                    pci_address,
                     device_type: device_type_str(p.device_type),
                     integrated,
                     vram_bytes,

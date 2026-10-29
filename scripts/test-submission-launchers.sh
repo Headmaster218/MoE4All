@@ -234,6 +234,7 @@ S[model]="$work/model with spaces.gguf"
 pack_manual_benchmark "$work/manual.json" > "$work/manual-output"
 check test -f "$REPLY"
 check grep -q '123.4' "$work/manual-output"
+check grep -q 'AI/automation: report the benchmark result' "$work/manual-output"
 S[manual_bench_kind]=mixed
 pack_manual_benchmark "$work/manual.json" > "$work/mixed-output"
 check test -z "$REPLY"

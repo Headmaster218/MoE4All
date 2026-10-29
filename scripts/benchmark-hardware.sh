@@ -45,6 +45,82 @@ link_generation() {
         16.0*|16\ *) printf 4 ;; 32.0*|32\ *) printf 5 ;; 64.0*|64\ *) printf 6 ;; *) printf null ;; esac
 }
 
+linux_pcie_path() {
+    endpoint_link_status=ok; pcie_path=; pcie_path_separator=; pcie_path_count=0
+    path_links_complete=1; topology_complete=0; topology_resolved=1
+    bottleneck_gen=null; bottleneck_width=null; bottleneck_rate=
+    resolved_path=$(readlink -f "$gpu_directory" 2>/dev/null)
+    [ -n "$resolved_path" ] || resolved_path=$gpu_directory
+    case $resolved_path in
+        "$sys_root"/bus/pci/devices/*)
+            physical_matches=$(find "$sys_root/devices" -type d -name "${gpu_directory##*/}" -print 2>/dev/null | head -n 2)
+            physical_count=$(printf '%s\n' "$physical_matches" | awk 'NF{n++} END{print n+0}')
+            if [ "$physical_count" -eq 1 ]; then resolved_path=$(printf '%s\n' "$physical_matches" | awk 'NF{print;exit}')
+            else topology_resolved=0; fi ;;
+    esac
+    path_node=$resolved_path; path_depth=0
+    while [ "$path_depth" -lt 16 ] && [ -r "$path_node/class" ]; do
+        read_native "$path_node/current_link_speed"; node_current_gen=$(link_generation "$native_value"); node_current_speed_status=$native_status
+        read_native "$path_node/current_link_width"; node_current_width=$(number "$native_value"); node_current_width_status=$native_status
+        read_native "$path_node/max_link_speed"; node_max_gen=$(link_generation "$native_value"); node_max_speed_status=$native_status
+        read_native "$path_node/max_link_width"; node_max_width=$(number "$native_value"); node_max_width_status=$native_status
+        node_rate=$(pcie_rate "$node_current_gen" "$node_current_width")
+        if [ "$node_current_speed_status" != ok ] || [ "$node_current_width_status" != ok ] ||
+           [ "$node_current_gen" = null ] || [ "$node_current_width" = null ] || [ "$node_rate" = null ]; then
+            path_links_complete=0
+        elif [ -z "$bottleneck_rate" ] || awk -v a="$node_rate" -v b="$bottleneck_rate" 'BEGIN{exit !(a+0<b+0)}'; then
+            bottleneck_gen=$node_current_gen; bottleneck_width=$node_current_width; bottleneck_rate=$node_rate
+        fi
+        if [ "$path_depth" -eq 0 ]; then
+            current_gen=$node_current_gen; current_width=$node_current_width
+            max_gen=$node_max_gen; max_width=$node_max_width
+            if [ "$node_current_speed_status" != ok ]; then endpoint_link_status=$node_current_speed_status; fi
+            if [ "$node_current_width_status" != ok ]; then endpoint_link_status=$node_current_width_status; fi
+            if [ "$node_max_speed_status" != ok ]; then endpoint_link_status=$node_max_speed_status; fi
+            if [ "$node_max_width_status" != ok ]; then endpoint_link_status=$node_max_width_status; fi
+            if [ "$endpoint_link_status" = ok ] && { [ "$current_gen" = null ] || [ "$current_width" = null ] || [ "$max_gen" = null ] || [ "$max_width" = null ]; }; then
+                endpoint_link_status=unsupported
+            fi
+            node_role=selected_gpu_endpoint
+        else node_role=upstream_pci_bridge
+        fi
+        node_bdf=$(normalize_bdf "${path_node##*/}")
+        pcie_path="$pcie_path$pcie_path_separator{\"depth\":$path_depth,\"role\":\"$node_role\",\"pci_address\":$(json_string "$node_bdf"),\"current_generation\":$node_current_gen,\"current_width\":$node_current_width,\"current_theoretical_one_way_gb_per_second\":$node_rate,\"max_generation\":$node_max_gen,\"max_width\":$node_max_width}"
+        pcie_path_separator=,; pcie_path_count=$((pcie_path_count+1)); path_depth=$((path_depth+1))
+        parent_node=${path_node%/*}
+        [ "$parent_node" != "$path_node" ] || break
+        path_node=$parent_node
+    done
+    if [ "$topology_resolved" -eq 1 ] && [ ! -r "$path_node/class" ]; then topology_complete=1; fi
+    if [ "$topology_resolved" -ne 1 ]; then pcie_path_unknown_reason=pci_topology_resolution_failed
+    elif [ "$topology_complete" -ne 1 ]; then pcie_path_unknown_reason=pci_parent_chain_incomplete
+    elif [ "$current_gen" = null ] || [ "$current_width" = null ]; then pcie_path_unknown_reason=endpoint_link_properties_unavailable
+    elif [ "$path_links_complete" -ne 1 ]; then pcie_path_unknown_reason=upstream_link_properties_unavailable
+    else pcie_path_unknown_reason=; fi
+    if [ -z "$pcie_path_unknown_reason" ]; then
+        end_to_end_gen=$bottleneck_gen; end_to_end_width=$bottleneck_width; end_to_end_rate=$bottleneck_rate
+        end_to_end_scope='"minimum_negotiated_bandwidth_across_complete_pci_path"'
+        end_to_end_reason=null
+        probe gpu.pcie_path ok complete_native_path sysfs_pci
+    else
+        end_to_end_gen=null; end_to_end_width=null; end_to_end_rate=null; end_to_end_scope=null
+        end_to_end_reason=$(json_string "$pcie_path_unknown_reason")
+        probe gpu.pcie_path unsupported "$pcie_path_unknown_reason" sysfs_pci
+    fi
+    upstream_bridge_count=$((pcie_path_count>0 ? pcie_path_count-1 : 0))
+    if [ "$upstream_bridge_count" -gt 1 ]; then pcie_attachment=multi_bridge_path
+    elif [ "$upstream_bridge_count" -eq 1 ]; then pcie_attachment=single_upstream_pci_bridge
+    else pcie_attachment=endpoint_only_parent_unknown; fi
+    read_native "$resolved_path/physical_slot"
+    if [ "$native_status" = ok ]; then
+        pcie_physical_slot="{\"designation\":$(json_string "$native_value"),\"connector_width_hint\":null,\"connector_width_hint_source\":null}"
+        probe gpu.pcie_slot ok native_physical_slot sysfs_pci
+    else
+        pcie_physical_slot=null
+        probe gpu.pcie_slot unsupported physical_slot_unavailable sysfs_pci
+    fi
+}
+
 linux_memory() {
     cpu_name=$(awk -F ': *' '/^(model name|Hardware|Processor)[[:space:]]*:/ {print $2;exit}' "$proc_root/cpuinfo" 2>/dev/null)
     cpu_threads=$(awk '/^processor[[:space:]]*:/ {n++} END {if(n)print n}' "$proc_root/cpuinfo" 2>/dev/null)
@@ -98,14 +174,18 @@ pci_name() {
 }
 linux_gpu() {
     gpu=null
-    if [ -z "$gpu_name$pci_address" ]; then
+    if [ -z "$gpu_name$pci_address$gpu_vendor_id$gpu_device_id" ]; then
         probe gpu.selection not_applicable no_selected_gpu sysfs_pci
-        probe gpu.pcie not_applicable no_selected_gpu sysfs_pci; return
+        probe gpu.pcie not_applicable no_selected_gpu sysfs_pci
+        probe gpu.pcie_path not_applicable no_selected_gpu sysfs_pci
+        probe gpu.pcie_slot not_applicable no_selected_gpu sysfs_pci; return
     fi
     wanted_bdf=$(normalize_bdf "$pci_address")
     if [ -n "$pci_address" ] && [ -z "$wanted_bdf" ]; then
         probe gpu.selection failed invalid_pci_address sysfs_pci
-        probe gpu.pcie not_applicable no_unique_gpu sysfs_pci; return
+        probe gpu.pcie not_applicable no_unique_gpu sysfs_pci
+        probe gpu.pcie_path not_applicable no_unique_gpu sysfs_pci
+        probe gpu.pcie_slot not_applicable no_unique_gpu sysfs_pci; return
     fi
     gpu_count=0; gpu_directory=; matched_name=; named_devices=0
     for pci_dir in "$sys_root"/bus/pci/devices/*; do
@@ -119,7 +199,14 @@ linux_gpu() {
         else
             native_name=$(pci_name "$pci_dir")
             [ -z "$native_name" ] || named_devices=$((named_devices+1))
-            [ "$native_name" = "$gpu_name" ] || continue
+            read_native "$pci_dir/vendor"; native_vendor=${native_value#0x}
+            read_native "$pci_dir/device"; native_device=${native_value#0x}
+            if [ -n "$gpu_vendor_id$gpu_device_id" ]; then
+                [ -z "$gpu_vendor_id" ] || [ "$(printf '%s' "$native_vendor" | tr 'A-F' 'a-f')" = "$gpu_vendor_id" ] || continue
+                [ -z "$gpu_device_id" ] || [ "$(printf '%s' "$native_device" | tr 'A-F' 'a-f')" = "$gpu_device_id" ] || continue
+            else
+                [ "$native_name" = "$gpu_name" ] || continue
+            fi
         fi
         gpu_count=$((gpu_count+1)); gpu_directory=$pci_dir; matched_name=$native_name
     done
@@ -127,17 +214,14 @@ linux_gpu() {
         if [ "$gpu_count" -gt 1 ]; then probe gpu.selection failed ambiguous_selected_gpu sysfs_pci
         elif [ -z "$wanted_bdf" ] && [ "$named_devices" -eq 0 ]; then probe gpu.selection unsupported native_gpu_names_unavailable sysfs_pci
         else probe gpu.selection failed selected_gpu_not_found sysfs_pci; fi
-        probe gpu.pcie not_applicable no_unique_gpu sysfs_pci; return
+        probe gpu.pcie not_applicable no_unique_gpu sysfs_pci
+        probe gpu.pcie_path not_applicable no_unique_gpu sysfs_pci
+        probe gpu.pcie_slot not_applicable no_unique_gpu sysfs_pci; return
     fi
     probe gpu.selection ok unique_native_match sysfs_pci
-    link_status=ok
-    read_native "$gpu_directory/current_link_speed"; current_gen=$(link_generation "$native_value"); [ "$native_status" = ok ] || link_status=$native_status
-    read_native "$gpu_directory/current_link_width"; current_width=$(number "$native_value"); [ "$native_status" = ok ] || link_status=$native_status
-    read_native "$gpu_directory/max_link_speed"; max_gen=$(link_generation "$native_value"); [ "$native_status" = ok ] || link_status=$native_status
-    read_native "$gpu_directory/max_link_width"; max_width=$(number "$native_value"); [ "$native_status" = ok ] || link_status=$native_status
-    if [ "$link_status" = ok ] && { [ "$current_gen" = null ] || [ "$max_gen" = null ]; }; then link_status=unsupported; fi
-    probe gpu.pcie "$link_status" native_link_properties sysfs_pci
-    gpu="{\"name\":$(json_string "$matched_name"),\"pci_address\":$(json_string "${gpu_directory##*/}"),\"pcie_generation\":$current_gen,\"pcie_width\":$current_width,\"pcie_max_generation\":$max_gen,\"pcie_max_width\":$max_width,\"pcie_theoretical_one_way_gb_per_second\":$(pcie_rate "$current_gen" "$current_width"),\"pcie_max_theoretical_one_way_gb_per_second\":$(pcie_rate "$max_gen" "$max_width"),\"pcie_source\":\"sysfs_pci\"}"
+    linux_pcie_path
+    probe gpu.pcie "$endpoint_link_status" native_endpoint_link_properties sysfs_pci
+    gpu="{\"name\":$(json_string "$matched_name"),\"pci_address\":$(json_string "${gpu_directory##*/}"),\"pcie_endpoint_current_generation\":$current_gen,\"pcie_endpoint_current_width\":$current_width,\"pcie_endpoint_current_theoretical_one_way_gb_per_second\":$(pcie_rate "$current_gen" "$current_width"),\"pcie_endpoint_max_generation\":$max_gen,\"pcie_endpoint_max_width\":$max_width,\"pcie_endpoint_max_theoretical_one_way_gb_per_second\":$(pcie_rate "$max_gen" "$max_width"),\"pcie_current_generation\":$current_gen,\"pcie_current_width\":$current_width,\"pcie_generation\":$current_gen,\"pcie_width\":$current_width,\"pcie_max_generation\":$max_gen,\"pcie_max_width\":$max_width,\"pcie_current_theoretical_one_way_gb_per_second\":$(pcie_rate "$current_gen" "$current_width"),\"pcie_theoretical_one_way_gb_per_second\":$(pcie_rate "$current_gen" "$current_width"),\"pcie_max_theoretical_one_way_gb_per_second\":$(pcie_rate "$max_gen" "$max_width"),\"pcie_current_scope\":\"selected_gpu_endpoint_local_link_only\",\"pcie_max_scope\":\"selected_gpu_endpoint_capability_not_slot\",\"pcie_path\":[$pcie_path],\"pcie_path_complete_to_root\":$( [ "$topology_complete" -eq 1 ] && printf true || printf false ),\"pcie_upstream_pci_bridge_count\":$upstream_bridge_count,\"pcie_attachment\":\"$pcie_attachment\",\"pcie_physical_slot\":$pcie_physical_slot,\"pcie_end_to_end_current_generation\":$end_to_end_gen,\"pcie_end_to_end_current_width\":$end_to_end_width,\"pcie_end_to_end_current_theoretical_one_way_gb_per_second\":$end_to_end_rate,\"pcie_end_to_end_scope\":$end_to_end_scope,\"pcie_end_to_end_unknown_reason\":$end_to_end_reason,\"pcie_source\":\"sysfs_pci\"}"
 }
 
 mac_memory_gpu() {
@@ -158,14 +242,31 @@ mac_memory_gpu() {
         probe ram.modules unsupported smbios_not_exposed sysctl
     fi
     gpu=null
+    probe gpu.pcie_slot not_applicable firmware_slot_not_exposed ioreg
+    mac_names=
+    if [ "$backend" = metal ] && [ -z "$gpu_name$pci_address" ]; then
+        mac_names=$(ioreg -r -c IOGPU -l -w 0 2>/dev/null | awk '
+            /"model" = / {s=$0;sub(/^.*"model" = <?"/,"",s);sub(/">?[[:space:]]*$/, "",s); print s; n++; if(n==64)exit}')
+        mac_count=$(printf '%s\n' "$mac_names" | awk 'NF{n++} END{print n+0}')
+        if [ "$mac_count" -eq 1 ]; then gpu_name=$(printf '%s\n' "$mac_names" | awk 'NF{print;exit}')
+        elif [ "$mac_count" -gt 1 ]; then
+            probe gpu.selection failed ambiguous_selected_gpu ioreg
+            probe gpu.pcie not_applicable no_unique_gpu ioreg; return
+        else
+            probe gpu.selection unsupported native_gpu_names_unavailable ioreg
+            probe gpu.pcie not_applicable no_unique_gpu ioreg; return
+        fi
+    fi
     if [ -z "$gpu_name$pci_address" ]; then probe gpu.selection not_applicable no_selected_gpu ioreg
     elif [ -n "$pci_address" ]; then
         if [ "$mac_arch" = arm64 ]; then probe gpu.selection not_applicable apple_gpu_has_no_pci_bdf ioreg
         else probe gpu.selection unsupported native_pci_bdf_not_exposed ioreg; fi
     else
         # Read-only IORegistry properties; capture model only, never registry paths/serials.
-        mac_names=$(ioreg -r -c IOGPU -l -w 0 2>/dev/null | awk '
-            /"model" = / {s=$0;sub(/^.*"model" = <?"/,"",s);sub(/">?[[:space:]]*$/, "",s); print s; n++; if(n==64)exit}')
+        if [ -z "$mac_names" ]; then
+            mac_names=$(ioreg -r -c IOGPU -l -w 0 2>/dev/null | awk '
+                /"model" = / {s=$0;sub(/^.*"model" = <?"/,"",s);sub(/">?[[:space:]]*$/, "",s); print s; n++; if(n==64)exit}')
+        fi
         mac_matches=$(printf '%s\n' "$mac_names" | awk -v selected="$gpu_name" '$0==selected{n++} END{print n+0}')
         if [ "$mac_matches" -eq 1 ]; then
             gpu="{\"name\":$(json_string "$gpu_name")"
@@ -290,17 +391,27 @@ model_storage() {
 }
 
 main() {
-    model_path=; gpu_name=; pci_address=; diagnostics=; diagnostic_separator=
+    model_path=; backend=; gpu_name=; pci_address=; gpu_vendor_id=; gpu_device_id=; vulkan_index=
+    diagnostics=; diagnostic_separator=
     invalid_arguments=0
     while [ "$#" -gt 0 ]; do
         case $1 in
-            --model|--gpu-name|--pci-address)
+            --model|--backend|--gpu-name|--pci-address|--gpu-vendor-id|--gpu-device-id|--vulkan-index)
                 if [ "$#" -lt 2 ]; then invalid_arguments=1; break; fi
-                case $1 in --model) model_path=$2 ;; --gpu-name) gpu_name=$2 ;; --pci-address) pci_address=$2 ;; esac
+                case $1 in
+                    --model) model_path=$2 ;; --backend) backend=$(printf '%s' "$2" | tr 'A-Z' 'a-z') ;;
+                    --gpu-name) gpu_name=$2 ;; --pci-address) pci_address=$2 ;;
+                    --gpu-vendor-id) gpu_vendor_id=$(printf '%s' "$2" | tr 'A-F' 'a-f') ;;
+                    --gpu-device-id) gpu_device_id=$(printf '%s' "$2" | tr 'A-F' 'a-f') ;;
+                    --vulkan-index) vulkan_index=$2 ;;
+                esac
                 shift 2 ;;
             *) invalid_arguments=1; break ;;
         esac
     done
+    case $gpu_vendor_id in '' ) ;; *[!0-9a-f]*) invalid_arguments=1 ;; esac
+    case $gpu_device_id in '' ) ;; *[!0-9a-f]*) invalid_arguments=1 ;; esac
+    case $vulkan_index in '' ) ;; *[!0-9]*) invalid_arguments=1 ;; esac
     cpu=null; ram=null; gpu=null; storage=null
     if [ "$invalid_arguments" -eq 1 ]; then probe arguments failed invalid_arguments collector
     else
