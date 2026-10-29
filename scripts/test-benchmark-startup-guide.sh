@@ -107,15 +107,27 @@ benchmark_startup_guide <<< 1 > "$work/guided"
 model_path() { :; }
 choose_device() { S[device]=Vulkan0; }
 ask_yes() { S[$1]=false; }
-choice() { case $1 in launch_mode|bench_kind|manual_bench_kind) fail 'Guided benchmark must skip plan selection' ;; esac; }
+guided_profile=conservative
+choice() {
+    case $1 in
+        launch_mode|bench_kind|manual_bench_kind) fail 'Guided benchmark must skip plan selection' ;;
+        setup_mode) S[setup_mode]=$guided_profile ;;
+    esac
+}
 configure > "$work/configure"
 if [[ $platform == macos ]]; then S[device]=metal; fi
 build_command
+check '[[ " ${COMMAND[*]} " == *" device.auto_profile=conservative "* && " ${COMMAND[*]} " != *" device.auto_profile=aggressive "* ]]' 'Guided quick benchmark must preserve a conservative selection'
 if [[ $platform == linux ]]; then
     check '[[ " ${COMMAND[*]} " == *" --suite quick --parallel 1 "* ]]' 'Linux must build quick suite'
 else
     check '[[ ${S[bench_kind]} == manual && ${S[depth_tokens]} == 6144 && ${S[gen_tokens]} == 1024 && ${S[reps]} == 1 ]]' 'Metal must use short manual quick plan'
 fi
+guided_profile=aggressive
+configure > "$work/configure-aggressive"
+if [[ $platform == macos ]]; then S[device]=metal; fi
+build_command
+check '[[ " ${COMMAND[*]} " == *" device.auto_profile=aggressive "* && " ${COMMAND[*]} " != *" device.auto_profile=conservative "* ]]' 'Guided quick benchmark must preserve an aggressive selection'
 save_state
 json_load "$STATE"
 json_get '["launch_mode"]'; check '[[ $REPLY == serve ]]' 'Guided run must preserve daily launch mode'
