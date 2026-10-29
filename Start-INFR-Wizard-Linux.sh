@@ -2085,7 +2085,7 @@ extract_package() {
         [[ $name == "$prefix/"* ]] || return 1
         relative=${name#"$prefix/"}
         if [[ $relative == */ ]]; then
-            [[ $relative == documentation/ || $relative == documentation/*/ || $relative == image-codecs/ ]] || return 1
+            [[ $relative == scripts/ || $relative == documentation/ || $relative == documentation/*/ || $relative == image-codecs/ ]] || return 1
         else managed "$relative" || return 1; fi
     done <<< "$names"
     mkdir -p -- "$destination"

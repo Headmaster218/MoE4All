@@ -173,15 +173,26 @@ ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRE
             archive = module.package(root, root / "infr", root / "output", "1.0.0-test")
             with tarfile.open(archive) as bundle:
                 prefix = module.package_name("1.0.0-test")
+                members = {member.name.rstrip("/") for member in bundle.getmembers()}
+                self.assertIn(prefix + "/scripts", members, module.PLATFORM)
                 collector = bundle.extractfile(prefix + "/scripts/benchmark-hardware.sh").read()
                 self.assertEqual(collector, SCRIPT.read_bytes())
                 manifest = json.load(bundle.extractfile(prefix + "/install-manifest.json"))
                 entry = next(entry for entry in manifest["files"] if entry["path"] == "scripts/benchmark-hardware.sh")
                 self.assertEqual(entry["sha256"], hashlib.sha256(collector).hexdigest())
+                stage_root = root / "stage"
+                bundle.extractall(stage_root)
+            stage = stage_root / prefix
+            manifest_path = stage / "install-manifest.json"
+            manifest["files"] = [entry for entry in manifest["files"] if entry["path"] != "scripts/benchmark-hardware.sh"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (stage / "scripts/benchmark-hardware.sh").unlink()
+            with self.assertRaisesRegex(ValueError, "missing runtime files", msg=module.PLATFORM):
+                module.validate_package(stage, "1.0.0-test")
             self.assertTrue(module.managed("scripts/benchmark-hardware.sh"))
             self.assertFalse(module.managed("scripts/not-allowed.sh"))
 
-    def test_launcher_managed_allowlists_accept_optional_collector(self):
+    def test_launcher_allowlists_accept_collector_and_parent_directory(self):
         for name in ("Start-INFR-Wizard-Linux.sh", "Start-INFR-Wizard-macOS.sh"):
             source = (SCRIPT.parent.parent / name).read_text()
             managed = source.split("\nmanaged() {", 1)[1].split("\n}\n", 1)[0]
@@ -190,6 +201,8 @@ ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRE
             result = subprocess.run(["/bin/bash", "-s"], input=("managed() {" + managed + '\n}\nmanaged scripts/benchmark-hardware.sh || exit 1\nif managed scripts/not-allowed.sh; then exit 1; fi\n').encode(), capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, b"")
+            extract = source.split("\nextract_package() {", 1)[1].split("\n}\n", 1)[0]
+            self.assertIn("$relative == scripts/", extract)
 
 
 if __name__ == "__main__":
