@@ -16,7 +16,7 @@ impl CopyPublishFixture {
         stride: usize,
         host_source: bool,
     ) -> Self {
-        assert!(stride >= 16 && stride % 16 == 0);
+        assert!(stride >= 16 && stride.is_multiple_of(16));
         assert!((1..=infr_core::backend::MAX_DECODE_ROWS).contains(&rows));
         let count = rows * 3;
         let ordinal = 1u32;

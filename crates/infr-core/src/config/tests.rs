@@ -43,7 +43,8 @@ fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
 
 #[test]
 fn ordinary_decode_pipeline_defaults_preserve_explicit_fallbacks() {
-    let flags: [(&str, fn(&Config) -> bool); 5] = [
+    type ConfigFlag = (&'static str, fn(&Config) -> bool);
+    let flags: [ConfigFlag; 5] = [
         ("device.decode_command_ahead", |cfg| {
             cfg.device.decode_command_ahead
         }),

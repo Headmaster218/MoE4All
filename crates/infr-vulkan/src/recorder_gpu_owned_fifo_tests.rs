@@ -108,7 +108,7 @@ fn gpu_owned_fast_push_preserves_protocol_and_fits_portable_push_limit() {
     assert_eq!(&push[19..], &geometry);
     assert_eq!(bytemuck::cast_slice::<u32, u8>(&push).len(), 124);
     assert_eq!(GPU_OWNED_FAST_PUSH_BYTES, 124);
-    assert!(GPU_OWNED_FAST_PUSH_BYTES <= 128);
+    const { assert!(GPU_OWNED_FAST_PUSH_BYTES <= 128) };
 }
 
 impl Fixture {

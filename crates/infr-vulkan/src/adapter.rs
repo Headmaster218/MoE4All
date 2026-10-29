@@ -3004,7 +3004,7 @@ fn ple_gate_norm_candidate(
 fn q8_segmented_required_segments(rows: u32, pos: u32, cap: usize) -> Option<usize> {
     let end = pos.checked_add(rows)?;
     if !(1..=129).contains(&rows)
-        || cap % 512 != 0
+        || !cap.is_multiple_of(512)
         || end as usize > cap / 512
         || u64::from(end) * 512 > u64::from(u32::MAX)
     {
@@ -3343,10 +3343,8 @@ fn q8_kv_write_segmented_fusions_from_candidates(
         {
             continue;
         }
-        if sections.is_none() {
-            if rope_pos.get(&positions.0).copied() != Some(*pos as usize) {
-                continue;
-            }
+        if sections.is_none() && rope_pos.get(&positions.0).copied() != Some(*pos as usize) {
+            continue;
         }
         out.insert(
             i,
@@ -10894,11 +10892,7 @@ impl GraphSetupAnalysis {
                         ple.push((i, pair));
                     }
                 }
-                Op::DeltaNet { .. } => {
-                    if deltanet_norm_pair(graph, i).is_some() {
-                        delta.push(i);
-                    }
-                }
+                Op::DeltaNet { .. } if deltanet_norm_pair(graph, i).is_some() => delta.push(i),
                 _ => (),
             }
             if matches!(op, Op::QkNormRope { .. } | Op::QkNormMrope { .. }) {
@@ -11758,20 +11752,26 @@ fn execute_static_continuation(
         let _span = infr_core::timeline::span("staged_forward_drain");
         drop(forward);
     }
-    if result.is_ok() {
-        // No preparation aliases or submitted readers remain; capacity compaction is once per
-        // complete forward, never between the prefix and its continuation.
-        be_.runtime_phase.lock().unwrap().finish_execute();
-        for guard in &mut next_output_guards {
-            guard.commit();
+    match result {
+        Ok(()) => {
+            // No preparation aliases or submitted readers remain; capacity compaction is once per
+            // complete forward, never between the prefix and its continuation.
+            be_.runtime_phase.lock().unwrap().finish_execute();
+            for guard in &mut next_output_guards {
+                guard.commit();
+            }
+            Ok(())
         }
-    } else if let Err(cleanup) = cancel_decode_prefetch(be_) {
-        return Err(be(format!(
-            "{} (decode expert prefetch teardown also failed: {cleanup})",
-            result.unwrap_err()
-        )));
+        Err(error) => {
+            if let Err(cleanup) = cancel_decode_prefetch(be_) {
+                Err(be(format!(
+                    "{error} (decode expert prefetch teardown also failed: {cleanup})"
+                )))
+            } else {
+                Err(error)
+            }
+        }
     }
-    result
 }
 
 fn execute_static_inner(
@@ -12293,7 +12293,7 @@ fn execute_static_walk(
     let fused_q8_kv_write = HashMap::new();
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
     // recorder — hold them here so they drop only after `rec.finish()` submits.
-    let mut transient = &mut forward.transient;
+    let transient = &mut forward.transient;
 
     // `rec` is an `Option` (not a plain binding) because a PAGED `MoeFfn` op may hand the ambient
     // segment off mid-graph: `execute_paged_moe` records the whole MoE op INLINE into it on the
@@ -12353,7 +12353,7 @@ fn execute_static_walk(
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
-    let mut pstream = &mut forward.pstream;
+    let pstream = &mut forward.pstream;
     pstream.tape_cursor = prepared_tape_words;
     let mut resident_chunk = match prepared_resident {
         Some(chunk) => Some(chunk),
@@ -12423,7 +12423,7 @@ fn execute_static_walk(
         forward.inherited_stage_pending.take(),
         early_prefix.as_ref(),
     )?;
-    let mut segments = &mut forward.segments;
+    let segments = &mut forward.segments;
     let mut rolling_admission = RollingMappedAdmissionCache::default();
     let mut rolling_same_window = segments.is_empty()
         && (early_prefix.is_none() || prepared_layers != 0)
@@ -12697,7 +12697,7 @@ fn execute_static_walk(
                             let chunk = resident_chunk
                                 .as_mut()
                                 .expect("resident prepared packet batch");
-                            chunk.poll_notices(be_, &mut pstream, None)?;
+                            chunk.poll_notices(be_, pstream, None)?;
                             chunk.confirm_before_pure_group(
                                 be_, pstream, segments.back(),
                                 prepared_parts.front().map(|part| part.layers),
@@ -12760,8 +12760,8 @@ fn execute_static_walk(
                                         be_,
                                         recovery.op_idx,
                                         &mut rec,
-                                        &mut pstream,
-                                        &mut segments,
+                                        pstream,
+                                        segments,
                                         live_pos == live_ops.len(),
                                         &mut prepare_tail,
                                     )?;
@@ -12787,7 +12787,7 @@ fn execute_static_walk(
                                     pending.wait()?;
                                 }
                                 pstream.drain()?;
-                                chunk.complete_self_service(be_, &mut pstream)?;
+                                chunk.complete_self_service(be_, pstream)?;
                             }
                             // A complete prepared stage has no successor commands to cancel.
                             // Its finish arm discards this proven seed-only recorder, then
@@ -12796,7 +12796,7 @@ fn execute_static_walk(
                                 && (chunk.producer.is_some() || live_pos.is_multiple_of(8))
                                 && chunk.notices.is_some()
                             {
-                                chunk.poll_notices(be_, &mut pstream, None)?;
+                                chunk.poll_notices(be_, pstream, None)?;
                             }
                             if chunk.notice_resume.is_some() || chunk.notice_stop {
                                 // All commands currently being recorded follow a notified miss and would be
@@ -12815,11 +12815,11 @@ fn execute_static_walk(
                                 if let Some((op_idx, ids)) = chunk.finish(
                                     be_,
                                     &mut rec,
-                                    &mut pstream,
+                                    pstream,
                                     pool,
                                     graph,
                                     &paged_moe_shared,
-                                    &mut segments,
+                                    segments,
                                     live_pos == live_ops.len(),
                                     &mut prepare_tail,
                                 )? {
@@ -13181,7 +13181,7 @@ fn execute_static_walk(
                                     bindings,
                                     pool,
                                     &mut rec,
-                                    &mut pstream,
+                                    pstream,
                                     paged_moe_shared.get(&op_idx).copied(),
                                 )?;
                                 if pstream.guarded_retire_after_submit.is_none() {
@@ -13253,7 +13253,7 @@ fn execute_static_walk(
                                                 &fused_q8_segmented_write,
                                                 &fused_add,
                                                 &mode,
-                                                &mut transient,
+                                                transient,
                                                 &mut dyn_args,
                                                 pool,
                                                 &mut mmv_memo,
@@ -13403,7 +13403,7 @@ fn execute_static_walk(
                                     .is_some_and(|s| s.is_streamed(wid));
                                 if streamed {
                                     let arena_addr =
-                                        stage_dense_linear(be_, &mut rec, &mut pstream, pool, wid)?;
+                                        stage_dense_linear(be_, &mut rec, pstream, pool, wid)?;
                                     if let Err(e) = lower_op(
                                         be_,
                                         graph,
@@ -13417,7 +13417,7 @@ fn execute_static_walk(
                                         &fused_q8_segmented_write,
                                         &fused_add,
                                         &mode,
-                                        &mut transient,
+                                        transient,
                                         &mut dyn_args,
                                         pool,
                                         &mut mmv_memo,
@@ -13448,7 +13448,7 @@ fn execute_static_walk(
                             &fused_q8_segmented_write,
                             &fused_add,
                             &mode,
-                            &mut transient,
+                            transient,
                             &mut dyn_args,
                             pool,
                             &mut mmv_memo,
@@ -17024,14 +17024,16 @@ impl ResidentChunk {
     }
 }
 
+type OwnedPending = (
+    Arc<crate::pager::GpuCopyBuffers>,
+    Arc<dyn Buffer>,
+    u32,
+    [u32; 2],
+);
+
 #[derive(Default)]
 struct PagedStream {
-    owned_pending: Option<(
-        Arc<crate::pager::GpuCopyBuffers>,
-        Arc<dyn Buffer>,
-        u32,
-        [u32; 2],
-    )>,
+    owned_pending: Option<OwnedPending>,
     gpu_route: Option<GpuRoute>,
     resume_ids: Option<Vec<u32>>,
     resume_hit_masks: Option<Vec<u32>>,

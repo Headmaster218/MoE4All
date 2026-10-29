@@ -194,8 +194,10 @@ mod tests {
 
     #[test]
     fn packed_deepseek_layout_does_not_claim_generic_f16() {
-        let mut cfg = Config::default();
-        cfg.deepseek4 = true;
+        let cfg = Config {
+            deepseek4: true,
+            ..Config::default()
+        };
         let actual = kv_snapshot(&cfg, DType::F16, DType::F16);
         assert_eq!(actual["kv_layout"], "fp8-kv+mxfp4-index");
         assert!(actual["kv_type_k"].is_null());

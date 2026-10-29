@@ -254,7 +254,7 @@ fn gpu_pure_mapped_coalesce_two_lanes_with_distinct_routes_and_cpu_miss() {
             if tensor.desc.shape.as_slice() != [1, NE] {
                 continue;
             }
-            tensor.desc.shape = vec![2, NE].into();
+            tensor.desc.shape = vec![2, NE];
             if let Some((_, buffer)) = fixture.buffers.iter_mut().find(|(id, _)| id.0 as usize == index) {
                 let mut bytes = vec![0u8; NE * 4];
                 fixture.backend.download(buffer.as_ref(), &mut bytes).unwrap();

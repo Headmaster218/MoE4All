@@ -168,10 +168,10 @@ fn prove_stage(
         || !(1..=16).contains(&p.used)
         || p.ne == 0
         || p.ne > 65536
-        || p.ne % 256 != 0
+        || !p.ne.is_multiple_of(256)
         || p.nff == 0
         || p.nff > 1024
-        || p.nff % 32 != 0
+        || !p.nff.is_multiple_of(32)
         || i.job_count > CAPACITY
         || stage >= ring.stages
         || tasks.len_bytes() < TASK_WORDS * 4 + GUARD

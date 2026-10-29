@@ -44,15 +44,19 @@ pub(super) unsafe fn print_indirect_support(
         copy: 0,
         image: 0,
     };
-    let mut features = vk::PhysicalDeviceFeatures2::default();
-    features.p_next = (&mut copy as *mut Features).cast();
+    let mut features = vk::PhysicalDeviceFeatures2 {
+        p_next: (&mut copy as *mut Features).cast(),
+        ..Default::default()
+    };
     let mut copy_properties = Properties {
         s_type: vk::StructureType::from_raw(1_000_426_001),
         p_next: std::ptr::null_mut(),
         queues: vk::QueueFlags::empty(),
     };
-    let mut properties = vk::PhysicalDeviceProperties2::default();
-    properties.p_next = (&mut copy_properties as *mut Properties).cast();
+    let mut properties = vk::PhysicalDeviceProperties2 {
+        p_next: (&mut copy_properties as *mut Properties).cast(),
+        ..Default::default()
+    };
     unsafe {
         instance.get_physical_device_features2(physical, &mut features);
         instance.get_physical_device_properties2(physical, &mut properties);
@@ -122,6 +126,7 @@ unsafe fn barrier(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn verify(
     device: &ash::Device,
     pools: &BTreeMap<u32, vk::CommandPool>,
@@ -215,6 +220,7 @@ unsafe fn verify(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn run(
     device: &ash::Device,
     pools: &BTreeMap<u32, vk::CommandPool>,

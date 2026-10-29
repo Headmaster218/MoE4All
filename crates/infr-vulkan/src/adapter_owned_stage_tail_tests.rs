@@ -227,7 +227,7 @@ fn stage_fixture_with_cadence(
             if tensor.desc.shape.as_slice() != [1, NE] {
                 continue;
             }
-            tensor.desc.shape = vec![rows, NE].into();
+            tensor.desc.shape = vec![rows, NE];
             if let Some((_, buffer)) = fixture
                 .buffers
                 .iter_mut()
@@ -766,7 +766,7 @@ fn gpu_owned_staged_inherited_pending_retires_after_prefix_and_restores_zero_rec
                 .unwrap();
             fixture
                 .backend
-                .upload(input_buffer.as_ref(), bytemuck::cast_slice(&vec![3f32; NE]))
+                .upload(input_buffer.as_ref(), bytemuck::cast_slice(&[3f32; NE]))
                 .unwrap();
             let head_bindings = fixture.bindings();
             let mut tail_bindings = fixture.bindings();
@@ -980,7 +980,7 @@ fn gpu_owned_staged_tail_independent_input_and_failure_preserve_forward_lifetime
                         }
                         fixture
                             .backend
-                            .upload(input_buffer.as_ref(), bytemuck::cast_slice(&vec![3f32; NE]))?;
+                            .upload(input_buffer.as_ref(), bytemuck::cast_slice(&[3f32; NE]))?;
                     }
                     Ok(())
                 },

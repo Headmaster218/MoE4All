@@ -5170,6 +5170,7 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
 /// run settled on. The JSON keeps `avg_ts` as its first key and only ADDS fields, so
 /// `llama-bench -o json` consumers (including this CLI's own `ModelBench::infr_json`) are
 /// unaffected.
+#[allow(clippy::too_many_arguments)]
 fn print_bench_avg(
     samples: &[f64],
     label: &str,

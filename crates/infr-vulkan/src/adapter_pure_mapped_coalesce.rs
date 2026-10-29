@@ -474,8 +474,13 @@ mod tests {
                     if start != 0 && pure[start] {
                         assert!(pure[start..start + count].iter().all(|&p| p));
                     }
-                    for host in start..start + count {
-                        if !pure[host] {
+                    for (host, &is_pure) in pure
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(count)
+                    {
+                        if !is_pure {
                             assert!(start + count <= (host + 1).div_ceil(base) * base);
                         }
                     }

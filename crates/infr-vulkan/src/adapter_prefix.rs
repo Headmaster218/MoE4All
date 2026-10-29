@@ -2217,7 +2217,7 @@ mod tests {
                 certificates[host] = Some(false);
                 let layers = source_certificate_group_limit(&certificates, cadence).unwrap();
                 assert_eq!(layers, (host + 1).div_ceil(cadence) * cadence);
-                assert!(layers >= host + 1);
+                assert!(layers > host);
                 assert!(layers == 16 || resident_submit_due(layers, 0, cadence, 128));
                 // The execution window is NOT the speculative preparation limit.
                 assert_eq!(resident_execution_limit(true, 48, 16, 128).unwrap(), 48);
@@ -2815,11 +2815,11 @@ mod tests {
             assert!(preparing_commands());
         }
         assert!(!preparing_commands());
-        let result = (|| -> Result<()> {
+        let result: Result<()> = {
             let _guard = RecordingGuard::enter();
             assert!(preparing_commands());
             Err(be("CPU preparation failure"))
-        })();
+        };
         assert!(result.is_err());
         assert!(!preparing_commands());
     }
@@ -3436,7 +3436,7 @@ mod tests {
             segmented: Some((7, 16, 128, 2)),
         };
         assert!(key_sequence_matches(
-            &[key.clone()],
+            std::slice::from_ref(&key),
             std::iter::once(key.clone())
         ));
         for field in 0..8 {
@@ -3453,11 +3453,14 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                !key_sequence_matches(&[key.clone()], std::iter::once(changed)),
+                !key_sequence_matches(std::slice::from_ref(&key), std::iter::once(changed)),
                 "field {field}"
             );
         }
-        assert!(!key_sequence_matches(&[key.clone()], std::iter::empty()));
+        assert!(!key_sequence_matches(
+            std::slice::from_ref(&key),
+            std::iter::empty()
+        ));
         assert!(!key_sequence_matches(&[], std::iter::once(key)));
     }
 
@@ -3578,8 +3581,8 @@ mod tests {
                     }
                 }
             }
-            for arm in 0..2 {
-                let mean = elapsed[arm].iter().sum::<f64>() / elapsed[arm].len() as f64;
+            for (arm, elapsed) in elapsed.iter().enumerate() {
+                let mean = elapsed.iter().sum::<f64>() / elapsed.len() as f64;
                 eprintln!("ACK_VALIDATION_CPU scope=keys+position-bytes tensors={TENSORS} position_tensors=16 rows={rows} rounds=6 warmup=2 repeats={REPEATS} arm={} mean_us={mean:.3}", if arm == 0 { "allocating" } else { "allocation-free" });
             }
         }
