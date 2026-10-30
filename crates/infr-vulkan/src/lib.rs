@@ -1397,25 +1397,70 @@ impl VulkanShared {
     /// Wait for every in-flight staging copy and tear the ring down. Called when the weight-load
     /// scope ends, so all weights are fully resident before any forward is recorded — this is the
     /// synchronization point that replaced the old per-tensor `queue_wait_idle`.
-    fn drain_staging_ring(&self) {
-        let Some(mut ring) = self.staging_ring.lock().unwrap().take() else {
-            return;
-        };
-        let pending: Vec<vk::Fence> = (0..RING_SLOTS)
-            .filter(|&i| ring.busy[i])
-            .map(|i| ring.fences[i])
-            .collect();
-        unsafe {
-            if !pending.is_empty() {
-                let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
+    fn drain_staging_ring(&self) -> Result<()> {
+        let result = drain_staging_resource(
+            &self.staging_ring,
+            |ring| {
+                let pending: Vec<vk::Fence> = ring
+                    .fences
+                    .iter()
+                    .zip(&ring.busy)
+                    .filter_map(|(&fence, &busy)| busy.then_some(fence))
+                    .collect();
+                let result = if pending.is_empty() {
+                    Ok(())
+                } else {
+                    unsafe { self.device.wait_for_fences(&pending, true, u64::MAX) }
+                };
+                if let Err(error) = result {
+                    // Publish failure while the ring is locked, before another uploader/drainer
+                    // can see it. A later successful cleanup must not revive this queue.
+                    if self.queue_submit_failure().is_none() {
+                        let _ = self.make_queue_unusable(error, "staging-ring fence wait");
+                    }
+                }
+                result
+            },
+            |mut ring| {
+                // This immutable pool handle remains valid even if another pool user panicked.
+                let pool = self.cmd_pool.lock().unwrap_or_else(|p| p.into_inner());
+                unsafe {
+                    self.device.free_command_buffers(*pool, &ring.cmds);
+                    for fence in ring.fences.drain(..) {
+                        self.device.destroy_fence(fence, None);
+                    }
+                }
+                // Both staging buffers and quarantined rollback destinations drop only after
+                // successful completion, or terminal device loss (never a successful upload).
+            },
+        );
+        if let Err(error) = result {
+            if self.queue_submit_failure().is_none() {
+                let _ = self.make_queue_unusable(error, "staging-ring drain");
             }
-            let pool = self.cmd_pool.lock().unwrap();
-            self.device.free_command_buffers(*pool, &ring.cmds);
-            for f in ring.fences.drain(..) {
-                self.device.destroy_fence(f, None);
+            return Err(be(format!("staging-ring drain: {error}")));
+        }
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(be(format!(
+                "staging-ring drain: queue remains unusable ({error})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn retain_aborted_weight_blocks(&self, mut blocks: Vec<BdaArenaBlock>) {
+        let mut guard = self.staging_ring.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ring) = guard.as_mut() {
+            // A non-terminal wait failure left the ring pending. Preserve its destinations even
+            // if the backend/loader now drops. A later drain can retire these references safely.
+            if ring.retained_weight_blocks.is_empty() {
+                ring.retained_weight_blocks = blocks;
+            } else {
+                ring.retained_weight_blocks.append(&mut blocks);
             }
         }
-        // `ring.bufs` drop here → the staging slots are freed.
+        // None means another drainer has already completed cleanup (or observed device loss).
+        // In that case these destination references may be released immediately.
     }
 }
 
@@ -2326,6 +2371,14 @@ const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
+fn allocation_buffer_usage(device_address: bool) -> vk::BufferUsageFlags {
+    if device_address {
+        BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+    } else {
+        BUFFER_USAGE
+    }
+}
+
 /// On-demand block size floor for a resident-BDA arena block (see [`BdaWeightArena`]) — big enough
 /// to amortize a dedicated `vkAllocateMemory` across a run of small tensors, small enough not to
 /// waste much on the tail.
@@ -2641,6 +2694,27 @@ fn copy_to_mapped(src: &[u8], dst: *mut u8) {
     });
 }
 
+/// Serialize the entire wait/cleanup, including empty observations by other drainers. On errors
+/// other than device loss, leave the resource in place: completion has not been established.
+/// Device loss permits resource teardown but must still propagate as an error to the caller.
+fn drain_staging_resource<T>(
+    slot: &Mutex<Option<T>>,
+    wait: impl FnOnce(&T) -> std::result::Result<(), vk::Result>,
+    cleanup: impl FnOnce(T),
+) -> std::result::Result<(), vk::Result> {
+    let mut guard = slot.lock().map_err(|_| vk::Result::ERROR_UNKNOWN)?;
+    let Some(resource) = guard.as_ref() else {
+        return Ok(());
+    };
+    let result = wait(resource);
+    if result.is_ok() || result == Err(vk::Result::ERROR_DEVICE_LOST) {
+        if let Some(resource) = guard.take() {
+            cleanup(resource);
+        }
+    }
+    result
+}
+
 /// A ring of REUSED, fixed-size staging buffers — the weight-upload path on every device.
 ///
 /// The old path allocated a fresh DEDICATED staging buffer as large as each tensor, memcpy'd into
@@ -2660,6 +2734,9 @@ struct StagingRing {
     /// Whether slot `i` has work in flight that its fence must be waited on before reuse.
     busy: Vec<bool>,
     next: usize,
+    /// Rollbacks whose upload completion could not be established. This deliberate keepalive may
+    /// retain the device after a persistent wait error; freeing pending destinations is unsafe.
+    retained_weight_blocks: Vec<BdaArenaBlock>,
 }
 
 /// RAII for the raw command buffer used by [`VulkanBackend::one_shot`]. Vulkan command buffers do
@@ -2838,7 +2915,7 @@ impl WeightAllocationBatch for VulkanWeightAllocationBatch<'_> {
         // Async weight uploads retain only raw destination handles. Complete them before closing
         // the batch, independently of the caller's longer-lived weight-progress scope. Never
         // hold the weight-arena mutex while draining the staging ring/command pool.
-        self.backend.shared.drain_staging_ring();
+        self.backend.shared.drain_staging_ring()?;
         let mut guard = self.backend.bda_weight_arena.lock().unwrap();
         let arena = guard
             .as_mut()
@@ -2886,17 +2963,35 @@ impl Drop for VulkanWeightAllocationBatch<'_> {
         // Loader unwind drops this guard before its weight buffers, then weight_progress last.
         // Drain before removing arena keepalives so those later buffer drops cannot free a
         // destination that still has an in-flight staging copy (including escaped subviews).
-        self.backend.shared.drain_staging_ring();
-        let mut guard = self.backend.bda_weight_arena.lock().unwrap();
-        if let Some(arena) = guard.as_mut() {
-            if arena
-                .active_plan
-                .as_ref()
-                .is_some_and(|p| Arc::ptr_eq(&p.token, &self.token))
-            {
-                // Only these arena references disappear. Escaped BdaSub Arcs remain valid.
-                arena.active_plan = None;
+        let drained = self.backend.shared.drain_staging_ring();
+        let plan = {
+            let mut guard = self
+                .backend
+                .bda_weight_arena
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.as_mut().and_then(|arena| {
+                if arena
+                    .active_plan
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.token, &self.token))
+                {
+                    arena.active_plan.take()
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(plan) = plan {
+            if drained.is_err() {
+                self.backend
+                    .shared
+                    .retain_aborted_weight_blocks(plan.blocks);
             }
+            // Only this batch's arena references disappear; escaped BdaSub Arcs remain valid.
+        }
+        if let Err(error) = drained {
+            tracing::error!("[infr] resident weight rollback drain failed: {error}; pending destinations retained");
         }
     }
 }
@@ -3313,8 +3408,16 @@ impl Drop for WeightProgress {
         // Drain the staging ring FIRST: its copies are still in flight (we fence per slot instead
         // of stalling the queue per tensor), and the weights must be fully resident before the
         // loader records a forward.
-        self.shared.drain_staging_ring();
-        if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
+        if let Err(error) = self.shared.drain_staging_ring() {
+            tracing::error!("[infr] weight-progress drain failed: {error}");
+        }
+        if let Some(pb) = self
+            .shared
+            .weight_pb
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             pb.finish_and_clear();
         }
         // Post-load memory-hygiene visibility (`prof.vram`): the LIVE in-use figure right
@@ -5872,8 +5975,8 @@ impl VulkanBackend {
 
     /// Finish and release the temporary weight-upload ring before a caller measures live device
     /// room for a steady-state arena. Idempotent: the weight-progress guard may call it again.
-    pub fn finish_resident_uploads(&self) {
-        self.shared.drain_staging_ring();
+    pub fn finish_resident_uploads(&self) -> Result<()> {
+        self.shared.drain_staging_ring()
     }
 
     /// Allocate device-local dedicated buffers used only as a physical load-time reservation.
@@ -7181,10 +7284,60 @@ impl VulkanBackend {
         })
     }
 
+    /// Maximum VkBuffer byte capacity used by resident-weight layouts (not a model-total cap).
+    pub fn resident_weight_allocation_limit(&self) -> u64 {
+        self.shared.resident_weight_block_cap
+    }
+
+    /// Pure geometry check, including padding, the device block cap and the <4 GiB tensor limit.
+    /// False does not rule out a paged model whose fixed/placeholder allocation sizes are smaller.
+    /// Driver errors are deliberately left to `resident_weight_allocation_bytes`, never hidden here.
+    pub fn resident_weight_allocations_supported(&self, sizes: &[usize]) -> bool {
+        weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )
+        .is_ok()
+    }
+
+    /// Query the exact dedicated-memory requirement for the same packed layout used by begin.
+    /// Creates only temporary unbound VkBuffer objects: no memory allocations, fills or submits.
+    pub fn resident_weight_allocation_bytes(&self, sizes: &[usize]) -> Result<u64> {
+        let layout = weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )?;
+        let mut total = 0u64;
+        for block in &layout.blocks {
+            let bytes = usize::try_from(block.capacity_bytes)
+                .map_err(|_| be("resident weight block capacity exceeds host address space"))?;
+            let info = vk::BufferCreateInfo::default()
+                .size(fill_span(bytes))
+                .usage(allocation_buffer_usage(true))
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+                .map_err(|e| be(format!("resident weight planning create_buffer: {e}")))?;
+            let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+            // Destroy before the checked addition too, so an overflow cannot leak the probe.
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            total = total
+                .checked_add(requirements.size)
+                .ok_or_else(|| be("resident weight allocation byte total overflow"))?;
+        }
+        Ok(total)
+    }
+
     fn prepare_weight_allocation_batch(
         &self,
         sizes: &[usize],
     ) -> Result<VulkanWeightAllocationBatch<'_>> {
+        if let Some(error) = self.shared.queue_submit_failure() {
+            return Err(be(format!(
+                "cannot prepare resident weights on an unusable queue ({error})"
+            )));
+        }
         let mut guard = self.bda_weight_arena.lock().unwrap();
         if guard.as_ref().is_some_and(|a| a.active_plan.is_some()) {
             return Err(be("a resident weight allocation batch is already active"));
@@ -7534,13 +7687,7 @@ impl VulkanBackend {
         // matching DEVICE_ADDRESS alloc flag — gpu-allocator sets it (built with
         // `buffer_device_address: true`) on the pooled path below, and the UMA-overflow spill passes
         // it through to `alloc_vram_mapped` explicitly.
-        let mut usage = if device_address {
-            vk::BufferUsageFlags::from_raw(
-                BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
-            )
-        } else {
-            BUFFER_USAGE
-        };
+        let mut usage = allocation_buffer_usage(device_address);
         if self.shared.conditional_rendering.is_some() && label == "readback" {
             usage |= vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT;
         }
@@ -8010,7 +8157,16 @@ impl VulkanBackend {
         src: &[u8],
     ) -> Result<()> {
         let device = &self.shared.device;
-        let mut guard = self.shared.staging_ring.lock().unwrap();
+        let mut guard = self
+            .shared
+            .staging_ring
+            .lock()
+            .map_err(|_| be("staging-ring upload: ring mutex is poisoned"))?;
+        if let Some(error) = self.shared.queue_submit_failure() {
+            return Err(be(format!(
+                "staging-ring upload: queue is unusable ({error})"
+            )));
+        }
         if guard.is_none() {
             *guard = Some(self.make_staging_ring()?);
         }
@@ -8124,6 +8280,7 @@ impl VulkanBackend {
             fences,
             busy: vec![false; RING_SLOTS],
             next: 0,
+            retained_weight_blocks: Vec::new(),
         })
     }
 
@@ -11080,6 +11237,107 @@ mod tests {
     }
 
     #[test]
+    fn staging_drain_serializes_wait_cleanup_and_empty_observers() {
+        use std::sync::mpsc;
+        let slot = Mutex::new(Some(()));
+        let cleaned = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let slot_ref = &slot;
+            let cleaned_ref = &cleaned;
+            let first = scope.spawn(move || {
+                drain_staging_resource(
+                    slot_ref,
+                    |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    },
+                    |_| cleaned_ref.store(true, Ordering::Release),
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // A ring taken out before the wait would leave this lock available: the original bug.
+            assert!(
+                slot.try_lock().is_err(),
+                "drain must keep the mutex through the fence wait"
+            );
+            let second = scope.spawn(|| {
+                drain_staging_resource(
+                    &slot,
+                    |_| panic!("second drainer must observe completed cleanup"),
+                    |_| panic!("resource cleaned twice"),
+                )
+                .unwrap();
+                assert!(cleaned.load(Ordering::Acquire));
+            });
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Ok(()));
+            second.join().unwrap();
+        });
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn staging_drain_wait_error_retains_sources_and_destinations_until_retry() {
+        let source = Arc::new(());
+        let destination = Arc::new(());
+        let source_weak = Arc::downgrade(&source);
+        let destination_weak = Arc::downgrade(&destination);
+        let slot = Mutex::new(Some((source, destination)));
+        assert_eq!(
+            drain_staging_resource(&slot, |_| Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY), drop),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        );
+        assert!(slot.lock().unwrap().is_some());
+        assert!(source_weak.upgrade().is_some());
+        assert!(destination_weak.upgrade().is_some());
+        assert_eq!(drain_staging_resource(&slot, |_| Ok(()), drop), Ok(()));
+        assert!(source_weak.upgrade().is_none());
+        assert!(destination_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn staging_drain_device_loss_cleans_up_but_remains_an_error() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let slot = Mutex::new(Some(resource));
+        assert_eq!(
+            drain_staging_resource(&slot, |_| Err(vk::Result::ERROR_DEVICE_LOST), drop),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert!(slot.lock().unwrap().is_none());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn staging_drain_poisoned_mutex_returns_error_without_cleanup_or_panic() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let slot = Mutex::new(Some(resource));
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = slot.lock().unwrap();
+                    panic!("inject poisoned staging state");
+                })
+                .join()
+                .is_err());
+        });
+        assert_eq!(
+            drain_staging_resource(
+                &slot,
+                |_| panic!("poisoned state must not be trusted"),
+                |_| panic!("pending resource must be retained")
+            ),
+            Err(vk::Result::ERROR_UNKNOWN)
+        );
+        assert!(weak.upgrade().is_some());
+        assert!(slot.lock().unwrap_err().into_inner().is_some());
+    }
+
+    #[test]
     fn resident_bda_block_floor_grows_only_for_small_tensor_blocks() {
         const MIB: u64 = 1024 * 1024;
         let max = 4 * 1024 * MIB;
@@ -11106,12 +11364,29 @@ mod tests {
         let be = VulkanBackend::new().unwrap();
         let before = be.resident_weight_allocation_stats();
         let sizes = [1000usize, 4096, 300_000];
+        assert!(be.resident_weight_allocations_supported(&sizes));
+        if let Ok(oversize) = usize::try_from(be.resident_weight_allocation_limit() + 1) {
+            assert!(!be.resident_weight_allocations_supported(&[oversize]));
+        }
+        let budget_before_query = be.shared.budget_used();
+        let planned_bytes = be.resident_weight_allocation_bytes(&sizes).unwrap();
+        assert_eq!(be.resident_weight_allocation_bytes(&[]).unwrap(), 0);
+        assert_eq!(
+            be.shared.budget_used(),
+            budget_before_query,
+            "planning must not allocate memory"
+        );
+        assert_eq!(be.resident_weight_allocation_stats(), before);
         let mut batch = (&be as &dyn Backend)
             .begin_weight_allocation_batch(&sizes)
             .unwrap()
             .unwrap();
         assert!(be.begin_weight_allocation_batch(&[]).is_err());
         let prepared = be.resident_weight_allocation_stats();
+        assert_eq!(
+            prepared.physical_allocation_bytes - before.physical_allocation_bytes,
+            planned_bytes
+        );
         assert_eq!(prepared.block_count, before.block_count + 1);
         assert_eq!(prepared.requested_bytes - before.requested_bytes, 305_096);
         assert_eq!(
