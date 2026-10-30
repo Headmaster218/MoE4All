@@ -250,6 +250,12 @@ fn linear_scratch_requests(
             }
             continue;
         }
+        // Narrow-output native weights take the f32-expansion + f32r-GEMV pair at prefill rows —
+        // mirror `narrow_f32_gemv_applies` so the scratch exists exactly when the dispatcher asks.
+        if cfg.narrow_f32_gemv && crate::recorder::narrow_f32_gemm_eligible(dt, m, k, n) {
+            add("lin_w32", k * n * 4);
+            continue;
+        }
         if n % 64 != 0 {
             continue;
         }

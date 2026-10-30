@@ -614,6 +614,11 @@ cfg_struct! {
         /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
         /// The original BM64 path remains the per-feature fallback.
         q8_prefill_bm128: bool = true,
+        /// Expand a narrow-output (n not a multiple of 64, so no tiled GEMM tile exists) native
+        /// Prefill weight to f32 and contract it with the batched f32r GEMV instead of the native
+        /// per-row GEMV. The expansion is exact (Q8_0/BF16 decode fits f32); the weights it covers
+        /// are <= 512 KiB. See `narrow_f32_gemv_applies`.
+        narrow_f32_gemv: bool = true,
         /// Exact chronological QSA Top-K collection on measured devices.
         qsa_topk_ordered: bool = true,
         /// Reuse probability fragments in measured hd256 Prefill register-O kernels.

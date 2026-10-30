@@ -563,6 +563,28 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
+/// Upper bound on a weight the narrow-f32 route will expand: 128 Ki elements = 512 KiB of f32
+/// scratch. Both Flash-Next narrow tensors fit (10240x4 and 2560x48); anything bigger loses more to
+/// the per-chunk expansion than the batched GEMV wins back.
+pub(crate) const NARROW_F32_MAX_ELEMS: usize = 1 << 17;
+
+/// Shape/dtype half of the narrow-output f32 route — pure so the adapter's dispatch site and
+/// `adapter_stages`' scratch reservation cannot drift. `out_f` has no 64-multiple, so NO tiled GEMM
+/// tile can serve the shape; the weight is small enough that expanding it to f32 once per chunk
+/// costs a few microseconds; and the dtype needs a `weight_f32` expansion build.
+pub(crate) fn narrow_f32_gemm_eligible(
+    dtype: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    m > 16
+        && !out_f.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && in_f * out_f <= NARROW_F32_MAX_ELEMS
+        && crate::gemm::weight_f32_build_spv(dtype).is_some()
+}
+
 pub(crate) fn q8_prefill_bm128_applies(
     enabled: bool,
     measured: bool,
@@ -3090,13 +3112,48 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Expand a native weight into an f32 scratch buffer, read through its 64-bit address, one
+    /// element per thread. The Q8_0 / BF16 decode is exact in f32, so this is a pure layout change:
+    /// it exists so a narrow-output projection can take the batched f32r GEMV — see
+    /// [`narrow_f32_gemm_eligible`].
+    pub fn dequant_weight_f32(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_off: usize,
+        filler: &dyn Buffer,
+        dst: &dyn Buffer,
+        elems: usize,
+    ) {
+        let (name, spv) = crate::gemm::weight_f32_build_spv(dtype)
+            .expect("weight_f32: dtype without an expansion build");
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(elems as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(w_off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(filler), Self::vkb(dst)],
+            1,
+            &push,
+            (elems as u32).div_ceil(64),
+        );
+    }
+
     /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
     /// variant routing (same env escapes) so parity comparisons land on the same kernel.
-    /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
-    /// tests call it directly with an explicit arena address.
-    pub fn linear_f32_at(
+    ///
+    /// `w_track` is a buffer this kernel READS through a 64-bit address, i.e. one the hazard tracker
+    /// cannot see through the push constant. Binding it at slot 0 is what makes the tracker emit the
+    /// RAW barrier for it — a BDA-only read would otherwise let the previous writer's work overlap
+    /// this dispatch (the llama.cpp #25229 class of bug; validation layers are on, and they only
+    /// know about descriptors).
+    fn linear_f32_inner(
         &self,
         arena_addr: u64,
+        w_track: Option<&dyn Buffer>,
         x: &dyn Buffer,
         y: &dyn Buffer,
         rows: usize,
@@ -3146,11 +3203,40 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            &[Self::vkb(w_track.unwrap_or(x)), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
             groups,
         );
+    }
+
+    /// [`Self::linear_f32_inner`] against an EXPANDED f32 weight, which the dispatch must track.
+    pub fn linear_f32_tracked(
+        &self,
+        arena_addr: u64,
+        w_track: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.linear_f32_inner(arena_addr, Some(w_track), x, y, rows, in_f, out_f);
+    }
+
+    /// Production routes through [`Self::linear_f32`] (the weight's own BDA address); parity tests
+    /// call this directly with an explicit arena address. The BDA weight is not tracked because it
+    /// is a resident weight, written long before any Linear that reads it.
+    pub fn linear_f32_at(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.linear_f32_inner(arena_addr, None, x, y, rows, in_f, out_f);
     }
 
     pub(crate) fn can_silu_quant_q8(&self, rows: usize, k: usize) -> bool {

@@ -4051,6 +4051,17 @@ fn lower_op(
                         be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
                         transient,
                     )?;
+                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
+                    // Narrow output: no tile exists, and the native per-row GEMV re-reads the whole
+                    // weight once per row. Expand it to f32 into pooled scratch and let the batched
+                    // f32r GEMV contract it — a few microseconds of cast per chunk.
+                    let elems = in_f * out_f;
+                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
+                    rec.dequant_weight_f32(dt, arena_addr, w_off, xb, pool[&w32].as_ref(), elems);
+                    let w32_addr = pool[&w32]
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
@@ -4807,6 +4818,21 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
+                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
+                    // Resident twin of the streamed narrow-f32 route (the arena branch above):
+                    // expand the narrow native weight to f32 once per chunk and contract it with
+                    // the batched f32r GEMV instead of the per-row native GEMV. `w_off` rides as
+                    // an ELEMENT offset into `dq()` exactly as `linear_native` uses it.
+                    let w_addr = w.device_addr().ok_or_else(|| {
+                        be("vulkan adapter: narrow-f32 Linear needs a BDA weight address")
+                    })?;
+                    let elems = in_f * out_f;
+                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
+                    rec.dequant_weight_f32(dt, w_addr, w_off, xb, pool[&w32].as_ref(), elems);
+                    let w32_addr = pool[&w32]
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
@@ -17781,6 +17807,25 @@ fn sync_stream_inner<'a>(
     Ok(())
 }
 
+/// Narrow-output streamed Linears at prefill rows: expand the (tiny) native weight to f32 and take
+/// the batched f32r GEMV instead of the native per-row GEMV. Shape/dtype half lives in
+/// [`crate::recorder::narrow_f32_gemm_eligible`] so the scratch reservation tracks it exactly.
+///
+/// Measured on Qwen3.8-Flash-Next base (pp4096, the two families sum to 168 dispatches): the
+/// native GEMV spent 1.5 ms per `2560x48` and 0.96 ms per `10240x4`; the same contraction on the
+/// f32 path (as the UD variant runs it natively) takes ~0.25 ms — 202 ms of a 2.15 s chunk. The
+/// Q8_0/BF16 decode is exact in f32, so this changes speed only.
+fn narrow_f32_gemv_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    be_.cfg().kernels.vulkan.narrow_f32_gemv
+        && crate::recorder::narrow_f32_gemm_eligible(dt, m, in_f, out_f)
+}
+
 /// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
 /// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
 /// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
@@ -21174,6 +21219,69 @@ mod tests {
         truncated.ops.pop();
         assert_eq!(paged_moe_shared_candidates(&truncated, false).count(), 0);
         assert_eq!(paged_moe_shared_candidates(&Graph::new(), false).count(), 0);
+    }
+
+    /// The narrow-output f32 route is the only tier the Qwen3.8-Flash-Next `2560x48` / `10240x4`
+    /// tensors can take (no 64-multiple in `n`), and it is exact, so the gate must not drift into
+    /// shapes that either HAVE a tile, are decode-sized, or would expand a big weight.
+    #[test]
+    fn narrow_f32_gate_is_bounded_to_the_measured_shapes() {
+        use infr_core::DType;
+        for (dt, k, n) in [
+            (DType::Q8_0, 2560usize, 48usize),
+            (DType::Q8_0, 10240, 4),
+            (DType::Bf16, 2560, 48),
+            (DType::Bf16, 10240, 4),
+        ] {
+            assert!(
+                crate::recorder::narrow_f32_gemm_eligible(dt, 4096, k, n),
+                "{dt:?} {k}x{n} at prefill rows must take the f32 route"
+            );
+        }
+        // Decode keeps the native GEMV: one row is exactly what it is good at.
+        for m in [1usize, 2, 16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                m,
+                2560,
+                48
+            ));
+        }
+        // 64-multiple widths have a tiled GEMM tile; they must never come here.
+        for n in [64usize, 128, 2560] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                4096,
+                2560,
+                n
+            ));
+        }
+        // No expansion build for these dtypes.
+        for dt in [DType::Q4K, DType::Q6K, DType::F32, DType::F16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                dt, 4096, 2560, 48
+            ));
+        }
+        // K must stay on the native block grid.
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560 + 1,
+            48
+        ));
+        // Expansion ceiling: 128 Ki elements of f32 scratch.
+        assert!(crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560,
+            48
+        ));
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            4096,
+            33
+        ));
     }
 
     #[test]

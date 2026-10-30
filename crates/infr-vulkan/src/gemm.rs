@@ -1920,6 +1920,32 @@ pub(crate) fn native_gemm_warp_cm8_build_spv(
     })
 }
 
+/// `weight_f32.comp` builds: expand a native weight into an f32 buffer read by 64-bit address, so a
+/// narrow-output projection can take the batched f32r GEMV instead of the per-row native GEMV.
+/// Only Q8_0 and Bf16 — the dtypes Qwen3.8-Flash-Next's narrow tensors actually ship in.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn weight_f32_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("weight_f32_q8_0"),
+        Bf16 => v!("weight_f32_bf16"),
+        _ => None,
+    }
+}
+
 /// A_GLOBAL warptile variants: A pre-converted to f16 by the caller and coopMatLoad'd straight
 /// from global memory — no As staging, no As LDS. Shrinking LDS to Bs-only lifts occupancy from
 /// 2 to 3 workgroups/WGP, which is worth ~1.5x on the 8B prefill shapes (29→44 TF on the o

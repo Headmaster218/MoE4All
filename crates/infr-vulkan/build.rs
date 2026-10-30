@@ -1357,6 +1357,11 @@ fn main() {
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
+        // Expand a NARROW-output native weight into f32 scratch once per Prefill chunk so the
+        // mrow8/vec4 f32 GEMV can contract it (see `narrow_f32_gemm_eligible`). Only the formats
+        // Qwen3.8-Flash-Next's narrow tensors actually ship in are built.
+        ("weight_f32", "weight_f32_q8_0", &["-DFMT_Q8_0"]),
+        ("weight_f32", "weight_f32_bf16", &["-DFMT_BF16"]),
         // Quantize a KV row into the Q8_0 cache. f32 source (V) + f16 source (un-fused roped K),
         // each with a record-once (pos from params) variant.
         ("store_q8", "store_q8", &[]),
