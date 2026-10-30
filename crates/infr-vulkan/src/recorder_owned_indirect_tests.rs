@@ -913,7 +913,7 @@ fn gpu_owned_indirect_continuous_frames() {
                 reset_events();
                 recording.replay().unwrap();
             }
-            for candidate in 1..recordings.len() {
+            for (candidate, _) in recordings.iter().enumerate().skip(1) {
                 let mut baseline_us = Vec::new();
                 let mut candidate_us = Vec::new();
                 for pair in 0..6 {

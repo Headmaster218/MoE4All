@@ -665,6 +665,7 @@ impl CpuPreparation {
 ///   TensorId cannot be unioned across different topologies: `resolve` prefers scratch to binds.
 /// - `execute_static_prepared` consumes `CpuPreparation::fusions` in place of `plan_fusions`,
 ///   retaining binding-dependent validation and fusion adjustments on the execution thread.
+///
 /// Both hooks live in adapter.rs; no worker enters either hook.
 pub(crate) fn execute(
     be_: &VulkanBackend,

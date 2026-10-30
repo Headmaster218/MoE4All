@@ -1,6 +1,6 @@
 // Test-only serial copy/publish prototype. No production hook or allocation policy change.
 fn copy_count_predicate_word(ordinal: u32, journal_bytes: usize) -> Option<usize> {
-    if journal_bytes % RESIDENT_JOURNAL_BYTES != 0
+    if !journal_bytes.is_multiple_of(RESIDENT_JOURNAL_BYTES)
         || ordinal as usize >= journal_bytes / RESIDENT_JOURNAL_BYTES
     {
         return None;

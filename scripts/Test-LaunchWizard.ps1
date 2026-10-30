@@ -15,6 +15,9 @@ $realInvokeRecommendedModelDownload = ${function:Invoke-RecommendedModelDownload
 $realOfferBenchmarkUpload = ${function:Offer-BenchmarkUpload}
 $realInvokeNativeCommandResult = ${function:Invoke-NativeCommandResult}
 $source = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
+if ($source -notmatch 'AI/automation: report the benchmark result') {
+    throw 'Windows manual benchmark path is missing the automation guidance'
+}
 $start = $source.IndexOf('$reuseSavedSettings = $false')
 $save = $ast.EndBlock.Statements | Where-Object { $_.Extent.Text.StartsWith('$state = [ordered]') } | Select-Object -First 1
 if ($start -lt 0 -or $null -eq $save) { throw 'Missing wizard flow' }

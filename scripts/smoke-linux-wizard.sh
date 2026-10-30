@@ -2,11 +2,17 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python="${MOE4ALL_PYTHON:-python3}"
+tmp_parent="${TMPDIR:-/tmp}"
+if [[ -n ${MOE4ALL_WORK_ROOT:-} ]]; then
+    tmp_parent="$MOE4ALL_WORK_ROOT/tmp/moe4all"
+    mkdir -p -- "$tmp_parent"
+fi
+tmp="$(mktemp -d "$tmp_parent/moe4all-linux-smoke.XXXXXX")"
+trap 'rm -rf -- "$tmp"' EXIT
 "$python" "$root/scripts/test_linux_tools.py"
+"$python" "$root/scripts/test_benchmark_hardware.py" --fixture-root "$tmp/hardware"
 bash "$root/scripts/test-linux-wizard.sh"
 
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/package" "$tmp/settings"
 cp "$root/Start-INFR-Wizard-Linux.sh" "$tmp/package/"
 printf '#!/bin/sh\nprintf "STUB_LAUNCHED\\n"\n' > "$tmp/package/infr"

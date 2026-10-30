@@ -1,12 +1,13 @@
 //! CPU-only transport for one parallel Decode frontier.
 
 pub(crate) type TokenAcknowledgements = [bool; infr_core::backend::MAX_DECODE_ROWS];
+type BatchTokenCallback<'a> = dyn FnMut(&[(usize, u32)]) -> TokenAcknowledgements + 'a;
 
 /// Legacy callbacks complete delivery and ACK per token. Ordinary Decode can deliver a
 /// complete non-EOS frontier before collecting ACKs. Both must resolve every supplied row.
 pub(crate) enum ParallelTokenCallback<'a> {
     Legacy(&'a mut dyn FnMut(usize, u32) -> bool),
-    Batch(&'a mut dyn FnMut(&[(usize, u32)]) -> TokenAcknowledgements),
+    Batch(&'a mut BatchTokenCallback<'a>),
 }
 
 pub(crate) trait TokenDelivery {

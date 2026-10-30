@@ -11,6 +11,15 @@ use std::time::{Duration, Instant};
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug)]
+pub struct GpuIdentity<'a> {
+    pub name: &'a str,
+    pub pci_address: Option<&'a str>,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub vulkan_index: usize,
+}
+
 fn failure(status: &str) -> Value {
     json!({"hardware": {}, "collection": {"status": status}})
 }
@@ -96,7 +105,12 @@ fn run(mut command: Command, script: &'static [u8], timeout: Duration) -> Value 
     value
 }
 
-pub fn collect(model: &Path, gpu_name: &str, pci_address: Option<&str>) -> Value {
+pub fn collect(model: &Path, backend: &str, gpu: Option<GpuIdentity<'_>>) -> Value {
+    let gpu_name = gpu.map_or("", |gpu| gpu.name);
+    let pci_address = gpu.and_then(|gpu| gpu.pci_address).unwrap_or("");
+    let vendor_id = gpu.map(|gpu| format!("{:04x}", gpu.vendor_id));
+    let device_id = gpu.map(|gpu| format!("{:04x}", gpu.device_id));
+    let vulkan_index = gpu.map(|gpu| gpu.vulkan_index.to_string());
     #[cfg(windows)]
     let (command, script) = {
         let executable = std::env::var_os("SystemRoot")
@@ -104,11 +118,15 @@ pub fn collect(model: &Path, gpu_name: &str, pci_address: Option<&str>) -> Value
             .unwrap_or_else(|| "powershell.exe".into());
         let mut command = Command::new(executable);
         command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-            "$s = [Console]::In.ReadToEnd(); & ([scriptblock]::Create($s)) -ModelPath $env:MOE4ALL_PROBE_MODEL -SelectedGpuName $env:MOE4ALL_PROBE_GPU -PciAddress $env:MOE4ALL_PROBE_PCI"]);
+            "$s = [Console]::In.ReadToEnd(); & ([scriptblock]::Create($s)) -ModelPath $env:MOE4ALL_PROBE_MODEL -Backend $env:MOE4ALL_PROBE_BACKEND -SelectedGpuName $env:MOE4ALL_PROBE_GPU -PciAddress $env:MOE4ALL_PROBE_PCI -VendorId $env:MOE4ALL_PROBE_VENDOR -DeviceId $env:MOE4ALL_PROBE_DEVICE -VulkanIndex $env:MOE4ALL_PROBE_INDEX"]);
         command
             .env("MOE4ALL_PROBE_MODEL", model)
+            .env("MOE4ALL_PROBE_BACKEND", backend)
             .env("MOE4ALL_PROBE_GPU", gpu_name)
-            .env("MOE4ALL_PROBE_PCI", pci_address.unwrap_or(""));
+            .env("MOE4ALL_PROBE_PCI", pci_address)
+            .env("MOE4ALL_PROBE_VENDOR", vendor_id.as_deref().unwrap_or(""))
+            .env("MOE4ALL_PROBE_DEVICE", device_id.as_deref().unwrap_or(""))
+            .env("MOE4ALL_PROBE_INDEX", vulkan_index.as_deref().unwrap_or(""));
         (
             command,
             include_bytes!("../../../scripts/benchmark-hardware.ps1").as_slice(),
@@ -117,12 +135,14 @@ pub fn collect(model: &Path, gpu_name: &str, pci_address: Option<&str>) -> Value
     #[cfg(not(windows))]
     let (command, script) = {
         let mut command = Command::new("/bin/sh");
-        command.args(["-s", "--", "--model"]).arg(model).args([
-            "--gpu-name",
-            gpu_name,
-            "--pci-address",
-            pci_address.unwrap_or(""),
-        ]);
+        command
+            .args(["-s", "--", "--model"])
+            .arg(model)
+            .args(["--backend", backend, "--gpu-name", gpu_name])
+            .args(["--pci-address", pci_address])
+            .args(["--gpu-vendor-id", vendor_id.as_deref().unwrap_or("")])
+            .args(["--gpu-device-id", device_id.as_deref().unwrap_or("")])
+            .args(["--vulkan-index", vulkan_index.as_deref().unwrap_or("")]);
         (
             command,
             include_bytes!("../../../scripts/benchmark-hardware.sh").as_slice(),
@@ -411,7 +431,11 @@ mod tests {
     #[test]
     #[ignore = "explicit local platform probe; no model or GPU work"]
     fn live_platform_probe_is_bounded_and_retains_hardware() {
-        let result = collect(Path::new("missing-model-for-readonly-probe.gguf"), "", None);
+        let result = collect(
+            Path::new("missing-model-for-readonly-probe.gguf"),
+            "CPU",
+            None,
+        );
         assert!(result["hardware"].is_object(), "{result}");
         assert!(result["hardware"]["cpu"]["name"].is_string(), "{result}");
         assert!(result["collection"].is_object(), "{result}");

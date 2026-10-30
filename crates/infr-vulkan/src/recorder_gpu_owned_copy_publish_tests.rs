@@ -16,7 +16,7 @@ impl CopyPublishFixture {
         stride: usize,
         host_source: bool,
     ) -> Self {
-        assert!(stride >= 16 && stride % 16 == 0);
+        assert!(stride >= 16 && stride.is_multiple_of(16));
         assert!((1..=infr_core::backend::MAX_DECODE_ROWS).contains(&rows));
         let count = rows * 3;
         let ordinal = 1u32;
@@ -407,6 +407,86 @@ fn gpu_owned_copy_publish_multi_workgroup_matches_serial() {
                 }
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "central GPU runner only; 24-job CPU publication must make every owner entry READY"]
+fn gpu_owned_cpu_publish_24_jobs_is_atomic_and_visible() {
+    let be = backend();
+    let rows = infr_core::backend::MAX_DECODE_ROWS;
+    let count = rows * 3;
+    assert_eq!(count, 24);
+
+    let ordinal = 1u32;
+    let journal_base = ordinal as usize * RESIDENT_JOURNAL_WORDS;
+    let mut journal = vec![0u32; (ordinal as usize + 1) * RESIDENT_JOURNAL_WORDS];
+    journal[journal_base + RESIDENT_JOURNAL_STATUS_WORD] = 5;
+    journal[journal_base + RESIDENT_JOURNAL_JOB_COUNT_WORD] = count as u32;
+
+    let jobs_base = ordinal as usize * RESIDENT_JOURNAL_ID_WORDS * 3 * 8;
+    let mut jobs = vec![0u32; (ordinal as usize + 1) * RESIDENT_JOURNAL_ID_WORDS * 3 * 8];
+    let pool_count = 1usize;
+    let pool_base = 3usize;
+    let slot_base = pool_base + pool_count * 2;
+    let address_base = slot_base + count;
+    let mut nodes = vec![[0u32; 4]; address_base + count];
+    nodes[0] = [4, pool_count as u32, count as u32, 0];
+    nodes[1] = [0, pool_base as u32, slot_base as u32, address_base as u32];
+    let mut overlay = vec![[0u32, 0, 0, NONE]; count];
+    let destination = be.alloc_mapped_arena_bda(count * 16).unwrap().0;
+    let destination_address = destination.device_addr().unwrap();
+    for job in 0..count {
+        let address = destination_address + (job * 16) as u64;
+        let lo = address as u32;
+        let hi = (address >> 32) as u32;
+        nodes[slot_base + job] = [1, 0, job as u32, 2];
+        nodes[address_base + job] = [lo, hi, 0, job as u32];
+        overlay[job] = [lo, hi, 2, job as u32];
+        jobs[jobs_base + job * 8..jobs_base + job * 8 + 8]
+            .copy_from_slice(&[0, 0, lo, hi, 16, job as u32, job as u32, 0]);
+    }
+
+    let journal_buffer = be.alloc_mapped_arena_bda(journal.len() * 4).unwrap().0;
+    let jobs_buffer = be.alloc_mapped_arena_bda(jobs.len() * 4).unwrap().0;
+    let nodes_buffer = be.alloc_mapped_arena_bda(nodes.len() * 16).unwrap().0;
+    let overlay_buffer = be.alloc_mapped_arena_bda(overlay.len() * 16).unwrap().0;
+    upload_words(&be, journal_buffer.as_ref(), &journal);
+    upload_words(&be, jobs_buffer.as_ref(), &jobs);
+    be.upload(nodes_buffer.as_ref(), bytemuck::cast_slice(&nodes))
+        .unwrap();
+    be.upload(overlay_buffer.as_ref(), bytemuck::cast_slice(&overlay))
+        .unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.owned_copy_barrier(true, false);
+    let bindings = [
+        Recorder::vkb_exact(journal_buffer.as_ref()),
+        Recorder::vkb_exact(jobs_buffer.as_ref()),
+        Recorder::vkb_exact(nodes_buffer.as_ref()),
+        Recorder::vkb_exact(overlay_buffer.as_ref()),
+    ];
+    let publish = be.kernel(
+        "gpu_owned_publish",
+        crate::gemm::gpu_owned_publish_spv(),
+        4,
+        8,
+    );
+    rec.dispatch(
+        publish,
+        &bindings,
+        2,
+        bytemuck::cast_slice(&[ordinal, 1]),
+        1,
+    );
+    rec.owned_copy_barrier(false, true);
+    rec.finish().unwrap();
+
+    let published_nodes = read_words(&be, nodes_buffer.as_ref());
+    let published_overlay = read_words(&be, overlay_buffer.as_ref());
+    for job in 0..count {
+        assert_eq!(published_nodes[(slot_base + job) * 4 + 3], 1);
+        assert_eq!(published_overlay[job * 4 + 2], 1);
     }
 }
 

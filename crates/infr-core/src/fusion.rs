@@ -577,7 +577,8 @@ mod tests {
         });
         let no_write = [(0, untouched), (g.ops.len() / 2, untouched)];
         let read_at_end = [(0, tail_read), (g.ops.len() / 2, tail_read)];
-        let cases: [(&str, &[(usize, TensorId)], bool); 3] = [
+        type QueryCase<'a> = (&'static str, &'a [(usize, TensorId)], bool);
+        let cases: [QueryCase<'_>; 3] = [
             ("next_write_intervals", &next_writes, true),
             ("end_no_write", &no_write, true),
             ("end_read_no_write", &read_at_end, false),

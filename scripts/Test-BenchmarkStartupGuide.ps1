@@ -210,7 +210,13 @@ function Invoke-BenchmarkStartupGuide { Save-BenchmarkGuideState -NextRemindAt (
 function Start-VulkanDeviceProbe { }
 function Select-ModelPath { return $model }
 function Read-ComputeDevice { return 'Vulkan0' }
-function Read-Choice { param($Label, $Options, $DefaultValue); Assert ($Label -notmatch 'Benchmark plan|What would you like') 'Guided flow must use the quick plan'; return $DefaultValue }
+$script:GuidedProfile = 'conservative'
+function Read-Choice {
+    param($Label, $Options, $DefaultValue)
+    Assert ($Label -notmatch 'Benchmark plan|What would you like') 'Guided flow must use the quick plan'
+    if ($Label -match 'Configuration') { return $script:GuidedProfile }
+    return $DefaultValue
+}
 function Read-YesNo { return $false }
 function Read-IntegerValue { param($Label, $Default); return $Default }
 function Get-CpuMissTopology { return [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true } }
@@ -222,6 +228,10 @@ $repoRoot = $testRoot; $guiStatePath = Join-Path $testRoot 'no-gui.json'
 $infrPath = Join-Path $testRoot 'never-run.exe'; $InitialModelPath = ''
 . $flow
 Assert ($nativeArgs[0] -eq 'bench' -and 'quick' -in $nativeArgs -and '--parallel' -in $nativeArgs) 'Try must build the quick benchmark command'
+Assert ('device.auto_profile=conservative' -in $nativeArgs -and 'device.auto_profile=aggressive' -notin $nativeArgs) 'Guided quick benchmark must preserve a conservative selection'
+$script:GuidedProfile = 'aggressive'
+. $flow
+Assert ('device.auto_profile=aggressive' -in $nativeArgs -and 'device.auto_profile=conservative' -notin $nativeArgs) 'Guided quick benchmark must preserve an aggressive selection'
 Assert ($script:Saved.launch_mode -eq 'server' -and $script:Saved.bench_kind -eq 'full' -and $script:Saved.bench_parallel -eq '4') 'Daily defaults changed'
 Assert (-not (Test-Path -LiteralPath $statePath)) 'Guided configuration must not save daily defaults'
 [void][IO.Directory]::CreateDirectory($dataDir)

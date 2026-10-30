@@ -12739,7 +12739,9 @@ fn generate_dense_backend_inner(
     // Only immutable graph metadata reaches this closure: no bindings, buffers or token history.
     let prepare_decode_plan =
         |shape: Shape, first: bool| -> AResult<(Box<dyn Plan>, DecodeHandles)> {
-            let span = c.qwen4exp.then(|| if first { 0..1 } else { 1..c.n_layer });
+            let span = c
+                .qwen4exp
+                .then_some(if first { 0..1 } else { 1..c.n_layer });
             let (g, h) = build(
                 1,
                 shape.pos,
@@ -14820,13 +14822,13 @@ mod tests {
                 if abort_before_step {
                     request.abort();
                 }
-                for _ in 0..2 {
+                'candidate: {
                     if parallel_decode_should_stop(Some(&request), false, None) {
-                        break;
+                        break 'candidate;
                     }
                     let _gate = request.gate_pass();
                     if parallel_decode_should_stop(Some(&request), false, None) {
-                        break;
+                        break 'candidate;
                     }
                     forwards += 1;
                     // Both lane callbacks ACK, but a stop-sequence latch still cancels the cohort.
@@ -14835,7 +14837,7 @@ mod tests {
                         request.abort();
                     }
                     if parallel_decode_should_stop(Some(&request), false, None) {
-                        break;
+                        break 'candidate;
                     }
                     panic!("latched abort must prevent consuming the next prepared candidate");
                 }

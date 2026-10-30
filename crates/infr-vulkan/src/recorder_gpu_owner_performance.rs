@@ -198,7 +198,7 @@ impl PoolProbe {
                             ) {
                                 block % EXPERTS != 0
                             } else {
-                                block % EXPERTS % 2 == 0
+                                (block % EXPERTS).is_multiple_of(2)
                             })
                 })
                 .collect();

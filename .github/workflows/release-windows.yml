@@ -112,6 +112,8 @@ jobs:
           MOE4ALL_WORK_ROOT: ${{ runner.temp }}\moe4all-work
         run: |
           New-Item -ItemType Directory -Force -Path (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all') | Out-Null
+          powershell.exe -NoLogo -NoProfile -File .\scripts\test-benchmark-hardware.ps1 -FixtureRoot (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\benchmark-hardware')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoLogo -NoProfile -File .\scripts\Test-LaunchWizard.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoLogo -NoProfile -File .\scripts\Test-CpuMissWizard.ps1

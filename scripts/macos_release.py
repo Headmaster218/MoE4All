@@ -81,7 +81,7 @@ def validate_package(root, version):
             raise ValueError("Package entry is not a regular file: " + name)
         if path.stat().st_size != entry.get("size") or sha256(path) != entry.get("sha256"):
             raise ValueError("Package integrity check failed: " + name)
-    if not {"infr", "Start-INFR-Wizard-macOS.sh"}.issubset(names):
+    if not ({"infr", "Start-INFR-Wizard-macOS.sh"} | SCRIPT_FILES).issubset(names):
         raise ValueError("Package is missing runtime files")
     actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
     if actual != names | {"install-manifest.json"}:

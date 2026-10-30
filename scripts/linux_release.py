@@ -104,7 +104,7 @@ def validate_package(root, version):
         path = safe_target(root, name)
         if not path.is_file() or path.stat().st_size != entry["size"] or sha256(path) != entry["sha256"]:
             raise ValueError("Package integrity check failed: " + name)
-    if not {"infr", "Start-INFR-Wizard-Linux.sh"}.issubset(names):
+    if not ({"infr", "Start-INFR-Wizard-Linux.sh"} | SCRIPT_FILES).issubset(names):
         raise ValueError("Package is missing runtime files")
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
     if actual != names | {"install-manifest.json"}:

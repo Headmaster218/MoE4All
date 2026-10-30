@@ -3,10 +3,12 @@ use super::*;
 
 #[test]
 fn staged_binding_setup_reads_retained_scratch_without_switching_or_growing() {
-    let mut arena = RuntimePhaseArena::default();
-    arena.scratch = vec![Some(Box::new(CpuBuffer(16)) as Box<dyn Buffer>)];
-    arena.scratch_layout = vec![Some(16)];
-    arena.scratch_topology = vec![true];
+    let mut arena = RuntimePhaseArena {
+        scratch: vec![Some(Box::new(CpuBuffer(16)) as Box<dyn Buffer>)],
+        scratch_layout: vec![Some(16)],
+        scratch_topology: vec![true],
+        ..RuntimePhaseArena::default()
+    };
     arena.parked_scratch.push(PhaseScratch {
         topology: vec![false, true],
         layout: vec![None, Some(32)],

@@ -589,7 +589,7 @@ fn run_owned_upload_two_cpu_misses_outcome(
                 .backend
                 .upload(
                     fixture.buffer(output),
-                    bytemuck::cast_slice(&vec![-777.0f32; NE]),
+                    bytemuck::cast_slice(&[-777.0f32; NE]),
                 )
                 .unwrap();
         }

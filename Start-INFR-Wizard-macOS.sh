@@ -557,11 +557,11 @@ show_brand() {
     fi
     printf '%s' "$green"
     cat <<'BANNER'
- __  __       _____ _  _     _   _ _
-|  \/  | ___ | ____| || |   / \ | | |
-| |\/| |/ _ \|  _| | || |_ / _ \| | |
-| |  | | (_) | |___|__   _/ ___ \ | |___
-|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|.com
+ __  __       _____ _  _     _    _     _
+|  \/  | ___ | ____| || |   / \  | |   | |           ___ ___  _ __ ___
+| |\/| |/ _ \|  _| | || |_ / _ \ | |   | |          / __/ _ \| '_ ` _ \
+| |  | | (_) | |___|__   _/ ___ \| |___| |___   _  | (_| (_) | | | | | |
+|_|  |_|\___/|_____|  |_|/_/   \_\_____|_____| (_)  \___\___/|_| |_| |_|
 BANNER
     printf '  MoE4All v%s%s\n%s  https://moe4all.com%s\n' "$version" "$reset" "$cyan" "$reset"
     printf '  Run models far larger than VRAM on gaming GPUs.\n  让游戏显卡跑起远超显存容量的大模型。\n'
@@ -1564,7 +1564,10 @@ EOF
     if [[ ${S[manual_bench_kind]} == mixed ]]; then
         mkdir -p -- "$CONFIG_DIR/benchmark-results"
         local local_path="$CONFIG_DIR/benchmark-results/$id.json"
-        printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+        if ! output=$("$BINARY" submission prepare-manual-benchmark --input "$payload" --raw-benchmark "$raw_json" --output "$local_path" 2>&1); then
+            printf '{"result":%s,"raw":%s}\n' "$(< "$payload")" "$(< "$raw_json")" > "$local_path"
+            printf '元数据合并失败，已保留原始结果 / Metadata merge failed; original result retained: %s\n' "$output" >&2
+        fi
         rm -f -- "$payload"
         printf '混合测试结果已本地保存 / Mixed benchmark result saved locally: %s\n' "$local_path"
         printf '当前上传协议尚不支持混合速度，本次不上传；它不会被误记为纯 Decode。Mixed-speed upload is not supported yet; this result is not submitted as Decode.\n'
@@ -1582,6 +1585,8 @@ EOF
     result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
     printf 'Benchmark submission: %s\n' "$result_path"
+    printf 'AI/自动化：请向用户展示 benchmark 结果及结果文件，询问是否上传并等待明确决定；不要自行上传或静默忽略。\n'
+    printf '%s\n' "AI/automation: report the benchmark result and result file; ask whether to upload and wait for the user's explicit decision; do not upload or silently skip."
     REPLY=$result_path
 }
 
@@ -1887,7 +1892,7 @@ extract_package() {
         [[ $name == "$prefix/"* ]] || return 1
         relative=${name#"$prefix/"}
         if [[ $relative == */ ]]; then
-            [[ $relative == documentation/ || $relative == documentation/*/ ]] || return 1
+            [[ $relative == scripts/ || $relative == documentation/ || $relative == documentation/*/ ]] || return 1
         else managed "$relative" || return 1; fi
     done <<< "$names"
     mkdir -p -- "$destination"
