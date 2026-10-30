@@ -891,7 +891,7 @@ pub(crate) fn generate_dense_vulkan_session(
     };
     let out = generate_dense_backend(
         vk,
-        &*bind,
+        &bind,
         g,
         cfg,
         ec,
@@ -1020,7 +1020,7 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
     }));
     let out = runner::generate_dense_backend_parallel_sampled(
         vk,
-        &*bind,
+        &bind,
         g,
         cfg,
         ec,
@@ -1072,7 +1072,7 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     }));
     let out = runner::generate_dense_backend_parallel_prefill(
         vk,
-        &*bind,
+        &bind,
         g,
         cfg,
         ec,
@@ -1160,7 +1160,7 @@ pub(crate) fn generate_dense_vulkan_parallel_verify_session(
     let mut hidden = Vec::new();
     let result = runner::generate_dense_backend_parallel_mtp_verify(
         vk,
-        &*bind,
+        &bind,
         g,
         cfg,
         ec,
@@ -5622,7 +5622,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     }
     let bind = pipeline_binder(&pb);
     run_dense_oneshot(
-        &pb, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
+        &pb, &bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -5841,7 +5841,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     }
     let bind = tensor_parallel_binder(&tp, cfg);
     run_dense_oneshot(
-        &tp, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
+        &tp, &bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -6021,7 +6021,7 @@ pub(crate) fn generate_moe_vulkan_ep(
     }
     let bind = expert_parallel_binder(&ep, cfg);
     run_dense_oneshot(
-        &ep, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
+        &ep, &bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -6526,9 +6526,8 @@ pub(super) fn vulkan_weight_plan(
     } else {
         u64::MAX
     };
-    let fixed_bytes = if cfg.moe.is_none() {
-        resident_bytes // dense streaming computes its own exact placeholder layout below
-    } else if resident == fixed {
+    let fixed_bytes = if cfg.moe.is_none() || resident == fixed {
+        // Dense streaming computes its own exact placeholder layout below.
         resident_bytes
     } else {
         vk.resident_weight_allocation_bytes(&fixed)?

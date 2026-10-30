@@ -211,8 +211,10 @@ mod tests {
     fn cold_weight_plan_tied_and_gpu_embeddings_follow_upload_policy() {
         for untied in [false, true] {
             let (_file, gguf, cfg) = plan_fixture(untied);
-            let mut caps = infr_core::Capabilities::default();
-            caps.embed_gather = true;
+            let caps = infr_core::Capabilities {
+                embed_gather: true,
+                ..Default::default()
+            };
             let mut ec = crate::EngineConfig::default();
             ec.spec.gpu_embed = true;
             let plan = super::super::runner::cold_weight_plan(&gguf, &cfg, &caps, &ec).unwrap();
@@ -240,10 +242,12 @@ mod tests {
             let cfg = Config::from_gguf(&gguf).unwrap();
             let ec = crate::EngineConfig::default();
             for fused in [false, true] {
-                let mut caps = infr_core::Capabilities::default();
-                caps.embed_gather = fused;
-                caps.combined_gu = fused;
-                caps.qsa_prepare = fused;
+                let caps = infr_core::Capabilities {
+                    embed_gather: fused,
+                    combined_gu: fused,
+                    qsa_prepare: fused,
+                    ..Default::default()
+                };
                 let plan = super::super::runner::cold_weight_plan(&gguf, &cfg, &caps, &ec).unwrap();
                 let fp = plan.footprint().unwrap();
                 assert!(fp.total() > 0);

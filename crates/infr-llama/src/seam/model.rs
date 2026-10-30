@@ -2162,7 +2162,7 @@ impl DiffusionGemmaCpuSession {
         let bind = crate::seam::cpu_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2206,7 +2206,7 @@ impl DiffusionGemmaCpuSession {
         let bind = crate::seam::cpu_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2259,7 +2259,7 @@ impl DiffusionGemmaVulkanSession {
         )?;
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2322,7 +2322,7 @@ impl DiffusionGemmaVulkanSession {
         )?;
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2374,7 +2374,7 @@ impl DiffusionGemmaMetalSession {
         let bind = crate::seam::metal_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2412,7 +2412,7 @@ impl DiffusionGemmaMetalSession {
         let bind = crate::seam::metal_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,

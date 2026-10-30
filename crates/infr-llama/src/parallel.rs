@@ -4047,7 +4047,7 @@ impl ParallelSeam {
         )?;
         let (mut pending, mut pending_logits) = crate::mtp::run_qwen4_prime_frontier_with_finish(
             self.vk.as_ref(),
-            &*bind,
+            &bind,
             self.model.gguf(),
             cfg,
             ec,

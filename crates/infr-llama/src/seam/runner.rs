@@ -2685,7 +2685,6 @@ pub(super) fn cold_weight_plan(
         // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
         // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
     }
-    drop(wload);
     let mut allocation_specs = weight_groups
         .iter()
         .map(|group| {
@@ -3378,7 +3377,6 @@ fn generate_dense_backend_inner(
             let names: Vec<&str> = group.iter().map(String::as_str).collect();
             wload(&names)?;
         }
-        drop(wload);
         if e2b {
             debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
             debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);

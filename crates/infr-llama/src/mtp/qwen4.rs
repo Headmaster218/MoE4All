@@ -2797,7 +2797,7 @@ impl Qwen4MtpRuntime {
         )?;
         let (mut pending_token, mut pending_logits) = super::run_qwen4_prime_frontier_with_finish(
             vk,
-            &*target_bind,
+            &target_bind,
             model.gguf(),
             cfg,
             ec,
@@ -2900,7 +2900,7 @@ impl Qwen4MtpRuntime {
             )?;
             let (mut verify_ids, mut verify_logits, verify_h) = super::run_verify_with_finish(
                 vk,
-                &*target_bind,
+                &target_bind,
                 model.gguf(),
                 cfg,
                 ec,
