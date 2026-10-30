@@ -409,6 +409,16 @@ pub enum BufferUsage {
 /// lifetime marker: constructing it starts the display, dropping it finishes/clears it.
 pub trait ProgressScope: Send {}
 
+/// Optional upfront reservation for an ordered sequence of `BufferUsage::Weights` allocations.
+/// Keep this guard alive while allocating/uploading those buffers through the same backend.
+/// Dropping it without a successful [`finish`](Self::finish) rolls back the reservation; already
+/// returned buffers must retain their backing storage until their own last reference drops.
+pub trait WeightAllocationBatch {
+    /// Verify that every declared allocation was consumed and retain the packed storage.
+    /// An incomplete batch returns an error and remains active until completed or dropped.
+    fn finish(&mut self) -> Result<()>;
+}
+
 pub trait Buffer: Send + Sync {
     /// The LOGICAL extent of the tensor this buffer holds — the byte count the model asked for —
     /// NOT a per-device shard of it. A multi-device wrapper that splits one logical buffer across
@@ -621,6 +631,18 @@ pub trait Backend: Send + Sync {
     fn capabilities(&self) -> Capabilities;
 
     // ---- memory ----
+    /// Prepare storage for the exact ordered byte sizes subsequently passed to `alloc` or
+    /// `alloc_uninit` with `BufferUsage::Weights`. Other buffer usages do not consume the batch.
+    /// While active, an unexpected weight allocation must fail rather than use a fallback.
+    /// The scope is backend-wide: callers must serialize weight loading on this backend.
+    /// `None` means unsupported (or a weight path that should retain its ordinary allocator).
+    fn begin_weight_allocation_batch(
+        &self,
+        _sizes: &[usize],
+    ) -> Result<Option<Box<dyn WeightAllocationBatch + '_>>> {
+        Ok(None)
+    }
+
     /// Allocate a buffer of `bytes`, **guaranteed zero-initialized** (calloc semantics). This is the
     /// safe default: code that reads a buffer before fully writing it (accumulators, recurrent state,
     /// KV caches, padding rows) behaves identically on every backend. GPU backends return recycled,
