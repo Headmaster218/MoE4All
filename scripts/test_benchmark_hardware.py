@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fixture-only collector and package tests. Runtime collectors need no Python.
 
-Run on Linux (including WSL) with an explicit --fixture-root. If MOE4ALL_WORK_ROOT
-is set, fixtures must be inside its tmp/moe4all directory. Darwin tests mock
-native metadata and are not Mac hardware tests.
+Run on Linux (including WSL) or macOS with an explicit --fixture-root. If
+MOE4ALL_WORK_ROOT is set, fixtures must be inside its tmp/moe4all directory.
+Linux stat and Darwin metadata are fixtures, not real hardware acceptance tests.
 """
 import argparse
 import json
@@ -70,8 +70,9 @@ class HardwareTests(unittest.TestCase):
         memory[23:27] = bytes([1, 2, 0, 3])
         struct.pack_into("<H", memory, 32, 5600)
         raw.write_bytes(memory + b'Fixture Manufacturer\0SECRET_SERIAL\0Fixture Part\0\0')
-        stat = self.model.stat()
-        disk = self.sys / f"dev/block/{os.major(stat.st_dev)}:{os.minor(stat.st_dev)}"
+        # Linux dev_t and GNU stat are fixture inputs, even on the macOS runner.
+        self.linux_device_number = 8 * 256 + 1
+        disk = self.sys / "dev/block/8:1"
         (disk / "device").mkdir(parents=True)
         (disk / "queue").mkdir()
         (disk / "device/model").write_text("Fixture SSD\n")
@@ -98,7 +99,16 @@ class HardwareTests(unittest.TestCase):
     def collect_fixture(self, gpu_name="Fixture GPU", bdf="", model=None, extra="", vendor="", device=""):
         bindings = {"os": "Linux", "backend": "vulkan", "proc_root": str(self.proc), "sys_root": str(self.sys), "pci_ids": str(self.ids), "model_path": str(self.model if model is None else model), "gpu_name": gpu_name, "pci_address": bdf, "gpu_vendor_id": vendor, "gpu_device_id": device, "vulkan_index": "0"}
         setup = "\n".join(f"{key}={shlex.quote(value)}" for key, value in bindings.items())
-        return self.run_script(LIBRARY + '\ndiagnostics=; diagnostic_separator=\n' + setup + '\n' + extra + '\nlinux_memory\nlinux_gpu\nmodel_storage\nemit_result\n')
+        native_stat = f'''\nstat() {{
+    case "$1:$2" in
+        -Lc:%d) printf '%s\\n' {self.linux_device_number} ;;
+        -Lc:%s) printf '%s\\n' {self.model.stat().st_size} ;;
+        -f:-c) printf '%s\\n' fixturefs ;;
+        *) return 1 ;;
+    esac
+}}
+'''
+        return self.run_script(LIBRARY + '\ndiagnostics=; diagnostic_separator=\n' + setup + native_stat + '\n' + extra + '\nlinux_memory\nlinux_gpu\nmodel_storage\nemit_result\n')
 
     def test_posix_stdin_and_missing_path_retains_cpu_memory(self):
         value = self.run_script(SOURCE, ["--model", str(self.root / "missing fixture.bin")])
