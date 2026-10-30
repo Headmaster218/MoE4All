@@ -125,13 +125,29 @@ fn decode_mtp_isolation_overlap_eligibility_cpu() {
                 let ordinary_shape = !verify;
                 assert_eq!(
                     gpu_copy_overlap_eligible(
-                        true, verify, rows, independent, false, true, true, false, false,
+                        true,
+                        verify,
+                        rows,
+                        independent,
+                        false,
+                        true,
+                        true,
+                        false,
+                        false,
                     ),
                     ordinary_shape,
                 );
                 // Includes ordinary-looking target graphs, not just Verify graphs.
                 assert!(!gpu_copy_overlap_eligible(
-                    true, verify, rows, independent, false, true, true, false, true,
+                    true,
+                    verify,
+                    rows,
+                    independent,
+                    false,
+                    true,
+                    true,
+                    false,
+                    true,
                 ));
             }
         }

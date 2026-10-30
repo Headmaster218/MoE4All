@@ -160,14 +160,12 @@ fn gpu_pure_mapped_coalesce_host_boundaries_and_prepared_recovery() {
         // Prove actual prepared submission, not just successful optional recording.
         prepare_case(&fixture, false);
         PREPARED_MAPPED_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(PreparedMappedTestState {
-                        decisions: Vec::new(),
-                        fail_after_layers: None,
-                    }))
-                    .is_none()
-            )
+            assert!(state
+                .replace(Some(PreparedMappedTestState {
+                    decisions: Vec::new(),
+                    fail_after_layers: None,
+                }))
+                .is_none())
         });
         let consumed = execute_static(&fixture.backend, &next, &fixture.bindings());
         let decisions = PREPARED_MAPPED_TEST_STATE.with(|state| state.take().unwrap().decisions);
@@ -208,34 +206,28 @@ fn gpu_pure_mapped_coalesce_cancel_error_and_retry() {
         policy(&mut fixture, true);
         prepare_case(&fixture, false);
         ROLLING_MAPPED_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(RollingMappedTestState {
-                        decisions: Vec::new(),
-                        admission_proofs: 0,
-                        fail_after_layers: Some((5, abort)),
-                        confirm_recovery: false,
-                    }))
-                    .is_none()
-            )
+            assert!(state
+                .replace(Some(RollingMappedTestState {
+                    decisions: Vec::new(),
+                    admission_proofs: 0,
+                    fail_after_layers: Some((5, abort)),
+                    confirm_recovery: false,
+                }))
+                .is_none())
         });
         let result = execute_static(&fixture.backend, &plan, &fixture.bindings());
         let decisions = ROLLING_MAPPED_TEST_STATE.with(|state| state.take().unwrap().decisions);
         if abort {
             assert!(matches!(result, Err(Error::Aborted)));
         } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("injected rolling mapped-run")
-            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected rolling mapped-run"));
         }
-        assert!(
-            decisions
-                .iter()
-                .any(|d| d.end == 5 && d.eligible && d.over_budget)
-        );
+        assert!(decisions
+            .iter()
+            .any(|d| d.end == 5 && d.eligible && d.over_budget));
         // No manual handoff/reset before retry; parent recovery is responsible for safe reuse.
         fixture.reset_frontend();
         execute_static(&fixture.backend, &plan, &fixture.bindings()).unwrap();
@@ -254,12 +246,25 @@ fn gpu_pure_mapped_coalesce_two_lanes_with_distinct_routes_and_cpu_miss() {
             if tensor.desc.shape.as_slice() != [1, NE] {
                 continue;
             }
-            tensor.desc.shape = vec![2, NE].into();
-            if let Some((_, buffer)) = fixture.buffers.iter_mut().find(|(id, _)| id.0 as usize == index) {
+            tensor.desc.shape = vec![2, NE];
+            if let Some((_, buffer)) = fixture
+                .buffers
+                .iter_mut()
+                .find(|(id, _)| id.0 as usize == index)
+            {
                 let mut bytes = vec![0u8; NE * 4];
-                fixture.backend.download(buffer.as_ref(), &mut bytes).unwrap();
-                let expanded = fixture.backend.alloc(2 * NE * 4, BufferUsage::Staging).unwrap();
-                fixture.backend.upload(expanded.as_ref(), &bytes.repeat(2)).unwrap();
+                fixture
+                    .backend
+                    .download(buffer.as_ref(), &mut bytes)
+                    .unwrap();
+                let expanded = fixture
+                    .backend
+                    .alloc(2 * NE * 4, BufferUsage::Staging)
+                    .unwrap();
+                fixture
+                    .backend
+                    .upload(expanded.as_ref(), &bytes.repeat(2))
+                    .unwrap();
                 *buffer = expanded;
             }
         }
@@ -269,28 +274,54 @@ fn gpu_pure_mapped_coalesce_two_lanes_with_distinct_routes_and_cpu_miss() {
             }
         }
         fixture.graph.independent_rows = true;
-        fixture.graph.sequence_spans = [3, 11].into_iter().enumerate().map(|(row, start)| {
-            infr_core::graph::SequenceSpan { row_start: row as u32, rows: 1, start_pos: start }
-        }).collect();
-        let router_x = fixture.graph.ops.iter().find_map(|op| match op {
-            Op::MoeFfn { router_x, .. } => Some(*router_x),
-            _ => None,
-        }).unwrap();
+        fixture.graph.sequence_spans = [3, 11]
+            .into_iter()
+            .enumerate()
+            .map(|(row, start)| infr_core::graph::SequenceSpan {
+                row_start: row as u32,
+                rows: 1,
+                start_pos: start,
+            })
+            .collect();
+        let router_x = fixture
+            .graph
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::MoeFfn { router_x, .. } => Some(*router_x),
+                _ => None,
+            })
+            .unwrap();
         let mut routing = vec![1f32; 2 * NE];
         routing[NE] = -1.0;
-        fixture.backend.upload(fixture.buffer(router_x), bytemuck::cast_slice(&routing)).unwrap();
+        fixture
+            .backend
+            .upload(fixture.buffer(router_x), bytemuck::cast_slice(&routing))
+            .unwrap();
         let current = plan(&fixture);
         install(&fixture, &current);
         let reset = |fixture: &Fixture| {
-            fixture.backend.upload(fixture.buffer(fixture.frontend),
-                bytemuck::cast_slice(&vec![0f32; 2 * NE])).unwrap();
+            fixture
+                .backend
+                .upload(
+                    fixture.buffer(fixture.frontend),
+                    bytemuck::cast_slice(&vec![0f32; 2 * NE]),
+                )
+                .unwrap();
         };
         let outputs = |fixture: &Fixture| {
-            fixture.outputs.iter().map(|&id| {
-                let mut values = vec![0f32; 2 * NE];
-                fixture.backend.download(fixture.buffer(id), bytemuck::cast_slice_mut(&mut values)).unwrap();
-                values
-            }).collect::<Vec<_>>()
+            fixture
+                .outputs
+                .iter()
+                .map(|&id| {
+                    let mut values = vec![0f32; 2 * NE];
+                    fixture
+                        .backend
+                        .download(fixture.buffer(id), bytemuck::cast_slice_mut(&mut values))
+                        .unwrap();
+                    values
+                })
+                .collect::<Vec<_>>()
         };
         prepare_case(&fixture, true);
         reset(&fixture);
@@ -306,13 +337,27 @@ fn gpu_pure_mapped_coalesce_two_lanes_with_distinct_routes_and_cpu_miss() {
         let result = execute_static(&fixture.backend, &current, &fixture.bindings());
         let recovery = OWNED_RECOVERY_TEST_COUNTS.with(|counts| counts.replace(None).unwrap());
         result.unwrap();
-        assert!(recovery[0] > 0, "two-row case must really recover a CPU miss");
+        assert!(
+            recovery[0] > 0,
+            "two-row case must really recover a CPU miss"
+        );
         assert_eq!(outputs(&fixture), expected, "overlap={overlap}");
         let mut frontend = vec![0f32; 2 * NE];
-        fixture.backend.download(fixture.buffer(fixture.frontend), bytemuck::cast_slice_mut(&mut frontend)).unwrap();
+        fixture
+            .backend
+            .download(
+                fixture.buffer(fixture.frontend),
+                bytemuck::cast_slice_mut(&mut frontend),
+            )
+            .unwrap();
         assert_eq!(frontend, vec![pattern.len() as f32; 2 * NE]);
         assert_eq!(lru(&fixture), expected_lru, "overlap={overlap}");
-        assert!(trace.decisions().iter().any(|d| !d.preparing && d.entries - d.submitted > 1),
-            "two-row execution must actually hold a pure mapped group");
+        assert!(
+            trace
+                .decisions()
+                .iter()
+                .any(|d| !d.preparing && d.entries - d.submitted > 1),
+            "two-row execution must actually hold a pure mapped group"
+        );
     }
 }

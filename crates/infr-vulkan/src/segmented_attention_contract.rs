@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Portable regression contracts for the accepted segmented Q8 split-K path.
 //!
 //! Mount as a child of recorder.rs. CPU contracts run normally; the three GPU

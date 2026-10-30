@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Explicit destination-residency hint probes; no runtime policy or external shader changes.
 use super::*;
 use crate::indirect_copy::{
@@ -38,7 +40,7 @@ const ARMS: [Arm; 3] = [Arm::CuPartial, Arm::Hint0, Arm::Hint1];
 const COMPARISONS: [(usize, usize); 3] = [(1, 2), (0, 1), (0, 2)];
 
 fn pair_order(pair: usize, baseline: usize, candidate: usize) -> [usize; 2] {
-    if pair % 2 == 0 {
+    if pair.is_multiple_of(2) {
         [baseline, candidate]
     } else {
         [candidate, baseline]

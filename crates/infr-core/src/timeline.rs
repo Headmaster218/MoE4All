@@ -23,13 +23,17 @@ struct CaptureFilter {
 }
 
 fn label_patterns(value: Option<&str>) -> Result<Option<Vec<String>>, String> {
-    value.map(|value| {
-        let patterns: Vec<_> = value.split(',').map(str::trim).map(str::to_owned).collect();
-        if patterns.iter().any(String::is_empty) {
-            return Err("timeline label filters require non-empty comma-separated substrings".into());
-        }
-        Ok(patterns)
-    }).transpose()
+    value
+        .map(|value| {
+            let patterns: Vec<_> = value.split(',').map(str::trim).map(str::to_owned).collect();
+            if patterns.iter().any(String::is_empty) {
+                return Err(
+                    "timeline label filters require non-empty comma-separated substrings".into(),
+                );
+            }
+            Ok(patterns)
+        })
+        .transpose()
 }
 
 fn matches_label(patterns: Option<&[String]>, name: &str) -> bool {
@@ -38,21 +42,28 @@ fn matches_label(patterns: Option<&[String]>, name: &str) -> bool {
 
 impl CaptureFilter {
     fn device_matches(&self, name: &str, layer: i32) -> bool {
-        self.layer.is_none_or(|wanted| layer >= 0 && wanted == layer as usize)
+        self.layer
+            .is_none_or(|wanted| layer >= 0 && wanted == layer as usize)
             && matches_label(self.device.as_deref(), name)
     }
 }
 
 pub fn device_label_selected(name: &str, layer: i32) -> bool {
-    CAPTURE.get().is_none_or(|filter| filter.device_matches(name, layer))
+    CAPTURE
+        .get()
+        .is_none_or(|filter| filter.device_matches(name, layer))
 }
 
 pub fn device_labels_selective() -> bool {
-    CAPTURE.get().is_some_and(|filter| filter.device.is_some() || filter.layer.is_some())
+    CAPTURE
+        .get()
+        .is_some_and(|filter| filter.device.is_some() || filter.layer.is_some())
 }
 
 pub fn host_label_selected(name: &str) -> bool {
-    CAPTURE.get().is_none_or(|filter| matches_label(filter.host.as_deref(), name))
+    CAPTURE
+        .get()
+        .is_none_or(|filter| matches_label(filter.host.as_deref(), name))
 }
 
 thread_local! {
@@ -202,7 +213,9 @@ pub fn configure(cfg: &crate::config::ProfCfg) -> Result<(), String> {
     if STATE.get().is_some() {
         return Err("timeline already configured".into());
     }
-    CAPTURE.set(capture).map_err(|_| "timeline filters already configured".to_string())?;
+    CAPTURE
+        .set(capture)
+        .map_err(|_| "timeline filters already configured".to_string())?;
     STATE
         .set(Mutex::new(State {
             path: path.clone(),
@@ -627,9 +640,12 @@ mod tests {
                     .env(CHILD, mode)
                     .output()
                     .unwrap();
-                assert!(output.status.success(), "{mode}: {} {}",
+                assert!(
+                    output.status.success(),
+                    "{mode}: {} {}",
                     String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr));
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
             return;
         };

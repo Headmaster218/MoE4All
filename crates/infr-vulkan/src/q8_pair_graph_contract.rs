@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Parent-mounted adapter child: production Q8 LinearPair graph and binding contracts.
 use super::*;
 use infr_core::{DType, TensorDesc, WeightSource};

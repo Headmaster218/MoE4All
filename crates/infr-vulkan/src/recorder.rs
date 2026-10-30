@@ -121,8 +121,8 @@ fn owned_recovery_seed_shape_valid(
 ) -> bool {
     control_bytes == RESIDENT_CONTROL_BYTES
         && candidate_bytes >= 48
-        && candidate_bytes % 16 == 0
-        && journal_bytes % RESIDENT_JOURNAL_BYTES == 0
+        && candidate_bytes.is_multiple_of(16)
+        && journal_bytes.is_multiple_of(RESIDENT_JOURNAL_BYTES)
         && params[0] < params[1]
         && params[1] as usize <= RESIDENT_MAX_LAYERS
         && (params[0] as usize) < journal_bytes / RESIDENT_JOURNAL_BYTES
@@ -2126,7 +2126,9 @@ impl<'a> Recorder<'a> {
         #[cfg(test)]
         if result.is_ok() {
             crate::host_ready_combined_test_support::submitted(
-                &self.be.shared, host_ready.as_ref(), fence,
+                &self.be.shared,
+                host_ready.as_ref(),
+                fence,
             );
         }
         result
@@ -11446,7 +11448,7 @@ impl<'a> Recorder<'a> {
             && top_blocks == 512
             && blocks > top_blocks
             && blocks <= 65536;
-        let mask = blocks >= 7680 && blocks <= 65536;
+        let mask = (7680..=65536).contains(&blocks);
         if let Some(work) = topk_work.filter(|_| rows == 1 && self.vk().qsa_topk_parallel) {
             let groups = blocks.div_ceil(1024).clamp(1, QSA_TOPK_PARALLEL_MAX_GROUPS);
             let state_base = groups * 256;
@@ -14434,7 +14436,7 @@ impl<'a> Recorder<'a> {
         assert!(!self.conditional_active.get());
         assert!(self.independent_dispatch.borrow().is_none() && !self.suppress.get());
         assert!((1..=16).contains(&used));
-        assert!(count > 0 && count <= RESIDENT_JOURNAL_ID_WORDS && count % used == 0);
+        assert!(count > 0 && count <= RESIDENT_JOURNAL_ID_WORDS && count.is_multiple_of(used));
         let rows = count / used;
         assert!(rows <= infr_core::backend::MAX_DECODE_ROWS && masks.len() == rows);
         let routed_mask = (1u32 << used) - 1;

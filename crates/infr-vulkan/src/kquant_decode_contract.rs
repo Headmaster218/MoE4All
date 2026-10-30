@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Self-contained Recorder regression, independent of the research campaign modules.
 use super::*;
 use infr_core::{backend::BufferUsage, DType};

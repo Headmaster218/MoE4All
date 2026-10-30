@@ -212,8 +212,8 @@ fn gqa_fixture_host_reference_contract() {
                         / 16.0;
                     let p = (score - m).exp();
                     direct_l += p;
-                    for d in 0..16 {
-                        direct_pv[d] += p * dequant(row, h / (nh / NKV), d, 2, true);
+                    for (d, value) in direct_pv.iter_mut().enumerate() {
+                        *value += p * dequant(row, h / (nh / NKV), d, 2, true);
                     }
                 }
                 assert!((direct_l - l).abs() < 1e-9);
@@ -266,8 +266,8 @@ fn segmented_fixture_host_contract() {
                 / 16.0;
             let weight = (score - m).exp();
             direct_l += weight;
-            for d in 0..16 {
-                direct_pv[d] += weight * dequant(local, 1, d, seed, true);
+            for (d, value) in direct_pv.iter_mut().enumerate() {
+                *value += weight * dequant(local, 1, d, seed, true);
             }
         }
         assert!((direct_l - l).abs() < 1e-10);

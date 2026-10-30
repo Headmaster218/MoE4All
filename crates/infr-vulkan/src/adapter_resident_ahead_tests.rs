@@ -1,8 +1,6 @@
+#![cfg(test)]
+
 //! Small model-free resident command-ahead regressions; declared as a child of `adapter`.
-#[path = "adapter_promotion_isolation_tests.rs"]
-pub(crate) mod promotion_isolation_tests;
-#[path = "adapter_pure_mapped_coalesce_tests.rs"]
-mod pure_mapped_coalesce_tests;
 #[path = "adapter_owned_stage_tail_tests.rs"]
 mod owned_stage_tail_tests;
 #[path = "adapter_owned_topk_tests.rs"]
@@ -13,6 +11,10 @@ mod owned_upload_tests;
 mod prepared_empty_stage_tests;
 #[path = "adapter_prepared_mapped_run_tests.rs"]
 mod prepared_mapped_run_tests;
+#[path = "adapter_promotion_isolation_tests.rs"]
+pub(crate) mod promotion_isolation_tests;
+#[path = "adapter_pure_mapped_coalesce_tests.rs"]
+mod pure_mapped_coalesce_tests;
 #[path = "adapter_rolling_mapped_run_tests.rs"]
 mod rolling_mapped_run_tests;
 #[path = "adapter_single_verify_tests.rs"]
@@ -646,7 +648,13 @@ impl Fixture {
         host_ready: bool,
     ) -> Self {
         Self::new_with_preparation_budget(
-            submit_layers, producer, copy, kv_reserve_bytes, kv_segment_bytes, host_ready, 3,
+            submit_layers,
+            producer,
+            copy,
+            kv_reserve_bytes,
+            kv_segment_bytes,
+            host_ready,
+            3,
         )
     }
 
@@ -660,8 +668,14 @@ impl Fixture {
         preparation_layers: usize,
     ) -> Self {
         Self::new_with_combined_policy(
-            submit_layers, producer, copy, kv_reserve_bytes, kv_segment_bytes,
-            host_ready, preparation_layers, false,
+            submit_layers,
+            producer,
+            copy,
+            kv_reserve_bytes,
+            kv_segment_bytes,
+            host_ready,
+            preparation_layers,
+            false,
         )
     }
 
@@ -1185,14 +1199,19 @@ fn gpu_resident_prepared_cooperative_cancellation_preserves_forward_and_fallback
     fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
     let expected = fixture.outputs();
     let tape = fixture.tape();
-    let epoch = fixture.backend.shared.resource_epoch.load(Ordering::Acquire);
+    let epoch = fixture
+        .backend
+        .shared
+        .resource_epoch
+        .load(Ordering::Acquire);
 
     for (next_token, point) in [false, true].into_iter().flat_map(|next_token| {
         [
             RecordingCheckpoint::Setup,
             RecordingCheckpoint::Op(1),
             RecordingCheckpoint::Finalize,
-        ].map(|point| (next_token, point))
+        ]
+        .map(|point| (next_token, point))
     }) {
         let next = VkDecodePlan::new_cpu(&fixture.graph, false, true);
         let cancelled = AtomicBool::new(false);
@@ -1201,12 +1220,23 @@ fn gpu_resident_prepared_cooperative_cancellation_preserves_forward_and_fallback
             let RuntimePhaseArena { scratch, pool, .. } = &mut *arena;
             let job = if next_token {
                 StageRecording::snapshot_next_token(
-                    &fixture.backend, &next, &bindings, scratch, pool, &[1],
+                    &fixture.backend,
+                    &next,
+                    &bindings,
+                    scratch,
+                    pool,
+                    &[1],
                 )
             } else {
                 StageRecording::snapshot(
-                    &fixture.backend, &next, &bindings, scratch, pool, None,
-                    &HashMap::new(), &next.prepared_prefix,
+                    &fixture.backend,
+                    &next,
+                    &bindings,
+                    scratch,
+                    pool,
+                    None,
+                    &HashMap::new(),
+                    &next.prepared_prefix,
                 )
             }
             .unwrap()
@@ -1220,9 +1250,20 @@ fn gpu_resident_prepared_cooperative_cancellation_preserves_forward_and_fallback
         );
         assert!(next.prepared_prefix.lock().unwrap().is_none());
         fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
-        assert_eq!(fixture.outputs(), expected, "unsubmitted work must not execute");
+        assert_eq!(
+            fixture.outputs(),
+            expected,
+            "unsubmitted work must not execute"
+        );
         assert_eq!(fixture.tape(), tape);
-        assert_eq!(fixture.backend.shared.resource_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(
+            fixture
+                .backend
+                .shared
+                .resource_epoch
+                .load(Ordering::Acquire),
+            epoch
+        );
         fixture.reset_frontend();
         execute_static(&fixture.backend, &next, &bindings).unwrap();
         fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
@@ -1237,18 +1278,34 @@ fn gpu_resident_prepared_cooperative_cancellation_preserves_forward_and_fallback
         let mut arena = fixture.backend.runtime_phase.lock().unwrap();
         let RuntimePhaseArena { scratch, pool, .. } = &mut *arena;
         let job = StageRecording::snapshot_next_token(
-            &fixture.backend, &next, &bindings, scratch, pool, &[1],
-        ).unwrap().expect("real completed prefix");
+            &fixture.backend,
+            &next,
+            &bindings,
+            scratch,
+            pool,
+            &[1],
+        )
+        .unwrap()
+        .expect("real completed prefix");
         job.record(&fixture.backend, &next_cancelled).unwrap();
     }
     assert!(next.prepared_prefix.lock().unwrap().is_some());
     command_prefix::test_finish_preparation_scope(
-        &next_cancelled, &continuation_cancelled, false, true,
+        &next_cancelled,
+        &continuation_cancelled,
+        false,
+        true,
     );
-    assert!(next.prepared_prefix.lock().unwrap().is_some(), "ready packet survives stop");
+    assert!(
+        next.prepared_prefix.lock().unwrap().is_some(),
+        "ready packet survives stop"
+    );
     fixture.reset_frontend();
     execute_static(&fixture.backend, &next, &bindings).unwrap();
-    assert!(next.prepared_prefix.lock().unwrap().is_none(), "ready packet is consumed");
+    assert!(
+        next.prepared_prefix.lock().unwrap().is_none(),
+        "ready packet is consumed"
+    );
     fixture.assert_frontend(fixture.buffer(fixture.frontend), 3.0);
     assert_close(&fixture.outputs(), &expected);
 }
@@ -1495,11 +1552,19 @@ fn gpu_prepared_source_certificate_horizon_preserves_execution_and_recovery() {
                 session.gpu_decode_owner = None;
                 (sources, crate::pager::owned_seed(session, 0).unwrap())
             };
-            let owner = crate::pager::GpuCopyBuffers::new_owned(
-                &fixture.backend, sources, WINDOW, seed,
-            ).unwrap().unwrap();
+            let owner =
+                crate::pager::GpuCopyBuffers::new_owned(&fixture.backend, sources, WINDOW, seed)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(owner.owned_self_service(), cpu_layer.is_none());
-            fixture.backend.moe_pager().lock().unwrap().as_mut().unwrap().gpu_decode_owner = Some(owner.clone());
+            fixture
+                .backend
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .gpu_decode_owner = Some(owner.clone());
             fixture
                 .backend
                 .runtime_phase

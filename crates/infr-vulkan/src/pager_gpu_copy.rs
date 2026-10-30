@@ -122,7 +122,7 @@ fn effective_copy_groups(requested: usize, _wide_copy: bool) -> u32 {
 }
 
 fn all_registered_sources_mapped(words: &[u32]) -> bool {
-    if words.len() % 4 != 0 {
+    if !words.len().is_multiple_of(4) {
         return false;
     }
     let mut registered = false;

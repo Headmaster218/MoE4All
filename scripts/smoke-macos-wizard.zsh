@@ -3,8 +3,14 @@ emulate -LR zsh
 setopt ERR_EXIT NO_UNSET PIPE_FAIL
 
 repo=${0:A:h:h}
-work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/moe4all-macos-smoke.XXXXXX")
+work_parent=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
+if [[ -n ${MOE4ALL_WORK_ROOT:-} ]]; then
+    work_parent="$MOE4ALL_WORK_ROOT/tmp/moe4all"
+    mkdir -p -- "$work_parent"
+fi
+work=$(mktemp -d "$work_parent/moe4all-macos-smoke.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT INT TERM
+python3 "$repo/scripts/test_benchmark_hardware.py" --fixture-root "$work/hardware"
 
 fail() { print -u2 -- "$*"; return 1; }
 assert_contains() { [[ $1 == *$2* ]] || fail "missing '$2' in: $1"; }

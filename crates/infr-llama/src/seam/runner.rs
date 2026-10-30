@@ -2199,6 +2199,527 @@ pub(crate) fn generate_dense_backend_parallel_prefill(
     Ok(stats)
 }
 
+/// The exact cold upload order, derived without reading tensor payloads. Placement and the
+/// loader use this same plan, including rewrites and generated constants.
+pub(super) struct ColdWeightPlan {
+    pub groups: Vec<Vec<String>>,
+    pub specs: Vec<super::WeightUploadSpec>,
+    layer_has_epb: Vec<bool>,
+    layer_fused_experts: Vec<bool>,
+    mtp_lm_head_index: usize,
+    mtp_token_embd_index: usize,
+}
+
+impl ColdWeightPlan {
+    pub fn footprint(&self) -> AResult<crate::weights::WeightFootprint> {
+        let mut fp = crate::weights::WeightFootprint {
+            dense: 0,
+            expert: 0,
+        };
+        for spec in &self.specs {
+            let target = if spec.name.contains("_exps") {
+                &mut fp.expert
+            } else {
+                &mut fp.dense
+            };
+            *target = target
+                .checked_add(spec.bytes as u64)
+                .ok_or_else(|| anyhow!("weight footprint overflow: {}", spec.name))?;
+        }
+        Ok(fp)
+    }
+}
+
+fn gpu_embed_enabled(
+    caps: &infr_core::Capabilities,
+    g: &Gguf,
+    c: &Config,
+    ec: &EngineConfig,
+) -> bool {
+    caps.embed_gather
+        && c.n_embd.is_multiple_of(32)
+        && ec.spec.gpu_embed
+        && g.tensors()
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
+}
+
+fn gpu_ple_enabled(g: &Gguf, c: &Config, gpu_embed: bool) -> bool {
+    gpu_embed
+        && c.n_embd_per_layer > 0
+        && (c.n_layer * c.n_embd_per_layer).is_multiple_of(32)
+        && g.tensors()
+            .iter()
+            .find(|t| t.name == "per_layer_token_embd.weight")
+            .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
+}
+
+pub(super) fn cold_weight_plan(
+    g: &Gguf,
+    c: &Config,
+    caps: &infr_core::Capabilities,
+    ec: &EngineConfig,
+) -> AResult<ColdWeightPlan> {
+    let ne = c.n_embd;
+    let max_hd = c.max_head_dim();
+    let gemma = c.gemma;
+    let gemma4 = c.gemma4;
+    let qk_norm = c.qk_norm;
+    let e2b = c.n_embd_per_layer > 0;
+    let gpu_embed = gpu_embed_enabled(caps, g, c, ec);
+    let gpu_ple = gpu_ple_enabled(g, c, gpu_embed);
+    let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
+    let has_wv: Vec<bool> = (0..c.n_layer)
+        .map(|l| {
+            g.tensors()
+                .iter()
+                .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
+        })
+        .collect();
+    let fuse_gu = fuse_gu_decision(caps.combined_gu, g, c);
+    let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c, ec);
+    let fuse_qsa_prepare = fuse_qsa_prepare_decision(caps.qsa_prepare, g, c, ec);
+    let kda_qkv_fused = (0..c.n_layer)
+        .map(|l| {
+            if c.bailingmoe3 && !c.is_bailing_mla_layer(l) {
+                kda_qkv_is_fused(g, l)
+            } else {
+                Ok(false)
+            }
+        })
+        .collect::<AResult<Vec<_>>>()?;
+    let mut layer_has_epb = vec![false; c.n_layer];
+    let mut layer_fused_experts = vec![false; c.n_layer];
+    let mut weight_groups = Vec::<Vec<String>>::new();
+    let wload_count = std::cell::Cell::new(0usize);
+    let mut wload = |names: &[&str]| -> AResult<()> {
+        weight_groups.push(names.iter().map(|name| (*name).to_owned()).collect());
+        wload_count.set(wload_count.get() + 1);
+        Ok(())
+    };
+    for l in 0..c.n_layer {
+        let p = |s: &str| format!("blk.{l}.{s}");
+        // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
+        // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
+        let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
+        let is_mla = c.is_mla_layer(l);
+        let is_kda = c.bailingmoe3 && !is_mla;
+        // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
+        // output projection, attention sinks, hyper-connections and up to two compressor blocks
+        // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
+        let is_dsv4 = c.deepseek4;
+        if c.qwen4exp {
+            for name in [
+                "hc_attn_norm.weight",
+                "hc_attn_down.weight",
+                "hc_attn_up.weight",
+                "hc_attn_inject.weight",
+                "hc_ffn_norm.weight",
+                "hc_ffn_down.weight",
+                "hc_ffn_up.weight",
+                "hc_ffn_inject.weight",
+            ] {
+                wload(&[&p(name)])?;
+            }
+        } else {
+            wload(&[&p("attn_norm.weight")])?;
+        }
+        if is_mla {
+            // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
+            if !c.is_lite {
+                wload(&[&p("attn_q_a.weight")])?;
+                wload(&[&p("attn_q_a_norm.weight")])?;
+            }
+            wload(&[&p(if c.is_lite {
+                "attn_q.weight"
+            } else {
+                "attn_q_b.weight"
+            })])?;
+            wload(&[&p("attn_kv_a_mqa.weight")])?;
+            wload(&[&p("attn_kv_a_norm.weight")])?;
+            wload(&[&p("attn_k_b.weight")])?;
+            wload(&[&p("attn_v_b.weight")])?;
+            if c.bailingmoe3 {
+                wload(&[&p("attn_gate.weight")])?;
+            }
+            wload(&[&p("attn_output.weight")])?;
+            if c.deepseek32 {
+                // DeepSeek V3.2 lightning indexer (docs/deepseek.md § Stage 3), on EVERY
+                // layer — `deepseek32.cpp::load_arch_tensors` creates these five outside the
+                // dense-lead/MoE branch, so a dense-lead layer carries them too. `k_norm` is a
+                // mean-centred LayerNorm, hence a bias tensor alongside the weight under the
+                // one GGUF name (open question 8's shape, and the reason both are listed).
+                wload(&[&p("indexer.k_norm.weight")])?;
+                wload(&[&p("indexer.k_norm.bias")])?;
+                wload(&[&p("indexer.proj.weight")])?;
+                wload(&[&p("indexer.attn_k.weight")])?;
+                wload(&[&p("indexer.attn_q_b.weight")])?;
+            }
+        } else if is_dsv4 {
+            // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
+            // triple verbatim; everything after it is V4's own.
+            wload(&[&p("attn_sinks.weight")])?;
+            wload(&[&p("attn_q_a.weight")])?;
+            wload(&[&p("attn_q_a_norm.weight")])?;
+            wload(&[&p("attn_q_b.weight")])?;
+            // ONE KV head for every query head (MQA): `attn_kv` is `[n_embd, head_dim]`, not a
+            // per-head bank. `attn_kv_a_norm` is `LLM_TENSOR_ATTN_KV_NORM`, which shares its
+            // on-disk name with deepseek2's `LLM_TENSOR_ATTN_KV_A_NORM` (docs/deepseek.md open
+            // question 8) — two enum values, one string, and no way to tell them apart on disk.
+            wload(&[&p("attn_kv.weight")])?;
+            wload(&[&p("attn_kv_a_norm.weight")])?;
+            // Low-rank GROUPED output projection: `wo_a` over `o_group_count` groups, then
+            // `wo_b` back to n_embd. There is no single `attn_output` here.
+            wload(&[&p("attn_output_a.weight")])?;
+            wload(&[&p("attn_output_b.weight")])?;
+            // Hyper-connections: one (fn, base, scale) triple wrapping the attention sublayer
+            // and another wrapping the FFN. Both are per-layer and unconditional.
+            for name in [
+                "hc_attn_fn.weight",
+                "hc_attn_base.weight",
+                "hc_attn_scale.weight",
+                "hc_ffn_fn.weight",
+                "hc_ffn_base.weight",
+                "hc_ffn_scale.weight",
+            ] {
+                wload(&[&p(name)])?;
+            }
+            // The per-layer compression ratio decides which tensors this layer HAS: 0 carries
+            // no compressor at all, 4 and 128 carry the attention compressor, and 4 alone adds
+            // the lightning indexer with its own compressor. `Config::from_gguf` has already
+            // refused any other value, so these two comparisons cover every layer.
+            let ratio = c.layer_compress_ratio(l);
+            if ratio != 0 {
+                for name in [
+                    "attn_compressor_kv.weight",
+                    "attn_compressor_gate.weight",
+                    "attn_compressor_ape.weight",
+                    "attn_compressor_norm.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+            }
+            if ratio == 4 {
+                // V4's indexer has no `attn_k` and no `k_norm`, unlike V3.2's: its keys come out
+                // of the compressor below, so `indexer_top_k` counts compressed BLOCKS.
+                for name in [
+                    "indexer.proj.weight",
+                    "indexer.attn_q_b.weight",
+                    "indexer_compressor_kv.weight",
+                    "indexer_compressor_gate.weight",
+                    "indexer_compressor_ape.weight",
+                    "indexer_compressor_norm.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+            }
+        } else if is_kda {
+            if kda_qkv_fused[l] {
+                wload(&[
+                    &p("attn_q.weight"),
+                    &p("attn_k.weight"),
+                    &p("attn_v.weight"),
+                ])?;
+            } else {
+                wload(&[&p("attn_q.weight"), &p("attn_k.weight")])?;
+                wload(&[&p("attn_v.weight")])?;
+            }
+            wload(&[
+                &p("ssm_conv1d_q.weight"),
+                &p("ssm_conv1d_k.weight"),
+                &p("ssm_conv1d_v.weight"),
+            ])?;
+            let forget = kda_projection_name(g, l, "ssm_f.weight", "ssm_f_a.weight")?;
+            wload(&[&forget])?;
+            wload(&[&p("ssm_beta.weight")])?;
+            wload(&[&p("ssm_a")])?;
+            wload(&[&p("ssm_dt.bias")])?;
+            wload(&[&p("ssm_norm.weight")])?;
+            let gate = kda_projection_name(g, l, "ssm_g.weight", "ssm_g_a.weight")?;
+            wload(&[&gate])?;
+            wload(&[&p("attn_output.weight")])?;
+        } else if is_delta {
+            wload(&[&p("attn_qkv.weight")])?;
+            wload(&[&p("attn_gate.weight")])?;
+            wload(&[&p("ssm_conv1d.weight")])?;
+            wload(&[&p("ssm_alpha.weight")])?;
+            wload(&[&p("ssm_beta.weight")])?;
+            wload(&[&p("ssm_a")])?;
+            wload(&[&p("ssm_dt.bias")])?;
+            wload(&[&p("ssm_norm.weight")])?;
+            wload(&[&p("ssm_out.weight")])?;
+        } else if fuse_qkv {
+            wload(&[
+                &p("attn_q.weight"),
+                &p("attn_k.weight"),
+                &p("attn_v.weight"),
+            ])?;
+        } else {
+            wload(&[&p("attn_q.weight")])?;
+            wload(&[&p("attn_k.weight")])?;
+            if has_wv[l] {
+                wload(&[&p("attn_v.weight")])?;
+            }
+        }
+        // Qwen2/2.5 q/k/v projection biases (small f32 [out_f] vectors). Loaded AFTER the q/k/v
+        // weights so the upload order matches the `wpush` order below.
+        if c.qkv_bias {
+            wload(&[&p("attn_q.bias")])?;
+            wload(&[&p("attn_k.bias")])?;
+            wload(&[&p("attn_v.bias")])?;
+        }
+        if qk_norm && !is_delta && !is_mla && !is_kda {
+            wload(&[&p("attn_q_norm.weight")])?;
+            wload(&[&p("attn_k_norm.weight")])?;
+        }
+        // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
+        // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
+        if !is_delta && !is_mla && !is_kda && !is_dsv4 {
+            wload(&[&p("attn_output.weight")])?;
+        }
+        if c.qwen4exp && c.is_qwen_hybrid_attn_layer(l) {
+            if fuse_qsa_prepare {
+                wload(&[&p("indexer.k_norm.weight")])?;
+                wload(&[&p("indexer.q_norm.weight")])?;
+                wload(&[&p("indexer.q_proj.weight"), &p("indexer.k_proj.weight")])?;
+            } else {
+                for name in [
+                    "indexer.k_norm.weight",
+                    "indexer.k_proj.weight",
+                    "indexer.q_norm.weight",
+                    "indexer.q_proj.weight",
+                ] {
+                    wload(&[&p(name)])?;
+                }
+            }
+        }
+        if c.is_ple_layer(l) {
+            for name in [
+                "ple_key.weight",
+                "ple_value.weight",
+                "ple_norm_key.weight",
+                "ple_norm_query.weight",
+                "ple_norm_conv.weight",
+                "ple_conv1d.weight",
+            ] {
+                wload(&[&p(name)])?;
+            }
+        }
+        // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
+        // the graph, but load order is arbitrary as long as `wpush` mirrors it — kept right
+        // after `attn_output` (its logical neighbor). `[n_embd]`, resident (small f32 norm).
+        if c.sub_norm && !is_delta {
+            wload(&[&p("attn_sub_norm.weight")])?;
+        }
+        if gemma {
+            wload(&[&p("post_attention_norm.weight")])?;
+        }
+        // qwen35 names its post-mixer/pre-FFN norm `post_attention_norm.weight` on BOTH layer
+        // kinds (not `ffn_norm.weight`) — same role (`lw.ffn_norm`), different tensor name.
+        let ffn_norm_name = if c.qwen35 {
+            "post_attention_norm.weight"
+        } else {
+            "ffn_norm.weight"
+        };
+        if !c.qwen4exp {
+            wload(&[&p(ffn_norm_name)])?;
+        }
+        if c.dual_moe() {
+            // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
+            // per-expert down scale), summed — see docs/diffusion-gemma.md's FFN wiring. Shared
+            // by diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B); identical tensors.
+            // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
+            // definition) instead of two separate n_ff=2112 tensors.
+            if fuse_gu {
+                wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
+            } else {
+                wload(&[&p("ffn_gate.weight")])?;
+                wload(&[&p("ffn_up.weight")])?;
+            }
+            wload(&[&p("ffn_down.weight")])?;
+            wload(&[&p("post_ffw_norm_1.weight")])?;
+            wload(&[&p("pre_ffw_norm_2.weight")])?;
+            wload(&[&p("ffn_gate_inp.weight")])?;
+            wload(&[&p("ffn_gate_inp.scale")])?;
+            wload(&[&p("ffn_gate_up_exps.weight")])?;
+            wload(&[&p("ffn_down_exps.weight")])?;
+            wload(&[&p("ffn_down_exps.scale")])?;
+            wload(&[&p("post_ffw_norm_2.weight")])?;
+        } else if c.moe.is_some() && c.is_moe_layer(l) {
+            // qwen3moe / qwen35moe / llama4 (MoE layer): router + stacked per-expert gate/up/
+            // down banks. (llama4 interleaves dense layers on `moe_interleave_step`; those fall
+            // through to the dense branches below — Scout's step==1 makes every layer MoE.)
+            wload(&[&p("ffn_gate_inp.weight")])?;
+            let fused = g
+                .tensors()
+                .iter()
+                .any(|t| t.name == p("ffn_gate_up_exps.weight"));
+            layer_fused_experts[l] = fused;
+            if fused {
+                wload(&[&p("ffn_gate_up_exps.weight")])?;
+            } else {
+                wload(&[&p("ffn_gate_exps.weight")])?;
+                wload(&[&p("ffn_up_exps.weight")])?;
+            }
+            wload(&[&p("ffn_down_exps.weight")])?;
+            if c.deepseek2 || c.bailingmoe3 {
+                let ep_name = p("exp_probs_b.bias");
+                if g.tensors().iter().any(|t| t.name == ep_name) {
+                    wload(&[&ep_name])?;
+                    layer_has_epb[l] = true;
+                }
+            }
+            if c.deepseek4 {
+                // Hash-routed MoE: the first `hash_layer_count` layers pick their experts from
+                // a token-id → expert-id table INSTEAD of scoring the router bias, so the two
+                // tensors are mutually exclusive per layer — `deepseek4.cpp` creates exactly
+                // one of them. A V4 file is not optional about either (unlike deepseek2's
+                // `exp_probs_b`, which the pre-V3 GGUFs simply do not have).
+                if c.is_hash_moe_layer(l) {
+                    wload(&[&p("ffn_gate_tid2eid.weight")])?;
+                } else {
+                    wload(&[&p("exp_probs_b.bias")])?;
+                    layer_has_epb[l] = true;
+                }
+            }
+            if c.shexp_ff > 0 {
+                // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
+                // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
+                // has no gate tensor and sums it in plain — see `FfnW::Moe`'s `shexp` field.
+                if c.shexp_gated {
+                    wload(&[&p("ffn_gate_inp_shexp.weight")])?;
+                }
+                wload(&[&p("ffn_gate_shexp.weight")])?;
+                wload(&[&p("ffn_up_shexp.weight")])?;
+                wload(&[&p("ffn_down_shexp.weight")])?;
+            }
+        } else if fuse_gu {
+            wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
+            wload(&[&p("ffn_down.weight")])?;
+        } else {
+            wload(&[&p("ffn_gate.weight")])?;
+            wload(&[&p("ffn_up.weight")])?;
+            wload(&[&p("ffn_down.weight")])?;
+        }
+        // bitnet SubLN: the FFN-intermediate RMSNorm (`[n_ff]`) applied BEFORE `ffn_down` in the
+        // graph; loaded here to mirror the `wpush` order below. Only bitnet is dense-gated AND
+        // `sub_norm`, so this never fires on a MoE/dual-FFN layer.
+        if c.sub_norm {
+            wload(&[&p("ffn_sub_norm.weight")])?;
+        }
+        if gemma {
+            wload(&[&p("post_ffw_norm.weight")])?;
+        }
+        if e2b {
+            // gemma4 E2B per-layer input-embedding application weights.
+            wload(&[&p("inp_gate.weight")])?;
+            wload(&[&p("proj.weight")])?;
+            wload(&[&p("post_norm.weight")])?;
+        }
+    }
+    // Qwen3.8's final grouped HC mixer replaces output_norm and is stored before the LM head.
+    // Every other architecture keeps the original output_norm-first order exactly.
+    if c.qwen4exp {
+        for name in [
+            "output_hc_norm.weight",
+            "output_hc_down.weight",
+            "output_hc_up.weight",
+        ] {
+            wload(&[name])?;
+        }
+    } else {
+        wload(&["output_norm.weight"])?;
+    }
+    // LM head = `output.weight`, or (tied) the quantized `token_embd.weight` mapped from the
+    // mmap and dequantized per-row by `Op::Linear` — same f32 values as the host embedding.
+    let mtp_lm_head_index = wload_count.get();
+    if g.tensors().iter().any(|t| t.name == "output.weight") {
+        wload(&["output.weight"])?;
+    } else {
+        wload(&["token_embd.weight"])?;
+    }
+    // DeepSeek V4's hyper-connection HEAD: the model-level triple that collapses the `hc_mult`
+    // parallel residual streams back to one vector before `output_norm`. Model-level, not
+    // per-layer (`output_hc_*`, no `blk.` prefix) — same standing as `output_norm`/`output`
+    // above, which is why they load here rather than in the layer loop.
+    if c.deepseek4 {
+        wload(&["output_hc_fn.weight"])?;
+        wload(&["output_hc_base.weight"])?;
+        wload(&["output_hc_scale.weight"])?;
+    }
+    // GPU embed gather: untied models upload the quantized token_embd as one extra weight
+    // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
+    // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
+    let mut mtp_token_embd_index = mtp_lm_head_index;
+    if gpu_embed && untied_lm {
+        mtp_token_embd_index = wload_count.get();
+        wload(&["token_embd.weight"])?;
+    }
+    // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
+    // embedding table. Mirrors `build`'s `w_ple` wpush.
+    if gpu_ple {
+        wload(&["per_layer_token_embd.weight"])?;
+    }
+    // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
+    // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
+    // encoder-only causal prefill, which runs with self-conditioning permanently off (see
+    // docs/diffusion-gemma.md); the canvas denoise graph (Phase 2+) is the first reader.
+    // Loaded BEFORE the e2b block (mutually exclusive with it — no model is both) so the
+    // `debug_assert_eq!` below, which indexes `wspecs` directly, isn't straddled by a later
+    // `wload` call (the closure's mutable borrow of `wspecs` would conflict with that read).
+    if c.diffusion_gemma {
+        wload(&["self_cond_pre_norm.weight"])?;
+        wload(&["self_cond_gate.weight"])?;
+        wload(&["self_cond_up.weight"])?;
+        wload(&["self_cond_down.weight"])?;
+    }
+    // gemma4 E2B: the per-layer input-embedding projection weights, native-uploaded like any
+    // other weight (model_proj stays bf16 — the seam's native bf16 GEMV/GEMM reads it directly;
+    // proj_norm is f32). The GPU graph prologue (in `build`, below) runs the GEMV + RMSNorm that
+    // used to be a host loop. Declared here (in upload order) — `build` pushes the matching
+    // handles right after `w_lm`/before `v_ones`.
+    if e2b {
+        wload(&["per_layer_model_proj.weight"])?;
+        wload(&["per_layer_proj_norm.weight"])?;
+        // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
+        // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
+    }
+    let mut allocation_specs = weight_groups
+        .iter()
+        .map(|group| {
+            let names: Vec<&str> = group.iter().map(String::as_str).collect();
+            super::weight_upload::describe(c, g.tensors(), &names).map(|layout| layout.spec)
+        })
+        .collect::<AResult<Vec<_>>>()?;
+    // Weightless normalization constants are ordinary resident allocations too, in the same
+    // order as the uploads below. Include them so a missing allocation never steals a tail.
+    for (enabled, name, elements) in [
+        (gemma4, "@v_ones", max_hd),
+        (c.dual_moe(), "@router_ones", ne),
+        (c.kq_l2norm, "@qk_ones", c.head_dim),
+        (c.deepseek4, "@hc_ones", c.hc_mult.saturating_mul(ne)),
+    ] {
+        if enabled {
+            allocation_specs.push(super::WeightUploadSpec {
+                name: name.into(),
+                bytes: elements
+                    .checked_mul(4)
+                    .ok_or_else(|| anyhow!("weight constant size overflow: {name}"))?,
+                direct_mmap: false,
+            });
+        }
+    }
+    Ok(ColdWeightPlan {
+        groups: weight_groups,
+        specs: allocation_specs,
+        layer_has_epb,
+        layer_fused_experts,
+        mtp_lm_head_index,
+        mtp_token_embd_index,
+    })
+}
+
 fn take_verify_hidden_rows(hidden: &mut Vec<f32>, rows: std::ops::Range<usize>) -> Vec<f32> {
     if rows.start == 0 && rows.end == hidden.len() {
         std::mem::take(hidden)
@@ -2523,13 +3044,7 @@ fn generate_dense_backend_inner(
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
-    let gpu_embed = caps.embed_gather
-        && c.n_embd.is_multiple_of(32)
-        && g.tensors()
-            .iter()
-            .find(|t| t.name == "token_embd.weight")
-            .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
-        && ec.spec.gpu_embed;
+    let gpu_embed = gpu_embed_enabled(&caps, g, c, ec);
     // DeepSeek V4 hash-routed MoE: `build` declares the token-id Input for its `Op::GatherI32`
     // selection gathers even when `gpu_embed` is false, so the decode loop uploads the id and the
     // binder binds it under this flag too. Mirrors `build`'s own `hash_gather` (which is per-SPAN;
@@ -2539,13 +3054,7 @@ fn generate_dense_backend_inner(
     // Op::EmbedGather, table = per_layer_token_embd, scale = sqrt(npl)) — the last host-side
     // per-token gather. Costs the quantized table's on-disk size in VRAM (uploaded once);
     // unlocks the chained decode for E2B (its host ipl gather was the stale-rows blocker).
-    let gpu_ple = gpu_embed
-        && e2b
-        && (c.n_layer * npl).is_multiple_of(32)
-        && g.tensors()
-            .iter()
-            .find(|t| t.name == "per_layer_token_embd.weight")
-            .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype));
+    let gpu_ple = gpu_ple_enabled(g, c, gpu_embed);
 
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
     // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
@@ -2654,16 +3163,12 @@ fn generate_dense_backend_inner(
         // (CPU/Vulkan/Metal × one-shot/session/bench/serve) goes through — so no entry point can
         // load without it. The ticking lives in each backend's `alloc` (Weights/HostWeights);
         // backends without a display return a no-op scope. Guard drops when the init block ends.
-        let fp = crate::weights::weight_footprint(g);
-        let _weight_pb = be.weight_progress(Some(fp.dense + fp.expert));
         // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
         //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
         //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its
         //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
         let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut wspecs: Vec<(DType, usize)> = Vec::new();
-        let mut layer_has_epb = vec![false; c.n_layer];
-        let mut layer_fused_experts = vec![false; c.n_layer];
         // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
         // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
         // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
@@ -2708,7 +3213,19 @@ fn generate_dense_backend_inner(
             }
             out
         };
-        let wload_count = std::cell::Cell::new(0usize);
+        // Enumerate the actual upload order once, before reading any weight payload. The very
+        // same groups then drive upload; no independent architecture-specific size estimator.
+        let weight_plan = cold_weight_plan(g, c, &caps, ec)?;
+        let _weight_pb = be.weight_progress(Some(weight_plan.footprint()?.total()));
+        let ColdWeightPlan {
+            groups: weight_groups,
+            specs: allocation_specs,
+            layer_has_epb,
+            layer_fused_experts,
+            mtp_lm_head_index,
+            mtp_token_embd_index,
+        } = weight_plan;
+        let mut allocation_batch = bind_weight.prepare(&allocation_specs)?;
         let mut wload = |names: &[&str]| -> AResult<()> {
             let info = |name: &str| {
                 g.tensors()
@@ -2726,7 +3243,8 @@ fn generate_dense_backend_inner(
                     infr_gguf::nbytes(dt, c.n_embd)
                 }
             };
-            let (bytes, dt, numel) = if info(names[0])?.dtype == DType::I2S {
+            let layout = super::weight_upload::describe(c, g.tensors(), names)?;
+            let (bytes, dt, numel) = if layout.rewrite == super::weight_upload::Rewrite::I2sF16 {
                 // BitNet i2_s carries a per-TENSOR trailing f32 scale and an interleaved 128-group
                 // packing (see `DType::I2S`) — neither composes with the per-row weight streaming
                 // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
@@ -2765,7 +3283,7 @@ fn generate_dense_backend_inner(
                 // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
                 // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
                 // quantized buffer → OOB GPU fault → device lost.
-                if c.qwen4exp && name.ends_with("ple_conv1d.weight") {
+                if layout.rewrite == super::weight_upload::Rewrite::PleConvF32 {
                     let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                     let src = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
                     let channels = c.hc_mult * c.n_embd;
@@ -2785,12 +3303,7 @@ fn generate_dense_backend_inner(
                     }
                     let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
                     (WBytes::Owned(bytes), DType::F32, expanded.len())
-                } else if ((c.deepseek2 || c.bailingmoe3)
-                    && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
-                    || (c.deepseek4
-                        && (name.contains("_compressor_ape.weight")
-                            || name.contains("_compressor_norm.weight")))
-                {
+                } else if layout.rewrite == super::weight_upload::Rewrite::AbsorbedF32 {
                     let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                     let numel = i.shape.iter().product();
                     let f32v = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
@@ -2846,399 +3359,25 @@ fn generate_dense_backend_inner(
             };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
             // weights to f16), so the graph declares the handle to match what the backend will read.
+            if (bytes.len(), dt, numel) != (layout.spec.bytes, layout.dtype, layout.numel) {
+                return Err(anyhow!(
+                    "weight upload layout drift for {}: planned {:?}, actual {:?}",
+                    names[0],
+                    (layout.spec.bytes, layout.dtype, layout.numel),
+                    (bytes.len(), dt, numel)
+                ));
+            }
             let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)
                 .with_context(|| format!("bind fixed weight `{}`", names[0]))?;
             wbufs.push(buf);
             wspecs.push((eff_dt, numel));
-            wload_count.set(wload_count.get() + 1);
             Ok(())
         };
-        for l in 0..c.n_layer {
-            let p = |s: &str| format!("blk.{l}.{s}");
-            // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
-            // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
-            let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
-            let is_mla = c.is_mla_layer(l);
-            let is_kda = c.bailingmoe3 && !is_mla;
-            // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
-            // output projection, attention sinks, hyper-connections and up to two compressor blocks
-            // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
-            let is_dsv4 = c.deepseek4;
-            if c.qwen4exp {
-                for name in [
-                    "hc_attn_norm.weight",
-                    "hc_attn_down.weight",
-                    "hc_attn_up.weight",
-                    "hc_attn_inject.weight",
-                    "hc_ffn_norm.weight",
-                    "hc_ffn_down.weight",
-                    "hc_ffn_up.weight",
-                    "hc_ffn_inject.weight",
-                ] {
-                    wload(&[&p(name)])?;
-                }
-            } else {
-                wload(&[&p("attn_norm.weight")])?;
-            }
-            if is_mla {
-                // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
-                if !c.is_lite {
-                    wload(&[&p("attn_q_a.weight")])?;
-                    wload(&[&p("attn_q_a_norm.weight")])?;
-                }
-                wload(&[&p(if c.is_lite {
-                    "attn_q.weight"
-                } else {
-                    "attn_q_b.weight"
-                })])?;
-                wload(&[&p("attn_kv_a_mqa.weight")])?;
-                wload(&[&p("attn_kv_a_norm.weight")])?;
-                wload(&[&p("attn_k_b.weight")])?;
-                wload(&[&p("attn_v_b.weight")])?;
-                if c.bailingmoe3 {
-                    wload(&[&p("attn_gate.weight")])?;
-                }
-                wload(&[&p("attn_output.weight")])?;
-                if c.deepseek32 {
-                    // DeepSeek V3.2 lightning indexer (docs/deepseek.md § Stage 3), on EVERY
-                    // layer — `deepseek32.cpp::load_arch_tensors` creates these five outside the
-                    // dense-lead/MoE branch, so a dense-lead layer carries them too. `k_norm` is a
-                    // mean-centred LayerNorm, hence a bias tensor alongside the weight under the
-                    // one GGUF name (open question 8's shape, and the reason both are listed).
-                    wload(&[&p("indexer.k_norm.weight")])?;
-                    wload(&[&p("indexer.k_norm.bias")])?;
-                    wload(&[&p("indexer.proj.weight")])?;
-                    wload(&[&p("indexer.attn_k.weight")])?;
-                    wload(&[&p("indexer.attn_q_b.weight")])?;
-                }
-            } else if is_dsv4 {
-                // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
-                // triple verbatim; everything after it is V4's own.
-                wload(&[&p("attn_sinks.weight")])?;
-                wload(&[&p("attn_q_a.weight")])?;
-                wload(&[&p("attn_q_a_norm.weight")])?;
-                wload(&[&p("attn_q_b.weight")])?;
-                // ONE KV head for every query head (MQA): `attn_kv` is `[n_embd, head_dim]`, not a
-                // per-head bank. `attn_kv_a_norm` is `LLM_TENSOR_ATTN_KV_NORM`, which shares its
-                // on-disk name with deepseek2's `LLM_TENSOR_ATTN_KV_A_NORM` (docs/deepseek.md open
-                // question 8) — two enum values, one string, and no way to tell them apart on disk.
-                wload(&[&p("attn_kv.weight")])?;
-                wload(&[&p("attn_kv_a_norm.weight")])?;
-                // Low-rank GROUPED output projection: `wo_a` over `o_group_count` groups, then
-                // `wo_b` back to n_embd. There is no single `attn_output` here.
-                wload(&[&p("attn_output_a.weight")])?;
-                wload(&[&p("attn_output_b.weight")])?;
-                // Hyper-connections: one (fn, base, scale) triple wrapping the attention sublayer
-                // and another wrapping the FFN. Both are per-layer and unconditional.
-                for name in [
-                    "hc_attn_fn.weight",
-                    "hc_attn_base.weight",
-                    "hc_attn_scale.weight",
-                    "hc_ffn_fn.weight",
-                    "hc_ffn_base.weight",
-                    "hc_ffn_scale.weight",
-                ] {
-                    wload(&[&p(name)])?;
-                }
-                // The per-layer compression ratio decides which tensors this layer HAS: 0 carries
-                // no compressor at all, 4 and 128 carry the attention compressor, and 4 alone adds
-                // the lightning indexer with its own compressor. `Config::from_gguf` has already
-                // refused any other value, so these two comparisons cover every layer.
-                let ratio = c.layer_compress_ratio(l);
-                if ratio != 0 {
-                    for name in [
-                        "attn_compressor_kv.weight",
-                        "attn_compressor_gate.weight",
-                        "attn_compressor_ape.weight",
-                        "attn_compressor_norm.weight",
-                    ] {
-                        wload(&[&p(name)])?;
-                    }
-                }
-                if ratio == 4 {
-                    // V4's indexer has no `attn_k` and no `k_norm`, unlike V3.2's: its keys come out
-                    // of the compressor below, so `indexer_top_k` counts compressed BLOCKS.
-                    for name in [
-                        "indexer.proj.weight",
-                        "indexer.attn_q_b.weight",
-                        "indexer_compressor_kv.weight",
-                        "indexer_compressor_gate.weight",
-                        "indexer_compressor_ape.weight",
-                        "indexer_compressor_norm.weight",
-                    ] {
-                        wload(&[&p(name)])?;
-                    }
-                }
-            } else if is_kda {
-                if kda_qkv_fused[l] {
-                    wload(&[
-                        &p("attn_q.weight"),
-                        &p("attn_k.weight"),
-                        &p("attn_v.weight"),
-                    ])?;
-                } else {
-                    wload(&[&p("attn_q.weight"), &p("attn_k.weight")])?;
-                    wload(&[&p("attn_v.weight")])?;
-                }
-                wload(&[
-                    &p("ssm_conv1d_q.weight"),
-                    &p("ssm_conv1d_k.weight"),
-                    &p("ssm_conv1d_v.weight"),
-                ])?;
-                let forget = kda_projection_name(g, l, "ssm_f.weight", "ssm_f_a.weight")?;
-                wload(&[&forget])?;
-                wload(&[&p("ssm_beta.weight")])?;
-                wload(&[&p("ssm_a")])?;
-                wload(&[&p("ssm_dt.bias")])?;
-                wload(&[&p("ssm_norm.weight")])?;
-                let gate = kda_projection_name(g, l, "ssm_g.weight", "ssm_g_a.weight")?;
-                wload(&[&gate])?;
-                wload(&[&p("attn_output.weight")])?;
-            } else if is_delta {
-                wload(&[&p("attn_qkv.weight")])?;
-                wload(&[&p("attn_gate.weight")])?;
-                wload(&[&p("ssm_conv1d.weight")])?;
-                wload(&[&p("ssm_alpha.weight")])?;
-                wload(&[&p("ssm_beta.weight")])?;
-                wload(&[&p("ssm_a")])?;
-                wload(&[&p("ssm_dt.bias")])?;
-                wload(&[&p("ssm_norm.weight")])?;
-                wload(&[&p("ssm_out.weight")])?;
-            } else if fuse_qkv {
-                wload(&[
-                    &p("attn_q.weight"),
-                    &p("attn_k.weight"),
-                    &p("attn_v.weight"),
-                ])?;
-            } else {
-                wload(&[&p("attn_q.weight")])?;
-                wload(&[&p("attn_k.weight")])?;
-                if has_wv[l] {
-                    wload(&[&p("attn_v.weight")])?;
-                }
-            }
-            // Qwen2/2.5 q/k/v projection biases (small f32 [out_f] vectors). Loaded AFTER the q/k/v
-            // weights so the upload order matches the `wpush` order below.
-            if c.qkv_bias {
-                wload(&[&p("attn_q.bias")])?;
-                wload(&[&p("attn_k.bias")])?;
-                wload(&[&p("attn_v.bias")])?;
-            }
-            if qk_norm && !is_delta && !is_mla && !is_kda {
-                wload(&[&p("attn_q_norm.weight")])?;
-                wload(&[&p("attn_k_norm.weight")])?;
-            }
-            // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
-            // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
-            if !is_delta && !is_mla && !is_kda && !is_dsv4 {
-                wload(&[&p("attn_output.weight")])?;
-            }
-            if c.qwen4exp && c.is_qwen_hybrid_attn_layer(l) {
-                if fuse_qsa_prepare {
-                    wload(&[&p("indexer.k_norm.weight")])?;
-                    wload(&[&p("indexer.q_norm.weight")])?;
-                    wload(&[&p("indexer.q_proj.weight"), &p("indexer.k_proj.weight")])?;
-                } else {
-                    for name in [
-                        "indexer.k_norm.weight",
-                        "indexer.k_proj.weight",
-                        "indexer.q_norm.weight",
-                        "indexer.q_proj.weight",
-                    ] {
-                        wload(&[&p(name)])?;
-                    }
-                }
-            }
-            if c.is_ple_layer(l) {
-                for name in [
-                    "ple_key.weight",
-                    "ple_value.weight",
-                    "ple_norm_key.weight",
-                    "ple_norm_query.weight",
-                    "ple_norm_conv.weight",
-                    "ple_conv1d.weight",
-                ] {
-                    wload(&[&p(name)])?;
-                }
-            }
-            // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
-            // the graph, but load order is arbitrary as long as `wpush` mirrors it — kept right
-            // after `attn_output` (its logical neighbor). `[n_embd]`, resident (small f32 norm).
-            if c.sub_norm && !is_delta {
-                wload(&[&p("attn_sub_norm.weight")])?;
-            }
-            if gemma {
-                wload(&[&p("post_attention_norm.weight")])?;
-            }
-            // qwen35 names its post-mixer/pre-FFN norm `post_attention_norm.weight` on BOTH layer
-            // kinds (not `ffn_norm.weight`) — same role (`lw.ffn_norm`), different tensor name.
-            let ffn_norm_name = if c.qwen35 {
-                "post_attention_norm.weight"
-            } else {
-                "ffn_norm.weight"
-            };
-            if !c.qwen4exp {
-                wload(&[&p(ffn_norm_name)])?;
-            }
-            if c.dual_moe() {
-                // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
-                // per-expert down scale), summed — see docs/diffusion-gemma.md's FFN wiring. Shared
-                // by diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B); identical tensors.
-                // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
-                // definition) instead of two separate n_ff=2112 tensors.
-                if fuse_gu {
-                    wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
-                } else {
-                    wload(&[&p("ffn_gate.weight")])?;
-                    wload(&[&p("ffn_up.weight")])?;
-                }
-                wload(&[&p("ffn_down.weight")])?;
-                wload(&[&p("post_ffw_norm_1.weight")])?;
-                wload(&[&p("pre_ffw_norm_2.weight")])?;
-                wload(&[&p("ffn_gate_inp.weight")])?;
-                wload(&[&p("ffn_gate_inp.scale")])?;
-                wload(&[&p("ffn_gate_up_exps.weight")])?;
-                wload(&[&p("ffn_down_exps.weight")])?;
-                wload(&[&p("ffn_down_exps.scale")])?;
-                wload(&[&p("post_ffw_norm_2.weight")])?;
-            } else if c.moe.is_some() && c.is_moe_layer(l) {
-                // qwen3moe / qwen35moe / llama4 (MoE layer): router + stacked per-expert gate/up/
-                // down banks. (llama4 interleaves dense layers on `moe_interleave_step`; those fall
-                // through to the dense branches below — Scout's step==1 makes every layer MoE.)
-                wload(&[&p("ffn_gate_inp.weight")])?;
-                let fused = g
-                    .tensors()
-                    .iter()
-                    .any(|t| t.name == p("ffn_gate_up_exps.weight"));
-                layer_fused_experts[l] = fused;
-                if fused {
-                    wload(&[&p("ffn_gate_up_exps.weight")])?;
-                } else {
-                    wload(&[&p("ffn_gate_exps.weight")])?;
-                    wload(&[&p("ffn_up_exps.weight")])?;
-                }
-                wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 || c.bailingmoe3 {
-                    let ep_name = p("exp_probs_b.bias");
-                    if g.tensors().iter().any(|t| t.name == ep_name) {
-                        wload(&[&ep_name])?;
-                        layer_has_epb[l] = true;
-                    }
-                }
-                if c.deepseek4 {
-                    // Hash-routed MoE: the first `hash_layer_count` layers pick their experts from
-                    // a token-id → expert-id table INSTEAD of scoring the router bias, so the two
-                    // tensors are mutually exclusive per layer — `deepseek4.cpp` creates exactly
-                    // one of them. A V4 file is not optional about either (unlike deepseek2's
-                    // `exp_probs_b`, which the pre-V3 GGUFs simply do not have).
-                    if c.is_hash_moe_layer(l) {
-                        wload(&[&p("ffn_gate_tid2eid.weight")])?;
-                    } else {
-                        wload(&[&p("exp_probs_b.bias")])?;
-                        layer_has_epb[l] = true;
-                    }
-                }
-                if c.shexp_ff > 0 {
-                    // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
-                    // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
-                    // has no gate tensor and sums it in plain — see `FfnW::Moe`'s `shexp` field.
-                    if c.shexp_gated {
-                        wload(&[&p("ffn_gate_inp_shexp.weight")])?;
-                    }
-                    wload(&[&p("ffn_gate_shexp.weight")])?;
-                    wload(&[&p("ffn_up_shexp.weight")])?;
-                    wload(&[&p("ffn_down_shexp.weight")])?;
-                }
-            } else if fuse_gu {
-                wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
-                wload(&[&p("ffn_down.weight")])?;
-            } else {
-                wload(&[&p("ffn_gate.weight")])?;
-                wload(&[&p("ffn_up.weight")])?;
-                wload(&[&p("ffn_down.weight")])?;
-            }
-            // bitnet SubLN: the FFN-intermediate RMSNorm (`[n_ff]`) applied BEFORE `ffn_down` in the
-            // graph; loaded here to mirror the `wpush` order below. Only bitnet is dense-gated AND
-            // `sub_norm`, so this never fires on a MoE/dual-FFN layer.
-            if c.sub_norm {
-                wload(&[&p("ffn_sub_norm.weight")])?;
-            }
-            if gemma {
-                wload(&[&p("post_ffw_norm.weight")])?;
-            }
-            if e2b {
-                // gemma4 E2B per-layer input-embedding application weights.
-                wload(&[&p("inp_gate.weight")])?;
-                wload(&[&p("proj.weight")])?;
-                wload(&[&p("post_norm.weight")])?;
-            }
+        for group in &weight_groups {
+            let names: Vec<&str> = group.iter().map(String::as_str).collect();
+            wload(&names)?;
         }
-        // Qwen3.8's final grouped HC mixer replaces output_norm and is stored before the LM head.
-        // Every other architecture keeps the original output_norm-first order exactly.
-        if c.qwen4exp {
-            for name in [
-                "output_hc_norm.weight",
-                "output_hc_down.weight",
-                "output_hc_up.weight",
-            ] {
-                wload(&[name])?;
-            }
-        } else {
-            wload(&["output_norm.weight"])?;
-        }
-        // LM head = `output.weight`, or (tied) the quantized `token_embd.weight` mapped from the
-        // mmap and dequantized per-row by `Op::Linear` — same f32 values as the host embedding.
-        let mtp_lm_head_index = wload_count.get();
-        if g.tensors().iter().any(|t| t.name == "output.weight") {
-            wload(&["output.weight"])?;
-        } else {
-            wload(&["token_embd.weight"])?;
-        }
-        // DeepSeek V4's hyper-connection HEAD: the model-level triple that collapses the `hc_mult`
-        // parallel residual streams back to one vector before `output_norm`. Model-level, not
-        // per-layer (`output_hc_*`, no `blk.` prefix) — same standing as `output_norm`/`output`
-        // above, which is why they load here rather than in the layer loop.
-        if c.deepseek4 {
-            wload(&["output_hc_fn.weight"])?;
-            wload(&["output_hc_base.weight"])?;
-            wload(&["output_hc_scale.weight"])?;
-        }
-        // GPU embed gather: untied models upload the quantized token_embd as one extra weight
-        // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
-        // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
-        let mut mtp_token_embd_index = mtp_lm_head_index;
-        if gpu_embed && untied_lm {
-            mtp_token_embd_index = wload_count.get();
-            wload(&["token_embd.weight"])?;
-        }
-        // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
-        // embedding table. Mirrors `build`'s `w_ple` wpush.
-        if gpu_ple {
-            wload(&["per_layer_token_embd.weight"])?;
-        }
-        // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
-        // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
-        // encoder-only causal prefill, which runs with self-conditioning permanently off (see
-        // docs/diffusion-gemma.md); the canvas denoise graph (Phase 2+) is the first reader.
-        // Loaded BEFORE the e2b block (mutually exclusive with it — no model is both) so the
-        // `debug_assert_eq!` below, which indexes `wspecs` directly, isn't straddled by a later
-        // `wload` call (the closure's mutable borrow of `wspecs` would conflict with that read).
-        if c.diffusion_gemma {
-            wload(&["self_cond_pre_norm.weight"])?;
-            wload(&["self_cond_gate.weight"])?;
-            wload(&["self_cond_up.weight"])?;
-            wload(&["self_cond_down.weight"])?;
-        }
-        // gemma4 E2B: the per-layer input-embedding projection weights, native-uploaded like any
-        // other weight (model_proj stays bf16 — the seam's native bf16 GEMV/GEMM reads it directly;
-        // proj_norm is f32). The GPU graph prologue (in `build`, below) runs the GEMV + RMSNorm that
-        // used to be a host loop. Declared here (in upload order) — `build` pushes the matching
-        // handles right after `w_lm`/before `v_ones`.
         if e2b {
-            wload(&["per_layer_model_proj.weight"])?;
-            wload(&["per_layer_proj_norm.weight"])?;
-            // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
-            // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
             debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
             debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
         }
@@ -3296,6 +3435,12 @@ fn generate_dense_backend_inner(
             wbufs.push(b);
             wspecs.push((DType::F32, c.hc_mult * ne));
         }
+        if let Some(batch) = allocation_batch.as_mut() {
+            batch
+                .finish()
+                .map_err(|e| anyhow!("finish fixed weight layout: {e}"))?;
+        }
+        drop(allocation_batch);
         // ── re-decide the context against what the device says is LEFT ───────────────────────
         // Every weight this session will hold is resident by now. Paged Vulkan sessions physically
         // escrow their predicted runtime workspace while those allocations land; release it before
@@ -11238,7 +11383,8 @@ fn generate_dense_backend_inner(
                     );
                     drop(timeline_output);
                     if c.qwen4exp && !should_stop && step + 1 < max_new {
-                        let _timeline_ple_submit = infr_core::timeline::span("decode_next_ple_submit");
+                        let _timeline_ple_submit =
+                            infr_core::timeline::span("decode_next_ple_submit");
                         // All lane ACKs are resolved; only host gathering runs ahead of the next step.
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             step + 1,
@@ -12521,7 +12667,9 @@ fn generate_dense_backend_inner(
     // Only immutable graph metadata reaches this closure: no bindings, buffers or token history.
     let prepare_decode_plan =
         |shape: Shape, first: bool| -> AResult<(Box<dyn Plan>, DecodeHandles)> {
-            let span = c.qwen4exp.then(|| if first { 0..1 } else { 1..c.n_layer });
+            let span = c
+                .qwen4exp
+                .then_some(if first { 0..1 } else { 1..c.n_layer });
             let (g, h) = build(
                 1,
                 shape.pos,
@@ -13447,7 +13595,8 @@ fn generate_dense_backend_inner(
                         out.len(),
                         max_new,
                     ) {
-                        let _timeline_ple_submit = infr_core::timeline::span("decode_next_ple_submit");
+                        let _timeline_ple_submit =
+                            infr_core::timeline::span("decode_next_ple_submit");
                         next_ple_ticket = Some(ple_ticket_carry::Ticket::new(
                             next_pos,
                             submit_ple_token(
@@ -14601,13 +14750,13 @@ mod tests {
                 if abort_before_step {
                     request.abort();
                 }
-                for _ in 0..2 {
+                'candidate: {
                     if parallel_decode_should_stop(Some(&request), false, None) {
-                        break;
+                        break 'candidate;
                     }
                     let _gate = request.gate_pass();
                     if parallel_decode_should_stop(Some(&request), false, None) {
-                        break;
+                        break 'candidate;
                     }
                     forwards += 1;
                     // Both lane callbacks ACK, but a stop-sequence latch still cancels the cohort.
@@ -14616,7 +14765,7 @@ mod tests {
                         request.abort();
                     }
                     if parallel_decode_should_stop(Some(&request), false, None) {
-                        break;
+                        break 'candidate;
                     }
                     panic!("latched abort must prevent consuming the next prepared candidate");
                 }

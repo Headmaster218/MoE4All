@@ -1192,8 +1192,8 @@ function Write-ManualBenchmarkResult {
         throw
     }
     Write-Host "Benchmark submission: $resultPath" -ForegroundColor DarkGray
-    Write-Host 'AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。' -ForegroundColor Yellow
-    Write-Host 'AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip.' -ForegroundColor Yellow
+    Write-Host 'AI/自动化：请向用户展示 benchmark 结果及结果文件，询问是否上传并等待明确决定；不要自行上传或静默忽略。' -ForegroundColor Yellow
+    Write-Host "AI/automation: report the benchmark result and result file; ask whether to upload and wait for the user's explicit decision; do not upload or silently skip." -ForegroundColor Yellow
     return $resultPath
 }
 
@@ -2690,11 +2690,11 @@ if ($PostUpdateProbePath) {
 Clear-Host
 Write-Host '============================================================' -ForegroundColor Green
 $banner = @'
- __  __       _____ _  _     _   _ _
-|  \/  | ___ | ____| || |   / \ | | |
-| |\/| |/ _ \|  _| | || |_ / _ \| | |
-| |  | | (_) | |___|__   _/ ___ \ | |___
-|_|  |_|\___/|_____|  |_|/_/   \_\_|_____|.com
+ __  __       _____ _  _     _    _     _
+|  \/  | ___ | ____| || |   / \  | |   | |           ___ ___  _ __ ___
+| |\/| |/ _ \|  _| | || |_ / _ \ | |   | |          / __/ _ \| '_ ` _ \
+| |  | | (_) | |___|__   _/ ___ \| |___| |___   _  | (_| (_) | | | | | |
+|_|  |_|\___/|_____|  |_|/_/   \_\_____|_____| (_)  \___\___/|_| |_| |_|
 '@
 
 Write-Host $banner -ForegroundColor Green

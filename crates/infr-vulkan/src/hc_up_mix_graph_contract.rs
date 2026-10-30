@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Adapter child only; parent supplies the four-line cfg(test)/path/module mount.
 //! Ignored tests execute real graphs, not raw recorder substitutes. No timing claims.
 use super::*;

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Parent mounts as an adapter child after applying the evidence-only validation patch.
 use super::*;
 use infr_core::{DType, TensorDesc};
@@ -344,8 +346,8 @@ fn q8_pair_defensive_supported_graph_stays_exact() {
                 &got_input[..BYTES[2]],
                 bytemuck::cast_slice::<f32, u8>(&input)
             );
-            for i in 2..5 {
-                assert_eq!(&data.read(&be, i)[BYTES[i]..], &data.initial[i][BYTES[i]..]);
+            for (i, &bytes) in BYTES.iter().enumerate().take(5).skip(2) {
+                assert_eq!(&data.read(&be, i)[bytes..], &data.initial[i][bytes..]);
             }
         }
     }

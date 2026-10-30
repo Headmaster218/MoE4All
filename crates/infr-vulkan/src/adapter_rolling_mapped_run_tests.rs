@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Normal (not prepared) rolling-window admission, queue bounds and recovery re-certification.
 use super::*;
 
@@ -162,12 +164,11 @@ fn ordinary_case(pattern: &[usize]) -> (Fixture, VkDecodePlan, Vec<(TensorId, Ve
         .outputs
         .iter()
         .enumerate()
-        .filter_map(|(layer, &id)| {
-            pattern.contains(&layer).then(|| {
-                let values = fixture.read(fixture.buffer(id));
-                assert!(values.iter().all(|value| value.is_finite() && *value > 0.0));
-                (id, values)
-            })
+        .filter(|(layer, _)| pattern.contains(layer))
+        .map(|(_, &id)| {
+            let values = fixture.read(fixture.buffer(id));
+            assert!(values.iter().all(|value| value.is_finite() && *value > 0.0));
+            (id, values)
         })
         .collect();
     prepared_mapped_run_tests::install_mixed_owner(&fixture);

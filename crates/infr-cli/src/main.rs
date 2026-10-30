@@ -6,6 +6,7 @@ use infr_core::config::{Config, ConfigOverrides, PartialConfig};
 use std::io::Write as _;
 use std::sync::Arc;
 
+mod benchmark_artifact;
 mod benchmark_hardware;
 mod diagnostics;
 mod submission;
@@ -77,6 +78,15 @@ enum SubmissionCommand {
         raw_benchmark: Option<PathBuf>,
         #[arg(long, value_name = "DIR", default_value = "benchmark-database")]
         result_dir: PathBuf,
+    },
+    /// Merge engine metadata and raw samples into a local manual benchmark JSON.
+    PrepareManualBenchmark {
+        #[arg(long, value_name = "PATH")]
+        input: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        raw_benchmark: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
     },
     /// Replace a benchmark submission with an updated JSON payload while preserving its identity.
     RepackBenchmark {
@@ -1208,6 +1218,84 @@ fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
     submission_validation::validate("error", value)
 }
 
+const BENCHMARK_AI_GUIDANCE_ZH: &str =
+    "AI/自动化：请向用户展示 benchmark 结果及结果文件，询问是否上传并等待明确决定；不要自行上传或静默忽略。";
+const BENCHMARK_AI_GUIDANCE_EN: &str =
+    "AI/automation: report the benchmark result and result file; ask whether to upload and wait for the user's explicit decision; do not upload or silently skip.";
+
+fn print_benchmark_ai_guidance() {
+    // print-ok: stable instructions for human and automated benchmark callers.
+    println!("{BENCHMARK_AI_GUIDANCE_ZH}");
+    // print-ok: English benchmark instructions are part of the same user-facing output.
+    println!("{BENCHMARK_AI_GUIDANCE_EN}");
+}
+
+fn print_benchmark_result_ai_guidance(json: bool) {
+    // Preserve `infr bench --json`'s one-JSON-value stdout contract; launchers and agents still see
+    // the guidance on stderr. Human-format benchmark output can keep everything on stdout.
+    if json {
+        // print-ok: user-facing guidance goes to stderr to preserve JSON-only stdout.
+        eprintln!("{BENCHMARK_AI_GUIDANCE_ZH}");
+        // print-ok: English guidance also preserves JSON-only stdout.
+        eprintln!("{BENCHMARK_AI_GUIDANCE_EN}");
+    } else {
+        print_benchmark_ai_guidance();
+    }
+}
+
+fn preserve_human_benchmark_result(raw: &str) {
+    match benchmark_artifact::save(raw) {
+        Ok(path) => {
+            // print-ok: local raw result, distinct from an upload-ready .m4b submission.
+            println!("Benchmark JSON: {}", path.display());
+            // print-ok: machine-readable local result path; not an upload confirmation.
+            println!("MOE4ALL_BENCHMARK_JSON={}", path.display());
+        }
+        Err(error) => {
+            // print-ok: report failure to save the benchmark's user-requested result file.
+            eprintln!("保存 benchmark JSON 失败 / Could not save benchmark JSON: {error:#}");
+            // Keep the complete result available to a terminal/agent even when local storage
+            // fails. This is outside the timed region and never changes --json stdout.
+            // print-ok: preserve the complete benchmark result when its file cannot be saved.
+            eprintln!("Benchmark JSON: {raw}");
+        }
+    }
+}
+
+fn enrich_manual_from_raw(
+    report: &mut serde_json::Value,
+    raw: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let rows = raw
+        .as_array()
+        .context("manual benchmark output is not an array")?;
+    anyhow::ensure!(
+        rows.len() == 1,
+        "manual benchmark output must contain one row"
+    );
+    let row = &rows[0];
+    if let Some(metadata) = row.get("benchmark_metadata") {
+        benchmark_hardware::enrich_manual(report, metadata);
+    }
+    let manual = report
+        .pointer_mut("/contexts/0/manual_result")
+        .context("manual benchmark result is missing")?;
+    manual["raw"] = row.clone();
+    Ok(())
+}
+
+fn read_prepared_manual_benchmark(
+    input: &Path,
+    raw_benchmark: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    let bytes =
+        std::fs::read(input).with_context(|| format!("read benchmark JSON {}", input.display()))?;
+    let mut value = submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
+    let raw = submission_validation::parse_json(&std::fs::read(raw_benchmark)?)?;
+    enrich_manual_from_raw(&mut value, &raw)?;
+    Ok(value)
+}
+
 fn print_submission_summary(decoded: &submission::Decoded) {
     // print-ok: submission verification output consumed by users and launchers.
     println!("{}", submission::ARMOR_VERSION);
@@ -1232,16 +1320,13 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             raw_benchmark,
             result_dir,
         } => {
-            let bytes = std::fs::read(&input)
-                .with_context(|| format!("read benchmark JSON {}", input.display()))?;
-            let mut value =
-                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?;
-            if let Some(raw_path) = raw_benchmark {
-                let raw = submission_validation::parse_json(&std::fs::read(raw_path)?)?;
-                if let Some(metadata) = raw.get(0).and_then(|row| row.get("benchmark_metadata")) {
-                    benchmark_hardware::enrich_manual(&mut value, metadata);
-                }
-            }
+            let value = if let Some(raw_path) = raw_benchmark {
+                read_prepared_manual_benchmark(&input, &raw_path)?
+            } else {
+                let bytes = std::fs::read(&input)
+                    .with_context(|| format!("read benchmark JSON {}", input.display()))?;
+                submission_validation::parse_json(&bytes).context("parse benchmark JSON")?
+            };
             validate_benchmark_payload(&value)?;
             let created = value
                 .get("created_at_utc")
@@ -1257,6 +1342,20 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             println!("Benchmark submission: {}", path.display());
             // print-ok: machine-readable export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", path.display());
+            print_benchmark_ai_guidance();
+            Ok(())
+        }
+        SubmissionCommand::PrepareManualBenchmark {
+            input,
+            raw_benchmark,
+            output,
+        } => {
+            let value = read_prepared_manual_benchmark(&input, &raw_benchmark)?;
+            let json = serde_json::to_string_pretty(&value)? + "\n";
+            std::fs::write(&output, json)
+                .with_context(|| format!("write manual benchmark JSON {}", output.display()))?;
+            // print-ok: requested local manual benchmark export location.
+            println!("Manual benchmark JSON: {}", output.display());
             Ok(())
         }
         SubmissionCommand::RepackBenchmark { source, input } => {
@@ -1289,6 +1388,7 @@ fn cmd_submission(action: SubmissionCommand) -> anyhow::Result<()> {
             println!("Benchmark submission: {}", source.display());
             // print-ok: machine-readable re-export path for launchers.
             println!("MOE4ALL_SUBMISSION_PATH={}", source.display());
+            print_benchmark_ai_guidance();
             Ok(())
         }
         SubmissionCommand::Verify { path } => {
@@ -1483,7 +1583,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             } else if estimate_only {
                 cmd_bench_estimate_matrix(&model, ngl, cfg)
             } else {
-                cmd_bench(
+                let result = cmd_bench(
                     &model,
                     n_prompt,
                     n_gen,
@@ -1494,7 +1594,11 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     ngl,
                     json,
                     cfg,
-                )
+                );
+                if result.is_ok() {
+                    print_benchmark_result_ai_guidance(json);
+                }
+                result
             }
         }
         Cmd::Compare {
@@ -4376,7 +4480,6 @@ fn cmd_bench_suite(
     );
 
     let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let footprint = infr_llama::weight_footprint(loaded.gguf());
     let required_ctx = suite.required_context_tokens();
     let want_ctx = cfg
         .device
@@ -4395,12 +4498,19 @@ fn cmd_bench_suite(
     let load_started = std::time::Instant::now();
     let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
     let startup_seconds = load_started.elapsed().as_secs_f64();
+    let footprint = engine.weight_footprint()?;
     // The initialized device supplies the PCI identity; probing finishes before suite warmup.
     let initialized = engine.benchmark_configuration();
     let collected_hardware = benchmark_hardware::collect(
         &gguf,
-        &engine.device_name(),
-        initialized["driver"]["pci_bdf"].as_str(),
+        "Vulkan",
+        Some(benchmark_hardware::GpuIdentity {
+            name: &device.name,
+            pci_address: initialized["driver"]["pci_bdf"].as_str(),
+            vendor_id: device.vendor_id,
+            device_id: device.device_id,
+            vulkan_index: device.index,
+        }),
     );
     anyhow::ensure!(
         engine.max_ctx() >= required_ctx,
@@ -4580,6 +4690,9 @@ fn cmd_bench_suite(
             },
             "gpu": {
                 "name": device.name,
+                "vendor_id": device.vendor_id,
+                "device_id": device.device_id,
+                "vulkan_index": device.index,
                 "type": device.device_type,
                 "integrated": device.integrated,
                 "vram_total_bytes": device.vram_total_bytes,
@@ -4655,12 +4768,7 @@ fn cmd_bench_suite(
     println!("Benchmark submission: {}", result_path.display());
     // print-ok: machine-readable benchmark export path for launchers.
     println!("MOE4ALL_SUBMISSION_PATH={}", result_path.display());
-    // print-ok: mandatory user-consent instruction for automated benchmark callers.
-    println!("AI/自动化：请向用户展示结果并等待其明确决定是否上传；不要自行上传或静默忽略。");
-    // print-ok: English upload-consent instruction paired with the Chinese instruction.
-    println!(
-        "AI/automation: report the result and wait for the user to explicitly decide whether to upload; do not upload or silently skip."
-    );
+    print_benchmark_ai_guidance();
     Ok(())
 }
 
@@ -4754,25 +4862,80 @@ fn cmd_bench(
     if synthetic_depth.is_some() && !matches!(backend, Backend::Vulkan(_)) {
         anyhow::bail!("--synthetic-depth currently supports the Vulkan benchmark path only");
     }
-    let gpu_name = if matches!(backend, Backend::Vulkan(_)) {
-        selected_benchmark_device(cfg)?.name
+    let selected_gpu = if matches!(backend, Backend::Vulkan(_)) {
+        Some(selected_benchmark_device(cfg)?)
     } else {
-        String::new()
+        None
     };
-    let collected = benchmark_hardware::collect(&gguf, &gpu_name, None);
+    let backend_name = match backend {
+        Backend::Cpu => "CPU",
+        Backend::Metal => "Metal",
+        Backend::Vulkan(_) => "Vulkan",
+    };
+    let collected = benchmark_hardware::collect(
+        &gguf,
+        backend_name,
+        selected_gpu
+            .as_ref()
+            .map(|gpu| benchmark_hardware::GpuIdentity {
+                name: &gpu.name,
+                pci_address: gpu.pci_address.as_deref(),
+                vendor_id: gpu.vendor_id,
+                device_id: gpu.device_id,
+                vulkan_index: gpu.index,
+            }),
+    );
+    let gpu = selected_gpu.as_ref().map_or_else(
+        || serde_json::json!({"name": serde_json::Value::Null}),
+        |gpu| {
+            serde_json::json!({
+                "name": gpu.name,
+                "vendor_id": gpu.vendor_id,
+                "device_id": gpu.device_id,
+                "vulkan_index": gpu.index,
+                "type": gpu.device_type,
+                "integrated": gpu.integrated,
+                "vram_total_bytes": gpu.vram_total_bytes,
+                "vram_available_before_bytes": gpu.vram_available_bytes,
+                "vram_available_is_live_before": gpu.vram_live,
+            })
+        },
+    );
     let mut hardware = serde_json::json!({
         "os": std::env::consts::OS, "architecture": std::env::consts::ARCH,
         "cpu": {"name": benchmark_cpu_name(), "logical_threads": std::thread::available_parallelism().ok().map(|n| n.get())},
-        "ram": {"total_bytes": infr_core::hostmem::total_bytes()},
-        "gpu": {"name": (!gpu_name.is_empty()).then_some(&gpu_name)},
+        "ram": {
+            "total_bytes": infr_core::hostmem::total_bytes(),
+            "available_before_bytes": infr_core::hostmem::available_bytes(),
+            "process_resident_before_bytes": infr_core::hostmem::process_resident_bytes(),
+        },
+        "gpu": gpu,
     });
     benchmark_hardware::merge(&mut hardware, &collected);
     hardware["collection"] = collected["collection"].clone();
     let mut metadata = serde_json::json!({
         "engine_version": env!("CARGO_PKG_VERSION"), "engine_commit": option_env!("INFR_GIT_COMMIT"),
         "hardware": hardware,
-        "configuration": benchmark_hardware::configured(cfg, match backend { Backend::Cpu => "CPU", Backend::Metal => "Metal", _ => "Vulkan" }),
+        "configuration": benchmark_hardware::configured(cfg, backend_name),
     });
+    metadata["configuration"]["benchmark_kind"] = if pg.is_some() {
+        "mixed"
+    } else if n_gen > 0 {
+        "decode"
+    } else {
+        "prefill"
+    }
+    .into();
+    metadata["configuration"]["prompt_tokens"] = pg.map_or(n_prompt, |(p, _)| p).into();
+    metadata["configuration"]["decode_tokens"] = pg.map_or(n_gen, |(_, g)| g).into();
+    metadata["configuration"]["depth_tokens"] = synthetic_depth.unwrap_or(depth).into();
+    metadata["configuration"]["depth_mode"] = if synthetic_depth.is_some() {
+        "synthetic"
+    } else {
+        "real"
+    }
+    .into();
+    metadata["configuration"]["repetitions"] = reps.into();
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
@@ -5007,6 +5170,14 @@ fn print_bench_avg_mtp(
         spread_note(samples, avg),
         placement_note(placement),
     );
+    if metadata.is_some() {
+        preserve_human_benchmark_result(&bench_json_with_metadata(
+            samples,
+            Some(m),
+            placement,
+            metadata,
+        ));
+    }
 }
 
 /// `infr bench --json`'s one output line, as a string — the SINGLE place the machine-readable
@@ -5123,6 +5294,7 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
 /// run settled on. The JSON keeps `avg_ts` as its first key and only ADDS fields, so
 /// `llama-bench -o json` consumers (including this CLI's own `ModelBench::infr_json`) are
 /// unaffected.
+#[allow(clippy::too_many_arguments)]
 fn print_bench_avg(
     samples: &[f64],
     label: &str,
@@ -5152,6 +5324,11 @@ fn print_bench_avg(
             spread_note(samples, avg),
             placement_note(placement),
         );
+        if metadata.is_some() {
+            preserve_human_benchmark_result(&bench_json_with_metadata(
+                samples, None, placement, metadata,
+            ));
+        }
     }
 }
 
@@ -5657,6 +5834,15 @@ fn cmd_bench_diffusion_gemma(
     } else {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!("pp{}: {:.1} t/s{tag}  ({reps} reps)", r.last_np, r.pp_ts);
+    }
+    if !json {
+        let speed = if n_gen > 0 { r.gen_ts } else { r.pp_ts };
+        preserve_human_benchmark_result(&bench_json_with_metadata(
+            &[speed],
+            None,
+            None,
+            Some(metadata),
+        ));
     }
     Ok(())
 }
@@ -8029,6 +8215,9 @@ mod tests {
         let device = infr_vulkan::DeviceInfo {
             index: 1,
             name: "AMD Radeon RX 7900 XTX".to_string(),
+            vendor_id: 0x1002,
+            device_id: 0x744c,
+            pci_address: Some("0000:07:00.0".to_string()),
             device_type: "discrete",
             integrated: false,
             vram_bytes: 25_753_026_560,
@@ -8506,6 +8695,36 @@ mod tests {
         let decoded = submission::decode(&encoded).unwrap();
         assert_eq!(decoded.payload, payload);
         validate_benchmark_payload(&decoded.payload).unwrap();
+    }
+
+    #[test]
+    fn manual_benchmark_preparation_keeps_metadata_profile_and_raw_samples() {
+        let mut report = serde_json::json!({
+            "engine_version": "fixture",
+            "engine_commit": null,
+            "hardware": {"os": "linux"},
+            "model": {"name": "fixture.gguf"},
+            "configuration": {"auto_profile": "aggressive"},
+            "contexts": [{"manual_result": {"kind": "mixed"}}]
+        });
+        let raw = serde_json::json!([{
+            "avg_ts": 123.4,
+            "reps_ts": [120.0, 126.8],
+            "benchmark_metadata": {
+                "engine_version": "infr 1.2.0",
+                "engine_commit": "abcdef1234",
+                "hardware": {"cpu": {"name": "Fixture CPU"}},
+                "model": {"name": "native.gguf", "quantization": "Q4_K"},
+                "configuration": {"auto_profile": "engine", "actual_ubatch": 512}
+            }
+        }]);
+        enrich_manual_from_raw(&mut report, &raw).unwrap();
+        assert_eq!(report["engine_commit"], "abcdef1234");
+        assert_eq!(report["hardware"]["cpu"]["name"], "Fixture CPU");
+        assert_eq!(report["model"]["quantization"], "Q4_K");
+        assert_eq!(report["configuration"]["actual_ubatch"], 512);
+        assert_eq!(report["configuration"]["auto_profile"], "aggressive");
+        assert_eq!(report["contexts"][0]["manual_result"]["raw"], raw[0]);
     }
 
     #[test]

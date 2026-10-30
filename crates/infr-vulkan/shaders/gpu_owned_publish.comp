@@ -14,6 +14,7 @@ const uint COUNT_WORD = INFR_MAX_DECODE_ROWS * 17u;
 const uint STATUS_WORD = COUNT_WORD + 3u;
 const uint JOURNAL_WORDS = STATUS_WORD + 1u;
 shared uint valid, count, job_base, slot_count, pool_count, slot_base, address_base;
+shared uint lane_valid[64];
 bool fits(uint base, uint n, uint length) {
     return base <= length && n <= length - base;
 }
@@ -73,9 +74,19 @@ void main() {
     if (valid == 0u) return;
     // Every lane consumes the header result before any peer can reject a job.
     barrier();
+    uint local_valid = 1u;
     for (uint j = lane; j < count; j += gl_WorkGroupSize.x)
-        if (!valid_job(j)) atomicAnd(valid, 0u);
+        local_valid &= uint(valid_job(j));
+    lane_valid[lane] = local_valid;
     // Validate the whole batch before publishing any slot; repeated publication is safe.
+    // `barrier()` orders shared `valid`, but not the cross-lane SSBO reads above against
+    // the nodes/overlay writes below. Publish only after those buffer reads are complete.
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u) {
+        for (uint i = 0u; i < gl_WorkGroupSize.x; ++i)
+            valid &= lane_valid[i];
+    }
     barrier();
     if (valid == 0u) return;
     for (uint j = lane; j < count; j += gl_WorkGroupSize.x) {

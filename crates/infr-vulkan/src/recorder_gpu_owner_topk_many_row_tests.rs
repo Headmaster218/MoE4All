@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Experimental metadata-only ManyRow qualification. Fake BDAs never reach payloads.
 //! Oracle: actual moe_topk_sg (one WG/row), then the unchanged general WG64 owner.
 use super::*;
@@ -321,7 +323,7 @@ impl Probe {
                 .iter()
                 .copied()
                 .filter(|&block| {
-                    pool_of(block) == pool && (!shape.mixed || block % EXPERTS % 2 == 0)
+                    pool_of(block) == pool && (!shape.mixed || (block % EXPERTS).is_multiple_of(2))
                 })
                 .collect();
             residents.sort_unstable();
@@ -1326,8 +1328,8 @@ fn gpu_owned_topk_many_row_hot_route_attribution_4x10() {
     };
     // Warm BOTH paths; run() restores every seed outside the timestamp bracket.
     for _ in 0..2 {
-        for variant in 0..2 {
-            let (raw, _) = probes[variant].run(&be, &kernels, true, None);
+        for (variant, probe) in probes.iter().enumerate() {
+            let (raw, _) = probe.run(&be, &kernels, true, None);
             check(variant, &raw);
         }
     }

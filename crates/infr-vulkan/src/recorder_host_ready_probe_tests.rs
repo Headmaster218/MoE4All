@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Bounded hardware experiment only; this does not model an upload ticket or model speedup.
 use super::*;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};

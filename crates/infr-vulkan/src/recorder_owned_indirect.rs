@@ -8,9 +8,10 @@ impl Recorder<'_> {
     pub(crate) fn mark_owned_indirect_copy_ready(&self, event: vk::Event) {
         assert!(!self.conditional_active.get());
         unsafe {
-            self.be.shared.device.cmd_set_event(
-                self.cmd, event, vk::PipelineStageFlags::TRANSFER,
-            );
+            self.be
+                .shared
+                .device
+                .cmd_set_event(self.cmd, event, vk::PipelineStageFlags::TRANSFER);
         }
     }
 
@@ -19,18 +20,28 @@ impl Recorder<'_> {
     pub(crate) fn wait_owned_indirect_copy_ready(&self, event: vk::Event, transfer: bool) {
         assert!(!self.conditional_active.get());
         let (stage, access) = if transfer {
-            (vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+            (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE,
+            )
         } else {
-            (vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_READ)
+            (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ,
+            )
         };
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(access);
         unsafe {
             self.be.shared.device.cmd_wait_events(
-                self.cmd, &[event], vk::PipelineStageFlags::TRANSFER, stage,
-                &[barrier], &[], &[],
+                self.cmd,
+                &[event],
+                vk::PipelineStageFlags::TRANSFER,
+                stage,
+                &[barrier],
+                &[],
+                &[],
             );
         }
         *self.barriers.borrow_mut() += 1;
@@ -90,11 +101,14 @@ impl Recorder<'_> {
             || count == 0
             || count as usize > CAPACITY
             || phase[0] > 2
-            || (phase[0] != 0 && (phase[3] == 0
-                || phase[1].checked_add(phase[3]).is_none()
-                || phase[2].checked_add(phase[3]).is_none()))
+            || (phase[0] != 0
+                && (phase[3] == 0
+                    || phase[1].checked_add(phase[3]).is_none()
+                    || phase[2].checked_add(phase[3]).is_none()))
         {
-            return Err(be("indirect payload requires a bounded unconditional recording"));
+            return Err(be(
+                "indirect payload requires a bounded unconditional recording",
+            ));
         }
         let layer_end = (ordinal as usize)
             .checked_add(1)
@@ -109,11 +123,17 @@ impl Recorder<'_> {
         {
             return Err(be("indirect payload sidecar is too small"));
         }
-        let indirect = self.be.shared.indirect_copy.as_ref()
+        let indirect = self
+            .be
+            .shared
+            .indirect_copy
+            .as_ref()
             .ok_or_else(|| be("indirect memory copy is not supported on this queue"))?;
-        let command_address = commands.device_addr()
+        let command_address = commands
+            .device_addr()
             .ok_or_else(|| be("indirect payload commands have no BDA"))?;
-        let dummy_address = dummy.device_addr()
+        let dummy_address = dummy
+            .device_addr()
             .ok_or_else(|| be("indirect payload dummy has no BDA"))?;
         if (command_address | dummy_address) & 15 != 0 {
             return Err(be("indirect payload BDA must be 16-byte aligned"));
@@ -129,8 +149,14 @@ impl Recorder<'_> {
             &[Self::vkb(journal), Self::vkb(jobs), Self::vkb(commands)],
             1,
             bytemuck::cast_slice(&[
-                ordinal, count, dummy_address as u32, (dummy_address >> 32) as u32,
-                phase[0], phase[1], phase[2], phase[3],
+                ordinal,
+                count,
+                dummy_address as u32,
+                (dummy_address >> 32) as u32,
+                phase[0],
+                phase[1],
+                phase[2],
+                phase[3],
             ]),
             1,
         );
@@ -138,14 +164,22 @@ impl Recorder<'_> {
         // precedes the payload, so it cannot join that later transfer into the hit chain.
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
-            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ
-                | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE
-                | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            .dst_access_mask(
+                vk::AccessFlags::INDIRECT_COMMAND_READ
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE,
+            );
         unsafe {
             self.be.shared.device.cmd_pipeline_barrier(
-                self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(),
-                &[barrier], &[], &[],
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
             );
             indirect.record_with_flags(
                 self.cmd,

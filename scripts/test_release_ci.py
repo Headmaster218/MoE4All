@@ -136,6 +136,33 @@ class ReleaseCiTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     module.package_name(invalid)
 
+    def test_unix_packagers_require_engine_and_launcher_without_external_collectors(self):
+        for module in (linux_release, macos_release):
+            with self.subTest(platform=module.PLATFORM):
+                source = self.workspace / module.PLATFORM
+                source.mkdir()
+                (source / "documentation").mkdir()
+                for name in module.ROOT_FILES | module.SCRIPT_FILES:
+                    path = source / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"fixture\n")
+                archive = module.package(source, source / "infr", source / "output", VERSION)
+                prefix = module.package_name(VERSION)
+                stage_root = source / "stage"
+                with tarfile.open(archive, "r:gz") as bundle:
+                    bundle.extractall(stage_root)
+                stage = stage_root / prefix
+                manifest_path = stage / "install-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertFalse(any(entry["path"].startswith("scripts/") for entry in manifest["files"]))
+                self.assertFalse((stage / "scripts").exists())
+                module.validate_package(stage, VERSION)
+                manifest["files"] = [entry for entry in manifest["files"] if entry["path"] != "infr"]
+                (stage / "infr").unlink()
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "missing runtime files"):
+                    module.validate_package(stage, VERSION)
+
     def test_prerelease_package_support_does_not_change_stable_update_selection(self):
         releases = [
             {"tag_name": "release-1.0.3", "prerelease": False},

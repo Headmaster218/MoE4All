@@ -459,9 +459,8 @@ cfg_struct! {
         /// Bounded compute copy concurrent with resident hit projections.
         /// Requires serial-copy eligibility; false preserves its copy-then-full-FFN path.
         decode_gpu_resident_copy_overlap: bool = true,
-        /// Split owned GPU role copies around miss GU only for qualified single-row
-        /// Q5K Gate/Up geometry (NE2048, NFF512, top-k 8). False retains the old schedule.
-        decode_gpu_resident_role_pipeline: bool = true,
+        /// Split owned GPU role copies around miss Gate/Up. False retains the unsplit schedule.
+        decode_gpu_resident_role_pipeline: bool = false,
         /// Trial H-only chunk32 FFN for independent rows4 IQ2S/IQ4NL, NE2560/NFF640/top-k10.
         decode_gpu_resident_splitk_hit: bool = false,
         /// Extend the splitk-hit trial to qualified rows4 IQ3S/IQ4NL geometry.

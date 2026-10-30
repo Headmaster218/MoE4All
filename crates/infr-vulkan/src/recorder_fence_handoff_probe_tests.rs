@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! v65 hardware admission probe only: host latency, not a GPU-end or model-speed measurement.
 use super::*;
 use std::time::{Duration, Instant};
@@ -204,7 +206,7 @@ fn distribution(values: &[f64]) -> (f64, f64) {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    let median = if values.len() % 2 == 0 {
+    let median = if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]

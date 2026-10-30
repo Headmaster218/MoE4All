@@ -21,7 +21,10 @@ ROOT_FILES = {
     "infr", "Start-INFR-Wizard-Linux.sh", "README.md", "README_EN.md", "CHANGELOG.md",
     "infr.example.toml", "LICENSE", "LICENSE-MIT", "NOTICE",
 }
-SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
+# Collectors are embedded in infr. The released 1.1.0 updater cannot extract scripts/;
+# keep new archives within its layout, while still managing earlier preview installs.
+SCRIPT_FILES = set()
+MANAGED_SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
 CODEC_FILES = {"libheif.so.1", "libde265.so.0", "libdav1d.so.7", "libheif-LICENSE.txt",
                "libde265-LICENSE.txt", "dav1d-LICENSE.txt", "SOURCES.txt"}
 MAX_BYTES = 1024 * 1024 * 1024
@@ -67,7 +70,7 @@ def managed(name):
     path = PurePosixPath(name)
     if not name or "\\" in name or path.is_absolute() or any(p in (".", "..") for p in name.split("/")):
         return False
-    return name in ROOT_FILES | SCRIPT_FILES | {"install-manifest.json"} or name in {"image-codecs/" + n for n in CODEC_FILES} or (
+    return name in ROOT_FILES | MANAGED_SCRIPT_FILES | {"install-manifest.json"} or name in {"image-codecs/" + n for n in CODEC_FILES} or (
         name.startswith("documentation/") and path.suffix.lower() in {".md", ".png", ".jpg", ".svg", ".webp"})
 
 
@@ -104,7 +107,7 @@ def validate_package(root, version):
         path = safe_target(root, name)
         if not path.is_file() or path.stat().st_size != entry["size"] or sha256(path) != entry["sha256"]:
             raise ValueError("Package integrity check failed: " + name)
-    if not {"infr", "Start-INFR-Wizard-Linux.sh"}.issubset(names):
+    if not ({"infr", "Start-INFR-Wizard-Linux.sh"} | SCRIPT_FILES).issubset(names):
         raise ValueError("Package is missing runtime files")
     actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
     if actual != names | {"install-manifest.json"}:

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Module-only prototype tests, included as a child of recorder_gpu_owner_performance.
 //! Synthetic BDAs are metadata only; neither arm records payload or publish dispatches.
 use super::*;

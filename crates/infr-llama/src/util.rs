@@ -254,6 +254,18 @@ pub(crate) fn resolve_chat_eos(
     ids
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
+    g.metadata().u64(key)
+}
+
+/// Float metadata lookup (diffusion-gemma's `eb_*` sampler params are stored as GGUF strings —
+/// same KV store, no typed float accessor on `Metadata` — so parse through `as_f64`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn meta_f64(g: &Gguf, key: &str) -> Option<f64> {
+    g.metadata().get(key).and_then(|v| v.as_f64())
+}
+
 #[cfg(test)]
 mod chat_eos_tests {
     use super::*;
@@ -339,16 +351,4 @@ mod chat_eos_tests {
             [1]
         );
     }
-}
-
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
-    g.metadata().u64(key)
-}
-
-/// Float metadata lookup (diffusion-gemma's `eb_*` sampler params are stored as GGUF strings —
-/// same KV store, no typed float accessor on `Metadata` — so parse through `as_f64`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn meta_f64(g: &Gguf, key: &str) -> Option<f64> {
-    g.metadata().get(key).and_then(|v| v.as_f64())
 }

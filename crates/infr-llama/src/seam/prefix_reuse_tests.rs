@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Native diagnostic for recurrent prefix reuse across Prefill shapes. Never runs by default.
 use super::{DenseVulkanSession, SeamModel};
 use crate::seam::{runner, weights::TurnRecurrentCkpt, PlacementScope, SeamKv, TurnCheckpoint};
@@ -69,7 +71,9 @@ fn forward(
     turn: Option<TurnCheckpoint>,
 ) -> Vec<f32> {
     let mut logits = Vec::new();
-    let bind = |name: &str, _, _, _| Err(anyhow!("diagnostic must not rebind {name}"));
+    let bind = crate::seam::BindWeight::new(|name: &str, _, _, _| {
+        Err(anyhow!("diagnostic must not rebind {name}"))
+    });
     runner::generate_dense_backend(
         &session.be,
         &bind,

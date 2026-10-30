@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Metadata-only external-SPV differential; no payload dereferences synthetic BDAs.
 use super::*;
 

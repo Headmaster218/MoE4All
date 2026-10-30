@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! NEW, unmounted adapter child for parent unit5. Actual Graph execution, not raw dispatches.
 use super::*;
 use infr_core::backend::SegmentedKvSpec;
@@ -592,7 +594,8 @@ fn run_with_observer(case: Case, rewrite: Option<ObserverRewrite>) {
             crate::as_segmented_kv(b.as_ref()).unwrap().table_buffer(),
         )
     });
-    let mut reference: Option<([Vec<u8>; 2], [Vec<u8>; 2], Option<Vec<u8>>)> = None;
+    type GraphReference = ([Vec<u8>; 2], [Vec<u8>; 2], Option<Vec<u8>>);
+    let mut reference: Option<GraphReference> = None;
     for enabled in [false, true] {
         let mut cfg = be.cfg().clone();
         cfg.kernels.vulkan.q8_kv_write_segmented = enabled;
@@ -823,7 +826,7 @@ fn run_with_observer(case: Case, rewrite: Option<ObserverRewrite>) {
 fn o04_gather_pack_half_rounding_contract() {
     // Unit6's first baseline failure: code72 * scale0x215f is not a midpoint.
     let product = half::f16::from_bits(0x215f).to_f32() * 72.0;
-    assert_eq!(product, 0.75531005859375);
+    assert_eq!(product, 0.755_310_06);
     assert_eq!(half::f16::from_f32(product).to_bits(), 0x3a0b);
     assert_eq!(gather_pack_half_bits(product), 0x3a0a);
     assert_eq!(gather_pack_half_bits(-product), 0xba0a);
@@ -999,7 +1002,7 @@ fn o04_partial_overwrite_preserves_later_f16_observers() {
             let facts = Q8SegmentedGraphFacts::analyze(&c.graph);
             assert_eq!(
                 facts.dead_scratch.contains(&1),
-                matches!(case, 3 | 4 | 5),
+                matches!(case, 3..=5),
                 "mrope={mrope} rewrite_case={case}"
             );
             // The fix must not alter the first-cache observer or coupled-K/V proof.

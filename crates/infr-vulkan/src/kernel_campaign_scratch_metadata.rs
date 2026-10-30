@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! R02 CPU-only adapter child. Parent mounts with cpu-tests-mount.applypatch.
 //! Uses the REAL Graph, scratch_layout, scratch_reset_indices and plan memoizer.
 //! No Vulkan backend/device/buffer is constructed. The optional ignored benchmark
@@ -248,8 +250,10 @@ fn copy_scale_probe(
                 }
             }
             Op::Scale { x, dst, s, n } => {
-                for i in 0..n as usize {
-                    data[dst.0 as usize][i] = data[x.0 as usize][i] * s;
+                let source = data[x.0 as usize].clone();
+                for (target, value) in data[dst.0 as usize].iter_mut().zip(source).take(n as usize)
+                {
+                    *target = value * s;
                 }
             }
             _ => panic!("CPU probe covers only the Copy/Scale fixture, not Vulkan lowering"),
@@ -353,7 +357,7 @@ fn r02_metadata_cpu_alloc_and_timing() {
                         }
                     }
                 };
-                let (_, calls, bytes) = counted(|| analyze());
+                let (_, calls, bytes) = counted(analyze);
                 if cached {
                     assert_eq!((calls, bytes), (0, 0));
                 } else {

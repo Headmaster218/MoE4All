@@ -281,8 +281,8 @@ fn run_route(
         groups_used: 0,
         hash: false,
     };
-    assert!(
-        rec.defer_owned_topk(
+    assert!(rec
+        .defer_owned_topk(
             &copy,
             control.as_ref(),
             logits.as_ref(),
@@ -302,8 +302,7 @@ fn run_route(
             true,
             false
         )
-        .is_none()
-    );
+        .is_none());
     let mut route = rec
         .defer_owned_topk(
             &copy,
@@ -422,11 +421,9 @@ fn run_route(
                 be.download_range(arena, offset, bytemuck::cast_slice_mut(&mut payload))
                     .unwrap();
             }
-            assert!(
-                payload
-                    .iter()
-                    .all(|&v| v == pattern(job[5] as usize / EXPERTS, 0))
-            );
+            assert!(payload
+                .iter()
+                .all(|&v| v == pattern(job[5] as usize / EXPERTS, 0)));
         }
     }
     let old_hits = words[RESIDENT_JOURNAL_MASK_WORD..RESIDENT_JOURNAL_MASK_WORD + rows].to_vec();

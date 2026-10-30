@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Ignored module experiment, never part of the production queue scheduler.
 //! Child of recorder::owned_indirect_tests::fused::splitk_hit_v2.
 //! No external SPIR-V, event, fused FFN, ownership transfer, or runtime integration.
@@ -787,11 +789,9 @@ fn gpu_owned_native_same_family_dualqueue_module() {
                         bytemuck::cast_slice(&input),
                     );
                     let expected = fixture.ff.reference(&backend, &source, bank);
-                    assert!(
-                        expected[..expected.len() - GUARD]
-                            .chunks_exact(4)
-                            .any(|w| f32::from_le_bytes(w.try_into().unwrap()).abs() > 1e-3)
-                    );
+                    assert!(expected[..expected.len() - GUARD]
+                        .chunks_exact(4)
+                        .any(|w| f32::from_le_bytes(w.try_into().unwrap()).abs() > 1e-3));
                     fixture.prepare(&source, bank, mixed, false);
                     audit_jobs(&fixture, &source, bank, mixed);
                     let readonly = fixture.readonly();

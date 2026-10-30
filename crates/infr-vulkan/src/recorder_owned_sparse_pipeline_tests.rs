@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Child of recorder_owned_fused_tests; the parent adds its mod declaration separately.
 //! Cold copied RAM payload, but deliberately ONE shared resident H-weight bank per case.
 //! This isolates small-miss overlap, not a cold whole-model weight/cache workload.

@@ -1,7 +1,7 @@
 //! Bounded transfer-only work owned by one cached ResidentNoticeProducer.
-use super::{NoticeProducerAck, be};
+use super::{be, NoticeProducerAck};
 use infr_core::error::Result;
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 
 type Outcome = Result<Option<u64>>;
 type Work<E> = Box<dyn FnOnce(&E) -> Outcome + Send>;

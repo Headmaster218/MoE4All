@@ -1,4 +1,5 @@
 // Included in gpu_owned_tests to reuse its private FIFO/copy-publish fixture unchanged.
+#[cfg(test)]
 mod role_pipeline_tests {
     use super::*;
     use crate::recorder::owned_role_pipeline::{self as pipeline, contract, Geometry, Settings};

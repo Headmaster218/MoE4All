@@ -213,13 +213,15 @@ impl Drop for OwnedHostLease {
 
 /// Validated immutable CPU sources and the exact GPU-selected destinations. No pager lock
 /// is needed during execution; the active forward keeps residency ownership unchanged.
+type BoundedTransfers = (
+    Arc<InclusiveHostCache>,
+    Vec<(BlockId, DeviceTransferTarget)>,
+);
+
 pub(crate) struct OwnedUploadPlan {
     transfer_plan: Arc<SessionTransferPlan>,
     uploads: Vec<(Arc<AlignedHostBuffer>, usize, DeviceTransferTarget)>,
-    bounded: Vec<(
-        Arc<InclusiveHostCache>,
-        Vec<(BlockId, DeviceTransferTarget)>,
-    )>,
+    bounded: Vec<BoundedTransfers>,
     requested: usize,
     bytes: usize,
     class: OwnedUploadClass,
@@ -234,7 +236,9 @@ impl OwnedUploadClass {
     fn from_targets(has_bounded_sources: bool, targets: impl Iterator<Item = bool>) -> Self {
         let mut targets = targets.peekable();
         Self {
-            mapped: !has_bounded_sources && targets.peek().is_some() && targets.all(|mapped| mapped),
+            mapped: !has_bounded_sources
+                && targets.peek().is_some()
+                && targets.all(|mapped| mapped),
             no_imported_sources: std::sync::OnceLock::new(),
         }
     }
@@ -476,7 +480,7 @@ fn live_queue_slots(
     let end = start
         .checked_add(capacity)
         .ok_or_else(|| be("GPU owner FIFO physical range overflow"))?;
-    if nodes.len() % 4 != 0
+    if !nodes.len().is_multiple_of(4)
         || capacity == 0
         || residents > capacity
         || queue_header >= records

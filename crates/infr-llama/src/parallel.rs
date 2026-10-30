@@ -1810,6 +1810,17 @@ impl ParallelSeam {
         self.vk.vram()
     }
 
+    /// Selected backend's actual cold upload payload, including rewrites and generated constants.
+    /// This is the model footprint, not the paged arena's current resident expert contents.
+    pub fn weight_footprint(&self) -> Result<crate::weights::WeightFootprint> {
+        crate::seam::planned_weight_footprint(
+            &self.vk,
+            self.model.gguf(),
+            self.model.config(),
+            self.vk.cfg(),
+        )
+    }
+
     pub fn model(&self) -> &SeamModel {
         &self.model
     }
@@ -4036,7 +4047,7 @@ impl ParallelSeam {
         )?;
         let (mut pending, mut pending_logits) = crate::mtp::run_qwen4_prime_frontier_with_finish(
             self.vk.as_ref(),
-            &*bind,
+            &bind,
             self.model.gguf(),
             cfg,
             ec,

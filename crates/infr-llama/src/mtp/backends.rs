@@ -130,16 +130,8 @@ pub fn generate_mtp_spec_vulkan_timed_on(
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
-    let bind: &BindWeightFn = &|_name, tb, dt, _n| {
-        let bytes = tb.materialize();
-        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-        let buf = vk
-            .alloc(padded.len(), BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        vk.upload(buf.as_ref(), &padded)
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok((buf, dt))
-    };
+    let resident_bind = crate::seam::vulkan_resident_upload_bind(vk);
+    let bind: &BindWeightFn = &resident_bind;
     let mut head_sess = MtpHeadSession::new_vulkan(
         vk,
         model.gguf(),
@@ -176,14 +168,14 @@ pub fn generate_mtp_spec_metal_timed(
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
     let mtl = infr_metal::MetalBackend::new_with(model.cfg().clone())
         .map_err(|e| anyhow!("metal init: {e}"))?;
-    let bind: &BindWeightFn = &|_name, tb, dt, _n| {
+    let bind: &BindWeightFn = &BindWeightFn::new(|_name, tb, dt, _n| {
         let buf = mtl
             .alloc(tb.len().max(1), BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
         mtl.upload(buf.as_ref(), &tb.materialize())
             .map_err(|e| anyhow!("{e}"))?;
         Ok((buf, dt))
-    };
+    });
     let mut head_sess = MtpHeadSession::new_metal(
         &mtl,
         model.gguf(),
@@ -219,7 +211,7 @@ pub fn generate_mtp_spec_cpu_timed(
     let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
     let cpu = infr_cpu::CpuBackend::new_with(model.engine_cfg().clone());
-    let bind: &BindWeightFn = &|_name, tb, dt, _n| match tb {
+    let bind: &BindWeightFn = &BindWeightFn::new(|_name, tb, dt, _n| match tb {
         crate::seam::WBytes::Mmap(tb) => Ok((cpu.map_weight(tb), dt)),
         other => {
             let v = other.materialize();
@@ -229,7 +221,7 @@ pub fn generate_mtp_spec_cpu_timed(
             cpu.upload(buf.as_ref(), &v).map_err(|e| anyhow!("{e}"))?;
             Ok((buf, dt))
         }
-    };
+    });
     let mut head_sess = MtpHeadSession::new_cpu(
         &cpu,
         model.gguf(),

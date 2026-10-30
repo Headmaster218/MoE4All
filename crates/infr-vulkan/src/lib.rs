@@ -17,6 +17,8 @@ mod cpu_miss;
 pub mod ep;
 mod gemm;
 #[cfg(test)]
+mod host_ready_combined_test_support;
+#[cfg(test)]
 pub(crate) mod indirect_copy;
 pub mod linear;
 mod matmul;
@@ -31,10 +33,9 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 mod transfer;
-#[cfg(test)]
-mod host_ready_combined_test_support;
 pub mod unified;
 mod vkext;
+mod weight_layout;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use p2p::{P2pExport, P2pHandleType};
@@ -99,7 +100,7 @@ use gpu_allocator::MemoryLocation;
 use infr_core::{
     backend::{
         Bindings, Buffer, BufferUsage, Capabilities, ExecutionStage, IdleResourceReclaimer, Plan,
-        SegmentedKvSpec,
+        SegmentedKvSpec, WeightAllocationBatch,
     },
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,
@@ -792,6 +793,9 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
+    /// Alignment and supported physical buffer cap for upfront resident-weight batches.
+    resident_weight_alignment: u64,
+    resident_weight_block_cap: u64,
     /// `maxPushConstantsSize` — every kernel's push block is checked against THIS rather than
     /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
     /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
@@ -1293,10 +1297,11 @@ impl VulkanShared {
                     .store(false, Ordering::Release);
                 return;
             }
-            let completed = match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
-                Ok(value) => value,
-                Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
-            };
+            let completed =
+                match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
+                    Ok(value) => value,
+                    Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
+                };
             let retired = queue.take_completed_keepalive(completed);
             self.dedicated_transfer_keepalive_pending
                 .store(queue.has_pending_keepalive(), Ordering::Release);
@@ -1392,25 +1397,70 @@ impl VulkanShared {
     /// Wait for every in-flight staging copy and tear the ring down. Called when the weight-load
     /// scope ends, so all weights are fully resident before any forward is recorded — this is the
     /// synchronization point that replaced the old per-tensor `queue_wait_idle`.
-    fn drain_staging_ring(&self) {
-        let Some(mut ring) = self.staging_ring.lock().unwrap().take() else {
-            return;
-        };
-        let pending: Vec<vk::Fence> = (0..RING_SLOTS)
-            .filter(|&i| ring.busy[i])
-            .map(|i| ring.fences[i])
-            .collect();
-        unsafe {
-            if !pending.is_empty() {
-                let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
+    fn drain_staging_ring(&self) -> Result<()> {
+        let result = drain_staging_resource(
+            &self.staging_ring,
+            |ring| {
+                let pending: Vec<vk::Fence> = ring
+                    .fences
+                    .iter()
+                    .zip(&ring.busy)
+                    .filter_map(|(&fence, &busy)| busy.then_some(fence))
+                    .collect();
+                let result = if pending.is_empty() {
+                    Ok(())
+                } else {
+                    unsafe { self.device.wait_for_fences(&pending, true, u64::MAX) }
+                };
+                if let Err(error) = result {
+                    // Publish failure while the ring is locked, before another uploader/drainer
+                    // can see it. A later successful cleanup must not revive this queue.
+                    if self.queue_submit_failure().is_none() {
+                        let _ = self.make_queue_unusable(error, "staging-ring fence wait");
+                    }
+                }
+                result
+            },
+            |mut ring| {
+                // This immutable pool handle remains valid even if another pool user panicked.
+                let pool = self.cmd_pool.lock().unwrap_or_else(|p| p.into_inner());
+                unsafe {
+                    self.device.free_command_buffers(*pool, &ring.cmds);
+                    for fence in ring.fences.drain(..) {
+                        self.device.destroy_fence(fence, None);
+                    }
+                }
+                // Both staging buffers and quarantined rollback destinations drop only after
+                // successful completion, or terminal device loss (never a successful upload).
+            },
+        );
+        if let Err(error) = result {
+            if self.queue_submit_failure().is_none() {
+                let _ = self.make_queue_unusable(error, "staging-ring drain");
             }
-            let pool = self.cmd_pool.lock().unwrap();
-            self.device.free_command_buffers(*pool, &ring.cmds);
-            for f in ring.fences.drain(..) {
-                self.device.destroy_fence(f, None);
+            return Err(be(format!("staging-ring drain: {error}")));
+        }
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(be(format!(
+                "staging-ring drain: queue remains unusable ({error})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn retain_aborted_weight_blocks(&self, mut blocks: Vec<BdaArenaBlock>) {
+        let mut guard = self.staging_ring.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ring) = guard.as_mut() {
+            // A non-terminal wait failure left the ring pending. Preserve its destinations even
+            // if the backend/loader now drops. A later drain can retire these references safely.
+            if ring.retained_weight_blocks.is_empty() {
+                ring.retained_weight_blocks = blocks;
+            } else {
+                ring.retained_weight_blocks.append(&mut blocks);
             }
         }
-        // `ring.bufs` drop here → the staging slots are freed.
+        // None means another drainer has already completed cleanup (or observed device loss).
+        // In that case these destination references may be released immediately.
     }
 }
 
@@ -2321,6 +2371,14 @@ const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
+fn allocation_buffer_usage(device_address: bool) -> vk::BufferUsageFlags {
+    if device_address {
+        BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+    } else {
+        BUFFER_USAGE
+    }
+}
+
 /// On-demand block size floor for a resident-BDA arena block (see [`BdaWeightArena`]) — big enough
 /// to amortize a dedicated `vkAllocateMemory` across a run of small tensors, small enough not to
 /// waste much on the tail.
@@ -2578,6 +2636,13 @@ fn preferred_device_index(devices: &[(vk::PhysicalDeviceType, u64)]) -> usize {
 pub struct DeviceInfo {
     pub index: usize,
     pub name: String,
+    /// Vulkan's PCI vendor/device identity. These stay available even when the driver does not
+    /// expose `VK_EXT_pci_bus_info`, so platform benchmark collectors can disambiguate adapters.
+    pub vendor_id: u32,
+    pub device_id: u32,
+    /// PCI BDF from `VK_EXT_pci_bus_info`, when the driver exposes it. This identifies the
+    /// physical endpoint; it says nothing by itself about the upstream slot/switch path.
+    pub pci_address: Option<String>,
     pub device_type: &'static str,
     pub integrated: bool,
     /// Physical DEVICE_LOCAL capacity used for device selection. Windows NVIDIA discrete GPUs
@@ -2629,6 +2694,27 @@ fn copy_to_mapped(src: &[u8], dst: *mut u8) {
     });
 }
 
+/// Serialize the entire wait/cleanup, including empty observations by other drainers. On errors
+/// other than device loss, leave the resource in place: completion has not been established.
+/// Device loss permits resource teardown but must still propagate as an error to the caller.
+fn drain_staging_resource<T>(
+    slot: &Mutex<Option<T>>,
+    wait: impl FnOnce(&T) -> std::result::Result<(), vk::Result>,
+    cleanup: impl FnOnce(T),
+) -> std::result::Result<(), vk::Result> {
+    let mut guard = slot.lock().map_err(|_| vk::Result::ERROR_UNKNOWN)?;
+    let Some(resource) = guard.as_ref() else {
+        return Ok(());
+    };
+    let result = wait(resource);
+    if result.is_ok() || result == Err(vk::Result::ERROR_DEVICE_LOST) {
+        if let Some(resource) = guard.take() {
+            cleanup(resource);
+        }
+    }
+    result
+}
+
 /// A ring of REUSED, fixed-size staging buffers — the weight-upload path on every device.
 ///
 /// The old path allocated a fresh DEDICATED staging buffer as large as each tensor, memcpy'd into
@@ -2648,6 +2734,9 @@ struct StagingRing {
     /// Whether slot `i` has work in flight that its fence must be waited on before reuse.
     busy: Vec<bool>,
     next: usize,
+    /// Rollbacks whose upload completion could not be established. This deliberate keepalive may
+    /// retain the device after a persistent wait error; freeing pending destinations is unsafe.
+    retained_weight_blocks: Vec<BdaArenaBlock>,
 }
 
 /// RAII for the raw command buffer used by [`VulkanBackend::one_shot`]. Vulkan command buffers do
@@ -2679,10 +2768,9 @@ const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 // path. This is the ONLY weight path: every `BufferUsage::Weights` alloc routes through here (see
 // `make_alloc`).
 
-/// Byte alignment for resident-BDA weight sub-tensors within a block. Sub-tensors share one buffer
-/// object rather than getting their own `VkMemoryRequirements`, so this is a fixed constant rather
-/// than a probed one — 256 comfortably covers every access width a weight-reading shader uses (the
-/// widest today is a 16-byte vec4 load) with headroom to spare for future wider kernels.
+/// Minimum alignment for resident-BDA weight sub-tensors. The on-demand path retains its 256-byte
+/// alignment; upfront batches additionally honor the device's minStorageBufferOffsetAlignment.
+/// Sub-tensors share one buffer object rather than getting their own `VkMemoryRequirements`.
 const BDA_WEIGHT_ALIGN: u64 = 256;
 
 /// Initial and maximum size floors for resident-BDA arena blocks (see
@@ -2709,7 +2797,7 @@ fn bda_block_geometry(want: u64, floor: u64, max_alloc: u64) -> (u64, u64) {
 /// GiB truncates into a coherent-but-wrong pointer. This is also `maxStorageBufferRange` on RADV,
 /// the cap on the sub-range a `vkb` descriptor can bind. Enforced today by model reality; a single
 /// >4 GiB tensor would need a wider addressing scheme, not just a bigger allocation.
-const BDA_ADDRESSING_UNIT_MAX: u64 = 1 << 32;
+const BDA_ADDRESSING_UNIT_MAX: u64 = weight_layout::ADDRESSING_UNIT_MAX;
 
 /// Keepalive + addressing info for one [`BdaWeightArena`] block: a single dedicated
 /// `bufferDeviceAddress` buffer (exactly what [`VulkanBackend::alloc_arena_bda`] builds) that
@@ -2730,6 +2818,17 @@ struct BdaBlockHandle {
     base_addr: u64,
 }
 
+impl BdaBlockHandle {
+    fn physical_allocation_bytes(&self) -> u64 {
+        // BDA blocks force dedicated allocations. Use the allocator's returned size; the direct
+        // UMA path records its exact vkAllocateMemory allocationSize in mem_size instead.
+        match &self.buf.backing {
+            Backing::Pooled(allocation) => allocation.size(),
+            _ => self.buf.mem_size,
+        }
+    }
+}
+
 /// One [`BdaWeightArena`] block: the shared keepalive handle plus its live bump cursor. Split apart
 /// from `BdaBlockHandle` so the cursor can be mutated (behind `VulkanBackend::bda_weight_arena`'s
 /// `Mutex`) while sub-tensors hold their own `Arc` clone of the handle without needing `&mut`
@@ -2740,12 +2839,13 @@ struct BdaArenaBlock {
     size: u64,
     /// Next free byte offset (pre-alignment). Monotonic — sub-tensors are never freed individually.
     cursor: u64,
+    /// Raw tensor bytes represented by this block (excludes alignment padding).
+    requested_bytes: u64,
 }
 
-/// The resident-weight sub-allocator (the ONLY weight path — see `make_alloc`). Blocks are created
-/// ON DEMAND as `bda_weight_alloc` calls outgrow the current block; this is pure allocation/upload
-/// plumbing and doesn't thread a loader's total through this path, so an up-front-sized version can
-/// be layered on the same block/bump primitives later. Each block is capped at `max_mem_alloc_size`
+/// The resident-weight sub-allocator (the ONLY primary weight path — see `make_alloc`). Blocks are
+/// created on demand, or prepared transactionally for an upfront ordered allocation batch.
+/// Each block is capped at `max_mem_alloc_size`
 /// (a whole multi-GiB model can't be one `vkAllocateMemory`); a tensor never straddles a block
 /// boundary — one that doesn't fit the current block's remainder opens a fresh one.
 ///
@@ -2761,6 +2861,7 @@ struct BdaArenaBlock {
 /// tensors.
 struct BdaWeightArena {
     blocks: Vec<BdaArenaBlock>,
+    active_plan: Option<BdaWeightPlan>,
     /// Floor for the next block opened for a small tensor. Adaptive growth avoids the many
     /// partially-used 64 MiB tails seen on tensor-rich models without charging a 256 MiB minimum
     /// to every small model.
@@ -2771,7 +2872,126 @@ impl Default for BdaWeightArena {
     fn default() -> Self {
         Self {
             blocks: Vec::new(),
+            active_plan: None,
             next_block_floor: BDA_BLOCK_MIN,
+        }
+    }
+}
+
+struct BdaWeightPlan {
+    token: Arc<()>,
+    layout: weight_layout::WeightLayout,
+    /// Kept separate from older blocks so rollback cannot remove or mutate an old allocation.
+    blocks: Vec<BdaArenaBlock>,
+    consumed: usize,
+}
+
+/// Snapshot of arena-owned resident-weight reservations, including the entire active batch.
+/// After rollback, escaped subviews can keep physical blocks alive outside this snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentWeightAllocationStats {
+    /// Raw requested tensor bytes, excluding padding. Active batches count all declared tensors.
+    pub requested_bytes: u64,
+    /// Reserved tensor spans including alignment padding (zero-size tensors reserve one span).
+    pub padded_bytes: u64,
+    /// Sum of buffer capacities; on-demand blocks may have unused tails, packed blocks do not.
+    pub capacity_bytes: u64,
+    /// Sum of dedicated Vulkan memory allocation sizes, including driver allocation alignment.
+    pub physical_allocation_bytes: u64,
+    pub block_count: usize,
+}
+
+struct VulkanWeightAllocationBatch<'a> {
+    backend: &'a VulkanBackend,
+    token: Arc<()>,
+    finished: bool,
+}
+
+impl WeightAllocationBatch for VulkanWeightAllocationBatch<'_> {
+    fn finish(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        // Async weight uploads retain only raw destination handles. Complete them before closing
+        // the batch, independently of the caller's longer-lived weight-progress scope. Never
+        // hold the weight-arena mutex while draining the staging ring/command pool.
+        self.backend.shared.drain_staging_ring()?;
+        let mut guard = self.backend.bda_weight_arena.lock().unwrap();
+        let arena = guard
+            .as_mut()
+            .ok_or_else(|| be("resident weight batch lost its arena"))?;
+        let plan = arena
+            .active_plan
+            .as_ref()
+            .filter(|p| Arc::ptr_eq(&p.token, &self.token))
+            .ok_or_else(|| be("resident weight batch is no longer active"))?;
+        if plan.consumed != plan.layout.placements.len() {
+            return Err(be(format!(
+                "resident weight batch incomplete: consumed {} of {} allocations",
+                plan.consumed,
+                plan.layout.placements.len()
+            )));
+        }
+        let plan = arena.active_plan.take().unwrap();
+        let tensors = plan.consumed;
+        let blocks = plan.blocks.len();
+        let requested_bytes: u64 = plan.blocks.iter().map(|b| b.requested_bytes).sum();
+        let padded_bytes: u64 = plan.blocks.iter().map(|b| b.cursor).sum();
+        let capacity_bytes: u64 = plan.blocks.iter().map(|b| b.size).sum();
+        let physical_allocation_bytes: u64 = plan
+            .blocks
+            .iter()
+            .map(|b| b.handle.physical_allocation_bytes())
+            .sum();
+        arena.blocks.extend(plan.blocks);
+        self.finished = true;
+        drop(guard);
+        tracing::info!(
+            "[infr] resident weight batch finished: tensors={tensors} requested_bytes={requested_bytes} \
+             padded_bytes={padded_bytes} capacity_bytes={capacity_bytes} \
+             physical_allocation_bytes={physical_allocation_bytes} blocks={blocks}"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for VulkanWeightAllocationBatch<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Loader unwind drops this guard before its weight buffers, then weight_progress last.
+        // Drain before removing arena keepalives so those later buffer drops cannot free a
+        // destination that still has an in-flight staging copy (including escaped subviews).
+        let drained = self.backend.shared.drain_staging_ring();
+        let plan = {
+            let mut guard = self
+                .backend
+                .bda_weight_arena
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.as_mut().and_then(|arena| {
+                if arena
+                    .active_plan
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.token, &self.token))
+                {
+                    arena.active_plan.take()
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(plan) = plan {
+            if drained.is_err() {
+                self.backend
+                    .shared
+                    .retain_aborted_weight_blocks(plan.blocks);
+            }
+            // Only this batch's arena references disappear; escaped BdaSub Arcs remain valid.
+        }
+        if let Err(error) = drained {
+            tracing::error!("[infr] resident weight rollback drain failed: {error}; pending destinations retained");
         }
     }
 }
@@ -3188,8 +3408,16 @@ impl Drop for WeightProgress {
         // Drain the staging ring FIRST: its copies are still in flight (we fence per slot instead
         // of stalling the queue per tensor), and the weights must be fully resident before the
         // loader records a forward.
-        self.shared.drain_staging_ring();
-        if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
+        if let Err(error) = self.shared.drain_staging_ring() {
+            tracing::error!("[infr] weight-progress drain failed: {error}");
+        }
+        if let Some(pb) = self
+            .shared
+            .weight_pb
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             pb.finish_and_clear();
         }
         // Post-load memory-hygiene visibility (`prof.vram`): the LIVE in-use figure right
@@ -3581,6 +3809,15 @@ impl VulkanBackend {
                     exts.iter()
                         .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
                 };
+                let pci_address = has(c"VK_EXT_pci_bus_info").then(|| {
+                    let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+                    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+                    unsafe { instance.get_physical_device_properties2(pd, &mut props) };
+                    format!(
+                        "{:04x}:{:02x}:{:02x}.{:x}",
+                        pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function
+                    )
+                });
                 let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
                 let vram = physical_vram_info(
                     &instance,
@@ -3605,6 +3842,9 @@ impl VulkanBackend {
                 out.push(DeviceInfo {
                     index,
                     name,
+                    vendor_id: p.vendor_id,
+                    device_id: p.device_id,
+                    pci_address,
                     device_type: device_type_str(p.device_type),
                     integrated,
                     vram_bytes,
@@ -3837,11 +4077,15 @@ impl VulkanBackend {
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
         #[cfg(test)]
-        let test_aux_compute =
-            std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE").ok().as_deref() == Some("1");
+        let test_aux_compute = std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE")
+            .ok()
+            .as_deref()
+            == Some("1");
         #[cfg(test)]
         if test_aux_compute && qf_props[queue_family_index as usize].queue_count < 2 {
-            return Err(be("test auxiliary compute queue requires main-family queue_count >= 2"));
+            return Err(be(
+                "test auxiliary compute queue requires main-family queue_count >= 2",
+            ));
         }
         let dedicated_transfer_family_index = qf_props
             .iter()
@@ -3875,8 +4119,8 @@ impl VulkanBackend {
             )
         };
         #[cfg(test)]
-        let enable_indirect_copy = indirect_copy_support
-            .supports_queue(qf_props[queue_family_index as usize].queue_flags);
+        let enable_indirect_copy =
+            indirect_copy_support.supports_queue(qf_props[queue_family_index as usize].queue_flags);
 
         #[cfg(test)]
         let test_shader_clock =
@@ -4050,7 +4294,9 @@ impl VulkanBackend {
         let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
         #[cfg(test)]
         if test_aux_compute && timeline_feat.timeline_semaphore == 0 {
-            return Err(be("test auxiliary compute queue requires timeline semaphores"));
+            return Err(be(
+                "test auxiliary compute queue requires timeline semaphores",
+            ));
         }
         #[cfg(test)]
         let timeline_enabled = timeline_enabled || test_aux_compute;
@@ -4596,11 +4842,18 @@ impl VulkanBackend {
         // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
         // splits its up-front reservation into blocks no larger than this.
         let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut maint4_props = vk::PhysicalDeviceMaintenance4Properties::default();
+        let has_maint4_props = has_ext(c"VK_KHR_maintenance4")
+            || unsafe { instance.get_physical_device_properties(physical_device) }.api_version
+                >= vk::API_VERSION_1_3;
         let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut sgsize_props)
             .push_next(&mut maint3_props)
             .push_next(&mut subgroup_props);
+        if has_maint4_props {
+            props2 = props2.push_next(&mut maint4_props);
+        }
         unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
         let props = props2.properties;
         let compute_subgroup_operations = compute_subgroup_operations(
@@ -4613,6 +4866,15 @@ impl VulkanBackend {
         } else {
             maint3_props.max_memory_allocation_size
         };
+        let resident_weight_alignment =
+            BDA_WEIGHT_ALIGN.max(props.limits.min_storage_buffer_offset_alignment);
+        let resident_weight_block_cap = max_mem_alloc_size.min(BDA_ADDRESSING_UNIT_MAX).min(
+            if maint4_props.max_buffer_size == 0 {
+                max_mem_alloc_size
+            } else {
+                maint4_props.max_buffer_size
+            },
+        );
         let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -5100,6 +5362,8 @@ impl VulkanBackend {
                 ),
                 has_mem_budget,
                 max_mem_alloc_size,
+                resident_weight_alignment,
+                resident_weight_block_cap,
                 max_push_constants: props.limits.max_push_constants_size,
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
@@ -5711,8 +5975,8 @@ impl VulkanBackend {
 
     /// Finish and release the temporary weight-upload ring before a caller measures live device
     /// room for a steady-state arena. Idempotent: the weight-progress guard may call it again.
-    pub fn finish_resident_uploads(&self) {
-        self.shared.drain_staging_ring();
+    pub fn finish_resident_uploads(&self) -> Result<()> {
+        self.shared.drain_staging_ring()
     }
 
     /// Allocate device-local dedicated buffers used only as a physical load-time reservation.
@@ -7020,6 +7284,130 @@ impl VulkanBackend {
         })
     }
 
+    /// Maximum VkBuffer byte capacity used by resident-weight layouts (not a model-total cap).
+    pub fn resident_weight_allocation_limit(&self) -> u64 {
+        self.shared.resident_weight_block_cap
+    }
+
+    /// Pure geometry check, including padding, the device block cap and the <4 GiB tensor limit.
+    /// False does not rule out a paged model whose fixed/placeholder allocation sizes are smaller.
+    /// Driver errors are deliberately left to `resident_weight_allocation_bytes`, never hidden here.
+    pub fn resident_weight_allocations_supported(&self, sizes: &[usize]) -> bool {
+        weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )
+        .is_ok()
+    }
+
+    /// Query the exact dedicated-memory requirement for the same packed layout used by begin.
+    /// Creates only temporary unbound VkBuffer objects: no memory allocations, fills or submits.
+    pub fn resident_weight_allocation_bytes(&self, sizes: &[usize]) -> Result<u64> {
+        let layout = weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )?;
+        let mut total = 0u64;
+        for block in &layout.blocks {
+            let bytes = usize::try_from(block.capacity_bytes)
+                .map_err(|_| be("resident weight block capacity exceeds host address space"))?;
+            let info = vk::BufferCreateInfo::default()
+                .size(fill_span(bytes))
+                .usage(allocation_buffer_usage(true))
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+                .map_err(|e| be(format!("resident weight planning create_buffer: {e}")))?;
+            let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+            // Destroy before the checked addition too, so an overflow cannot leak the probe.
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            total = total
+                .checked_add(requirements.size)
+                .ok_or_else(|| be("resident weight allocation byte total overflow"))?;
+        }
+        Ok(total)
+    }
+
+    fn prepare_weight_allocation_batch(
+        &self,
+        sizes: &[usize],
+    ) -> Result<VulkanWeightAllocationBatch<'_>> {
+        if let Some(error) = self.shared.queue_submit_failure() {
+            return Err(be(format!(
+                "cannot prepare resident weights on an unusable queue ({error})"
+            )));
+        }
+        let mut guard = self.bda_weight_arena.lock().unwrap();
+        if guard.as_ref().is_some_and(|a| a.active_plan.is_some()) {
+            return Err(be("a resident weight allocation batch is already active"));
+        }
+        let layout = weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )?;
+        let mut blocks = Vec::with_capacity(layout.blocks.len());
+        // Do not publish anything, including an empty arena, until EVERY allocation succeeds.
+        // A failure drops the local blocks normally, restoring the physical accounting as well.
+        for block in &layout.blocks {
+            let bytes = usize::try_from(block.capacity_bytes)
+                .map_err(|_| be("resident weight block capacity exceeds host address space"))?;
+            let buf = self.make_buf_ex(
+                bytes,
+                MemoryLocation::GpuOnly,
+                "resident-bda-packed",
+                true,
+                true,
+            )?;
+            let base_addr = buf
+                .own_addr
+                .expect("packed resident block has a device address");
+            blocks.push(BdaArenaBlock {
+                handle: Arc::new(BdaBlockHandle { buf, base_addr }),
+                size: block.capacity_bytes,
+                // Packed blocks have no fallback tail, even before all views are consumed.
+                cursor: block.capacity_bytes,
+                requested_bytes: block.requested_bytes,
+            });
+        }
+        let token = Arc::new(());
+        guard
+            .get_or_insert_with(BdaWeightArena::default)
+            .active_plan = Some(BdaWeightPlan {
+            token: Arc::clone(&token),
+            layout,
+            blocks,
+            consumed: 0,
+        });
+        Ok(VulkanWeightAllocationBatch {
+            backend: self,
+            token,
+            finished: false,
+        })
+    }
+
+    /// Arena-owned resident weight totals. Includes all prepared active-batch blocks, excludes
+    /// unified auxiliary weights and blocks retained solely by subviews after a batch rollback.
+    pub fn resident_weight_allocation_stats(&self) -> ResidentWeightAllocationStats {
+        let guard = self.bda_weight_arena.lock().unwrap();
+        let mut stats = ResidentWeightAllocationStats::default();
+        if let Some(arena) = guard.as_ref() {
+            for block in arena
+                .blocks
+                .iter()
+                .chain(arena.active_plan.iter().flat_map(|p| p.blocks.iter()))
+            {
+                stats.requested_bytes += block.requested_bytes;
+                stats.padded_bytes += block.cursor;
+                stats.capacity_bytes += block.size;
+                stats.physical_allocation_bytes += block.handle.physical_allocation_bytes();
+                stats.block_count += 1;
+            }
+        }
+        stats
+    }
+
     /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
     /// [`BdaWeightArena`]). Bump-allocates within the current block at [`BDA_WEIGHT_ALIGN`]; when the
     /// request doesn't fit the current block's remainder, opens a fresh dedicated block (never
@@ -7028,6 +7416,23 @@ impl VulkanBackend {
     /// offset within it — see that variant's doc for why the handle must never be bound as a
     /// descriptor at its full range.
     fn bda_weight_alloc(&self, size: usize) -> Result<VkBuffer> {
+        let mut guard = self.bda_weight_arena.lock().unwrap();
+        if let Some(plan) = guard.as_mut().and_then(|a| a.active_plan.as_mut()) {
+            let placement = plan.layout.expected(plan.consumed, size)?;
+            let handle = Arc::clone(&plan.blocks[placement.block].handle);
+            plan.consumed += 1;
+            return Ok(VkBuffer {
+                shared: Arc::clone(&self.shared),
+                buffer: handle.buf.buffer,
+                backing: Backing::BdaSub(handle),
+                size,
+                mem_size: 0,
+                location: MemoryLocation::GpuOnly,
+                sub_offset: placement.offset as usize,
+                own_addr: None,
+                act_bytes: 0,
+            });
+        }
         // Load-time guard for the BYTE half of the addressing invariant (see
         // [`BDA_ADDRESSING_UNIT_MAX`] / [`BdaWeightArena`]): a single arena tensor at or above 4 GiB
         // would wrap the u32 intra-unit byte offsets the STREAMED kernels apply, silently reading
@@ -7044,7 +7449,6 @@ impl VulkanBackend {
             )));
         }
         let want = (size as u64).max(1).next_multiple_of(BDA_WEIGHT_ALIGN);
-        let mut guard = self.bda_weight_arena.lock().unwrap();
         let arena = guard.get_or_insert_with(BdaWeightArena::default);
 
         // First-fit over ALL open blocks, not just the last: a big tensor opens an exact-size
@@ -7056,6 +7460,7 @@ impl VulkanBackend {
             let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
             if off + want <= b.size {
                 b.cursor = off + want;
+                b.requested_bytes += size as u64;
                 return Ok(VkBuffer {
                     shared: Arc::clone(&self.shared),
                     buffer: b.handle.buf.buffer,
@@ -7109,6 +7514,7 @@ impl VulkanBackend {
             handle: Arc::clone(&handle),
             size: block_bytes,
             cursor: want,
+            requested_bytes: size as u64,
         });
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
@@ -7281,13 +7687,7 @@ impl VulkanBackend {
         // matching DEVICE_ADDRESS alloc flag — gpu-allocator sets it (built with
         // `buffer_device_address: true`) on the pooled path below, and the UMA-overflow spill passes
         // it through to `alloc_vram_mapped` explicitly.
-        let mut usage = if device_address {
-            vk::BufferUsageFlags::from_raw(
-                BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
-            )
-        } else {
-            BUFFER_USAGE
-        };
+        let mut usage = allocation_buffer_usage(device_address);
         if self.shared.conditional_rendering.is_some() && label == "readback" {
             usage |= vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT;
         }
@@ -7757,7 +8157,16 @@ impl VulkanBackend {
         src: &[u8],
     ) -> Result<()> {
         let device = &self.shared.device;
-        let mut guard = self.shared.staging_ring.lock().unwrap();
+        let mut guard = self
+            .shared
+            .staging_ring
+            .lock()
+            .map_err(|_| be("staging-ring upload: ring mutex is poisoned"))?;
+        if let Some(error) = self.shared.queue_submit_failure() {
+            return Err(be(format!(
+                "staging-ring upload: queue is unusable ({error})"
+            )));
+        }
         if guard.is_none() {
             *guard = Some(self.make_staging_ring()?);
         }
@@ -7871,6 +8280,7 @@ impl VulkanBackend {
             fences,
             busy: vec![false; RING_SLOTS],
             next: 0,
+            retained_weight_blocks: Vec::new(),
         })
     }
 
@@ -8034,6 +8444,18 @@ impl Backend for VulkanBackend {
 
     fn capabilities(&self) -> Capabilities {
         self.shared.caps.clone()
+    }
+
+    fn begin_weight_allocation_batch(
+        &self,
+        sizes: &[usize],
+    ) -> Result<Option<Box<dyn WeightAllocationBatch + '_>>> {
+        // Vision/embedding clients allocate weights from the shared elastic unified arena.
+        // Reserving separate BDA blocks here would bypass that allocator's ownership/budgeting.
+        if self.unified_client.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(self.prepare_weight_allocation_batch(sizes)?)))
     }
 
     fn weight_progress(
@@ -10815,6 +11237,107 @@ mod tests {
     }
 
     #[test]
+    fn staging_drain_serializes_wait_cleanup_and_empty_observers() {
+        use std::sync::mpsc;
+        let slot = Mutex::new(Some(()));
+        let cleaned = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let slot_ref = &slot;
+            let cleaned_ref = &cleaned;
+            let first = scope.spawn(move || {
+                drain_staging_resource(
+                    slot_ref,
+                    |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    },
+                    |_| cleaned_ref.store(true, Ordering::Release),
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // A ring taken out before the wait would leave this lock available: the original bug.
+            assert!(
+                slot.try_lock().is_err(),
+                "drain must keep the mutex through the fence wait"
+            );
+            let second = scope.spawn(|| {
+                drain_staging_resource(
+                    &slot,
+                    |_| panic!("second drainer must observe completed cleanup"),
+                    |_| panic!("resource cleaned twice"),
+                )
+                .unwrap();
+                assert!(cleaned.load(Ordering::Acquire));
+            });
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Ok(()));
+            second.join().unwrap();
+        });
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn staging_drain_wait_error_retains_sources_and_destinations_until_retry() {
+        let source = Arc::new(());
+        let destination = Arc::new(());
+        let source_weak = Arc::downgrade(&source);
+        let destination_weak = Arc::downgrade(&destination);
+        let slot = Mutex::new(Some((source, destination)));
+        assert_eq!(
+            drain_staging_resource(&slot, |_| Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY), drop),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        );
+        assert!(slot.lock().unwrap().is_some());
+        assert!(source_weak.upgrade().is_some());
+        assert!(destination_weak.upgrade().is_some());
+        assert_eq!(drain_staging_resource(&slot, |_| Ok(()), drop), Ok(()));
+        assert!(source_weak.upgrade().is_none());
+        assert!(destination_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn staging_drain_device_loss_cleans_up_but_remains_an_error() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let slot = Mutex::new(Some(resource));
+        assert_eq!(
+            drain_staging_resource(&slot, |_| Err(vk::Result::ERROR_DEVICE_LOST), drop),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert!(slot.lock().unwrap().is_none());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn staging_drain_poisoned_mutex_returns_error_without_cleanup_or_panic() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let slot = Mutex::new(Some(resource));
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = slot.lock().unwrap();
+                    panic!("inject poisoned staging state");
+                })
+                .join()
+                .is_err());
+        });
+        assert_eq!(
+            drain_staging_resource(
+                &slot,
+                |_| panic!("poisoned state must not be trusted"),
+                |_| panic!("pending resource must be retained")
+            ),
+            Err(vk::Result::ERROR_UNKNOWN)
+        );
+        assert!(weak.upgrade().is_some());
+        assert!(slot.lock().unwrap_err().into_inner().is_some());
+    }
+
+    #[test]
     fn resident_bda_block_floor_grows_only_for_small_tensor_blocks() {
         const MIB: u64 = 1024 * 1024;
         let max = 4 * 1024 * MIB;
@@ -10833,6 +11356,383 @@ mod tests {
             128 * MIB,
             "large tensors do not advance the floor"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_roundtrip_and_finish() {
+        let be = VulkanBackend::new().unwrap();
+        let before = be.resident_weight_allocation_stats();
+        let sizes = [1000usize, 4096, 300_000];
+        assert!(be.resident_weight_allocations_supported(&sizes));
+        if let Ok(oversize) = usize::try_from(be.resident_weight_allocation_limit() + 1) {
+            assert!(!be.resident_weight_allocations_supported(&[oversize]));
+        }
+        let budget_before_query = be.shared.budget_used();
+        let planned_bytes = be.resident_weight_allocation_bytes(&sizes).unwrap();
+        assert_eq!(be.resident_weight_allocation_bytes(&[]).unwrap(), 0);
+        assert_eq!(
+            be.shared.budget_used(),
+            budget_before_query,
+            "planning must not allocate memory"
+        );
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        let mut batch = (&be as &dyn Backend)
+            .begin_weight_allocation_batch(&sizes)
+            .unwrap()
+            .unwrap();
+        assert!(be.begin_weight_allocation_batch(&[]).is_err());
+        let prepared = be.resident_weight_allocation_stats();
+        assert_eq!(
+            prepared.physical_allocation_bytes - before.physical_allocation_bytes,
+            planned_bytes
+        );
+        assert_eq!(prepared.block_count, before.block_count + 1);
+        assert_eq!(prepared.requested_bytes - before.requested_bytes, 305_096);
+        assert_eq!(
+            prepared.capacity_bytes - before.capacity_bytes,
+            prepared.padded_bytes - before.padded_bytes
+        );
+        assert!(
+            prepared.physical_allocation_bytes - before.physical_allocation_bytes
+                >= prepared.capacity_bytes - before.capacity_bytes
+        );
+        let mut buffers = Vec::new();
+        for (index, &size) in sizes.iter().enumerate() {
+            let buf = be.alloc(size, BufferUsage::Weights).unwrap();
+            let view = as_vk_buf(buf.as_ref()).unwrap();
+            assert_eq!(
+                view.sub_offset as u64 % be.shared.resident_weight_alignment,
+                0
+            );
+            assert_eq!(
+                buf.device_addr().unwrap(),
+                match &view.backing {
+                    Backing::BdaSub(block) => block.base_addr + view.sub_offset as u64,
+                    _ => panic!("expected packed BDA view"),
+                }
+            );
+            be.upload(buf.as_ref(), &vec![(index + 1) as u8; size])
+                .unwrap();
+            buffers.push(buf);
+        }
+        assert!(
+            be.alloc(1, BufferUsage::Weights).is_err(),
+            "exhaustion must not fallback"
+        );
+        batch.finish().unwrap();
+        batch.finish().unwrap();
+        assert_eq!(be.resident_weight_allocation_stats(), prepared);
+        // A finished guard can remain alive while another batch starts; dropping it is harmless.
+        let next = be.begin_weight_allocation_batch(&[]).unwrap().unwrap();
+        drop(batch);
+        assert!(be.alloc(1, BufferUsage::Weights).is_err());
+        drop(next);
+        for (index, buf) in buffers.iter().enumerate() {
+            let mut bytes = vec![0; sizes[index]];
+            be.download(buf.as_ref(), &mut bytes).unwrap();
+            assert_eq!(bytes, vec![(index + 1) as u8; sizes[index]]);
+        }
+        // Non-batched callers resume their normal allocation path after finish/drop.
+        be.alloc(128, BufferUsage::Weights).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_rollback_and_unexpected_allocation() {
+        let be = VulkanBackend::new().unwrap();
+        let old = be.alloc(64, BufferUsage::Weights).unwrap();
+        be.upload(old.as_ref(), &[17; 64]).unwrap();
+        let before = be.resident_weight_allocation_stats();
+        let physical_before = be.shared.budget_used();
+        // Early exit before consuming any view releases the complete reservation.
+        drop(be.begin_weight_allocation_batch(&[4096]).unwrap().unwrap());
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        assert_eq!(be.shared.budget_used(), physical_before);
+        let mut batch = be
+            .begin_weight_allocation_batch(&[1000, 2048])
+            .unwrap()
+            .unwrap();
+        let prepared = be.resident_weight_allocation_stats();
+        assert!(be.alloc(2048, BufferUsage::Weights).is_err());
+        assert!(batch.finish().is_err());
+        // Non-weight allocations do not consume or bypass the active weight sequence.
+        be.alloc(16, BufferUsage::Activations).unwrap();
+        let escaped = be.alloc(1000, BufferUsage::Weights).unwrap();
+        be.upload(escaped.as_ref(), &[53; 1000]).unwrap();
+        assert!(batch.finish().is_err());
+        assert_eq!(be.resident_weight_allocation_stats(), prepared);
+        drop(batch);
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        // The dropped batch's subview still owns its block. A later normal allocation must not
+        // reuse that range or invalidate old blocks, even if an old arena tail can satisfy it.
+        let ordinary = be.alloc(1000, BufferUsage::Weights).unwrap();
+        be.upload(ordinary.as_ref(), &[91; 1000]).unwrap();
+        let mut bytes = [0; 1000];
+        be.download(escaped.as_ref(), &mut bytes).unwrap();
+        assert_eq!(bytes, [53; 1000]);
+        let mut old_bytes = [0; 64];
+        be.download(old.as_ref(), &mut old_bytes).unwrap();
+        assert_eq!(old_bytes, [17; 64]);
+        // Mismatches leave the expected cursor unchanged, so a caller may recover and finish.
+        let mut retry = be.begin_weight_allocation_batch(&[32]).unwrap().unwrap();
+        assert!(be.alloc(64, BufferUsage::Weights).is_err());
+        be.alloc(32, BufferUsage::Weights).unwrap();
+        retry.finish().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_close_drains_uploads_before_progress_drop() {
+        for finish in [false, true] {
+            let be = VulkanBackend::new().unwrap();
+            let before = be.resident_weight_allocation_stats();
+            // Match loader declaration order: batch drops before buffers, progress drops last.
+            let progress = be.weight_progress(Some(8192));
+            let mut buffers = Vec::new();
+            let mut batch = be
+                .begin_weight_allocation_batch(&[4096, 4096])
+                .unwrap()
+                .unwrap();
+            let first = be.bda_weight_alloc(4096).unwrap();
+            let block = match &first.backing {
+                Backing::BdaSub(block) => Arc::downgrade(block),
+                _ => panic!("expected packed weight subview"),
+            };
+            // Call the async path directly so mapped/UMA devices exercise pending copies too.
+            be.upload_staged_ring(first.buffer, first.sub_offset as u64, &[41; 4096])
+                .unwrap();
+            buffers.push(first);
+            if finish {
+                let second = be.bda_weight_alloc(4096).unwrap();
+                be.upload_staged_ring(second.buffer, second.sub_offset as u64, &[83; 4096])
+                    .unwrap();
+                buffers.push(second);
+            }
+            assert!(be
+                .shared
+                .staging_ring
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|ring| ring.busy.iter().any(|&busy| busy)));
+            if finish {
+                batch.finish().unwrap();
+            }
+            drop(batch);
+            assert!(be.shared.staging_ring.lock().unwrap().is_none());
+            assert!(
+                be.shared.weight_pb.lock().unwrap().is_some(),
+                "progress still alive"
+            );
+            if !finish {
+                assert_eq!(be.resident_weight_allocation_stats(), before);
+            }
+            // The escaped view is safe to read and then free before progress finally drains.
+            let mut bytes = [0; 4096];
+            be.download(&buffers[0], &mut bytes).unwrap();
+            assert_eq!(bytes, [41; 4096]);
+            if finish {
+                be.download(&buffers[1], &mut bytes).unwrap();
+                assert_eq!(bytes, [83; 4096]);
+            }
+            drop(buffers);
+            assert_eq!(
+                block.upgrade().is_some(),
+                finish,
+                "only successful finish retains the arena's block reference"
+            );
+            drop(progress);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_descriptor_compute_uses_distinct_offsets() {
+        let be = VulkanBackend::new().unwrap();
+        let mut batch = be
+            .begin_weight_allocation_batch(&[16, 16, 16])
+            .unwrap()
+            .unwrap();
+        let a = be.alloc(16, BufferUsage::Weights).unwrap();
+        let b = be.alloc(16, BufferUsage::Weights).unwrap();
+        let y = be.alloc(16, BufferUsage::Weights).unwrap();
+        be.upload(a.as_ref(), bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0]))
+            .unwrap();
+        be.upload(
+            b.as_ref(),
+            bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]),
+        )
+        .unwrap();
+        batch.finish().unwrap();
+        let recorder = Recorder::new(&be).unwrap();
+        recorder.add(a.as_ref(), b.as_ref(), y.as_ref(), 4);
+        recorder.finish().unwrap();
+        let mut values = [0.0f32; 4];
+        be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [11.0, 22.0, 33.0, 44.0]);
+        // Re-read both inputs after the output write in the same physical buffer.
+        be.download(a.as_ref(), bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [1.0, 2.0, 3.0, 4.0]);
+        be.download(b.as_ref(), bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[ignore = "requires a Vulkan GPU with roughly half its supported block cap free"]
+    fn packed_resident_weights_descriptor_compute_large_offsets() {
+        let be = VulkanBackend::new().unwrap();
+        let cap = be.shared.resident_weight_block_cap;
+        let alignment = be.shared.resident_weight_alignment;
+        // Exercise >1 GiB offsets on a 2 GiB-cap device, and >2 GiB on a 4 GiB-cap device.
+        // Honor the real device cap and reserve all three aligned payload spans in the same block.
+        let prefix_bytes =
+            ((cap / 2).next_multiple_of(alignment) + 256).next_multiple_of(alignment);
+        let payload_padded_bytes = 3 * 16u64.next_multiple_of(alignment);
+        let capacity_bytes = prefix_bytes + payload_padded_bytes;
+        assert!(
+            capacity_bytes <= cap,
+            "large-offset test must fit the supported block cap"
+        );
+        eprintln!(
+            "packed resident large offsets: supported_block_cap={cap} alignment={alignment} \
+             prefix_bytes={prefix_bytes} payload_padded_bytes={payload_padded_bytes} \
+             capacity_bytes={capacity_bytes}"
+        );
+        let prefix_size = usize::try_from(prefix_bytes).unwrap();
+        let before = be.resident_weight_allocation_stats();
+        let mut batch = be
+            .begin_weight_allocation_batch(&[prefix_size, 16, 16, 16])
+            .unwrap()
+            .unwrap();
+        // Deliberately use the raw uninitialized allocator for the prefix: Backend::alloc_uninit
+        // poisons the entire range in debug builds. Never fill/upload/read this large view.
+        let prefix = be.bda_weight_alloc(prefix_size).unwrap();
+        let a = be.bda_weight_alloc(16).unwrap();
+        let b = be.bda_weight_alloc(16).unwrap();
+        let y = be.bda_weight_alloc(16).unwrap();
+        assert_eq!(prefix.buffer, a.buffer);
+        assert_eq!(a.sub_offset as u64, prefix_bytes);
+        assert_eq!(a.buffer, b.buffer);
+        assert_eq!(b.buffer, y.buffer);
+        for view in [&a, &b, &y] {
+            assert!(view.sub_offset as u64 > cap / 2);
+            assert_eq!(
+                view.device_addr().unwrap(),
+                prefix.device_addr().unwrap() + view.sub_offset as u64
+            );
+        }
+        assert_eq!(
+            be.resident_weight_allocation_stats().block_count,
+            before.block_count + 1
+        );
+        be.upload(&a, bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0]))
+            .unwrap();
+        be.upload(&b, bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]))
+            .unwrap();
+        batch.finish().unwrap();
+        // Recorder::add binds actual STORAGE_BUFFER descriptors with each view's large offset.
+        // The block base remains u64 for BDA; descriptor/copy offsets remain VkDeviceSize.
+        let recorder = Recorder::new(&be).unwrap();
+        recorder.add(&a, &b, &y, 4);
+        recorder.finish().unwrap();
+        let mut values = [0.0f32; 4];
+        be.download(&y, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [11.0, 22.0, 33.0, 44.0]);
+        be.download(&a, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [1.0, 2.0, 3.0, 4.0]);
+        be.download(&b, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_prepare_failure_is_transactional() {
+        const MIB: usize = 1024 * 1024;
+        let mut config = Config::default();
+        config.device.vram_budget = Some(infr_core::SizeSpec::Bytes((6 * MIB) as u64));
+        config.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(0));
+        config.kernels.vulkan.no_vram_guard = false;
+        config.kernels.vulkan.gemv.id_grid_buffer = Some(false);
+        let mut be = VulkanBackend::new_with(Arc::new(config)).unwrap();
+        Arc::get_mut(&mut be.shared)
+            .expect("no live startup buffers")
+            .resident_weight_block_cap = (4 * MIB) as u64;
+        let before = be.resident_weight_allocation_stats();
+        let bytes_before = be.shared.budget_used();
+        let epoch_before = be.shared.resource_epoch.load(Ordering::Acquire);
+        // First physical block fits; the explicit budget rejects the second before allocation.
+        assert!(be
+            .begin_weight_allocation_batch(&[4 * MIB, 4 * MIB])
+            .is_err());
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        assert_eq!(be.shared.budget_used(), bytes_before);
+        assert!(
+            be.shared.resource_epoch.load(Ordering::Acquire) > epoch_before,
+            "a prepared first block must have been dropped on second-block failure"
+        );
+        assert!(
+            be.bda_weight_arena.lock().unwrap().is_none(),
+            "no partial plan published"
+        );
+        let mut retry = be.begin_weight_allocation_batch(&[16]).unwrap().unwrap();
+        be.bda_weight_alloc(16).unwrap();
+        retry.finish().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_skip_unified_auxiliary_clients() {
+        let be = VulkanBackend::new().unwrap();
+        let unified = be.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let vision = be.fork_vision_client().unwrap();
+        let embedding = be.fork_embedding_client().unwrap();
+        let mut auxiliary_weights = Vec::new();
+        for (index, client) in [&vision, &embedding].into_iter().enumerate() {
+            assert!(client
+                .begin_weight_allocation_batch(&[64])
+                .unwrap()
+                .is_none());
+            let buf = client.alloc(64, BufferUsage::Weights).unwrap();
+            assert!(matches!(
+                &as_vk_buf(buf.as_ref()).unwrap().backing,
+                Backing::UnifiedSub(_)
+            ));
+            assert_eq!(client.resident_weight_allocation_stats().block_count, 0);
+            client
+                .upload(buf.as_ref(), &[(index + 23) as u8; 64])
+                .unwrap();
+            auxiliary_weights.push(buf);
+        }
+        let unified_before = unified.stats();
+        let resident_before = be.resident_weight_allocation_stats();
+        let batch = be
+            .begin_weight_allocation_batch(&[1000, 4096])
+            .unwrap()
+            .unwrap();
+        let escaped = be.alloc(1000, BufferUsage::Weights).unwrap();
+        be.upload(escaped.as_ref(), &[77; 1000]).unwrap();
+        drop(batch); // Leave one allocation unconsumed and keep the other subview alive.
+        assert_eq!(unified.stats(), unified_before);
+        assert_eq!(be.resident_weight_allocation_stats(), resident_before);
+        for (index, client) in [&vision, &embedding].into_iter().enumerate() {
+            let mut bytes = [0; 64];
+            client
+                .download(auxiliary_weights[index].as_ref(), &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, [(index + 23) as u8; 64]);
+        }
+        let mut bytes = [0; 1000];
+        be.download(escaped.as_ref(), &mut bytes).unwrap();
+        assert_eq!(bytes, [77; 1000]);
+        assert_eq!(unified.stats(), unified_before);
     }
 
     /// Resident-BDA weight arena: sub-allocate three odd-sized weight buffers directly from

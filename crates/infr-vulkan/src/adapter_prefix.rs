@@ -120,7 +120,11 @@ pub(super) fn test_finish_preparation_scope(
     failed: bool,
     experimental_end_cancel: bool,
 ) {
-    finish_preparation_scope(next_cancelled, continuation_cancelled, failed || experimental_end_cancel);
+    finish_preparation_scope(
+        next_cancelled,
+        continuation_cancelled,
+        failed || experimental_end_cancel,
+    );
 }
 
 #[cfg(test)]
@@ -1177,7 +1181,9 @@ pub(super) fn copy_binding_matches(
 impl PreparedPrefix {
     #[cfg(test)]
     pub(super) fn coalesced_test_parts(&self) -> Vec<usize> {
-        std::iter::once(self.head_layers).chain(self.parts.iter().map(|part| part.layers)).collect()
+        std::iter::once(self.head_layers)
+            .chain(self.parts.iter().map(|part| part.layers))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1327,7 +1333,10 @@ impl PreparedPrefix {
             }) {
                 return reject("decode_packet_reject_role_params");
             }
-            if prepared.chunk.pure_mapped_schedule.as_ref()
+            if prepared
+                .chunk
+                .pure_mapped_schedule
+                .as_ref()
                 .is_some_and(|schedule| !schedule.resources_current(be_, &prepared.chunk, pool))
             {
                 return reject("decode_packet_reject_coalescing_policy");
@@ -1418,7 +1427,9 @@ pub(super) fn record(
     pool: ScratchPool,
     resident: Option<ResidentChunk>,
 ) -> Result<PreparedPrefix> {
-    record_inner(be_, plan, scratch, bindings, positions, pool, resident, None)
+    record_inner(
+        be_, plan, scratch, bindings, positions, pool, resident, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1434,7 +1445,14 @@ pub(super) fn record_cancellable(
 ) -> Result<Option<PreparedPrefix>> {
     cancellable_recording(cancelled, || {
         record_inner(
-            be_, plan, scratch, bindings, positions, pool, resident, Some(cancelled),
+            be_,
+            plan,
+            scratch,
+            bindings,
+            positions,
+            pool,
+            resident,
+            Some(cancelled),
         )
     })
 }
@@ -1607,7 +1625,10 @@ fn record_with_horizon(
         let (reads, writes) = op.io_inline();
         ids.extend(reads.into_iter().chain(writes));
     }
-    if let Some(schedule) = resident.as_ref().and_then(|chunk| chunk.pure_mapped_schedule.as_ref()) {
+    if let Some(schedule) = resident
+        .as_ref()
+        .and_then(|chunk| chunk.pure_mapped_schedule.as_ref())
+    {
         // Classification may look past the recording horizon solely to stop before a
         // future host entry. Its complete physical binding proof belongs to this ACK too.
         ids.extend(schedule.bank_tensors.iter().copied());
@@ -1804,10 +1825,19 @@ fn record_with_horizon(
             let chunk = resident.as_ref().unwrap();
             let submitted = parts.last().map_or(0, |part: &PreparedPart| part.layers);
             if owned_batch {
-                chunk.preserve_coalesced_boundary(recorder.as_ref().unwrap(), submitted, true, true);
+                chunk.preserve_coalesced_boundary(
+                    recorder.as_ref().unwrap(),
+                    submitted,
+                    true,
+                    true,
+                );
             }
             if owned_batch
-                && chunk.pure_group_due(parts.last().map_or(0, |part: &PreparedPart| part.layers), true, true)
+                && chunk.pure_group_due(
+                    parts.last().map_or(0, |part: &PreparedPart| part.layers),
+                    true,
+                    true,
+                )
                 && index + 1 < end
             {
                 parts.push(PreparedPart {
@@ -2217,7 +2247,7 @@ mod tests {
                 certificates[host] = Some(false);
                 let layers = source_certificate_group_limit(&certificates, cadence).unwrap();
                 assert_eq!(layers, (host + 1).div_ceil(cadence) * cadence);
-                assert!(layers >= host + 1);
+                assert!(layers > host);
                 assert!(layers == 16 || resident_submit_due(layers, 0, cadence, 128));
                 // The execution window is NOT the speculative preparation limit.
                 assert_eq!(resident_execution_limit(true, 48, 16, 128).unwrap(), 48);
@@ -2815,11 +2845,11 @@ mod tests {
             assert!(preparing_commands());
         }
         assert!(!preparing_commands());
-        let result = (|| -> Result<()> {
+        let result: Result<()> = {
             let _guard = RecordingGuard::enter();
             assert!(preparing_commands());
             Err(be("CPU preparation failure"))
-        })();
+        };
         assert!(result.is_err());
         assert!(!preparing_commands());
     }
@@ -3436,7 +3466,7 @@ mod tests {
             segmented: Some((7, 16, 128, 2)),
         };
         assert!(key_sequence_matches(
-            &[key.clone()],
+            std::slice::from_ref(&key),
             std::iter::once(key.clone())
         ));
         for field in 0..8 {
@@ -3453,11 +3483,14 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                !key_sequence_matches(&[key.clone()], std::iter::once(changed)),
+                !key_sequence_matches(std::slice::from_ref(&key), std::iter::once(changed)),
                 "field {field}"
             );
         }
-        assert!(!key_sequence_matches(&[key.clone()], std::iter::empty()));
+        assert!(!key_sequence_matches(
+            std::slice::from_ref(&key),
+            std::iter::empty()
+        ));
         assert!(!key_sequence_matches(&[], std::iter::once(key)));
     }
 
@@ -3578,8 +3611,8 @@ mod tests {
                     }
                 }
             }
-            for arm in 0..2 {
-                let mean = elapsed[arm].iter().sum::<f64>() / elapsed[arm].len() as f64;
+            for (arm, elapsed) in elapsed.iter().enumerate() {
+                let mean = elapsed.iter().sum::<f64>() / elapsed.len() as f64;
                 eprintln!("ACK_VALIDATION_CPU scope=keys+position-bytes tensors={TENSORS} position_tensors=16 rows={rows} rounds=6 warmup=2 repeats={REPEATS} arm={} mean_us={mean:.3}", if arm == 0 { "allocating" } else { "allocation-free" });
             }
         }

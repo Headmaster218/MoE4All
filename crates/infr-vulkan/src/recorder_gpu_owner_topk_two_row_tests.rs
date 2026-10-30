@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! External WG128 experiment. The oracle is the actual multirow router plus v69 WG64 owner.
 //! Synthetic BDAs never reach payload dispatches; the recovery test replaces them with real BDAs.
 use super::*;

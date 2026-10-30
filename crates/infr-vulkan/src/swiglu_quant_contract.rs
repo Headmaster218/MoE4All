@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Self-contained Recorder child; parent mounts with #[cfg(test)] only.
 //! No campaign modules, external SPVs, model files, environment probes, filesystem
 //! output, timing or additional dependencies. GPU tests are ignored and must run
@@ -672,10 +674,10 @@ fn moe_graph_contract(expect_rejection: bool) {
                         cases += 1;
                         continue;
                     }
-                    for repeat in 0..2 {
+                    for (repeat, candidate) in results[1].iter().enumerate().take(2) {
                         exact(
                             &format!("{label}/repeat{repeat}/output"),
-                            &results[1][repeat],
+                            candidate,
                             &results[0][repeat],
                             4,
                         );
@@ -709,7 +711,7 @@ fn moe_graph_contract(expect_rejection: bool) {
 fn swiglu_quant_recipe_and_geometry_contract() {
     assert_eq!(GRAPH_NE % 64, 0);
     assert_eq!(GRAPH_NE % 32, 0);
-    assert!(GRAPH_ROWS > 8);
+    const { assert!(GRAPH_ROWS > 8) };
     for rows in [1usize, 513, 5120, 40960] {
         for k in [512usize, 640, 1024] {
             let groups = rows * (k / 32);

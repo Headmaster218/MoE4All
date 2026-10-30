@@ -1,16 +1,18 @@
+#![cfg(test)]
+
 //! External-SPIR-V FFN probes. All GPU entry points require explicit parent serialization.
 use super::*;
 
+#[path = "recorder_owned_hit_event_tests.rs"]
+pub(super) mod hit_event;
 #[path = "recorder_owned_sparse_pipeline_tests.rs"]
 mod sparse_pipeline;
+#[path = "recorder_owned_splitk_hit_tests.rs"]
+mod splitk_hit_v2;
 #[path = "recorder_owned_tree64_local64_tests.rs"]
 mod tree64_local64;
 #[path = "recorder_owned_tree64_wide_nr_tests.rs"]
 mod tree64_wide_nr;
-#[path = "recorder_owned_splitk_hit_tests.rs"]
-mod splitk_hit_v2;
-#[path = "recorder_owned_hit_event_tests.rs"]
-pub(super) mod hit_event;
 use crate::ops::ComputeKernel;
 use std::path::PathBuf;
 
@@ -246,12 +248,11 @@ impl FusedFixture {
                 self.inner.job_count, 0,
                 "all-hit fixture must publish zero jobs"
             );
-            assert!(
-                self.inner
-                    .hits
-                    .iter()
-                    .all(|&mask| mask == (1 << self.inner.p.used) - 1)
-            );
+            assert!(self
+                .inner
+                .hits
+                .iter()
+                .all(|&mask| mask == (1 << self.inner.p.used) - 1));
         } else {
             self.inner.prepare(source, bank, false);
         }
@@ -490,7 +491,10 @@ impl FusedFixture {
                         self.fused(rec, kernels, true);
                     },
                 );
-                assert_eq!(selected, no_entry, "requested phase2 entry must be selected");
+                assert_eq!(
+                    selected, no_entry,
+                    "requested phase2 entry must be selected"
+                );
                 self.down(rec, 2, 0);
                 return;
             }
@@ -516,7 +520,10 @@ impl FusedFixture {
                         self.projections(rec, 2, 0);
                     },
                 );
-                assert_eq!(selected, no_entry, "requested phase2 entry must be selected");
+                assert_eq!(
+                    selected, no_entry,
+                    "requested phase2 entry must be selected"
+                );
                 self.activation(rec);
                 self.down(rec, 2, 0);
                 return;
@@ -736,11 +743,9 @@ fn gpu_owned_tree64_gu_correctness_rows_1_to_8() {
                     reference_kernels.iter().all(|name| !name.contains("_sg")),
                     "selected native path is an SG rather than Tree64 reduction: profile={p:?} rows={rows} kernels={reference_kernels:?}; do not relax ACT equality or silently force a different oracle"
                 );
-                assert!(
-                    expected[expected.len() - GUARD..]
-                        .iter()
-                        .all(|&v| v == POISON)
-                );
+                assert!(expected[expected.len() - GUARD..]
+                    .iter()
+                    .all(|&v| v == POISON));
                 assert!(
                     expected[..expected.len() - GUARD]
                         .chunks_exact(4)

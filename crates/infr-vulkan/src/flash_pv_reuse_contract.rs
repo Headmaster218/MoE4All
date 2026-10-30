@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Recorder child: embedded production PV-reuse routes, without research artifacts or timing.
 use super::*;
 use infr_core::backend::BufferUsage;

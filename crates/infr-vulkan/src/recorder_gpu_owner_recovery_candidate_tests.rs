@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Metadata-only recovery qualification; synthetic BDAs never reach payload dispatches.
 //! Child of topk_many_row_tests to reuse its guarded Probe and the performance helpers.
 use super::*;
@@ -17,11 +19,10 @@ struct RecoveryKernels {
 
 impl RecoveryKernels {
     fn new(be: &VulkanBackend) -> Self {
-        assert!(
-            be.shared
-                .compute_subgroup_operations
-                .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC)
-        );
+        assert!(be
+            .shared
+            .compute_subgroup_operations
+            .contains(vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC));
         Self {
             fast: be.kernel_sg(
                 "recovery_candidate_split_fast",

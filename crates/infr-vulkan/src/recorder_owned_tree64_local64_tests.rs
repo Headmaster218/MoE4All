@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! GU-only LOCAL64 qualification against the actual selected native GU path.
 use super::*;
 
@@ -102,16 +104,12 @@ fn exact_native_gu(grid_buffer: bool) {
                 native_kernels.iter().all(|name| !name.contains("_sg")),
                 "selected native SG reduction is not Tree64: {native_kernels:?}"
             );
-            assert!(
-                expected[..expected.len() - GUARD]
-                    .chunks_exact(4)
-                    .all(|word| f32::from_le_bytes(word.try_into().unwrap()).is_finite())
-            );
-            assert!(
-                expected[expected.len() - GUARD..]
-                    .iter()
-                    .all(|&b| b == POISON)
-            );
+            assert!(expected[..expected.len() - GUARD]
+                .chunks_exact(4)
+                .all(|word| f32::from_le_bytes(word.try_into().unwrap()).is_finite()));
+            assert!(expected[expected.len() - GUARD..]
+                .iter()
+                .all(|&b| b == POISON));
             println!(
                 "TREE64_LOCAL64_ORACLE profile={} rows={rows} native_kernels={native_kernels:?} native_grid_policy={} native_grid_nr={} native_lds_nr={} candidate_grid_buffer={grid_buffer} artifact=builtin_sdk_spv",
                 p.name,

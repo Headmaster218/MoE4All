@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Child of recorder_owned_fused_tests; parent registers this module separately.
 //! Test-only NFF-chunk UG+SiLU+Down partial, INCLUDING the final reduction cost.
 use super::*;
@@ -77,9 +79,7 @@ impl SplitKernels {
         assert!(CHUNKS.contains(&chunk));
         assert!(matches!(
             (p.gate_up, p.down),
-            (DType::Q5K, DType::Q5K)
-                | (DType::Iq2S, DType::Iq4Nl)
-                | (DType::Iq3S, DType::Iq4Nl)
+            (DType::Q5K, DType::Q5K) | (DType::Iq2S, DType::Iq4Nl) | (DType::Iq3S, DType::Iq4Nl)
         ));
         let suffix = if shared { "-shared" } else { "" };
         Self {

@@ -132,24 +132,20 @@ impl Trace {
         if disabled {
             gate.release();
         }
-        assert!(
-            gates()
-                .lock()
-                .unwrap()
-                .insert(device, Arc::downgrade(&gate))
-                .is_none()
-        );
+        assert!(gates()
+            .lock()
+            .unwrap()
+            .insert(device, Arc::downgrade(&gate))
+            .is_none());
         STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(State {
-                        disabled,
-                        gate: Arc::clone(&gate),
-                        decisions: Vec::new(),
-                        failure,
-                    }))
-                    .is_none()
-            )
+            assert!(state
+                .replace(Some(State {
+                    disabled,
+                    gate: Arc::clone(&gate),
+                    decisions: Vec::new(),
+                    failure,
+                }))
+                .is_none())
         });
         OWNED_RECOVERY_TEST_COUNTS.with(|state| assert!(state.replace(Some([0; 3])).is_none()));
         Self { device, gate }
@@ -662,13 +658,14 @@ fn gpu_guarded_owner_run_host_potential_all_hits_and_missing_receipt() {
             "{decisions:?}"
         );
         if mode == 1 {
-            assert!(
-                decisions
-                    .iter()
-                    .any(|d| d.pending == 2 && d.eligible && d.confirmed == 0)
-            );
+            assert!(decisions
+                .iter()
+                .any(|d| d.pending == 2 && d.eligible && d.confirmed == 0));
             assert!(decisions.iter().all(|d| d.pending <= 3));
-            assert!(decisions.iter().filter(|d| d.eligible).all(|d| d.pending <= 2));
+            assert!(decisions
+                .iter()
+                .filter(|d| d.eligible)
+                .all(|d| d.pending <= 2));
         }
         for d in &decisions {
             assert!(d.pending <= d.end && d.pending <= d.limit && d.first < d.end);
@@ -774,19 +771,15 @@ fn gpu_guarded_owner_run_error_cancel_drain_and_next_request() {
         if abort {
             assert!(matches!(result, Err(Error::Aborted)));
         } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("injected guarded-owner-run")
-            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected guarded-owner-run"));
         }
-        assert!(
-            trace
-                .decisions()
-                .iter()
-                .any(|d| d.end == 3 && !d.eligible && d.pending == 3)
-        );
+        assert!(trace
+            .decisions()
+            .iter()
+            .any(|d| d.end == 3 && !d.eligible && d.pending == 3));
         drop(trace);
         fixture.install_cpu_owner(&[1]);
         execute_static(&fixture.be, &plan, &fixture.bindings()).unwrap();

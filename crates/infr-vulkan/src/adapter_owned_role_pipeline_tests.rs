@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Actual ordinary adapter and ACK-activated prepared C, independent of NE32/F32 fixtures.
 use super::*;
 use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};
@@ -541,7 +543,9 @@ impl Fixture {
         assert_eq!(predicate, [3, copy.copy_groups, 1, 1]);
         let names = self.backend.built_kernel_names();
         if selected {
-            assert!(names.contains(&"owned_role_gu_tree64_q5k_256_nr2"));
+            assert!(names.iter().any(|name| {
+                name.starts_with("owned_role_gu_tree64_") && name.ends_with("_256_nr2")
+            }));
             assert!(names.contains(&if copy.wide_copy {
                 "owned_role_copy1024"
             } else {
@@ -609,15 +613,13 @@ struct ActivationTrace;
 impl ActivationTrace {
     fn begin() -> Self {
         STAGED_ACTIVATION_TEST_STATE.with(|state| {
-            assert!(
-                state
-                    .replace(Some(StagedActivationTestState {
-                        events: Vec::new(),
-                        setup_failure: None,
-                        retirement_failure: None,
-                    }))
-                    .is_none()
-            );
+            assert!(state
+                .replace(Some(StagedActivationTestState {
+                    events: Vec::new(),
+                    setup_failure: None,
+                    retirement_failure: None,
+                }))
+                .is_none());
         });
         OWNED_RECOVERY_TEST_COUNTS.with(|state| assert!(state.replace(Some([0; 3])).is_none()));
         Self
@@ -664,13 +666,11 @@ fn gpu_owned_role_pipeline_adapter_prepared_mapped_miss() {
         let _off = pipeline::test_scope(&fixture.backend, false);
         execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
         assert_eq!(counts.counts(), [0, 0]);
-        assert!(
-            !fixture
-                .backend
-                .built_kernel_names()
-                .iter()
-                .any(|name| name.starts_with("owned_role_"))
-        );
+        assert!(!fixture
+            .backend
+            .built_kernel_names()
+            .iter()
+            .any(|name| name.starts_with("owned_role_")));
         let output = fixture.read(fixture.buffer(fixture.output), NE);
         let activation = fixture.activation();
         assert!(output.iter().all(|x| x.is_finite()) && output.iter().any(|x| x.abs() > 1e-7));
@@ -770,53 +770,6 @@ fn gpu_owned_role_pipeline_adapter_prepared_mapped_miss() {
     );
 }
 
-#[test]
-fn owned_role_pipeline_auto_gate_qualified_geometry_only() {
-    for enabled in [false, true] {
-        for gate in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Iq2S, DType::Iq3S] {
-            for up in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Iq2S, DType::Iq3S] {
-                for ne in [1792, 2048, 2304] {
-                    for nff in [480, 512, 544] {
-                        for used in [7, 8, 9] {
-                            for rows in [1, 2, 4, 8] {
-                                let expected = enabled
-                                    && gate == DType::Q5K
-                                    && up == DType::Q5K
-                                    && ne == 2048
-                                    && nff == 512
-                                    && used == 8
-                                    && rows == 1;
-                                assert_eq!(
-                                    pipeline::production_eligible(
-                                        enabled,
-                                        [gate, up],
-                                        ne,
-                                        nff,
-                                        rows,
-                                        used
-                                    ),
-                                    expected,
-                                    "enabled={enabled} G={gate:?} U={up:?} ne={ne} nff={nff} used={used} rows={rows}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for rows in [1, 2, 4, 8] {
-        assert!(!pipeline::production_eligible(
-            true,
-            [DType::Iq2S; 2],
-            2560,
-            640,
-            rows,
-            10
-        ));
-    }
-}
-
 fn assert_exact(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
@@ -832,7 +785,7 @@ fn assert_exact(actual: &[f32], expected: &[f32]) {
     }
 }
 
-fn exercise_auto(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>, Vec<f32>) {
+fn exercise_configured(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>, Vec<f32>) {
     let counts = pipeline::test_selection_scope(&fixture.backend);
     let current = VkDecodePlan::new_cpu(&fixture.graph, false, true);
     let next = VkDecodePlan::new_cpu(&fixture.graph, false, true);
@@ -841,19 +794,17 @@ fn exercise_auto(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>,
         let _old = pipeline::test_scope(&fixture.backend, false);
         execute_static(&fixture.backend, &current, &fixture.bindings()).unwrap();
         assert_eq!(counts.counts(), [0, 0]);
-        assert!(
-            !fixture
-                .backend
-                .built_kernel_names()
-                .iter()
-                .any(|name| name.starts_with("owned_role_"))
-        );
+        assert!(!fixture
+            .backend
+            .built_kernel_names()
+            .iter()
+            .any(|name| name.starts_with("owned_role_")));
         (
             fixture.read(fixture.buffer(fixture.output), fixture.rows * fixture.ne),
             fixture.activation(),
         )
     };
-    // No experimental override here or during preparation/replay: exercise config + shape auto.
+    // No test override here or during preparation/replay: exercise the config toggle directly.
     fixture.force_mapped_miss();
     fixture.reset_frontend();
     fixture.poison_role_scratch();
@@ -923,14 +874,14 @@ fn exercise_auto(fixture: Fixture, selected: bool, prepared: bool) -> (Vec<f32>,
 }
 
 #[test]
-#[ignore = "explicit MOE4ALL_TEST_DEVICE; serialized adapter auto on/off, real miss and prepared replay"]
-fn gpu_owned_role_pipeline_adapter_auto_on_off() {
-    let off = exercise_auto(
+#[ignore = "explicit MOE4ALL_TEST_DEVICE; serialized adapter explicit on/off, real miss and prepared replay"]
+fn gpu_owned_role_pipeline_adapter_explicit_on_off() {
+    let off = exercise_configured(
         Fixture::with_profile(2048, 512, 8, 1, [DType::Q5K; 3], false),
         false,
         true,
     );
-    let on = exercise_auto(
+    let on = exercise_configured(
         Fixture::with_profile(2048, 512, 8, 1, [DType::Q5K; 3], true),
         true,
         true,
@@ -940,16 +891,16 @@ fn gpu_owned_role_pipeline_adapter_auto_on_off() {
 }
 
 #[test]
-#[ignore = "explicit MOE4ALL_TEST_DEVICE; serialized real adapter default fallback, Q5K rows 2/4/8 and Flash geometry"]
-fn gpu_owned_role_pipeline_adapter_auto_multirow_and_flash_fallback() {
+#[ignore = "explicit MOE4ALL_TEST_DEVICE; serialized explicit role pipeline, Q5K rows 2/4/8 and Flash geometry"]
+fn gpu_owned_role_pipeline_adapter_explicit_multirow_and_flash() {
     for rows in [2, 4, 8] {
-        exercise_auto(
+        exercise_configured(
             Fixture::with_profile(2048, 512, 8, rows, [DType::Q5K; 3], true),
-            false,
+            true,
             false,
         );
     }
-    exercise_auto(
+    exercise_configured(
         Fixture::with_profile(
             2560,
             640,
@@ -958,7 +909,7 @@ fn gpu_owned_role_pipeline_adapter_auto_multirow_and_flash_fallback() {
             [DType::Iq2S, DType::Iq2S, DType::Iq4Nl],
             true,
         ),
-        false,
+        true,
         false,
     );
 }
