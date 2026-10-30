@@ -4119,6 +4119,57 @@ fn main() {
             "native_gemm_warp_q8_0_n128_ag_bm128",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
         ),
+        // BM128 (128x128 single-buffer) warptile for the rest of the native-dense formats. The
+        // tile itself is format-agnostic — A_GLOBAL only changes how the A fragment is loaded and
+        // the dequant path is unchanged — so each is the SAME -DBM128 switch on its own FMT define.
+        // The recorder's `dense_bm128_applies` decides when it is taken (measured-large m with
+        // wide k/n; the bench loses at m=128 and several short-k/narrow-n shapes regressed in
+        // isolated BAAB, so this is not a blanket "always on").
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n128_ag_bm128",
+            &["-DFMT_BF16", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_n128_ag_bm128",
+            &["-DFMT_IQ4NL", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4xs_n128_ag_bm128",
+            &["-DFMT_IQ4XS", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q2k_n128_ag_bm128",
+            &["-DFMT_Q2K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_n128_ag_bm128",
+            &["-DFMT_Q3K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4_0_n128_ag_bm128",
+            &["-DFMT_Q4_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_ag_bm128",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_ag_bm128",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_ag_bm128",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
         (
             // Qwen3.8 recurrent projection: N=320 is divisible by 64 but not 128, so it used to
             // miss every warptile and fall back to the legacy BN=64/BK=32 kernel. Keep BN=64,

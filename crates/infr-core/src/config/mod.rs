@@ -611,8 +611,10 @@ cfg_struct! {
         iq4_pair_lut: bool = true,
         /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
         kquant_packed_decode: bool = true,
-        /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
-        /// The original BM64 path remains the per-feature fallback.
+        /// BM128 (128x128 single-buffer) Prefill warptile on measured Windows RX 7900 XTX.
+        /// Every native-dense format with a `_n128_ag_bm128` build takes it at m>=1024 with
+        /// whole 128-row tiles and wide k/n; short-k/narrow-n shapes and the m=512 Flash tuples
+        /// that regressed keep the BM64 tile. See `dense_bm128_applies`.
         q8_prefill_bm128: bool = true,
         /// Expand a narrow-output (n not a multiple of 64, so no tiled GEMM tile exists) native
         /// Prefill weight to f32 and contract it with the batched f32r GEMV instead of the native

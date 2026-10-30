@@ -1989,6 +1989,31 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
     })
 }
 
+/// BM=128 row-tile variant of [`native_gemm_warp_n128_ag_kernel_name`]: NARROW_N + A_GLOBAL with
+/// the row tile doubled (WM 32→64, 4×4 accumulator frags per warp — more B-frag reuse per LDS
+/// load). `kernel-bench`'s `t128sb` sweep measured 52.9 → 72.3 TF on 2048x4096x14336 and 53.4 →
+/// 63.0 on 2048x4096x4096, but a LOSS at m=128 (4.9 vs 3.8 TF), so the recorder only takes this
+/// tile at measured-large m with wide k/n — see `dense_bm128_applies`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_ag_bm128_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_n128_ag_bm128",
+        Iq4Nl => "native_gemm_warp_iq4nl_n128_ag_bm128",
+        Iq4Xs => "native_gemm_warp_iq4xs_n128_ag_bm128",
+        Q2K => "native_gemm_warp_q2k_n128_ag_bm128",
+        Q3K => "native_gemm_warp_q3k_n128_ag_bm128",
+        Q4_0 => "native_gemm_warp_q4_0_n128_ag_bm128",
+        Q4K => "native_gemm_warp_q4k_n128_ag_bm128",
+        Q5K => "native_gemm_warp_q5k_n128_ag_bm128",
+        Q6K => "native_gemm_warp_q6k_n128_ag_bm128",
+        Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm128",
+        _ => return None,
+    })
+}
+
 /// BN=64/BK=64 A_GLOBAL warptile for output widths divisible by 64 but not 128.
 /// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
 /// Bf16 is Qwen3.8-Flash-Next's HC-projection width (320x10240 / 10240x320 at prefill m).

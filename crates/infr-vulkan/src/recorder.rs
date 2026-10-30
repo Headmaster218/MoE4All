@@ -585,7 +585,21 @@ pub(crate) fn narrow_f32_gemm_eligible(
         && crate::gemm::weight_f32_build_spv(dtype).is_some()
 }
 
-pub(crate) fn q8_prefill_bm128_applies(
+/// The BM128 (128x128 single-buffer A_GLOBAL) row tile: when to take it instead of the BM64
+/// `*_n128_ag` tile. `kernel-bench`'s `t128sb` sweep measured the tile at 52.9 → 72.3 TF
+/// (2048x4096x14336) and 53.4 → 63.0 (2048x4096x4096), but a LOSS at m=128 (4.9 vs 3.8 TF). The
+/// tile itself is format-agnostic, so this gate is dtype-generic: ANY native-dense format with a
+/// `_n128_ag_bm128` build qualifies (see `native_gemm_warp_n128_ag_bm128_kernel_name`).
+///
+/// `m % 128 == 0` is a CORRECTNESS bound, not a tuning one: the kernel stores whole BM-row C tiles
+/// into the caller's buffer, and `lin_a16` is only padded to 64 rows. A ragged chunk (the usual
+/// tail of a prompt) therefore keeps the BM64 tile.
+///
+/// The shape guards come from this tree's own BAAB record, which the `t128sb` microbenchmark did
+/// not cover: short-K and narrow-N shapes LOST with this tile at m>=1024 (k=512 n=2048, k=1024
+/// n=3072, k=640 n=2560, k=2560 n=640), and of the three Flash m=512 shapes only k=3072 kept its
+/// win. Those stay on BM64; nothing else is excluded.
+pub(crate) fn dense_bm128_applies(
     enabled: bool,
     measured: bool,
     default_ag: bool,
@@ -597,15 +611,12 @@ pub(crate) fn q8_prefill_bm128_applies(
     enabled
         && measured
         && default_ag
-        && dtype == infr_core::DType::Q8_0
-        && matches!(
-            (k, n, m),
-            (3072, 8192, 512)
-                | (8192, 3072, 1024)
-                | (3072, 12288, 512 | 1024)
-                | (2560, 10240, 1024)
-                | (2560, 12288, 1024)
-        )
+        && n.is_multiple_of(128)
+        && k.is_multiple_of(32)
+        && m.is_multiple_of(128)
+        && crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).is_some()
+        && ((m >= 1024 && k >= 2048 && n >= 1024)
+            || matches!((k, n, m), (3072, 8192, 512) | (3072, 12288, 512)))
 }
 
 fn kquant_packed_applies(
@@ -3796,8 +3807,10 @@ impl<'a> Recorder<'a> {
                 64,
             )
         };
-        // All six tuples have M%128==0 and production splits==1. No padding or split policy change.
-        let (name, bn, bm) = if q8_prefill_bm128_applies(
+        // BM128 needs m%128==0 (whole-tile C stores into an m-row buffer, and `lin_a16` is only
+        // padded to 64 rows); `dense_bm128_applies` enforces it, so the padded-dst dance and the
+        // split policy are unchanged.
+        let (name, bn, bm) = if dense_bm128_applies(
             self.vk().q8_prefill_bm128,
             self.be.prefers_q8_prefill_bm128(),
             self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
@@ -3806,7 +3819,11 @@ impl<'a> Recorder<'a> {
             k,
             n,
         ) {
-            ("native_gemm_warp_q8_0_n128_ag_bm128", 128, 128)
+            (
+                crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).expect("bm128 name"),
+                128,
+                128,
+            )
         } else {
             (name, bn, bm)
         };
