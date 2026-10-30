@@ -125,8 +125,18 @@ pub struct Config {
     pub qwen4exp: bool,
     /// Ling 3.0 (`bailingmoe3`): hybrid KDA/MLA mixer and DeepSeek-style MoE.
     pub bailingmoe3: bool,
+    /// GLM-5.3-Flash (`glm5next`): the Ling-shaped KDA/MLA hybrid PLUS deepseek4-style
+    /// hyper-connections, a kpool-4 indexer compressor on its MLA blocks, NoPE everywhere
+    /// (`rope.dimension_count = 0`), and one NextN block. Shares the `bailingmoe3`-shaped KDA
+    /// fields (head dim / gate bound / conv kernel / per-layer selector) and the deepseek2-shaped
+    /// MLA/MoE fields; its own additions are [`Config::glm_mla_layers`], [`Config::indexer_kpool`]
+    /// and the `deepseek4`-shared `hc_*` triple below.
+    pub glm5next: bool,
     /// Per-layer mixer selector for `bailingmoe3`: true is MLA, false is KDA. Empty elsewhere.
     pub bailing_mla_layers: Vec<bool>,
+    /// Per-layer mixer selector for `glm5next` (same `attention.head_count_kv` 0/1-array encoding
+    /// as [`Config::bailing_mla_layers`]: 1 = MLA, 0 = KDA). Empty outside `glm5next`.
+    pub glm_mla_layers: Vec<bool>,
     /// Ling KDA per-head Q/K/V width and lower bound used by its log-decay gate.
     pub kda_head_dim: usize,
     pub kda_gate_lower_bound: f32,
@@ -304,6 +314,11 @@ pub struct Config {
     /// indexer keys come from the compressor. `0` for every model that is neither `deepseek32` nor
     /// `deepseek4`.
     pub indexer_top_k: usize,
+    /// GLM-5.3-Flash (`{arch}.attention.indexer.kpool`): how many consecutive indexer keys pool
+    /// into one scored key (llama.cpp's glm5next compressor: the per-layer
+    /// `indexer_compressor_ape`/`_gate` pair scores each k-pool; incomplete tail pools are kept).
+    /// `top_k` counts POOLED keys. `0` for every other arch.
+    pub indexer_kpool: usize,
     /// llama.cpp's `hparams.f_norm_eps` — the epsilon of a non-RMS LayerNorm, DISTINCT from
     /// [`Config::rms_eps`] (`f_norm_rms_eps`, read from the GGUF). The lightning indexer's
     /// `k_norm` is the only mean-centred norm anywhere in this family, and `deepseek32.cpp`
@@ -528,7 +543,7 @@ impl Config {
     /// and rides the every-layer branch. `false` for dense models (`self.moe` is `None`).
     pub fn is_moe_layer(&self, il: usize) -> bool {
         self.moe.is_some()
-            && if self.deepseek || self.deepseek2 || self.bailingmoe3 {
+            && if self.deepseek || self.deepseek2 || self.bailingmoe3 || self.glm5next {
                 il >= self.n_layer_dense_lead
             } else if self.moe_interleave_step > 0 {
                 (il + 1).is_multiple_of(self.moe_interleave_step)
@@ -570,14 +585,20 @@ impl Config {
         self.bailingmoe3 && self.bailing_mla_layers.get(il).copied().unwrap_or(false)
     }
 
+    /// Whether GLM-5.3-Flash layer `il` uses MLA rather than KDA.
+    pub fn is_glm_mla_layer(&self, il: usize) -> bool {
+        self.glm5next && self.glm_mla_layers.get(il).copied().unwrap_or(false)
+    }
+
     pub fn is_mla_layer(&self, il: usize) -> bool {
-        self.deepseek2 || self.is_bailing_mla_layer(il)
+        self.deepseek2 || self.is_bailing_mla_layer(il) || self.is_glm_mla_layer(il)
     }
 
     pub fn is_recurrent_layer(&self, il: usize) -> bool {
         (self.qwen35 && !self.is_qwen35_attn_layer(il))
             || (self.qwen4exp && self.recurrent_layers.get(il).copied().unwrap_or(false))
             || (self.bailingmoe3 && !self.is_bailing_mla_layer(il))
+            || (self.glm5next && !self.is_glm_mla_layer(il))
     }
 
     /// Whether this architecture has been validated with independent sequence rows in one
@@ -588,7 +609,7 @@ impl Config {
     }
 
     pub fn recurrent_conv_channels(&self) -> usize {
-        if self.bailingmoe3 {
+        if self.bailingmoe3 || self.glm5next {
             3 * self.n_head * self.kda_head_dim
         } else {
             self.q35_conv_channels()
@@ -596,7 +617,7 @@ impl Config {
     }
 
     pub fn recurrent_state_elems(&self) -> usize {
-        if self.bailingmoe3 {
+        if self.bailingmoe3 || self.glm5next {
             self.n_head * self.kda_head_dim * self.kda_head_dim
         } else {
             self.q35_num_v_heads() * self.q35_head_k_dim() * self.q35_head_v_dim()
@@ -643,6 +664,7 @@ impl Config {
             | crate::arch::DEEPSEEK32
             | crate::arch::DEEPSEEK4
             | crate::arch::BAILINGMOE3
+            | crate::arch::GLM5NEXT
             | crate::arch::BITNET
             | crate::arch::BITNET_B158 => false,
             crate::arch::QWEN3
@@ -723,7 +745,12 @@ impl Config {
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
         let qwen4exp = arch == crate::arch::QWEN4EXP;
         let bailingmoe3 = arch == crate::arch::BAILINGMOE3;
-        let mla_arch = deepseek2 || bailingmoe3;
+        // GLM-5.3-Flash: the bailingmoe3-shaped hybrid (KDA/MLA selector, KDA dims, dense lead,
+        // deepseek2-style MoE) PLUS deepseek4-style hyper-connections and a kpool indexer
+        // compressor on its MLA blocks. It folds into every bailingmoe3/deepseek2-shared gate
+        // below; its genuinely new parts are gated on `glm5next` alone.
+        let glm5next = arch == crate::arch::GLM5NEXT;
+        let mla_arch = deepseek2 || bailingmoe3 || glm5next;
         let mk = |k: &str| format!("{arch}.{k}");
         // DeepSeek2-specific metadata: MLA dims, MoE gating function, YaRN (everything EXCEPT
         // "lite" detection, which needs n_layer — added after `n_layer` below).
@@ -776,7 +803,7 @@ impl Config {
             (0, 0, 0, 0, 0)
         };
         let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) =
-            if deepseek2 || deepseek4 || bailingmoe3 {
+            if deepseek2 || deepseek4 || bailingmoe3 || glm5next {
                 // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
                 // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
                 // with no such fallback, and neither arch's real value is softmax — defaulting it would
@@ -863,12 +890,12 @@ impl Config {
         } else {
             (0, 0)
         };
-        let n_expert_groups = if deepseek2 || bailingmoe3 {
+        let n_expert_groups = if deepseek2 || bailingmoe3 || glm5next {
             meta_u64(g, &mk("expert_group_count")).unwrap_or(0) as usize
         } else {
             0
         };
-        let n_expert_groups_used = if deepseek2 || bailingmoe3 {
+        let n_expert_groups_used = if deepseek2 || bailingmoe3 || glm5next {
             meta_u64(g, &mk("expert_group_used_count")).unwrap_or(0) as usize
         } else {
             0
@@ -880,7 +907,7 @@ impl Config {
         // `indexer.k_norm` — its keys come from the compressor) but is described by the same three
         // numbers.
         let (indexer_n_head, indexer_head_size, indexer_top_k) =
-            if deepseek32 || deepseek4 || qwen4exp {
+            if deepseek32 || deepseek4 || qwen4exp || glm5next {
                 let ix = |k: &str| -> Result<usize> {
                     let key = mk(k);
                     let v = meta_u64(g, &key).with_context(|| format!("{key} missing"))?;
@@ -894,10 +921,24 @@ impl Config {
             } else {
                 (0, 0, 0)
             };
+        // GLM-5.3-Flash's key-pooling factor (`attention.indexer.kpool`): the indexer scores
+        // one pooled key per kpool consecutive tokens (llama.cpp's glm5next keeps incomplete
+        // tail pools). Required on glm5next — its `top_k` counts POOLED keys, so a missing or
+        // zero value would silently change what the indexer selects.
+        let indexer_kpool = if glm5next {
+            let key = mk("attention.indexer.kpool");
+            positive_model_dimension(
+                &key,
+                meta_u64(g, &key).with_context(|| format!("{key} missing"))?,
+            )?
+        } else {
+            0
+        };
         // The indexer's `k_norm` is a real (mean-centred) LayerNorm and `deepseek32.cpp` hardcodes
         // `hparams.f_norm_eps = 1e-6` for it — a SEPARATE epsilon from `f_norm_rms_eps` (`rms_eps`
-        // below), which stays whatever the GGUF declares.
-        let norm_eps = if deepseek32 { 1e-6 } else { 0.0 };
+        // below), which stays whatever the GGUF declares. glm5next carries the same k_norm and
+        // llama.cpp's glm5next.cpp hardcodes the same epsilon.
+        let norm_eps = if deepseek32 || glm5next { 1e-6 } else { 0.0 };
         let n_layer_all = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
         // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/mtp.md): `{arch}.nextn_predict_layers`
         // extra decoder block(s) appended AFTER the trunk — `block_count` INCLUDES them. Ported
@@ -930,13 +971,15 @@ impl Config {
             && arch != crate::arch::QWEN35
             && arch != crate::arch::QWEN35_MOE
             && !deepseek32
+            && !glm5next
         {
             bail!(
-                "{arch}.nextn_predict_layers is only supported on arch={}|{}|{} (MTP/NextN); got \
+                "{arch}.nextn_predict_layers is only supported on arch={}|{}|{}|{} (MTP/NextN); got \
                  nextn_predict_layers={n_layer_nextn} on arch={arch:?}",
                 crate::arch::QWEN35,
                 crate::arch::QWEN35_MOE,
                 crate::arch::DEEPSEEK32,
+                crate::arch::GLM5NEXT,
             );
         }
         // The reference caps qwen35 at a single MTP block (`GGML_ASSERT(hparams.n_layer_nextn ==
@@ -993,6 +1036,18 @@ impl Config {
                     0,
                     0,
                 )
+            } else if glm5next {
+                // glm5next.cpp reads the same (count, sinkhorn_iterations, epsilon) triple as
+                // deepseek4 — full-rank Sinkhorn HC, no low-rank bottleneck, no hash routing, and
+                // its output projection is a plain `attn_output` (no group/LoRA split).
+                (
+                    0,
+                    0,
+                    req_dim("hyper_connection.count")?,
+                    0,
+                    req_u64("hyper_connection.sinkhorn_iterations")? as usize,
+                    0,
+                )
             } else {
                 (0, 0, 0, 0, 0, 0)
             };
@@ -1001,6 +1056,9 @@ impl Config {
                 req_f32("attention.compress_rope_freq_base")?,
                 req_f32("hyper_connection.epsilon")?,
             )
+        } else if glm5next {
+            // No compressed layers → no compress rope base; the Sinkhorn epsilon is required.
+            (0.0, req_f32("hyper_connection.epsilon")?)
         } else {
             (0.0, 0.0)
         };
@@ -1078,10 +1136,11 @@ impl Config {
                 );
             }
             (exp, shexp)
-        } else if bailingmoe3 {
+        } else if bailingmoe3 || glm5next {
             // llama.cpp's bailingmoe3 loader reads both keys with `required = false`. Ling 3.0
             // Tiny publishes neither because its HF clamp lists are null; Flash GGUFs may publish
             // either independently. A zero limit is the graph's explicit "clamp disabled" value.
+            // glm5next publishes BOTH as full all-10.0 arrays; same optional-key handling.
             let exp = clamp_arr("swiglu_clamp_exp").unwrap_or_else(|| vec![0.0; n_layer]);
             if exp.len() < n_layer {
                 bail!(
@@ -1219,6 +1278,7 @@ impl Config {
             || deepseek2
             || deepseek4
             || bailingmoe3
+            || glm5next
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
@@ -1241,7 +1301,7 @@ impl Config {
                     true,
                     meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
                 )
-            } else if deepseek2 || deepseek4 || bailingmoe3 {
+            } else if deepseek2 || deepseek4 || bailingmoe3 || glm5next {
                 let gating = match expert_gating_func {
                     // 0 = the key is absent, which llama.cpp documents as softmax for the old
                     // V2/V2.5 GGUFs written before `expert_gating_func` existed
@@ -1441,11 +1501,10 @@ impl Config {
         } else {
             Vec::new()
         };
-        let (kda_head_dim, kda_gate_lower_bound) = if bailingmoe3 {
+        let (kda_head_dim, kda_gate_lower_bound) = if bailingmoe3 || glm5next {
             (
-                meta_u64(g, &mk("kda.head_dim")).context("bailingmoe3.kda.head_dim")? as usize,
-                meta_f64(g, &mk("kda.gate_lower_bound"))
-                    .context("bailingmoe3.kda.gate_lower_bound")? as f32,
+                meta_u64(g, &mk("kda.head_dim")).context("kda.head_dim")? as usize,
+                meta_f64(g, &mk("kda.gate_lower_bound")).context("kda.gate_lower_bound")? as f32,
             )
         } else {
             (0, 0.0)
@@ -1465,10 +1524,9 @@ impl Config {
                     .with_context(|| format!("{arch} ssm.time_step_rank"))?
                     as usize,
             )
-        } else if bailingmoe3 {
+        } else if bailingmoe3 || glm5next {
             (
-                meta_u64(g, &mk("ssm.conv_kernel")).context("bailingmoe3.ssm.conv_kernel")?
-                    as usize,
+                meta_u64(g, &mk("ssm.conv_kernel")).context("ssm.conv_kernel")? as usize,
                 kda_head_dim,
                 n_head * kda_head_dim,
                 n_head,
@@ -1494,7 +1552,7 @@ impl Config {
         };
         let attn_out_gate = qwen35 || qwen4exp;
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
-        let n_layer_dense_lead = if deepseek || deepseek2 || bailingmoe3 {
+        let n_layer_dense_lead = if deepseek || deepseek2 || bailingmoe3 || glm5next {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
         } else {
             0
@@ -1508,7 +1566,7 @@ impl Config {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
-        } else if deepseek || deepseek2 || deepseek4 || bailingmoe3 {
+        } else if deepseek || deepseek2 || deepseek4 || bailingmoe3 || glm5next {
             let n_shared = meta_u64(g, &mk("expert_shared_count")).unwrap_or(0) as usize;
             moe.map(|m| m.n_ff_exp * n_shared).unwrap_or(0)
         } else {
@@ -1576,7 +1634,9 @@ impl Config {
         } else {
             (0, 0.0, 0.0, 0.0, 0, 0.0)
         };
-        let bailing_mla_layers = if bailingmoe3 {
+        // Per-layer mixer selector, shared by bailingmoe3 and glm5next: `attention.head_count_kv`
+        // is a per-layer 0/1 ARRAY (not a scalar) on both — 0 = KDA layer, 1 = MLA layer.
+        let mla_selector = || -> Result<Vec<bool>> {
             let key = mk("attention.head_count_kv");
             let values = g
                 .metadata()
@@ -1594,7 +1654,15 @@ impl Config {
                     Some(1) => Ok(true),
                     other => bail!("{key}[{il}] must be 0 (KDA) or 1 (MLA), got {other:?}"),
                 })
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()
+        };
+        let bailing_mla_layers = if bailingmoe3 {
+            mla_selector()?
+        } else {
+            Vec::new()
+        };
+        let glm_mla_layers = if glm5next {
+            mla_selector()?
         } else {
             Vec::new()
         };
@@ -1877,7 +1945,9 @@ impl Config {
             qwen35,
             qwen4exp,
             bailingmoe3,
+            glm5next,
             bailing_mla_layers,
+            glm_mla_layers,
             kda_head_dim,
             kda_gate_lower_bound,
             full_attn_interval,
@@ -1925,6 +1995,7 @@ impl Config {
             indexer_n_head,
             indexer_head_size,
             indexer_top_k,
+            indexer_kpool,
             norm_eps,
             q_lora_rank,
             kv_lora_rank,

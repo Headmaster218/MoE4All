@@ -2,7 +2,7 @@
 //! Mechanically split out of `lib.rs` (no logic change).
 use crate::{
     BAILINGMOE_PRE_RE, DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES,
-    LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE,
+    GLM4_PRE_RE, LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
@@ -164,6 +164,21 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
             // Sequence[ Split(pre regex, Isolated), ByteLevel(use_regex=false) ] — matches HF.
             let split = Split::new(
                 SplitPattern::Regex(re.to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .map_err(|e| anyhow!("split pretokenizer: {e}"))?;
+            let seq = PreSequence::new(vec![
+                PreTokenizerWrapper::Split(split),
+                PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+            ]);
+            tok.with_pre_tokenizer(Some(seq));
+        }
+        "glm4" | "chatglm4" => {
+            // GLM-4 / glm5next: Sequence[ Split(glm4 regex, Isolated), ByteLevel ] — same shape
+            // as the qwen2/bailing arms, GLM's own pattern (contractions + 1-3-digit runs).
+            let split = Split::new(
+                SplitPattern::Regex(GLM4_PRE_RE.to_string()),
                 SplitDelimiterBehavior::Isolated,
                 false,
             )
@@ -750,5 +765,42 @@ mod tokenizer_tests {
         // template tokenizer: <|im_end|> matched as the special id; user tokenizer: NOT.
         assert!(tok.encode(s, false).unwrap().get_ids().contains(&im_end));
         assert!(!user.encode(s, false).unwrap().get_ids().contains(&im_end));
+    }
+
+    // M3 acceptance for the glm5next port: `tokenizer.ggml.pre == "glm4"` must reproduce
+    // `llama-tokenize` ids on the REAL export, byte for byte. The three strings pin the two
+    // glm4-specific behaviours the GPT-2 default arm gets wrong — spelled-out contractions
+    // (`I'm` -> one token) and 1-3-digit number runs (`12345` -> `123`+`45`) — plus CJK.
+    // Opt-in like the config test: point `INFR_TEST_GLM5NEXT` at shard 1; without it, skip.
+    #[test]
+    fn glm4_pre_tokenizer_matches_llama_tokenize() {
+        let Some(path) = std::env::var("INFR_TEST_GLM5NEXT")
+            .ok()
+            .map(std::path::PathBuf::from)
+        else {
+            eprintln!("skip: set INFR_TEST_GLM5NEXT to the glm5.3-flash GGUF shard 1");
+            return;
+        };
+        let g = Gguf::open(&path).expect("open gguf");
+        assert_eq!(
+            g.metadata().str("tokenizer.ggml.pre"),
+            Some("glm4"),
+            "test model must be the glm4 pre-type"
+        );
+        let tok = build_tokenizer(&g).expect("build tokenizer");
+        let ids = |s: &str| tok.encode(s, false).unwrap().get_ids().to_vec();
+        // Gold ids from `llama-tokenize --stdin --verbose` on this exact file (no BOS, no specials).
+        assert_eq!(
+            ids("I'm the capital — 12345 ok"),
+            vec![40, 2776, 279, 6722, 1959, 220, 108714, 100461, 5394]
+        );
+        assert_eq!(
+            ids("你好，世界！GLM-4 6.35B"),
+            vec![109377, 3837, 99011, 6313, 3825, 44, 12, 19, 220, 21, 13, 100235, 33]
+        );
+        assert_eq!(
+            ids("def f(x): return x**2"),
+            vec![750, 282, 2075, 1648, 470, 856, 334, 17]
+        );
     }
 }

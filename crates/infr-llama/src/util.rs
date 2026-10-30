@@ -16,6 +16,13 @@ pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}
 /// pre-type rather than Qwen2's case-insensitive contraction group.
 pub(crate) const BAILINGMOE_PRE_RE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
 
+/// GLM-4 / glm5next pre-tokenizer (`tokenizer.ggml.pre == "glm4"`), llama.cpp's CHATGLM4 pre-type
+/// verbatim (`src/llama-vocab.cpp`). Two visible departures from the GPT-2 default: spelled-out
+/// case-sensitive contractions (`'m`/`'s`… become single tokens) and `\p{N}{1,3}` digit runs —
+/// numbers split in groups of up to THREE (`12345` -> `123`+`45`), where GPT-2/Qwen cap at one
+/// digit per token. Verified against `llama-tokenize` on this exact GGUF.
+pub(crate) const GLM4_PRE_RE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// Qwen3.5/3.8 pre-tokenizer. `\p{M}` is significant for combining marks; this is the exact
 /// pattern published in Qwen3.8's tokenizer.json and selected by llama.cpp's `qwen35` pre-type.
 pub(crate) const QWEN35_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";

@@ -1379,8 +1379,8 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// * `INFR_PROFILE` and `INFR_GIT_COMMIT` in `build.rs` — BUILD-time inputs; a runtime `Config` cannot exist
 ///   when it is read (§5.3).
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_EMBEDDING_TEST_*` /
-///   `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that point at files on disk, deliberately left
-///   on the environment.
+///   `INFR_LLAMA_DIFFUSION_CLI` / `INFR_TEST_GLM5NEXT` — test/dev fixtures that point at files on
+///   disk, deliberately left on the environment.
 /// * `INFR_NO_MOE_SHARED_SLOT` — a backend-private same-binary validation escape hatch, explicitly
 ///   accounted for in `manifest::NOT_MIGRATED`.
 ///
@@ -1402,6 +1402,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_NO_MOE_SHARED_SLOT",
         "INFR_IMAGE_CODEC_DIR",
         "INFR_IMAGE_CODEC_FIXTURES",
+        "INFR_TEST_GLM5NEXT",
     ];
 
     let Some(crates) = repo_crates_dir() else {

@@ -932,6 +932,52 @@ pub enum Op {
         /// Absolute position of the first query row (the causal bound is `pos + t`).
         pos: u32,
     },
+    /// GLM-5.3-Flash's k-pool DSA indexer (`glm5-next.cpp`): the indexer scores ONE pooled key
+    /// per `kpool` consecutive tokens and keeps the top `top_k / kpool` pools, emitting their
+    /// member TOKEN indices `[rows, top_k]` — pools in score-DESC order, members ascending —
+    /// for the following `Op::TopkMask` to turn into the additive MLA mask.
+    ///
+    /// Pooling is PER CHANNEL along the slot axis: `pooled[p][d] = Σ_s softmax_s(gate[p·kpool+s]
+    /// [d] + ape[s·head_dim+d]) · key[p·kpool+s][d]`. The last pool may be incomplete: missing
+    /// members contribute `key = 0, gate = 0` (the reference reads them from a zeroed dump row),
+    /// so their `ape` logits still join the softmax.
+    ///
+    /// Scoring is `Op::LightningIndexer`'s over pooled keys: `score[p] = Σ_h (w[t,h] · scale) ·
+    /// relu(iq[t,h] · pooled[p])`. Pool `p` is visible to the query at `q = pos + t` when its
+    /// FIRST member is causally eligible (`p · kpool <= q`); incomplete tail pools are never
+    /// appended separately (`attention.indexer.kpool_select_tail` is absent — false — in this
+    /// export). When every visible pool fits in the budget (short contexts) the emitted set is
+    /// exactly the causal prefix, which is why the dense interim was numerically equal there.
+    ///
+    /// `k_cache` rows are `[key | gate]` = `2 · head_dim` f32 per token, written by `Op::WriteKv`
+    /// from the packed scratch. Padding slots (fewer than `top_k / kpool` pools exist) repeat
+    /// token 0 — `Op::TopkMask`'s write is idempotent, and every slot must carry a real index
+    /// (the i32-in-f32-bits convention has no sentinel).
+    GlmKpoolIndexer {
+        /// Indexer queries `[rows, n_head, head_dim]`, f32 — NO rope (the arch is NoPE).
+        q: TensorId,
+        /// Indexer key cache `[cap_rows, 2 · head_dim]` — key at columns `0..head_dim`, pool gate
+        /// at `head_dim..2·head_dim`, one row per token.
+        k_cache: TensorId,
+        /// Learned per-slot pooling APE `[kpool · head_dim]` f32, slot-major (`ape[s·head_dim+d]`);
+        /// the GGUF `[head_dim, kpool]` array lands in this order.
+        ape: TensorId,
+        /// Per-head indexer weights `w` `[rows, n_head]`, f32 — `indexer_proj · x`, UNSCALED.
+        weights: TensorId,
+        /// Selected token indices `[rows, top_k]`, i32 (u32-bits-in-f32 convention).
+        dst: TensorId,
+        rows: u32,
+        kv_len: u32,
+        n_head: u32,
+        head_dim: u32,
+        kpool: u32,
+        /// TOKEN budget (pools kept = `top_k / kpool`, clamped to the pool count).
+        top_k: u32,
+        /// `1/sqrt(head_dim * n_head)` — multiplies `w[t, h]`, like `Op::LightningIndexer`.
+        scale: f32,
+        /// Absolute position of the first query row.
+        pos: u32,
+    },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
     /// shifts the `up` read by a whole-element offset so a layer-major slice of a bigger buffer can
@@ -1488,6 +1534,7 @@ impl Op {
             Op::Attention { .. } => "Attention",
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
+            Op::GlmKpoolIndexer { .. } => "GlmKpoolIndexer",
             Op::TopkMask { .. } => "TopkMask",
             Op::HyperConnectMix { .. } => "HyperConnectMix",
             Op::HyperConnectPre { .. } => "HyperConnectPre",
@@ -1751,6 +1798,14 @@ impl Op {
                 dst,
                 ..
             } => (vec![q, k_cache, weights], vec![dst]),
+            Op::GlmKpoolIndexer {
+                q,
+                k_cache,
+                ape,
+                weights,
+                dst,
+                ..
+            } => (vec![q, k_cache, ape, weights], vec![dst]),
             Op::TopkMask { idx, dst, .. } => (vec![idx], vec![dst]),
             Op::HyperConnectMix {
                 mixes,
@@ -2079,7 +2134,9 @@ impl Graph {
                     // of its BOUND buffer at the op's own dtype, never through the interpreter's
                     // f32 working store. `Skip` is what keeps the store from mirroring (and, for
                     // an f32-declared cache, writing back) a buffer no op here ever wrote.
-                    Op::Mla { k_cache, .. } | Op::LightningIndexer { k_cache, .. } => {
+                    Op::Mla { k_cache, .. }
+                    | Op::LightningIndexer { k_cache, .. }
+                    | Op::GlmKpoolIndexer { k_cache, .. } => {
                         set.insert(*k_cache);
                     }
                     _ => {}
