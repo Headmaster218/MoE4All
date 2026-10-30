@@ -1589,7 +1589,8 @@ const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 4096 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// 5120 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default and the
+/// measurements behind that number). ONE
 /// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
 /// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
@@ -1709,18 +1710,36 @@ fn first_successful_moe_ubatch<T, E>(
     Ok(None)
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 4096 rows on a
-/// discrete GPU in both profiles, EXCEPT on an integrated GPU, where a chunk that big is a single
-/// multi-second command buffer and trips
-/// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
-/// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 5120 rows on a
+/// discrete GPU, EXCEPT on an integrated GPU, where a chunk that big is a single multi-second
+/// command buffer and trips the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` ->
+/// `VK_ERROR_DEVICE_LOST`). See [`infr_core::integrated_ubatch_rows`] for the measurements behind
+/// the smaller default.
+///
+/// 5120 is measured, not guessed, and UBATCH IS THE FIRST ALLOCATION: its runtime reserve comes off
+/// the top of the unified arena (`ModelMemoryPlan::runtime_elastic`, ~1.5 GiB per 1024 rows on
+/// Qwen3.8-Flash-Next — 6.2 GiB at 4096) and the expert cache is whatever remains, so this constant
+/// is the knob that decides how much VRAM the experts get. Two independent measurements put the
+/// knee here:
+///   - `kernel-bench --sweep-m` (Vulkan coopmat, the model's two MoE shapes): 640x2560 peaks at
+///     m=4096 (52.9 TF) and 2560x1280 keeps climbing only to 8192 (48.9 → 54.1 TF), so there is
+///     nothing to win far past one warp-tile row block.
+///   - this branch, pp30000 `--ctx 32768` on the 7900 XTX, each rung run twice in the symmetric
+///     order 4096 / 5120 / 6144 / 6144 / 5120 / 4096: base 1718.4 / 1834.8 / 1881.4 t/s (+6.8% then
+///     +2.5%) and IQ3_S 1361.8 / 1415.0 / 1412.4 (+3.9% then −0.2%). 5120 is the tallest rung that
+///     held all FOUR prefill lanes in every leg; one of the two base 6144 legs fell to three
+///     (`target_lanes=4 actual_lanes=3`), and the expert cache the extra 1024 rows costs is worth
+///     less than the lane.
+/// A GPU too small for 5120's reserve loses nothing: the plan's placement sweep starts at this
+/// height and walks [`ubatch_fallbacks_below`] down until the expert cache clears the prefill floor,
+/// so aiming high costs one CPU-side plan recomputation.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) uses the profile default.
+/// `device_class()` is `None`) uses this default.
 fn default_ubatch_rows(_profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 4096,
+        _ => 5120,
     }
 }
 
@@ -7218,16 +7237,16 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            4096,
-            "no pin, no iGPU: both profiles start at 4096 and let placement fall back"
+            5120,
+            "no pin, no iGPU: both profiles start at the measured 5120 and let placement fall back"
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_rows(&aggressive),
-            4096,
-            "the aggressive discrete default uses a larger prefill chunk"
+            5120,
+            "the aggressive discrete default uses the same measured prefill chunk"
         );
 
         let pinned = EngineConfig {
@@ -7256,7 +7275,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            4096,
+            5120,
             "…and the height falls back"
         );
     }
@@ -7265,10 +7284,10 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 5120);
 
         ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 5120);
 
         ec.device.ubatch = Some(3072);
         ec.device.ubatch_specified = true;
@@ -7285,17 +7304,17 @@ mod seam_helper_tests {
         let mut automatic = EngineConfig::default();
         automatic.spec.mtp = true;
 
-        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(super::ubatch_rows(&automatic), 5120);
         assert_eq!(
             super::ubatch_candidates(&automatic),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         automatic.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(super::ubatch_rows(&automatic), 5120);
         assert_eq!(
             super::ubatch_candidates(&automatic),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         automatic.device.ubatch = Some(3072);
@@ -8822,17 +8841,17 @@ mod seam_helper_tests {
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 4096);
+        assert_eq!(super::ubatch_rows(&unset), 5120);
         assert_eq!(
             super::ubatch_candidates(&unset),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_candidates(&aggressive),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
         assert_eq!(
             super::ubatch_fallbacks_below(3072),

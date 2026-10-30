@@ -178,7 +178,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 **`[device]`** — 使用哪块 GPU（`dev`）、上下文大小（`ctx`）、预填充微批（`ubatch`、`ubatch_parallel`）、CPU `threads`，以及两个低层设备调节项（用于 iGPU 提交拆分器的 `submit_dispatches`，以及强制子组为 16 或 32 的 `subgroup_pref`）。
 
-`device.auto_profile` 可设为 `conservative`（默认）或 `aggressive`。未显式指定 RAM 预算或旧分页覆盖时，启动阶段将保守档的“当前可用 RAM - 3 GiB”、激进档的“总物理 RAM - 13 GiB”写入 `device.ram_budget`，之后按显式总进程预算路径处理。离散 GPU 两档的 Prefill ubatch 都从 4096 行开始，并可因显存放置不足而下调；并发 ubatch 未单独指定时继承最终值，iGPU 使用独立的小批默认值。
+`device.auto_profile` 可设为 `conservative`（默认）或 `aggressive`。未显式指定 RAM 预算或旧分页覆盖时，启动阶段将保守档的“当前可用 RAM - 3 GiB”、激进档的“总物理 RAM - 13 GiB”写入 `device.ram_budget`，之后按显式总进程预算路径处理。离散 GPU 两档的 Prefill ubatch 都从 5120 行开始（由 m 扫描的算力拐点与本机 pp30k 阶梯实测确定：5120 是仍能保住全部 4 条 prefill lane 的最高档），并可因显存放置不足而下调；并发 ubatch 未单独指定时继承最终值，iGPU 使用独立的小批默认值。
 
 `device.vram_budget` / `INFR_VRAM_BUDGET` 限制后端的总设备内存占用：常驻权重、KV、运行时分配以及专家/稠密分页器都计入其中。`device.vram_reserve` / `INFR_VRAM_RESERVE` 还会在 Vulkan 内置的 256 MiB 安全保护之上额外保留相应的物理 VRAM。例如，`INFR_VRAM_BUDGET=23g` 和 `INFR_VRAM_RESERVE=512m` 表示严格的 23 GiB 进程上限加 512 MiB 额外物理余量。两者都未显式指定时，保守自动档在分配器 guard 外再留 768 MiB（合计约 1 GiB），激进档直接使用扣除 guard 后的设备当前可用量。任一显式值出现时走显式约束路径；统一 arena 仍以固定资源落地后的真实余量定容，物理分配失败时会缩小 arena 或下调 Ubatch 后重新探测。
 
