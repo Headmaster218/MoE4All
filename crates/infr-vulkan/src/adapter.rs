@@ -32,6 +32,9 @@ mod copy_policy_tests;
 #[cfg(test)]
 #[path = "adapter_deferred_prepare_tests.rs"]
 mod deferred_prepare_tests;
+#[cfg(test)]
+#[path = "adapter_dense_mmq_fallback_tests.rs"]
+mod dense_mmq_fallback_tests;
 #[path = "adapter_verify_pair.rs"]
 mod pair_admission;
 #[path = "adapter_pure_mapped_coalesce.rs"]
@@ -4360,7 +4363,7 @@ fn lower_op(
             // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
             // the Linears it covers, and only under INFR_CM_8X8=1.
             // Two arms, same padded-dst convention as `is_gemm`:
-            //  • `nc_mmq`: weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` + `caps.i8_dot` →
+            //  • `nc_mmq`: an available DENSE MMQ kernel + `caps.i8_dot` →
             //    the DENSE dp4a mmq GEMM family (`matmul_mmq` — the same shader code the batched
             //    MoE expert path already gates on `i8_dot` alone, base-grid build), fed by the
             //    same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq arm uses.
@@ -4372,7 +4375,11 @@ fn lower_op(
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
             let nc_tier =
                 gemm_ok && !be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.mmq_fallback;
-            let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
+            // Expert MMQ coverage is wider than the dense family (IQ2_XS/IQ3_XXS are
+            // expert-only). Admit only kernels the dense recorder can actually dispatch.
+            let nc_mmq = nc_tier
+                && be_.caps().i8_dot
+                && crate::gemm::native_gemm_mmq_dense_spv(dt).is_some();
             let nc_fma =
                 nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
             // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
