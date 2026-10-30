@@ -2862,9 +2862,6 @@ $configureThinking = [bool](Get-SavedValue 'configure_thinking' ($thinkMode -ne 
 $cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
 $cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
 $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
-# The engine routes hd256 prefill away from the fused flash pipeline on amdvlk because that build
-# crashes the driver; this saved opt-in is the only way to force the kernel back on.
-$amdvlkHd256Flash = [bool](Get-SavedValue 'amdvlk_hd256_flash' $false)
 $customSets = [string](Get-SavedValue 'custom_sets' '')
 
 if (-not $reuseSavedSettings) {
@@ -3051,12 +3048,6 @@ if (-not $reuseSavedSettings) {
         Write-Host '要求 AVX2 + FMA3、支持的量化和完整 RAM 专家缓存；超出 miss 上限或其他不支持工况自动使用 GPU。' -ForegroundColor DarkGray
         Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
         Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
-    }
-    $amdvlkHd256Flash = Read-YesNo -Label '在 AMD 专有驱动（amdvlk）上强制启用 hd256 融合 flash 注意力内核？/ Force the fused hd256 flash attention kernel on AMD proprietary driver (amdvlk)?' -Default $amdvlkHd256Flash
-    if ($amdvlkHd256Flash) {
-        Write-Host '仅为规避驱动缺陷而设的开关：默认关闭时 hd256 prefill 走 coopmat nonfa 层级。已知 26.9.2 / 26.10.1 打开后会在 vkCreateComputePipelines 内于 amdvlk64.dll+0x2b65705 崩溃（驱动 LLPC 缺陷），启动即失败。' -ForegroundColor Yellow
-        Write-Host 'Off keeps hd256 prefill on the coopmat nonfa tier. On forces the fused attn_flash_warp_hd256_bm16 build back: known to crash inside vkCreateComputePipelines at amdvlk64.dll+0x2b65705 on 26.9.2/26.10.1 (an LLPC driver defect), so use it only on older driver builds or to re-verify the AMD fix.' -ForegroundColor DarkGray
-        Write-Host '此开关只在 AMD 专有驱动上生效；RADV 与其他厂商驱动忽略它。This switch only matters on the AMD proprietary driver; RADV and other vendors ignore it.' -ForegroundColor DarkGray
     }
     if ($launchMode -eq 'server') {
         $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
@@ -3282,11 +3273,6 @@ if ($cpuMissEnabled) {
     Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_token_park' 'true'
     Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_spin' '262144'
 }
-# Emitted only when ON: the config default is already OFF, and an explicit `=false` would override
-# an INFR_AMDVLK_HD256_FLASH the operator set in the environment for a one-off driver test.
-if ($amdvlkHd256Flash) {
-    Add-SetArgument $nativeArgs 'kernels.vulkan.amdvlk_hd256_flash' 'true'
-}
 if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
     foreach ($entry in $customSets.Split(';')) {
         $entry = $entry.Trim()
@@ -3441,7 +3427,6 @@ $state = [ordered]@{
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
-    amdvlk_hd256_flash = $amdvlkHd256Flash
     custom_sets = $customSets; last_command = $commandText
 }
 if (-not $DryRun -and -not $script:PendingSubmissionPrompted) { Offer-PendingSubmissions }
