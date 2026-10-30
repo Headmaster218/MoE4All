@@ -1928,6 +1928,7 @@ pub(crate) fn native_gemm_warp_cm8_build_spv(
 pub(crate) fn native_gemm_warp_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_ag",
         Iq4Nl => "native_gemm_warp_iq4nl_ag",
         Iq4Xs => "native_gemm_warp_iq4xs_ag",
         Q2K => "native_gemm_warp_q2k_ag",
@@ -1948,6 +1949,7 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
 ) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_n128_ag",
         Iq4Nl => "native_gemm_warp_iq4nl_n128_ag",
         Iq4Xs => "native_gemm_warp_iq4xs_n128_ag",
         Q2K => "native_gemm_warp_q2k_n128_ag",
@@ -1961,12 +1963,14 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
     })
 }
 
-/// BN=64/BK=64 A_GLOBAL warptile for Q8_0 output widths divisible by 64 but not 128.
+/// BN=64/BK=64 A_GLOBAL warptile for output widths divisible by 64 but not 128.
 /// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
+/// Bf16 is Qwen3.8-Flash-Next's HC-projection width (320x10240 / 10240x320 at prefill m).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n64_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     match dtype {
         infr_core::DType::Q8_0 => Some("native_gemm_warp_q8_0_n64_ag"),
+        infr_core::DType::Bf16 => Some("native_gemm_warp_bf16_n64_ag"),
         _ => None,
     }
 }
@@ -5377,6 +5381,51 @@ mod tests {
             native_mrow_spv(infr_core::DType::Q8_0, 3).unwrap().0,
             "native_mrow_q8_0"
         );
+    }
+
+    /// Qwen3.8-Flash-Next ships its hyper-connected projections (bf16 `10240x320` / `320x10240`)
+    /// and its MoE router (`ffn_gate_inp`, bf16 `2560x512`) as Bf16. Those are the prefill shapes,
+    /// and the `lin_a16` scratch gate in `adapter_stages::linear_scratch_requests` asks the WIDE
+    /// table even when `n%128!=0` and dispatch later uses the `_n128_ag` / `_n64_ag` twin. So the
+    /// three must stay in lockstep: with Bf16 absent from the wide table, `use_ag` is false, no
+    /// `lin_a16` is allocated, and every bf16 prefill GEMM silently drops to the 64x64
+    /// `native_gemm_bf16` fallback — measured at 2.6 ms per `10240x320` dispatch vs 0.85 ms tiled.
+    #[test]
+    fn bf16_owns_the_whole_ag_family() {
+        use infr_core::DType::Bf16;
+        assert_eq!(
+            native_gemm_warp_ag_kernel_name(Bf16),
+            Some("native_gemm_warp_bf16_ag")
+        );
+        assert_eq!(
+            native_gemm_warp_n128_ag_kernel_name(Bf16),
+            Some("native_gemm_warp_bf16_n128_ag")
+        );
+        assert_eq!(
+            native_gemm_warp_n64_ag_kernel_name(Bf16),
+            Some("native_gemm_warp_bf16_n64_ag")
+        );
+        // The `n%128!=0` dispatch path must find a tile for every dtype the wide table claims:
+        // a wide-only dtype would allocate `lin_a16` and then have no kernel to run with it.
+        for dt in [
+            infr_core::DType::Iq4Nl,
+            infr_core::DType::Iq4Xs,
+            infr_core::DType::Q2K,
+            infr_core::DType::Q3K,
+            infr_core::DType::Q4_0,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q5K,
+            infr_core::DType::Q6K,
+            infr_core::DType::Q8_0,
+            Bf16,
+        ] {
+            if native_gemm_warp_ag_kernel_name(dt).is_some() {
+                assert!(
+                    native_gemm_warp_n128_ag_kernel_name(dt).is_some(),
+                    "{dt:?} has a wide A_GLOBAL tile but no NARROW_N twin"
+                );
+            }
+        }
     }
 
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never

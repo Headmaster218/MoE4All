@@ -4143,6 +4143,26 @@ fn main() {
             "native_gemm_warp_bf16_n128",
             &["-DFMT_BF16", "-DNARROW_N"],
         ),
+        // A_GLOBAL twins of the bf16 warptiles. Bf16 is the Qwen3.8-Flash-Next IQ3_S mix's dense
+        // weight type (HC projections 10240x320 / 320x10240, MoE router 2560x512): without these
+        // the HC GEMMs sat on the 64x64 `native_gemm_bf16` fallback (2.6 ms per 10240x320 dispatch
+        // at m=4096, 254 ms over the model) while the f16-clamp decode is unchanged — A_GLOBAL only
+        // lifts occupancy (LDS to Bs-only, 2->3 wgs/WGP) exactly as for every quant sibling.
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_ag",
+            &["-DFMT_BF16", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n128_ag",
+            &["-DFMT_BF16", "-DNARROW_N", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n64_ag",
+            &["-DFMT_BF16", "-DN64", "-DA_GLOBAL", "-DWG_THREADS=128"],
+        ),
         // NATIVE bf16 cooperative-matrix (WMMA) variant of the SAME production warptile above —
         // gated behind INFR_BF16_COOPMAT=1 + caps.bf16_coopmat (RDNA4 native bf16 WMMA; see
         // adapter.rs `bf16cm_ok` / native_gemm_warp.comp's BF16CM doc). -DBF16CM swaps ONLY the
@@ -4152,9 +4172,9 @@ fn main() {
         // speed while keeping bf16's full exponent range. Replaces the old standalone
         // native_gemm_bf16cm.comp measurement kernel (retired: this variant subsumes it).
         // Default-off; correctness UNVALIDATED on this box (no bf16 coopmat hardware here —
-        // compile-checked only), pending an RDNA4 run. No A_GLOBAL variant: the existing
-        // `native_gemm_warp_bf16` f16-clamp path doesn't use A_GLOBAL either (Bf16 isn't in
-        // `native_gemm_warp_ag_build_spv`'s dtype match), so there's nothing to mirror there.
+        // compile-checked only), pending an RDNA4 run. No A_GLOBAL variant of THIS one: the bf16
+        // A_GLOBAL twins above are the f16-clamp path (plain `-DFMT_BF16`), which is what the
+        // 7900 XTX actually dispatches; a BF16CM+AGLOBAL combination has no caller yet.
         (
             "native_gemm_warp",
             "native_gemm_warp_bf16cm",

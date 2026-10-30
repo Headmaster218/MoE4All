@@ -9020,7 +9020,6 @@ fn lower_op(
                 // discarded) — pad the packed row dimension so the LAST expert's overread stays
                 // in-bounds.
                 let npad = n_pairs.div_ceil(64) * 64 + 64;
-                let logits = alu(rows * n_expert * 4)?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
                 // Bucket arrays index the LOCAL expert shard under EP (ids are remapped to
@@ -9054,16 +9053,29 @@ fn lower_op(
                 let dsa = pooled(pool, be_, "moe_dsa", npad * (nff / 32) * 2)?;
                 let ye = pooled(pool, be_, "moe_ye", npad * ne * 4)?;
 
+                // Router logits may take the 64-row tiled GEMM at prefill rows (see
+                // `moe_router_gemm_applies`): its C store covers whole row tiles.
+                let logits = alu(
+                    moe_router_logits_rows(
+                        rows,
+                        moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                    ) * n_expert
+                        * 4,
+                )?;
                 // Router logits for all rows (on `router_x`, NOT `x`), then GPU routing.
                 let rdt = graph.desc(*router).dtype;
                 let rw = r(*router)?;
-                if native_dense_supported(rdt) {
-                    rec.linear_native(rdt, rw, 0, rxb, logits.as_ref(), rows, ne, n_expert);
-                } else if matches!(rdt, infr_core::DType::F32) {
-                    rec.linear_f32(rw, rxb, logits.as_ref(), rows, ne, n_expert);
-                } else {
-                    rec.linear(rw, rxb, logits.as_ref(), rows, ne, n_expert);
-                }
+                record_moe_router_logits(
+                    be_,
+                    rdt,
+                    rw,
+                    rxb,
+                    logits.as_ref(),
+                    rows,
+                    ne,
+                    n_expert,
+                    rec,
+                );
                 let bias_buf: &dyn Buffer = match exp_probs_b {
                     Some(epb) => r(*epb)?,
                     None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -9348,7 +9360,18 @@ fn lower_op(
             // `INFR_NO_MOE_SM_POOL=1` restores the per-layer zeroed allocs (A/B correctness oracle).
             let no_pool = be_.cfg().kernels.vulkan.no_moe_sm_pool;
             let n_slots = rows * n_used;
-            let logits = sm_buf(pool, be_, no_pool, "moe_sm_logits", rows * n_expert)?;
+            // Router logits may take the 64-row tiled GEMM at prefill rows (see
+            // `moe_router_gemm_applies`): its C store covers whole row tiles.
+            let logits = sm_buf(
+                pool,
+                be_,
+                no_pool,
+                "moe_sm_logits",
+                moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert,
+            )?;
             let ids = sm_buf(pool, be_, no_pool, "moe_sm_ids", n_slots)?;
             let wts = sm_buf(pool, be_, no_pool, "moe_sm_wts", n_slots)?;
             // Fused: one [n_slots, 2*nff] gate|up buffer (gate half first, up half second per row —
@@ -9381,15 +9404,17 @@ fn lower_op(
             // Router logits over all experts, all `rows` tokens in one dispatch.
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
-            if native_dense_supported(rdt) {
-                rec.linear_native(rdt, rw, 0, rxb, logits.get(pool), rows, ne, n_expert);
-            } else if matches!(rdt, infr_core::DType::F32) {
-                // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
-                // bytes as f16 garbage and route to arbitrary experts.
-                rec.linear_f32(rw, rxb, logits.get(pool), rows, ne, n_expert);
-            } else {
-                rec.linear(rw, rxb, logits.get(pool), rows, ne, n_expert);
-            }
+            record_moe_router_logits(
+                be_,
+                rdt,
+                rw,
+                rxb,
+                logits.get(pool),
+                rows,
+                ne,
+                n_expert,
+                rec,
+            );
             let bias_buf: &dyn Buffer = match exp_probs_b {
                 Some(epb) => r(*epb)?,
                 None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -17789,6 +17814,77 @@ fn streamed_gemm_applies(
             && be_.cfg().kernels.vulkan.mmq)
 }
 
+/// Router logits tier for prefill rows. The MoE router is a plain dense [n_expert, in_f] matrix,
+/// and every router site used to record it through the scalar GEMV family — which, past
+/// `rows == 1`, re-reads the whole router weight once per row. On Qwen3.8-Flash-Next IQ3_S
+/// (`ffn_gate_inp`, bf16 2560x512) the per-row route costs ~15 ms per layer at m=4096 where the
+/// tiled GEMM of the same shape takes ~1.4 ms (the base model's F32 router already takes its own
+/// `linear_f32` mrow tile at ~1.9 ms for the same reason); the end-to-end win is the +4.4% paired
+/// pp30000 in the CHANGELOG, and bigger where the router reaches the arena-streamed GEMV, which
+/// re-reads the weight from the pager instead of a resident buffer.
+///
+/// Gate mirrors `streamed_gemm_applies` (m > 16, n%64, k%32, coopmat f16 tiles, native dense
+/// dtype, `INFR_NO_GEMM_WARP` honored) with one deliberate difference: Q4_K is NOT excluded. That
+/// exclusion exists on the Linear path because a resident dense Q4_K GEMM would diverge from the
+/// dp4a `mmq` tier the dense arm prefers; the router has no mmq arm — its only alternative is the
+/// per-row GEMV, which even the 64x64 native-GEMM floor beats ~64x on weight traffic.
+fn moe_router_gemm_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+) -> bool {
+    rows > 16
+        && n_expert.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && be_.caps().f16_coopmat()
+        && native_dense_supported(dt)
+        && be_.cfg().kernels.vulkan.gemm_warp
+}
+
+/// Router logits buffer rows: the tiled GEMM stores whole 64-row C tiles (the padded-dst
+/// convention every prefill GEMM follows), so the buffer must cover `ceil(rows/64)*64` rows;
+/// `moe_topk` still reads only the `rows` real ones.
+fn moe_router_logits_rows(rows: usize, gemm: bool) -> usize {
+    if gemm {
+        rows.div_ceil(64) * 64
+    } else {
+        rows
+    }
+}
+
+/// Record a MoE layer's router logits (all `rows` tokens at once) into `logits` — the prefill
+/// tiled-GEMM tier or the scalar GEMV family, see `moe_router_gemm_applies`. Shared by the
+/// batched and small-m MoE arms so both pick the same tier for the same shape.
+#[allow(clippy::too_many_arguments)]
+fn record_moe_router_logits(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    w: &dyn Buffer,
+    x: &dyn Buffer,
+    logits: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+    rec: &Recorder<'_>,
+) {
+    if moe_router_gemm_applies(be_, dt, rows, in_f, n_expert) {
+        let w_addr = w
+            .device_addr()
+            .expect("resident-BDA router weight: the prefill GEMM reads it by u64 address");
+        rec.matmul_native_off(dt, x, w_addr, 0, logits, rows, in_f, n_expert);
+    } else if native_dense_supported(dt) {
+        rec.linear_native(dt, w, 0, x, logits, rows, in_f, n_expert);
+    } else if matches!(dt, infr_core::DType::F32) {
+        // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its bytes as
+        // f16 garbage and route to arbitrary experts.
+        rec.linear_f32(w, x, logits, rows, in_f, n_expert);
+    } else {
+        rec.linear(w, x, logits, rows, in_f, n_expert);
+    }
+}
+
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
 /// warp prefill arm (see the `is_gemm` block in `lower_op`): the SAME tile selection (A_GLOBAL
 /// f16-A cast, narrow-n split-K, or the direct tile) and the SAME padded-dst dance, but the weight
@@ -20745,6 +20841,20 @@ mod shared_verify_contract;
 
 #[cfg(test)]
 mod tests {
+    /// The router's tiled-GEMM tier stores whole 64-row C tiles (the padded-dst convention every
+    /// prefill GEMM follows), so the logits buffer has to grow with it — but ONLY then; the GEMV
+    /// tiers must keep the exact row count they always had.
+    #[test]
+    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
+        for rows in [1usize, 17, 63, 64, 65, 4096, 5120] {
+            assert_eq!(super::moe_router_logits_rows(rows, false), rows);
+            let padded = super::moe_router_logits_rows(rows, true);
+            assert!(padded >= rows && padded % 64 == 0, "rows {rows} → {padded}");
+        }
+        assert_eq!(super::moe_router_logits_rows(4096, true), 4096);
+        assert_eq!(super::moe_router_logits_rows(17, true), 64);
+    }
+
     fn prepare_metadata_graph(rows: usize, dtype: infr_core::DType) -> super::Graph {
         use super::*;
         use infr_core::TensorDesc;

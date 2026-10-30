@@ -304,10 +304,21 @@ fn linear_scratch_requests(
             add("mmq_sact", m * (k / 32) * 2);
         }
         let mpad = m.div_ceil(64) * 64;
-        if warp
+        // A_GLOBAL `a16` reservation — mirrors `native_warp_gemm`'s `use_ag` exactly: the
+        // wide/n128 ag tile for n%128==0, and the BN=64 ag tile for n%64-but-not-128 widths
+        // (Qwen3.8's 320-wide HC/recurrent projections; Q8_0 already dispatches it, so the
+        // reservation was previously missing those shapes' buffers).
+        let use_ag = coop
+            && cfg.gemm_warp
+            && k % 32 == 0
+            && if n % 128 == 0 {
+                crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
+            } else {
+                n % 64 == 0 && crate::gemm::native_gemm_warp_n64_ag_kernel_name(dt).is_some()
+            };
+        if use_ag
             && !(cfg.gemm_direct_a
                 && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some())
-            && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
         {
             add("lin_a16", mpad * k * 2);
         }
