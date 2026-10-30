@@ -6,7 +6,6 @@ is set, fixtures must be inside its tmp/moe4all directory. Darwin tests mock
 native metadata and are not Mac hardware tests.
 """
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -187,7 +186,7 @@ ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRE
         self.assertNotIn("vram_total_bytes", value["hardware"]["gpu"])
         self.assertEqual(value["collection"]["probes"]["gpu.pcie"]["status"], "not_applicable")
 
-    def test_unix_packages_include_exact_collector_and_manifest(self):
+    def test_unix_packages_use_embedded_collector_and_old_updater_layout(self):
         for module in (linux_release, macos_release):
             root = self.root / module.PLATFORM
             root.mkdir()
@@ -199,23 +198,21 @@ ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRE
             with tarfile.open(archive) as bundle:
                 prefix = module.package_name("1.0.0-test")
                 members = {member.name.rstrip("/") for member in bundle.getmembers()}
-                self.assertIn(prefix + "/scripts", members, module.PLATFORM)
-                collector = bundle.extractfile(prefix + "/scripts/benchmark-hardware.sh").read()
-                self.assertEqual(collector, SCRIPT.read_bytes())
+                self.assertNotIn(prefix + "/scripts", members, module.PLATFORM)
+                self.assertNotIn(prefix + "/scripts/benchmark-hardware.sh", members, module.PLATFORM)
                 manifest = json.load(bundle.extractfile(prefix + "/install-manifest.json"))
-                entry = next(entry for entry in manifest["files"] if entry["path"] == "scripts/benchmark-hardware.sh")
-                self.assertEqual(entry["sha256"], hashlib.sha256(collector).hexdigest())
+                self.assertFalse(any(entry["path"].startswith("scripts/") for entry in manifest["files"]))
+                required = {"infr", "Start-INFR-Wizard-" + ("Linux" if module is linux_release else "macOS") + ".sh"}
+                self.assertTrue(required.issubset({entry["path"] for entry in manifest["files"]}))
                 stage_root = root / "stage"
                 bundle.extractall(stage_root)
             stage = stage_root / prefix
-            manifest_path = stage / "install-manifest.json"
-            manifest["files"] = [entry for entry in manifest["files"] if entry["path"] != "scripts/benchmark-hardware.sh"]
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            (stage / "scripts/benchmark-hardware.sh").unlink()
-            with self.assertRaisesRegex(ValueError, "missing runtime files", msg=module.PLATFORM):
-                module.validate_package(stage, "1.0.0-test")
+            module.validate_package(stage, "1.0.0-test")
             self.assertTrue(module.managed("scripts/benchmark-hardware.sh"))
             self.assertFalse(module.managed("scripts/not-allowed.sh"))
+
+        embedded = (SCRIPT.parent.parent / "crates/infr-cli/src/benchmark_hardware.rs").read_text()
+        self.assertIn('include_bytes!("../../../scripts/benchmark-hardware.sh")', embedded)
 
     def test_launcher_allowlists_accept_collector_and_parent_directory(self):
         for name in ("Start-INFR-Wizard-Linux.sh", "Start-INFR-Wizard-macOS.sh"):

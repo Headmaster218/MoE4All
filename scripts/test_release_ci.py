@@ -136,7 +136,7 @@ class ReleaseCiTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     module.package_name(invalid)
 
-    def test_unix_packagers_require_runtime_scripts(self):
+    def test_unix_packagers_require_engine_and_launcher_without_external_collectors(self):
         for module in (linux_release, macos_release):
             with self.subTest(platform=module.PLATFORM):
                 source = self.workspace / module.PLATFORM
@@ -154,11 +154,11 @@ class ReleaseCiTests(unittest.TestCase):
                 stage = stage_root / prefix
                 manifest_path = stage / "install-manifest.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                for name in module.SCRIPT_FILES:
-                    manifest["files"] = [
-                        entry for entry in manifest["files"] if entry["path"] != name
-                    ]
-                    (stage / name).unlink()
+                self.assertFalse(any(entry["path"].startswith("scripts/") for entry in manifest["files"]))
+                self.assertFalse((stage / "scripts").exists())
+                module.validate_package(stage, VERSION)
+                manifest["files"] = [entry for entry in manifest["files"] if entry["path"] != "infr"]
+                (stage / "infr").unlink()
                 manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "missing runtime files"):
                     module.validate_package(stage, VERSION)
