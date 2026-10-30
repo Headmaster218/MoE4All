@@ -7371,7 +7371,24 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                let flash_ok = flash_geom && !segmented_read && !(k_q8_eff || v_q8_eff);
+                //
+                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) faulted with 0xc0000005 INSIDE
+                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first fused flash use
+                // of a ragged 4K prefill, e.g. 4001 query rows, at amdvlk64.dll+0x2b65705). The
+                // trigger was the shader's fully-unrolled IR, not the driver's pipeline path: the
+                // kernel now ships as TWO builds (`attn_flash_warp_hd256.comp`'s UNROLL macro) and
+                // the recorder gives amdvlk the non-unrolled one, which carries the same math — so
+                // hd256 prefill takes the fused tier on this driver BY DEFAULT. This latch is the
+                // escape hatch for a driver that still faults: `INFR_AMDVLK_HD256_FLASH=0`
+                // (`--set kernels.vulkan.amdvlk_hd256_flash=false`) drops it back to the coopmat
+                // `attn_qk`/`softmax`/`attn_pv` tier, which is 10-24% slower at pp4k on 35B.
+                let amdvlk_hd256_flash_avoided = hd == 256
+                    && be_.is_amd_proprietary_driver()
+                    && !be_.cfg().kernels.vulkan.amdvlk_hd256_flash;
+                let flash_ok = flash_geom
+                    && !segmented_read
+                    && !(k_q8_eff || v_q8_eff)
+                    && !amdvlk_hd256_flash_avoided;
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.

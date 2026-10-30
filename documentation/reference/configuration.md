@@ -194,7 +194,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 **`[kernels]`** — 两个与后端无关的图形状门控（`qkv_fuse`、`gated_rmsnorm`）以及每个后端的一个子节。其下的所有项都是内核**层级**覆盖：引擎会选择设备支持的最佳层级，而这些设置用于在二分定位正确性或性能问题时强制禁用某一层级。
 
-- **`[kernels.vulkan]`**（最大节，62 个键）：能力掩码（`coopmat`、`f16`、`i8_dot`、`coopmat_8x8`、`i8_coopmat`）、GEMM/GEMV 层级（`gemm_warp`、`mmq`、`mmv`、`mrow`、`moe_small_m`、`[kernels.vulkan.gemv]` 子表）、注意力（`flash_warp`、`flash_splits`、`flash_min_rows`、`pv_splits`）、DeltaNet（`dn_chunk_scan`、`dn_chunk`、`dn_split`）以及管线开关（`push_desc`、`pipeline_cache_disk`、`no_replay`、`no_vram_guard`、BDA 块上限）。注意：无论 `coopmat` 为何值，`f16 = false` 都会禁用 coopmat，与当前 `INFR_NO_F16` 的效果一致。
+- **`[kernels.vulkan]`**（最大节，63 个键）：能力掩码（`coopmat`、`f16`、`i8_dot`、`coopmat_8x8`、`i8_coopmat`）、GEMM/GEMV 层级（`gemm_warp`、`mmq`、`mmv`、`mrow`、`moe_small_m`、`[kernels.vulkan.gemv]` 子表）、注意力（`flash_warp`、`flash_splits`、`flash_min_rows`、`pv_splits`、`amdvlk_hd256_flash`）、DeltaNet（`dn_chunk_scan`、`dn_chunk`、`dn_split`）以及管线开关（`push_desc`、`pipeline_cache_disk`、`no_replay`、`no_vram_guard`、BDA 块上限）。注意：无论 `coopmat` 为何值，`f16 = false` 都会禁用 coopmat，与当前 `INFR_NO_F16` 的效果一致。`amdvlk_hd256_flash` 默认开启：AMD 专有驱动（amdvlk）上 hd256 prefill 走 bm16 融合 flash，LLPC 无法编译其全展开 IR，因此该内核同时构建展开版与 `-DNO_UNROLL` 版并按驱动选用；设为 `false` 时 hd256 prefill 退回 coopmat `nonfa` 层级（供仍会故障的驱动使用）。
 - **`[kernels.metal]`** — Apple 后端按 dtype 区分的原生/CMM/RT 内核家族，以及 `deltanet`、`moe` 和 `pipeline_cache`（将编译后的 `MTLComputePipelineState` 作为 `MTLBinaryArchive` 持久化到 `~/.cache/infr`，这样每次启动无需为每个内核重新运行驱动的 AIR → GPU-ISA 后端；MSL → AIR 前端不可缓存，仍会在每次启动时运行）。与 `kernels.cpu.reference` 一样，它没有 `INFR_*` 对应项。
 - **`[kernels.cpu]`** — `spin`（自旋池空闲上限）、`spinpool`、`repack_mb` 和 `reference`（位参考内核路径，没有也从未有过 `INFR_*` 对应项）。`repack_mb` 同样是兼容名称；其数值表示 MiB。
 

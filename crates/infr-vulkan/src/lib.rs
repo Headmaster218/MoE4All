@@ -736,6 +736,10 @@ struct VulkanShared {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     exact_silu_quant_order: bool,
+    /// VK_DRIVER_ID_AMD_PROPRIETARY (amdvlk / LLPC) — read once from the probed driver, because the
+    /// shader-compiler defects it has (see `attn_flash_warp_hd256.comp`) are driver properties, not
+    /// device capabilities. `driver_id_reported` guards the default-valued case.
+    amd_proprietary_driver: bool,
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
@@ -3361,6 +3365,14 @@ impl VulkanBackend {
         &self.shared.caps
     }
 
+    /// True on the AMD proprietary Windows driver (amdvlk / LLPC). Kernel-tier picks use this to
+    /// dodge driver compiler faults — the hd256 fused flash build is the current case, see
+    /// `attn_flash_warp_hd256.comp`'s UNROLL macro. RADV (`AMD_OPEN_SOURCE`) and every other vendor
+    /// get the default build.
+    pub(crate) fn is_amd_proprietary_driver(&self) -> bool {
+        self.shared.amd_proprietary_driver
+    }
+
     /// The measured Windows/RDNA3 decode policy. Keep the unmeasured Linux/RADV path unchanged,
     /// and keep architecture quirks out of the backend-neutral capability API.
     pub(crate) fn prefers_generic_hd256_decode(&self) -> bool {
@@ -5231,6 +5243,8 @@ impl VulkanBackend {
                 exact_silu_quant_order: device_probe.driver_id_reported
                     && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY
                     && props.driver_version == 8_389_003,
+                amd_proprietary_driver: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
                 device,
                 queue,
                 queue_family_index,
