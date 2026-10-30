@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Experimental metadata-only ManyRow qualification. Fake BDAs never reach payloads.
 //! Oracle: actual moe_topk_sg (one WG/row), then the unchanged general WG64 owner.
 use super::*;

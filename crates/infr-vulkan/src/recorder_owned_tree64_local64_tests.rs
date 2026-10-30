@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! GU-only LOCAL64 qualification against the actual selected native GU path.
 use super::*;
 

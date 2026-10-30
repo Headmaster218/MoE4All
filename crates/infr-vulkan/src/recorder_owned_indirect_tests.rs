@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Real FFN module probes for the test-only indirect payload helper. No owner-policy fixture.
 use super::*;
 use crate::AlignedHostBuffer;

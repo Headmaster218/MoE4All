@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Parent mounts as an adapter child after applying the evidence-only validation patch.
 use super::*;
 use infr_core::{DType, TensorDesc};

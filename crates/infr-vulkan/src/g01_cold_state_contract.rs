@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Parent-serialized Unit8 rotating-state contract for the production Recorder.
 //! Production embedded kernels/APIs only; no external SPVs or hand-packed G01 PC.
 //! v1 MAY FAIL the strict output contract. No tolerant fallback or timing qualification.

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! NEW, unmounted adapter child for parent unit5. Actual Graph execution, not raw dispatches.
 use super::*;
 use infr_core::backend::SegmentedKvSpec;

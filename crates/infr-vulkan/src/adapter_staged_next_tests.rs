@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Nested under resident_ahead_tests; model-free staged next-token packet contracts.
 use super::*;
 use infr_core::backend::{ExecutionStage, SegmentedKvSpec};

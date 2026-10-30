@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! External-SPIR-V FFN probes. All GPU entry points require explicit parent serialization.
 use super::*;
 

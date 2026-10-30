@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Characterization of the legacy schedule, not authorization to change LRU policy.
 //! CPU tests use real Pager decisions; the ignored test also calls real session/upload methods.
 use super::*;

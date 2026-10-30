@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! R02 CPU-only adapter child. Parent mounts with cpu-tests-mount.applypatch.
 //! Uses the REAL Graph, scratch_layout, scratch_reset_indices and plan memoizer.
 //! No Vulkan backend/device/buffer is constructed. The optional ignored benchmark

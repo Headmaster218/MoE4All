@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Register as a child of recorder::owned_indirect_tests::fused:
 //! #[path = "recorder_owned_hit_event_tests.rs"] pub(super) mod hit_event;
 //!

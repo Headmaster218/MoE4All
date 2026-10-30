@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Small model-free resident command-ahead regressions; declared as a child of `adapter`.
 #[path = "adapter_owned_stage_tail_tests.rs"]
 mod owned_stage_tail_tests;

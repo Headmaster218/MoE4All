@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Raw differential: independent original router + unchanged overlap owner vs 11-binding fusion.
 //! The inherited fixture has synthetic BDAs: never record payload work in this module.
 use super::*;

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Canvas mask propagation, raw partial parity, and ordinary wrapper compatibility.
 use super::*;
 

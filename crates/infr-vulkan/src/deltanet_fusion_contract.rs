@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use infr_core::tensor::{DType, TensorDesc};
 

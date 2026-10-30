@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Continuous metadata-only replay of the existing serial external-SPV TopK fixture.
 use super::*;
 

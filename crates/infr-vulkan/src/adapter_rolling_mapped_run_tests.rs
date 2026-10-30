@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Normal (not prepared) rolling-window admission, queue bounds and recovery re-certification.
 use super::*;
 

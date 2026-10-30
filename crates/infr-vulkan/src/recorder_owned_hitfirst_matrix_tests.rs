@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Complete H + whole-payload copy comparisons. No role-split transfers in any arm.
 use super::*;
 
