@@ -2474,6 +2474,7 @@ pub(crate) const MIN_SESSION_CTX: usize = 1024;
 /// committed its weights, so `tracked_used=0`; the allocator applies the same helper later with its
 /// live per-backend allocation tally. The physical side starts at `VramInfo::alloc_room()` (already
 /// net of Vulkan's mandatory guard), then applies the automatic profile or explicit knobs.
+#[cfg(test)]
 fn planned_vram_room(vram: &infr_vulkan::VramInfo, ec: &EngineConfig) -> u64 {
     infr_core::budget::unified_vram_room_for_profile(
         vram.total,
@@ -2568,12 +2569,37 @@ pub(crate) fn dense_resident_need(
 /// free figure and refuses anything that reaches into it, so a residency decision taken against
 /// the raw figure can declare a model resident while planning 256 MiB the allocator will never
 /// hand out — and then fail on an activation alloc mid-prefill.
+#[cfg(test)]
 pub(crate) fn dense_placement_fits(
     cfg: &Config,
     caps: &Capabilities,
     ec: &EngineConfig,
     weights: u64,
     vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> bool {
+    dense_placement_fits_in_room(
+        cfg,
+        caps,
+        ec,
+        weights,
+        planned_vram_room(vram, ec),
+        want_ctx,
+        ubatch,
+        k_fmt,
+        v_fmt,
+    )
+}
+
+pub(crate) fn dense_placement_fits_in_room(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    weights: u64,
+    room: u64,
     want_ctx: usize,
     ubatch: usize,
     k_fmt: DType,
@@ -2588,12 +2614,13 @@ pub(crate) fn dense_placement_fits(
         0
     };
     dense_resident_need(cfg, caps, weights, want_ctx, ring, ubatch, k_fmt, v_fmt).saturating_add(lm)
-        <= planned_vram_room(vram, ec)
+        <= room
 }
 
 /// The TALLEST [`ubatch_candidates`] rung at which this dense session fits resident, or `None` when
 /// none of them does (the caller streams). The rung the placement sweep settles on — and the same
 /// walk [`kv_fit_ctx_for`] makes when it decides a context fits.
+#[cfg(test)]
 pub(crate) fn dense_resident_rung(
     cfg: &Config,
     caps: &Capabilities,
@@ -2604,21 +2631,68 @@ pub(crate) fn dense_resident_rung(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
-    ubatch_candidates(ec)
-        .into_iter()
-        .find(|&ub| dense_placement_fits(cfg, caps, ec, weights, vram, want_ctx, ub, k_fmt, v_fmt))
+    dense_resident_rung_in_room(
+        cfg,
+        caps,
+        ec,
+        weights,
+        planned_vram_room(vram, ec),
+        want_ctx,
+        k_fmt,
+        v_fmt,
+    )
+}
+
+pub(crate) fn dense_resident_rung_in_room(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    weights: u64,
+    room: u64,
+    want_ctx: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
+    ubatch_candidates(ec).into_iter().find(|&ub| {
+        dense_placement_fits_in_room(cfg, caps, ec, weights, room, want_ctx, ub, k_fmt, v_fmt)
+    })
 }
 
 /// Streaming budget: what is left of the allocator's ceiling for the dense weight-streaming arenas
 /// once the always-resident weights, the KV cache and the activation reserve are paid for. Same
 /// ceiling as [`dense_placement_fits`] — every byte this over-states is a slot the arena allocates
 /// and the guard then refuses.
+#[cfg(test)]
 pub(crate) fn dense_stream_budget_at(
     cfg: &Config,
     caps: &Capabilities,
     ec: &EngineConfig,
     resident_weights: u64,
     vram: &infr_vulkan::VramInfo,
+    want_ctx: usize,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> u64 {
+    dense_stream_budget_in_room(
+        cfg,
+        caps,
+        ec,
+        resident_weights,
+        planned_vram_room(vram, ec),
+        want_ctx,
+        ubatch,
+        k_fmt,
+        v_fmt,
+    )
+}
+
+pub(crate) fn dense_stream_budget_in_room(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    resident_weights: u64,
+    room: u64,
     want_ctx: usize,
     ubatch: usize,
     k_fmt: DType,
@@ -2632,18 +2706,17 @@ pub(crate) fn dense_stream_budget_at(
     } else {
         0
     };
-    planned_vram_room(vram, ec)
-        .saturating_sub(dense_resident_need(
-            cfg,
-            caps,
-            resident_weights,
-            want_ctx,
-            ring,
-            ubatch,
-            k_fmt,
-            v_fmt,
-        ))
-        .saturating_sub(lm)
+    room.saturating_sub(dense_resident_need(
+        cfg,
+        caps,
+        resident_weights,
+        want_ctx,
+        ring,
+        ubatch,
+        k_fmt,
+        v_fmt,
+    ))
+    .saturating_sub(lm)
 }
 
 /// One lightweight account of the VRAM ceiling shared by placement, the loader and control planes.
@@ -2775,8 +2848,8 @@ impl ModelMemoryPlan {
 
 /// Build the same conservative pre-load memory account used by the Vulkan MoE loader.
 ///
-/// Control planes use this instead of duplicating the resident-weight packing margin and
-/// architecture-specific driver reserves. `persistent_state_bytes` is the already-selected KV /
+/// `dense_weight_bytes` must already include the selected backend's physical fixed layout.
+/// This helper adds architecture-specific driver reserves, never an estimated packing margin. `persistent_state_bytes` is the already-selected KV /
 /// recurrent-state layout, and `runtime_reserve_bytes` is the peak elastic activation estimate.
 pub fn estimate_model_memory_plan(
     cfg: &Config,
@@ -2790,35 +2863,10 @@ pub fn estimate_model_memory_plan(
         dense_weight_bytes,
         persistent_state_bytes,
         runtime_reserve_bytes,
-        resident_weight_packing_margin(dense_weight_bytes),
+        0, // callers supply fixed bytes; physical layout requires the selected backend
         load_driver_reserve(cfg),
         POST_KV_DEVICE_RESERVE,
     )
-}
-
-/// Resident BDA weights are packed into adaptive 64/128/256 MiB blocks, so summing logical tensor
-/// bytes understates the committed allocation by the unused block tails. Measurements across
-/// supported model families put that delta at 1.16%-2.43%; 3%, rounded to the initial block unit
-/// and floored at 256 MiB, protects new architectures without carrying a second copy of allocator
-/// state into the planner.
-fn resident_weight_packing_margin(dense_weight_bytes: u64) -> u64 {
-    const BLOCK: u64 = 64 * 1024 * 1024;
-    const MIN: u64 = 256 * 1024 * 1024;
-    dense_weight_bytes
-        .saturating_mul(3)
-        .div_ceil(100)
-        .max(MIN)
-        .next_multiple_of(BLOCK)
-}
-
-/// Expert bytes required by the all-resident path after the dense-only packing margin has already
-/// been withheld from the memory plan. Paged experts live in an explicitly sized arena and do not
-/// need this BDA block-tail allowance.
-fn resident_expert_required_bytes(dense_weight_bytes: u64, expert_weight_bytes: u64) -> u64 {
-    let all_weight_bytes = dense_weight_bytes.saturating_add(expert_weight_bytes);
-    let incremental_packing = resident_weight_packing_margin(all_weight_bytes)
-        .saturating_sub(resident_weight_packing_margin(dense_weight_bytes));
-    expert_weight_bytes.saturating_add(incremental_packing)
 }
 
 /// Extra room withheld from the expert arena while a DeepSeek V4 model is still loading. V4's
@@ -3196,6 +3244,7 @@ const CTX_FIT_SEARCH_CAP: usize = 1 << 22;
 /// Returns the RAW fit, which may be below [`MIN_SESSION_CTX`] (or `0`) — that is the signal the
 /// refuse rung reads. `None` for a pure recurrent-state arch: no per-token KV to size.
 ///
+#[cfg(test)]
 pub(crate) fn kv_fit_ctx_for(
     cfg: &Config,
     caps: &Capabilities,
@@ -3205,13 +3254,33 @@ pub(crate) fn kv_fit_ctx_for(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
+    kv_fit_ctx_for_in_room(
+        cfg,
+        caps,
+        ec,
+        weights,
+        planned_vram_room(vram, ec),
+        k_fmt,
+        v_fmt,
+    )
+}
+
+pub(crate) fn kv_fit_ctx_for_in_room(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    weights: u64,
+    room: u64,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
     // The ALLOCATOR's ceiling, derived by the same function the placement sweeps use, so the two
     // decide against one budget (see the `budgets_agree_with_the_allocator_ceiling` drift test).
     kv_fit_ctx_in_budget(
         cfg,
         caps,
         ec,
-        planned_vram_room(vram, ec).saturating_sub(weights),
+        room.saturating_sub(weights),
         &ubatch_candidates(ec),
         k_fmt,
         v_fmt,
@@ -3222,6 +3291,7 @@ pub(crate) fn kv_fit_ctx_for(
 /// includes their load-time fixed reserves. The remaining physical arena is shared by Expert
 /// slots and transient runtime allocations, so it must hold the larger of the one-layer Expert
 /// floor and the activation peak, not both at once.
+#[cfg(test)]
 pub(crate) fn kv_fit_ctx_for_moe(
     cfg: &Config,
     caps: &Capabilities,
@@ -3232,11 +3302,33 @@ pub(crate) fn kv_fit_ctx_for_moe(
     k_fmt: DType,
     v_fmt: DType,
 ) -> Option<usize> {
+    kv_fit_ctx_for_moe_in_room(
+        cfg,
+        caps,
+        ec,
+        fixed_bytes,
+        minimum_elastic_bytes,
+        planned_vram_room(vram, ec),
+        k_fmt,
+        v_fmt,
+    )
+}
+
+pub(crate) fn kv_fit_ctx_for_moe_in_room(
+    cfg: &Config,
+    caps: &Capabilities,
+    ec: &EngineConfig,
+    fixed_bytes: u64,
+    minimum_elastic_bytes: u64,
+    room: u64,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Option<usize> {
     kv_fit_ctx_in_budgets(
         cfg,
         caps,
         ec,
-        planned_vram_room(vram, ec).saturating_sub(fixed_bytes),
+        room.saturating_sub(fixed_bytes),
         None,
         minimum_elastic_bytes,
         &ubatch_candidates(ec),
@@ -3772,7 +3864,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // full dense native set plus F16/F32 for float banks), so
         // `infr_vulkan::linear::moe_expert_dtype_ok` is true for all of them; the invariant is
         // pinned by `moe_expert_floor_covers_dense_set` in infr-vulkan's linear.rs tests.
-        let fp = crate::weights::weight_footprint(g);
+        let weight_plan = vulkan_weight_plan(vk, g, cfg, ec)?;
+        let fp = weight_plan.footprint;
         // These are clean GGUF mapping pages used only as the source of fixed GPU uploads. The
         // bounded Expert arena is populated after those uploads finish, so they are load-time
         // working set, not a persistent owner of the process RAM budget.
@@ -3838,11 +3931,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // only cold Decode arena ranges and returns them on `enter_decode`.
         let runtime_reserve =
             runtime_reserve_at(cfg, &caps, want_ctx, ring, selected_ubatch, k_fmt, v_fmt);
-        let packing_margin = resident_weight_packing_margin(fp.dense);
+        let packing_margin = 0; // exact fixed allocation geometry is already in weight_plan.fixed_bytes
         let load_driver_reserve = session_load_driver_reserve(cfg, ec);
         let Some(mut plan) = ModelMemoryPlan::new_with_dynamic_reserve(
             room,
-            fp.dense,
+            weight_plan.fixed_bytes,
             persistent_state,
             runtime_reserve,
             dynamic_kv_reserve,
@@ -3862,7 +3955,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         };
         let requested_cache = cache_override.map(|spec| spec.resolve(vram.available));
         requested_cache_bytes = requested_cache;
-        let resident_expert_bytes = resident_expert_required_bytes(fp.dense, fp.expert);
+        let resident_expert_bytes = weight_plan
+            .resident_bytes
+            .saturating_sub(weight_plan.fixed_bytes);
         let paged_target_at = |candidate: ModelMemoryPlan| match requested_cache {
             Some(requested) => Some(requested.min(candidate.expert_cache_bytes)),
             None if candidate.expert_cache_bytes < resident_expert_bytes => {
@@ -3881,7 +3976,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     runtime_reserve_at(cfg, &caps, want_ctx, ring, candidate, k_fmt, v_fmt);
                 let Some(candidate_plan) = ModelMemoryPlan::new_with_dynamic_reserve(
                     room,
-                    fp.dense,
+                    weight_plan.fixed_bytes,
                     candidate_persistent,
                     candidate_runtime,
                     dynamic_kv_reserve,
@@ -4194,7 +4289,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
             finish_fixed_allocations = Some(Box::new(move || {
                 // Staging is part of the load, not the steady-state layout. Free it before the
                 // live budget query so its ring cannot reduce the expert filler permanently.
-                vk.finish_resident_uploads();
+                vk.finish_resident_uploads()
+                    .map_err(|error| anyhow!("finish resident uploads: {error}"))?;
 
                 let dynamic_state_reserve = provisional_plan.dynamic_state_reserve_bytes;
                 let mut last_layout_error = None;
@@ -4815,12 +4911,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 Some((comps, dt, raw, numel))
             })
             .collect();
-        let streamable_resident: u64 = eligible
-            .iter()
-            .map(|(_, dt, raw, numel)| crate::weights::tensor_resident_bytes(*dt, *numel, *raw))
-            .sum();
-        let fp = crate::weights::weight_footprint(g);
+        let weight_plan = vulkan_weight_plan(vk, g, cfg, ec)?;
         let vram = vk.vram();
+        let room = vk.alloc_room();
         // The per-side KV formats a chunk/format candidate prices: `q8` = BOTH sides Q8_0 (34
         // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
         // (see `kv_rows`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
@@ -4842,7 +4935,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // the fit math validated the context at 256 rows while this went resident at 512).
         let fits = |ubatch: usize, q8: bool| {
             let (k, v) = kv_fmts(q8);
-            dense_placement_fits(cfg, &caps, ec, fp.total(), &vram, want_ctx, ubatch, k, v)
+            dense_placement_fits_in_room(
+                cfg,
+                &caps,
+                ec,
+                weight_plan.resident_bytes,
+                room,
+                want_ctx,
+                ubatch,
+                k,
+                v,
+            )
         };
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
@@ -4872,9 +4975,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
             // to decide a context fits, so the rung it lands on here is the rung that math priced.
             // Its first entry is the height `resident` above already priced and rejected.
             let (k, v) = kv_fmts(kv_auto_q8());
-            if let Some(cand) =
-                dense_resident_rung(cfg, &caps, ec, fp.total(), &vram, want_ctx, k, v)
-            {
+            if let Some(cand) = dense_resident_rung_in_room(
+                cfg,
+                &caps,
+                ec,
+                weight_plan.resident_bytes,
+                room,
+                want_ctx,
+                k,
+                v,
+            ) {
                 pin_ubatch(cand);
                 // Re-read through the pin (a racing earlier set wins — use whatever stuck).
                 if fits(ubatch_rows(ec), kv_auto_q8()) {
@@ -4908,9 +5018,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
             && kv_q8_layout_ok(cfg)
         {
             let (k, v) = kv_fmts(true);
-            if let Some(cand) =
-                dense_resident_rung(cfg, &caps, ec, fp.total(), &vram, want_ctx, k, v)
-            {
+            if let Some(cand) = dense_resident_rung_in_room(
+                cfg,
+                &caps,
+                ec,
+                weight_plan.resident_bytes,
+                room,
+                want_ctx,
+                k,
+                v,
+            ) {
                 pin_kv_auto_q8();
                 if cand != ubatch_rows(ec) {
                     pin_ubatch(cand);
@@ -4947,17 +5064,27 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let stride_of = |dt: infr_core::DType, raw: usize| {
             raw.next_multiple_of(lcm(infr_gguf::block_layout(dt).1, 4))
         };
-        let streamed_fixed = fp.total().saturating_sub(streamable_resident);
+        let streamed_fixed = if cache_override.is_some() || !resident {
+            let streamed_names = eligible
+                .iter()
+                .map(|(names, _, _, _)| names[0].clone())
+                .collect();
+            let upload = runner::cold_weight_plan(g, cfg, &caps, ec)?;
+            let streamed_sizes = vulkan_fixed_allocation_sizes(&upload.specs, &streamed_names, 0)?;
+            vk.resident_weight_allocation_bytes(&streamed_sizes)?
+        } else {
+            0 // unused: keep successful resident loads independent of streaming-only probes
+        };
         let budget = match cache_override {
             Some(spec) => {
                 let requested = spec.resolve(vram.available);
                 let (k, v) = kv_fmts(kv_auto_q8());
-                let safe = dense_stream_budget_at(
+                let safe = dense_stream_budget_in_room(
                     cfg,
                     &caps,
                     ec,
                     streamed_fixed,
-                    &vram,
+                    room,
                     want_ctx,
                     ubatch_rows(ec),
                     k,
@@ -4992,12 +5119,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // over-states is an arena slot the allocator then refuses.
                 let budget_at = |ub: usize| {
                     let (k, v) = kv_fmts(q8);
-                    dense_stream_budget_at(
+                    dense_stream_budget_in_room(
                         cfg,
                         &caps,
                         ec,
                         streamed_fixed,
-                        &vram,
+                        room,
                         want_ctx,
                         ub,
                         k,
@@ -6359,6 +6486,58 @@ fn moe_role_of(name: &str) -> Option<infr_vulkan::pager::Role> {
     } else {
         None
     }
+}
+
+/// Payload accounting and physical storage for the SAME upload plan used by the runner.
+/// `fixed_bytes` includes the 4-byte placeholders used by paged expert banks. Driver/runtime
+/// reserves are separate from this layout; no historical percentage margin is added.
+pub(super) struct VulkanWeightPlan {
+    pub footprint: crate::weights::WeightFootprint,
+    pub fixed_bytes: u64,
+    pub resident_bytes: u64,
+}
+
+pub(crate) fn planned_weight_footprint(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+) -> AResult<crate::weights::WeightFootprint> {
+    runner::cold_weight_plan(g, cfg, &vk.capabilities(), ec)?.footprint()
+}
+
+pub(super) fn vulkan_weight_plan(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+) -> AResult<VulkanWeightPlan> {
+    let plan = runner::cold_weight_plan(g, cfg, &vk.capabilities(), ec)?;
+    let resident = vulkan_fixed_allocation_sizes(&plan.specs, &Default::default(), 0)?;
+    let fixed = vulkan_fixed_allocation_sizes(&plan.specs, &Default::default(), cfg.n_layer)?;
+    // A monolithic expert bank can exceed the resident addressing/block limit while its paged
+    // placeholder remains valid. Mark full residency impossible without rejecting that model.
+    // Driver errors during an otherwise valid query still propagate, never become a silent zero.
+    let resident_supported = vk.resident_weight_allocations_supported(&resident);
+    let resident_bytes = if resident_supported || cfg.moe.is_none() {
+        // Dense streaming retains a whole projection group per slot; it cannot rescue a group
+        // exceeding this addressing/allocation limit. Preserve the precise geometry error.
+        vk.resident_weight_allocation_bytes(&resident)?
+    } else {
+        u64::MAX
+    };
+    let fixed_bytes = if cfg.moe.is_none() {
+        resident_bytes // dense streaming computes its own exact placeholder layout below
+    } else if resident == fixed {
+        resident_bytes
+    } else {
+        vk.resident_weight_allocation_bytes(&fixed)?
+    };
+    Ok(VulkanWeightPlan {
+        footprint: plan.footprint()?,
+        fixed_bytes,
+        resident_bytes,
+    })
 }
 
 fn vulkan_fixed_allocation_sizes(
@@ -8862,6 +9041,69 @@ mod seam_helper_tests {
     /// Each assertion below is placed ONE BYTE either side of the final policy ceiling, so using
     /// either raw free space or only the physical guard flips it.
     #[test]
+    fn resolved_backend_room_is_shared_without_double_reserving() {
+        let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
+        let cfg = gemma3_12b();
+        let caps = conservative_caps();
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(256);
+        ec.device.ubatch_specified = true;
+        ec.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(384 << 20));
+        let (ctx, ub, weights) = (32768, 256, 64 << 20);
+        let ring = super::placement_ring(&cfg, &ec, DType::F16, DType::F16);
+        let need =
+            super::dense_resident_need(&cfg, &caps, weights, ctx, ring, ub, DType::F16, DType::F16);
+        // A backend has already applied its profile/reserve, physical guard, and prior allocations.
+        let room = need + 1024;
+        let fits = |w| {
+            super::dense_placement_fits_in_room(
+                &cfg,
+                &caps,
+                &ec,
+                w,
+                room,
+                ctx,
+                ub,
+                DType::F16,
+                DType::F16,
+            )
+        };
+        assert!(fits(weights + 1024));
+        assert!(!fits(weights + 1025));
+        assert_eq!(
+            super::dense_stream_budget_in_room(
+                &cfg,
+                &caps,
+                &ec,
+                weights,
+                room,
+                ctx,
+                ub,
+                DType::F16,
+                DType::F16,
+            ),
+            1024
+        );
+        let fit =
+            super::kv_fit_ctx_for_in_room(&cfg, &caps, &ec, weights, room, DType::F16, DType::F16)
+                .unwrap();
+        assert!(fit >= ctx);
+        assert!(
+            super::kv_fit_ctx_for_in_room(
+                &cfg,
+                &caps,
+                &ec,
+                weights,
+                weights,
+                DType::F16,
+                DType::F16,
+            )
+            .unwrap()
+                < ctx
+        );
+    }
+
+    #[test]
     fn budgets_agree_with_the_allocator_ceiling() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let vram = xtx(XTX_FREE);
@@ -8981,33 +9223,9 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn moe_weight_packing_margin_is_block_rounded_and_budgeted() {
+    fn exact_weight_plan_preserves_explicit_reserves() {
         const MIB: u64 = 1024 * 1024;
         const GIB: u64 = 1024 * MIB;
-        assert_eq!(super::resident_weight_packing_margin(1), 256 * MIB);
-        assert_eq!(super::resident_weight_packing_margin(16 * GIB), 512 * MIB);
-        assert_eq!(
-            super::resident_expert_required_bytes(4 * GIB, 16 * GIB),
-            16 * GIB + 384 * MIB
-        );
-
-        let logical_experts_only_fit = super::ModelMemoryPlan::new_with_reserves(
-            20 * GIB + 256 * MIB,
-            4 * GIB,
-            0,
-            0,
-            super::resident_weight_packing_margin(4 * GIB),
-            0,
-            0,
-        )
-        .expect("logical Expert fit plan");
-        assert_eq!(logical_experts_only_fit.expert_cache_bytes, 16 * GIB);
-        assert!(
-            logical_experts_only_fit.expert_cache_bytes
-                < super::resident_expert_required_bytes(4 * GIB, 16 * GIB),
-            "logical Expert bytes fitting exactly must still page when resident BDA packing does not"
-        );
-
         let plan = super::ModelMemoryPlan::new_with_reserves(
             20 * GIB,
             4 * GIB,
@@ -9053,7 +9271,7 @@ mod seam_helper_tests {
         assert_eq!(super::load_driver_reserve(&cfg), 0);
         let estimated = super::estimate_model_memory_plan(&cfg, 4 * GIB, 20 * GIB, 2 * GIB, GIB)
             .expect("control-plane estimate");
-        assert_eq!(estimated.weight_packing_margin_bytes, 256 * MIB);
+        assert_eq!(estimated.weight_packing_margin_bytes, 0);
         assert_eq!(estimated.post_load_reserve_bytes, 256 * MIB);
         cfg.deepseek4 = true;
         assert_eq!(super::load_driver_reserve(&cfg), 1536 * MIB);

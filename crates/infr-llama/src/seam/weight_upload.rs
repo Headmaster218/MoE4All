@@ -126,6 +126,150 @@ mod tests {
         }
     }
 
+    // A metadata-only fixture: no device, tokenizer or real model payload is needed to exercise
+    // the cold loader's selected groups, embedding choices and generated constants.
+    fn plan_fixture(untied: bool) -> (tempfile::NamedTempFile, infr_gguf::Gguf, Config) {
+        use std::io::Write;
+        let mut names: Vec<String> = [
+            "attn_norm",
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_norm",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ]
+        .into_iter()
+        .map(|n| format!("blk.0.{n}.weight"))
+        .collect();
+        names.extend(["output_norm.weight".into(), "token_embd.weight".into()]);
+        if untied {
+            names.push("output.weight".into());
+        }
+        names.push("unused_auxiliary.weight".into());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(names.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        for (index, name) in names.iter().enumerate() {
+            bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&32u64.to_le_bytes());
+            bytes.extend_from_slice(
+                &(if name == "token_embd.weight" { 1u32 } else { 0 }).to_le_bytes(),
+            ); // F16 embedding, F32 elsewhere
+            bytes.extend_from_slice(&(index as u64 * 128).to_le_bytes());
+        }
+        bytes.resize(bytes.len().next_multiple_of(32) + names.len() * 128, 0);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.flush().unwrap();
+        let gguf = infr_gguf::Gguf::open(file.path()).unwrap();
+        let cfg = Config {
+            n_layer: 1,
+            n_head: 1,
+            n_kv: 1,
+            n_embd: 32,
+            n_ff: 32,
+            head_dim: 32,
+            vocab: 32,
+            ..Default::default()
+        };
+        (file, gguf, cfg)
+    }
+
+    #[test]
+    fn cold_weight_plan_counts_selected_f32_and_constants_once() {
+        let (_file, gguf, mut cfg) = plan_fixture(true);
+        cfg.kq_l2norm = true;
+        let mut ec = crate::EngineConfig::default();
+        ec.spec.gpu_embed = false;
+        let plan = super::super::runner::cold_weight_plan(
+            &gguf,
+            &cfg,
+            &infr_core::Capabilities::default(),
+            &ec,
+        )
+        .unwrap();
+        assert_eq!(plan.groups.len(), 11); // 9 layer weights + norm + untied head
+        assert_eq!(plan.specs.len(), 12); // generated q/k ones
+        assert_eq!(plan.footprint().unwrap().dense, 12 * 128);
+        assert_eq!(plan.footprint().unwrap().expert, 0);
+        assert_eq!(plan.specs.last().unwrap().name, "@qk_ones");
+        assert!(!plan
+            .specs
+            .iter()
+            .any(|s| s.name == "unused_auxiliary.weight"));
+        assert!(!plan.specs.iter().any(|s| s.name == "token_embd.weight"));
+    }
+
+    #[test]
+    fn cold_weight_plan_tied_and_gpu_embeddings_follow_upload_policy() {
+        for untied in [false, true] {
+            let (_file, gguf, cfg) = plan_fixture(untied);
+            let mut caps = infr_core::Capabilities::default();
+            caps.embed_gather = true;
+            let mut ec = crate::EngineConfig::default();
+            ec.spec.gpu_embed = true;
+            let plan = super::super::runner::cold_weight_plan(&gguf, &cfg, &caps, &ec).unwrap();
+            let embeddings = plan
+                .specs
+                .iter()
+                .filter(|s| s.name == "token_embd.weight")
+                .count();
+            assert_eq!(embeddings, 1);
+            assert_eq!(plan.specs.len(), if untied { 12 } else { 11 });
+            assert_eq!(
+                plan.footprint().unwrap().total(),
+                (plan.specs.len() as u64 - 1) * 128 + 64
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires MOE4ALL_WEIGHT_PLAN_MODELS; metadata only, no GPU or tensor payload reads"]
+    fn real_model_cold_weight_plan_metadata() {
+        use infr_core::WeightSource;
+        let models = std::env::var_os("MOE4ALL_WEIGHT_PLAN_MODELS").expect("set model paths");
+        for path in std::env::split_paths(&models) {
+            let gguf = infr_gguf::Gguf::open(&path).unwrap();
+            let cfg = Config::from_gguf(&gguf).unwrap();
+            let ec = crate::EngineConfig::default();
+            for fused in [false, true] {
+                let mut caps = infr_core::Capabilities::default();
+                caps.embed_gather = fused;
+                caps.combined_gu = fused;
+                caps.qsa_prepare = fused;
+                let plan = super::super::runner::cold_weight_plan(&gguf, &cfg, &caps, &ec).unwrap();
+                let fp = plan.footprint().unwrap();
+                assert!(fp.total() > 0);
+                assert_eq!(
+                    fp.total(),
+                    plan.specs.iter().map(|s| s.bytes as u64).sum::<u64>()
+                );
+                assert_eq!(
+                    plan.groups.len(),
+                    plan.specs
+                        .iter()
+                        .filter(|s| !s.name.starts_with('@'))
+                        .count()
+                );
+                if cfg.qwen4exp {
+                    assert!(!plan
+                        .specs
+                        .iter()
+                        .any(|s| s.name == "per_layer_token_embd.weight"));
+                }
+                println!("WEIGHT_PLAN model={} fused={fused} tensors={} groups={} dense_bytes={} expert_bytes={}",
+                    path.file_name().unwrap().to_string_lossy(), gguf.tensors().len(), plan.groups.len(), fp.dense, fp.expert);
+            }
+        }
+    }
+
     #[test]
     fn fixed_upload_native_concat_and_f32_are_exact() {
         let tensors = [

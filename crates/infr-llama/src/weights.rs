@@ -1,6 +1,5 @@
-//! Weight-footprint accounting: how many VRAM bytes a model's weights will occupy once resident
-//! (dense vs MoE-expert), mirroring the native-quant/f16 upload policy used by the production
-//! agnostic-seam loaders.
+//! Tensor-payload accounting for resident weights (dense vs MoE-expert). Exact Vulkan layout
+//! planning additionally accounts for the loader's groups, model-specific rewrites and constants.
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
 
@@ -30,16 +29,17 @@ impl WeightFootprint {
     }
 }
 
-/// Resident VRAM bytes for one tensor, mirroring [`upload_wt`]'s path so the estimate matches what
-/// actually gets allocated: native raw blocks (padded to u32) for every quant format, else f16
-/// (float/norms dequanted to half).
+/// Resident payload bytes for one tensor, padded to u32 alignment. Only BitNet I2S is converted
+/// to F16 here; every other dtype retains its native bytes, including F32 norms and biases.
+/// Model-specific rewrites are accounted for by the seam's exact upload plan.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbytes: usize) -> u64 {
-    if infr_vulkan::linear::native_dense_supported(dtype) {
-        ((nbytes + 3) & !3) as u64 // raw blocks, padded to u32 alignment
+    let bytes = if dtype == infr_core::DType::I2S {
+        numel as u64 * 2
     } else {
-        (numel * 2) as u64 // f16
-    }
+        nbytes as u64
+    };
+    (bytes + 3) & !3
 }
 
 /// Sum the resident weight footprint across all tensors (MoE-aware). Enumerating every tensor means
@@ -72,4 +72,38 @@ pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
         }
     }
     WeightFootprint { dense, expert }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tensor_resident_bytes;
+    use infr_core::DType;
+
+    #[test]
+    fn resident_payload_preserves_native_float_integer_and_quant_bytes() {
+        for (dtype, numel, nbytes, expected) in [
+            (DType::F32, 3, 12, 12),
+            (DType::F16, 3, 6, 8),
+            (DType::Bf16, 3, 6, 8),
+            (DType::I32, 3, 12, 12),
+            (DType::U32, 3, 12, 12),
+            (DType::Q4_0, 32, 18, 20),
+            (DType::Q8_0, 32, 34, 36),
+            (DType::Tq1_0, 256, 54, 56),
+            (DType::F32, 0, 0, 0),
+        ] {
+            assert_eq!(
+                tensor_resident_bytes(dtype, numel, nbytes),
+                expected,
+                "{dtype:?} must retain its native payload"
+            );
+        }
+    }
+
+    #[test]
+    fn resident_payload_expands_only_i2s_to_f16() {
+        // 128 two-bit values plus the per-tensor F32 scale become 128 F16 values.
+        assert_eq!(tensor_resident_bytes(DType::I2S, 128, 36), 256);
+        assert_eq!(tensor_resident_bytes(DType::I2S, 256, 68), 512);
+    }
 }
