@@ -29,6 +29,7 @@ mod segmented_kv;
 pub(crate) mod token_delivery;
 pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
+mod weight_upload;
 mod weights;
 
 pub(crate) use runner::{
@@ -543,7 +544,7 @@ fn cpu_bind_with<'a>(
     be: &'a CpuBackend,
     store: Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>,
 ) -> Box<BindWeight<'a>> {
-    Box::new(move |_name, tb, dt, _n| {
+    Box::new(BindWeight::new(move |_name, tb, dt, _n| {
         if let Some(store) = &store {
             // `file_ranges` is `None` exactly for bytes the loader REWROTE (the qwen2 q/k permute,
             // the BitNet dequant), which correspond to nothing on disk and so cannot be re-read.
@@ -555,7 +556,7 @@ fn cpu_bind_with<'a>(
             }
         }
         cpu_bind_resident(be, tb, dt)
-    })
+    }))
 }
 
 /// The non-paged half of the CPU binder: map an mmap slice zero-copy, or materialize owned/fused
@@ -581,14 +582,36 @@ fn cpu_bind_resident(be: &CpuBackend, tb: WBytes, dt: DType) -> AResult<(Box<dyn
 /// so the Metal session runner and `verify_dense_metal2` share one copy.
 #[cfg(target_os = "macos")]
 fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
-    Box::new(move |_name, tb, dt, _n| {
+    Box::new(BindWeight::new(move |_name, tb, dt, _n| {
         let buf = be
             .alloc(tb.len().max(1), BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(buf.as_ref(), &tb.materialize())
             .map_err(|e| anyhow!("{e}"))?;
         Ok((buf, dt))
-    })
+    }))
+}
+
+/// Plain resident Vulkan upload, including a metadata-only allocation batch for callers that
+/// intentionally bypass MoE placement (e.g. the full-resident parity and speculative runners).
+pub(crate) fn vulkan_resident_upload_bind(vk: &infr_vulkan::VulkanBackend) -> Box<BindWeight<'_>> {
+    let mut bind = BindWeight::new(move |_name, bytes, dtype, _numel| {
+        let raw = bytes.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&raw);
+        let buffer = vk
+            .alloc_uninit(padded.len(), BufferUsage::Weights)
+            .map_err(|error| anyhow!("{error}"))?;
+        vk.upload(buffer.as_ref(), &padded)
+            .map_err(|error| anyhow!("{error}"))?;
+        bytes.release_source_pages();
+        Ok((buffer, dtype))
+    });
+    bind.prepare = Some(Box::new(move |weights| {
+        let sizes = vulkan_fixed_allocation_sizes(weights, &Default::default(), 0)?;
+        vk.begin_weight_allocation_batch(&sizes)
+            .map_err(|error| anyhow!("{error}"))
+    }));
+    Box::new(bind)
 }
 
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
@@ -851,8 +874,9 @@ pub(crate) fn generate_dense_vulkan_session(
     // building the full `vulkan_moe_binder` — which re-resolves the placement tiers and allocs a
     // Box — is pure per-turn waste. Skip it: a no-op binder that errors loudly if the invariant
     // ever breaks.
-    let warm_binder: Box<BindWeight<'_>> =
-        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
+    let warm_binder: Box<BindWeight<'_>> = Box::new(BindWeight::new(|name: &str, _tb, _dt, _n| {
+        Err(anyhow!("warm session must not re-bind {name}"))
+    }));
     let (bind, finish_fixed_allocations) = if state.is_some() {
         (warm_binder, None)
     } else {
@@ -935,9 +959,9 @@ pub(crate) fn generate_dense_vulkan_prepared_prefill_session(
     want_ctx: usize,
     prepared: runner::PreparedParallelPrompt,
 ) -> AResult<GenStats> {
-    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+    let bind: Box<BindWeight<'_>> = Box::new(BindWeight::new(|name: &str, _tb, _dt, _n| {
         Err(anyhow!("warm prepared Prefill must not re-bind {name}"))
-    });
+    }));
     let result = runner::generate_dense_backend_prepared_prefill(
         vk,
         bind.as_ref(),
@@ -991,9 +1015,9 @@ pub(crate) fn generate_dense_vulkan_parallel_sampled_session(
             "sampled parallel Vulkan decode requires an initialized primary session"
         ));
     }
-    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+    let bind: Box<BindWeight<'_>> = Box::new(BindWeight::new(|name: &str, _tb, _dt, _n| {
         Err(anyhow!("warm parallel session must not re-bind {name}"))
-    });
+    }));
     let out = runner::generate_dense_backend_parallel_sampled(
         vk,
         &*bind,
@@ -1043,9 +1067,9 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
             "parallel Vulkan prefill requires an initialized primary session"
         ));
     }
-    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+    let bind: Box<BindWeight<'_>> = Box::new(BindWeight::new(|name: &str, _tb, _dt, _n| {
         Err(anyhow!("warm parallel session must not re-bind {name}"))
-    });
+    }));
     let out = runner::generate_dense_backend_parallel_prefill(
         vk,
         &*bind,
@@ -1128,9 +1152,9 @@ pub(crate) fn generate_dense_vulkan_parallel_verify_session(
 ) -> AResult<(Vec<Vec<u32>>, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
     // Reject unsupported/invalid requests before the failure cleanup can reset warm targets.
     runner::validate_parallel_target_verify(vk, g, cfg, ec, feeds, mrope_plans, primary, peers)?;
-    let bind: Box<BindWeight<'_>> = Box::new(|name: &str, _tb, _dt, _n| {
+    let bind: Box<BindWeight<'_>> = Box::new(BindWeight::new(|name: &str, _tb, _dt, _n| {
         Err(anyhow!("warm parallel MTP session must not re-bind {name}"))
-    });
+    }));
     let mut ids = Vec::new();
     let mut logits = Vec::new();
     let mut hidden = Vec::new();
@@ -3973,29 +3997,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
             pager_budget_bytes as f64 / GIB_F64,
         );
     }
-    // The layer index of a `blk.{l}.…_exps…` tensor name.
-    let exps_layer = |name: &str| -> Option<usize> {
-        if !name.contains("_exps") {
-            return None;
-        }
-        name.strip_prefix("blk.")
-            .and_then(|r| r.split('.').next())
-            .and_then(|l| l.parse::<usize>().ok())
-    };
-    // A FUSED gate_up bank pages under `Role::Gate` (one double-width slot per expert; the model
-    // then has no `Role::Up` sources at all) — see `infr_vulkan::pager`'s MoE-session doc.
-    let moe_role_of = |name: &str| -> Option<infr_vulkan::pager::Role> {
-        use infr_vulkan::pager::Role;
-        if name.ends_with("ffn_gate_exps.weight") || name.ends_with("ffn_gate_up_exps.weight") {
-            Some(Role::Gate)
-        } else if name.ends_with("ffn_up_exps.weight") {
-            Some(Role::Up)
-        } else if name.ends_with("ffn_down_exps.weight") {
-            Some(Role::Down)
-        } else {
-            None
-        }
-    };
     // Paged tensors bind their final 4-byte placeholders now, but registration is queued until
     // every fixed allocation has landed. The runner executes the returned one-shot hook before
     // graph construction, so `Backend::moe_paged` and every placeholder identity are published
@@ -5121,7 +5122,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
     }
 
     let pending_moe_registrations_for_bind = pending_moe_registrations.clone();
-    let bind: Box<BindWeight<'a>> = Box::new(move |name, tb, dt, numel| {
+    let streamed_names: std::collections::HashSet<String> = dense_plan.keys().cloned().collect();
+    let mut bind: Box<BindWeight<'a>> = Box::new(BindWeight::new(move |name, tb, dt, numel| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
         // F32 stays native (rmsnorm/qk_norm_rope read f32); bf16 → in-shader expand (bf16 is the
@@ -5296,7 +5298,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // This applies to discrete GPUs too; persistent allocations remain in that snapshot.
         tb.release_source_pages();
         Ok((buf, dt))
-    });
+    }));
+    bind.prepare = Some(Box::new(move |weights| {
+        let sizes = vulkan_fixed_allocation_sizes(weights, &streamed_names, n_paged)?;
+        vk.begin_weight_allocation_batch(&sizes)
+            .map_err(|e| anyhow!("{e}"))
+    }));
     Ok((bind, finish_fixed_allocations))
 }
 
@@ -5405,25 +5412,27 @@ pub fn pipeline_devices(ec: &EngineConfig) -> Option<&[usize]> {
 /// resident weights only (pipeline v1 is dense-attention; the MoE-paged / dense-streamed placement
 /// tiers of [`vulkan_moe_binder`] are out of scope).
 fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'a>> {
-    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
-        // lm_head / embedding tables (issue #77) are read only by dispatch-chunked ops, so they may
-        // legitimately exceed the u32 element cap — mirror the resident/EP binders and exempt them
-        // (a large/quantized-vocab lm_head must not hard-reject a model that runs single-device/EP).
-        if !chunk_covered_dense_tensor(name) {
-            check_bda_element_cap(name, "tensor", numel)?;
-        }
-        let d = pb.device_for_weight(name);
-        let bytes = tb.materialize();
-        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-        let buf = pb
-            .backend(d)
-            .alloc_uninit(padded.len(), BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        pb.backend(d)
-            .upload(buf.as_ref(), &padded)
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok((infr_vulkan::PipelineBuffer::single(d, buf), dt))
-    })
+    Box::new(BindWeight::new(
+        move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+            // lm_head / embedding tables (issue #77) are read only by dispatch-chunked ops, so they may
+            // legitimately exceed the u32 element cap — mirror the resident/EP binders and exempt them
+            // (a large/quantized-vocab lm_head must not hard-reject a model that runs single-device/EP).
+            if !chunk_covered_dense_tensor(name) {
+                check_bda_element_cap(name, "tensor", numel)?;
+            }
+            let d = pb.device_for_weight(name);
+            let bytes = tb.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+            let buf = pb
+                .backend(d)
+                .alloc_uninit(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            pb.backend(d)
+                .upload(buf.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((infr_vulkan::PipelineBuffer::single(d, buf), dt))
+        },
+    ))
 }
 
 /// Multi-GPU PIPELINE (layer-split) dense generation — the layers of ONE model are split across
@@ -5597,57 +5606,61 @@ fn tensor_parallel_binder<'a>(
     cfg: &'a Config,
 ) -> Box<BindWeight<'a>> {
     let world = tp.world();
-    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
-        // lm_head / embedding tables (issue #77) are read only by dispatch-chunked ops, so they may
-        // legitimately exceed the u32 element cap — mirror the resident/EP binders and exempt them
-        // (they are replicated below, never sharded, so the whole-tensor cap would wrongly reject a
-        // large/quantized-vocab lm_head that runs fine single-device/EP).
-        if !chunk_covered_dense_tensor(name) {
-            check_bda_element_cap(name, "tensor", numel)?;
-        }
-        match tp_weight_role(name, cfg) {
-            Some((role, in_f)) => {
-                // Every rank's slice is cut from the whole tensor, so this binder needs the bytes
-                // themselves — materialize once for all `world` cuts, not per rank.
-                let tb = tb.materialize();
-                let mut bufs = Vec::with_capacity(world);
-                for r in 0..world {
-                    let slice = match role {
-                        infr_vulkan::TpRole::Column => tp_slice_column(&tb, dt, in_f, r, world)?,
-                        infr_vulkan::TpRole::Row => tp_slice_row(&tb, dt, in_f, r, world)?,
-                        infr_vulkan::TpRole::Replicated => tb.to_vec(),
-                    };
-                    let padded = infr_vulkan::linear::pad_to_u32_align(&slice);
-                    let buf = tp
-                        .rank(r)
-                        .alloc_uninit(padded.len(), BufferUsage::Weights)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    tp.rank(r)
-                        .upload(buf.as_ref(), &padded)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    bufs.push(buf);
-                }
-                Ok((infr_vulkan::TpBuffer::weight(role, bufs), dt))
+    Box::new(BindWeight::new(
+        move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+            // lm_head / embedding tables (issue #77) are read only by dispatch-chunked ops, so they may
+            // legitimately exceed the u32 element cap — mirror the resident/EP binders and exempt them
+            // (they are replicated below, never sharded, so the whole-tensor cap would wrongly reject a
+            // large/quantized-vocab lm_head that runs fine single-device/EP).
+            if !chunk_covered_dense_tensor(name) {
+                check_bda_element_cap(name, "tensor", numel)?;
             }
-            None => {
-                // Replicated: the full padded tensor on every rank.
-                let bytes = tb.materialize();
-                let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-                let mut bufs = Vec::with_capacity(world);
-                for r in 0..world {
-                    let buf = tp
-                        .rank(r)
-                        .alloc_uninit(padded.len(), BufferUsage::Weights)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    tp.rank(r)
-                        .upload(buf.as_ref(), &padded)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    bufs.push(buf);
+            match tp_weight_role(name, cfg) {
+                Some((role, in_f)) => {
+                    // Every rank's slice is cut from the whole tensor, so this binder needs the bytes
+                    // themselves — materialize once for all `world` cuts, not per rank.
+                    let tb = tb.materialize();
+                    let mut bufs = Vec::with_capacity(world);
+                    for r in 0..world {
+                        let slice = match role {
+                            infr_vulkan::TpRole::Column => {
+                                tp_slice_column(&tb, dt, in_f, r, world)?
+                            }
+                            infr_vulkan::TpRole::Row => tp_slice_row(&tb, dt, in_f, r, world)?,
+                            infr_vulkan::TpRole::Replicated => tb.to_vec(),
+                        };
+                        let padded = infr_vulkan::linear::pad_to_u32_align(&slice);
+                        let buf = tp
+                            .rank(r)
+                            .alloc_uninit(padded.len(), BufferUsage::Weights)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        tp.rank(r)
+                            .upload(buf.as_ref(), &padded)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        bufs.push(buf);
+                    }
+                    Ok((infr_vulkan::TpBuffer::weight(role, bufs), dt))
                 }
-                Ok((infr_vulkan::TpBuffer::replica(bufs), dt))
+                None => {
+                    // Replicated: the full padded tensor on every rank.
+                    let bytes = tb.materialize();
+                    let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+                    let mut bufs = Vec::with_capacity(world);
+                    for r in 0..world {
+                        let buf = tp
+                            .rank(r)
+                            .alloc_uninit(padded.len(), BufferUsage::Weights)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        tp.rank(r)
+                            .upload(buf.as_ref(), &padded)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        bufs.push(buf);
+                    }
+                    Ok((infr_vulkan::TpBuffer::replica(bufs), dt))
+                }
             }
-        }
-    })
+        },
+    ))
 }
 
 /// Multi-GPU TENSOR-PARALLEL (dense) generation — each transformer layer's weight matrices are
@@ -5739,67 +5752,69 @@ fn expert_parallel_binder<'a>(
 ) -> Box<BindWeight<'a>> {
     let world = ep.world();
     let n_expert = cfg.moe.as_ref().map(|m| m.n_expert).unwrap_or(0).max(1);
-    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
-        if is_expert_bank(name) {
-            // Split the bank by expert. The stacked bank is `n_expert` contiguous per-expert slices
-            // (the arena kernels index `arena + expert·stride`), so band `[r·nl, (r+1)·nl)` is a
-            // contiguous byte range and its per-expert element cap is `numel/n_expert`.
-            let total = tb.len();
-            if !total.is_multiple_of(n_expert) {
-                return Err(anyhow!(
+    Box::new(BindWeight::new(
+        move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+            if is_expert_bank(name) {
+                // Split the bank by expert. The stacked bank is `n_expert` contiguous per-expert slices
+                // (the arena kernels index `arena + expert·stride`), so band `[r·nl, (r+1)·nl)` is a
+                // contiguous byte range and its per-expert element cap is `numel/n_expert`.
+                let total = tb.len();
+                if !total.is_multiple_of(n_expert) {
+                    return Err(anyhow!(
                     "ep: expert bank '{name}' {total} bytes not divisible by n_expert={n_expert}"
                 ));
-            }
-            let stride_bytes = total / n_expert;
-            if !n_expert.is_multiple_of(world) {
-                return Err(anyhow!(
-                    "ep: n_expert={n_expert} not divisible by world {world}"
-                ));
-            }
-            let nl = n_expert / world;
-            check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
-            // Each rank uploads its own band of the bank, so the bytes are needed here.
-            let tb = tb.materialize();
-            let mut bufs = Vec::with_capacity(world);
-            for r in 0..world {
-                let start = r * nl * stride_bytes;
-                let slice = &tb[start..start + nl * stride_bytes];
-                let padded = infr_vulkan::linear::pad_to_u32_align(slice);
-                let buf = ep
-                    .rank(r)
-                    .alloc_uninit(padded.len(), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                ep.rank(r)
-                    .upload(buf.as_ref(), &padded)
-                    .map_err(|e| anyhow!("{e}"))?;
-                bufs.push(buf);
-            }
-            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
-        } else {
-            // Replicated: the full padded tensor on every rank. Mirror the resident binder's
-            // per-expert-slice / chunk-covered / whole-tensor element-cap policy for non-bank
-            // weights (a replicated router is a whole tensor; lm_head/token_embd are chunk-covered).
-            if chunk_covered_dense_tensor(name) {
-                // no whole-tensor cap (dispatch-chunked reads)
+                }
+                let stride_bytes = total / n_expert;
+                if !n_expert.is_multiple_of(world) {
+                    return Err(anyhow!(
+                        "ep: n_expert={n_expert} not divisible by world {world}"
+                    ));
+                }
+                let nl = n_expert / world;
+                check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+                // Each rank uploads its own band of the bank, so the bytes are needed here.
+                let tb = tb.materialize();
+                let mut bufs = Vec::with_capacity(world);
+                for r in 0..world {
+                    let start = r * nl * stride_bytes;
+                    let slice = &tb[start..start + nl * stride_bytes];
+                    let padded = infr_vulkan::linear::pad_to_u32_align(slice);
+                    let buf = ep
+                        .rank(r)
+                        .alloc_uninit(padded.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    ep.rank(r)
+                        .upload(buf.as_ref(), &padded)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    bufs.push(buf);
+                }
+                Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
             } else {
-                check_bda_element_cap(name, "tensor", numel)?;
+                // Replicated: the full padded tensor on every rank. Mirror the resident binder's
+                // per-expert-slice / chunk-covered / whole-tensor element-cap policy for non-bank
+                // weights (a replicated router is a whole tensor; lm_head/token_embd are chunk-covered).
+                if chunk_covered_dense_tensor(name) {
+                    // no whole-tensor cap (dispatch-chunked reads)
+                } else {
+                    check_bda_element_cap(name, "tensor", numel)?;
+                }
+                let bytes = tb.materialize();
+                let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+                let mut bufs = Vec::with_capacity(world);
+                for r in 0..world {
+                    let buf = ep
+                        .rank(r)
+                        .alloc_uninit(padded.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    ep.rank(r)
+                        .upload(buf.as_ref(), &padded)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    bufs.push(buf);
+                }
+                Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
             }
-            let bytes = tb.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-            let mut bufs = Vec::with_capacity(world);
-            for r in 0..world {
-                let buf = ep
-                    .rank(r)
-                    .alloc_uninit(padded.len(), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                ep.rank(r)
-                    .upload(buf.as_ref(), &padded)
-                    .map_err(|e| anyhow!("{e}"))?;
-                bufs.push(buf);
-            }
-            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
-        }
-    })
+        },
+    ))
 }
 
 /// Multi-GPU EXPERT-PARALLEL (MoE) generation — the model's experts are split across the `devices`
@@ -6161,16 +6176,7 @@ pub(crate) fn verify_dense_vulkan(
     let mut state = None;
     generate_dense_backend(
         vk,
-        &|_name, tb, dt, _n| {
-            let bytes = tb.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-            let buf = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buf.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buf, dt))
-        },
+        &vulkan_resident_upload_bind(vk),
         g,
         cfg,
         ec,
@@ -6276,12 +6282,111 @@ impl WBytes {
 /// GPU binder may convert float weights to f16), so the graph declares the handle to match. The
 /// tensor NAME lets a binder place specific tensors differently (the Vulkan binder puts
 /// auto-fit-offloaded MoE expert banks in host-visible memory instead of VRAM).
-type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+type BindWeightFn<'a> =
+    dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+
+/// A metadata-only upload description. Rewrites and concatenation use the same description
+/// during planning and loading; paged/streamed binders replace only their own allocations.
+struct WeightUploadSpec {
+    name: String,
+    bytes: usize,
+    direct_mmap: bool,
+}
+
+type PrepareWeightLoad<'a> = dyn Fn(
+        &[WeightUploadSpec],
+    ) -> AResult<Option<Box<dyn infr_core::backend::WeightAllocationBatch + 'a>>>
+    + 'a;
+
+pub(crate) struct BindWeight<'a> {
+    upload: Box<BindWeightFn<'a>>,
+    prepare: Option<Box<PrepareWeightLoad<'a>>>,
+}
+
+impl<'a> BindWeight<'a> {
+    pub(crate) fn new(
+        upload: impl Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a,
+    ) -> Self {
+        Self {
+            upload: Box::new(upload),
+            prepare: None,
+        }
+    }
+
+    fn prepare(
+        &self,
+        weights: &[WeightUploadSpec],
+    ) -> AResult<Option<Box<dyn infr_core::backend::WeightAllocationBatch + 'a>>> {
+        match &self.prepare {
+            Some(prepare) => prepare(weights),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for BindWeight<'a> {
+    type Target = BindWeightFn<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.upload.as_ref()
+    }
+}
 
 /// One-shot cold-load boundary used by paged Vulkan sessions. Expert weights are represented by
 /// placeholders while fixed allocations land; this hook then sizes the elastic arena from the
 /// backend's measured remainder and publishes the deferred registrations before any graph runs.
 type FinishFixedAllocations<'a> = dyn Fn() -> AResult<()> + 'a;
+
+// The layer index of a `blk.{l}.…_exps…` tensor name.
+fn exps_layer(name: &str) -> Option<usize> {
+    if !name.contains("_exps") {
+        return None;
+    }
+    name.strip_prefix("blk.")
+        .and_then(|r| r.split('.').next())
+        .and_then(|l| l.parse::<usize>().ok())
+}
+// A FUSED gate_up bank pages under `Role::Gate` (one double-width slot per expert; the model
+// then has no `Role::Up` sources at all) — see `infr_vulkan::pager`'s MoE-session doc.
+fn moe_role_of(name: &str) -> Option<infr_vulkan::pager::Role> {
+    use infr_vulkan::pager::Role;
+    if name.ends_with("ffn_gate_exps.weight") || name.ends_with("ffn_gate_up_exps.weight") {
+        Some(Role::Gate)
+    } else if name.ends_with("ffn_up_exps.weight") {
+        Some(Role::Up)
+    } else if name.ends_with("ffn_down_exps.weight") {
+        Some(Role::Down)
+    } else {
+        None
+    }
+}
+
+fn vulkan_fixed_allocation_sizes(
+    weights: &[WeightUploadSpec],
+    streamed_names: &std::collections::HashSet<String>,
+    n_paged: usize,
+) -> AResult<Vec<usize>> {
+    weights
+        .iter()
+        .map(|weight| {
+            // Match the upload binder's branches exactly. A rewritten expert is not an mmap bank
+            // and therefore must not be priced as a placeholder.
+            if streamed_names.contains(&weight.name)
+                || (weight.direct_mmap
+                    && exps_layer(&weight.name).is_some_and(|layer| layer < n_paged)
+                    && moe_role_of(&weight.name).is_some())
+            {
+                Ok(4)
+            } else {
+                weight
+                    .bytes
+                    .checked_add(3)
+                    .map(|bytes| bytes / 4 * 4)
+                    .ok_or_else(|| anyhow!("weight allocation size overflow: {}", weight.name))
+            }
+        })
+        .collect()
+}
 
 struct PendingPagedExpert {
     role: infr_vulkan::pager::Role,

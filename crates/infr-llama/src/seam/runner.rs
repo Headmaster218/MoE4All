@@ -2708,148 +2708,12 @@ fn generate_dense_backend_inner(
             }
             out
         };
+        // Enumerate the actual upload order once, before reading any weight payload. The very
+        // same groups then drive upload; no independent architecture-specific size estimator.
+        let mut weight_groups = Vec::<Vec<String>>::new();
         let wload_count = std::cell::Cell::new(0usize);
         let mut wload = |names: &[&str]| -> AResult<()> {
-            let info = |name: &str| {
-                g.tensors()
-                    .iter()
-                    .find(|t| t.name == name)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("tensor not found: {name}"))
-            };
-            // Bytes-per-row for the permute: a weight row is `n_embd` elements of the tensor's
-            // dtype (block-aligned); a bias "row" is one f32.
-            let row_bytes = |name: &str, dt: DType| -> usize {
-                if name.ends_with(".bias") {
-                    4
-                } else {
-                    infr_gguf::nbytes(dt, c.n_embd)
-                }
-            };
-            let (bytes, dt, numel) = if info(names[0])?.dtype == DType::I2S {
-                // BitNet i2_s carries a per-TENSOR trailing f32 scale and an interleaved 128-group
-                // packing (see `DType::I2S`) — neither composes with the per-row weight streaming
-                // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
-                // block per weight row, and the GPU has no i2_s kernel). Host-dequant to f16 ONCE
-                // here; every downstream stage then treats it as a plain f16 weight. The f16
-                // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` already
-                // prices for a non-`native_dense_supported` dtype, so the VRAM budget stays honest.
-                let mut cat: Vec<u8> = Vec::new();
-                let mut numel = 0usize;
-                for name in names {
-                    let i = info(name)?;
-                    if i.dtype != DType::I2S {
-                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
-                    }
-                    numel += i.shape.iter().product::<usize>();
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    let f32v = crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
-                    let f16: Vec<u8> = f32v
-                        .iter()
-                        .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
-                        .collect();
-                    match qk_perm_heads(name) {
-                        Some(heads) => cat.extend_from_slice(&permute_rows(
-                            &f16,
-                            heads,
-                            row_bytes(name, DType::F16),
-                        )),
-                        None => cat.extend_from_slice(&f16),
-                    }
-                }
-                (WBytes::Owned(cat), DType::F16, numel)
-            } else if let [name] = names {
-                let i = info(name)?;
-                // MLA absorbed-form weights: the `mla` kernels (Vulkan/Metal) read wk_b/wv_b as
-                // PLAIN f32, but GGUFs carry them quantized (Q5_0/Q4K on V2-Lite). Host-dequant to
-                // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
-                // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
-                // quantized buffer → OOB GPU fault → device lost.
-                if c.qwen4exp && name.ends_with("ple_conv1d.weight") {
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    let src = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
-                    let channels = c.hc_mult * c.n_embd;
-                    let src_k = c.ple_conv_kernel;
-                    let dst_k = (src_k - 1) * c.ple_ngram_size + 1;
-                    if src.len() != channels * src_k {
-                        return Err(anyhow!(
-                            "{name}: {} values do not match {channels} channels x {src_k} taps",
-                            src.len()
-                        ));
-                    }
-                    let mut expanded = vec![0.0f32; channels * dst_k];
-                    for ch in 0..channels {
-                        for tap in 0..src_k {
-                            expanded[ch * dst_k + tap * c.ple_ngram_size] = src[ch * src_k + tap];
-                        }
-                    }
-                    let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
-                    (WBytes::Owned(bytes), DType::F32, expanded.len())
-                } else if ((c.deepseek2 || c.bailingmoe3)
-                    && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight")))
-                    || (c.deepseek4
-                        && (name.contains("_compressor_ape.weight")
-                            || name.contains("_compressor_norm.weight")))
-                {
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    let numel = i.shape.iter().product();
-                    let f32v = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
-                    let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
-                    (WBytes::Owned(bytes), DType::F32, numel)
-                } else {
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    let numel = i.shape.iter().product();
-                    match qk_perm_heads(name) {
-                        Some(heads) => {
-                            let rb = row_bytes(name, i.dtype);
-                            (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
-                        }
-                        None => (WBytes::Mmap(tb), i.dtype, numel),
-                    }
-                }
-            } else {
-                // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
-                // concatenated buffer: a binder that pages or streams the group registers their
-                // file ranges and never wants the bytes, and materializing here would build — and
-                // fault in — a multi-MiB copy per group only to drop it. `WBytes::materialize` joins
-                // them for the binders that do read bytes.
-                //
-                // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
-                // any group containing one falls back to the owned concat.
-                let mut parts = Vec::with_capacity(names.len());
-                let mut numel = 0usize;
-                let mut permuted = false;
-                let dt = info(names[0])?.dtype;
-                for name in names {
-                    let i = info(name)?;
-                    if i.dtype != dt {
-                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
-                    }
-                    numel += i.shape.iter().product::<usize>();
-                    parts.push(g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
-                    permuted |= qk_perm_heads(name).is_some();
-                }
-                if !permuted {
-                    (WBytes::Concat(parts), dt, numel)
-                } else {
-                    let mut cat = Vec::new();
-                    for (name, tb) in names.iter().zip(&parts) {
-                        match qk_perm_heads(name) {
-                            Some(heads) => {
-                                cat.extend_from_slice(&permute_rows(tb, heads, row_bytes(name, dt)))
-                            }
-                            None => cat.extend_from_slice(tb),
-                        }
-                    }
-                    (WBytes::Owned(cat), dt, numel)
-                }
-            };
-            // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
-            // weights to f16), so the graph declares the handle to match what the backend will read.
-            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)
-                .with_context(|| format!("bind fixed weight `{}`", names[0]))?;
-            wbufs.push(buf);
-            wspecs.push((eff_dt, numel));
+            weight_groups.push(names.iter().map(|name| (*name).to_owned()).collect());
             wload_count.set(wload_count.get() + 1);
             Ok(())
         };
@@ -3239,6 +3103,187 @@ fn generate_dense_backend_inner(
             wload(&["per_layer_proj_norm.weight"])?;
             // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
             // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
+        }
+        drop(wload);
+        let mut allocation_specs = weight_groups
+            .iter()
+            .map(|group| {
+                let names: Vec<&str> = group.iter().map(String::as_str).collect();
+                super::weight_upload::describe(c, g.tensors(), &names).map(|layout| layout.spec)
+            })
+            .collect::<AResult<Vec<_>>>()?;
+        // Weightless normalization constants are ordinary resident allocations too, in the same
+        // order as the uploads below. Include them so a missing allocation never steals a tail.
+        for (enabled, name, elements) in [
+            (gemma4, "@v_ones", max_hd),
+            (c.dual_moe(), "@router_ones", ne),
+            (c.kq_l2norm, "@qk_ones", c.head_dim),
+            (c.deepseek4, "@hc_ones", c.hc_mult.saturating_mul(ne)),
+        ] {
+            if enabled {
+                allocation_specs.push(super::WeightUploadSpec {
+                    name: name.into(),
+                    bytes: elements
+                        .checked_mul(4)
+                        .ok_or_else(|| anyhow!("weight constant size overflow: {name}"))?,
+                    direct_mmap: false,
+                });
+            }
+        }
+        let mut allocation_batch = bind_weight.prepare(&allocation_specs)?;
+        let mut wload = |names: &[&str]| -> AResult<()> {
+            let info = |name: &str| {
+                g.tensors()
+                    .iter()
+                    .find(|t| t.name == name)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("tensor not found: {name}"))
+            };
+            // Bytes-per-row for the permute: a weight row is `n_embd` elements of the tensor's
+            // dtype (block-aligned); a bias "row" is one f32.
+            let row_bytes = |name: &str, dt: DType| -> usize {
+                if name.ends_with(".bias") {
+                    4
+                } else {
+                    infr_gguf::nbytes(dt, c.n_embd)
+                }
+            };
+            let layout = super::weight_upload::describe(c, g.tensors(), names)?;
+            let (bytes, dt, numel) = if layout.rewrite == super::weight_upload::Rewrite::I2sF16 {
+                // BitNet i2_s carries a per-TENSOR trailing f32 scale and an interleaved 128-group
+                // packing (see `DType::I2S`) — neither composes with the per-row weight streaming
+                // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
+                // block per weight row, and the GPU has no i2_s kernel). Host-dequant to f16 ONCE
+                // here; every downstream stage then treats it as a plain f16 weight. The f16
+                // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` already
+                // prices for a non-`native_dense_supported` dtype, so the VRAM budget stays honest.
+                let mut cat: Vec<u8> = Vec::new();
+                let mut numel = 0usize;
+                for name in names {
+                    let i = info(name)?;
+                    if i.dtype != DType::I2S {
+                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
+                    }
+                    numel += i.shape.iter().product::<usize>();
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let f32v = crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let f16: Vec<u8> = f32v
+                        .iter()
+                        .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
+                        .collect();
+                    match qk_perm_heads(name) {
+                        Some(heads) => cat.extend_from_slice(&permute_rows(
+                            &f16,
+                            heads,
+                            row_bytes(name, DType::F16),
+                        )),
+                        None => cat.extend_from_slice(&f16),
+                    }
+                }
+                (WBytes::Owned(cat), DType::F16, numel)
+            } else if let [name] = names {
+                let i = info(name)?;
+                // MLA absorbed-form weights: the `mla` kernels (Vulkan/Metal) read wk_b/wv_b as
+                // PLAIN f32, but GGUFs carry them quantized (Q5_0/Q4K on V2-Lite). Host-dequant to
+                // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
+                // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
+                // quantized buffer → OOB GPU fault → device lost.
+                if layout.rewrite == super::weight_upload::Rewrite::PleConvF32 {
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let src = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let channels = c.hc_mult * c.n_embd;
+                    let src_k = c.ple_conv_kernel;
+                    let dst_k = (src_k - 1) * c.ple_ngram_size + 1;
+                    if src.len() != channels * src_k {
+                        return Err(anyhow!(
+                            "{name}: {} values do not match {channels} channels x {src_k} taps",
+                            src.len()
+                        ));
+                    }
+                    let mut expanded = vec![0.0f32; channels * dst_k];
+                    for ch in 0..channels {
+                        for tap in 0..src_k {
+                            expanded[ch * dst_k + tap * c.ple_ngram_size] = src[ch * src_k + tap];
+                        }
+                    }
+                    let bytes = expanded.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                    (WBytes::Owned(bytes), DType::F32, expanded.len())
+                } else if layout.rewrite == super::weight_upload::Rewrite::AbsorbedF32 {
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let numel = i.shape.iter().product();
+                    let f32v = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                    (WBytes::Owned(bytes), DType::F32, numel)
+                } else {
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let numel = i.shape.iter().product();
+                    match qk_perm_heads(name) {
+                        Some(heads) => {
+                            let rb = row_bytes(name, i.dtype);
+                            (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
+                        }
+                        None => (WBytes::Mmap(tb), i.dtype, numel),
+                    }
+                }
+            } else {
+                // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
+                // concatenated buffer: a binder that pages or streams the group registers their
+                // file ranges and never wants the bytes, and materializing here would build — and
+                // fault in — a multi-MiB copy per group only to drop it. `WBytes::materialize` joins
+                // them for the binders that do read bytes.
+                //
+                // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
+                // any group containing one falls back to the owned concat.
+                let mut parts = Vec::with_capacity(names.len());
+                let mut numel = 0usize;
+                let mut permuted = false;
+                let dt = info(names[0])?.dtype;
+                for name in names {
+                    let i = info(name)?;
+                    if i.dtype != dt {
+                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
+                    }
+                    numel += i.shape.iter().product::<usize>();
+                    parts.push(g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                    permuted |= qk_perm_heads(name).is_some();
+                }
+                if !permuted {
+                    (WBytes::Concat(parts), dt, numel)
+                } else {
+                    let mut cat = Vec::new();
+                    for (name, tb) in names.iter().zip(&parts) {
+                        match qk_perm_heads(name) {
+                            Some(heads) => {
+                                cat.extend_from_slice(&permute_rows(tb, heads, row_bytes(name, dt)))
+                            }
+                            None => cat.extend_from_slice(tb),
+                        }
+                    }
+                    (WBytes::Owned(cat), dt, numel)
+                }
+            };
+            // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
+            // weights to f16), so the graph declares the handle to match what the backend will read.
+            if (bytes.len(), dt, numel) != (layout.spec.bytes, layout.dtype, layout.numel) {
+                return Err(anyhow!(
+                    "weight upload layout drift for {}: planned {:?}, actual {:?}",
+                    names[0],
+                    (layout.spec.bytes, layout.dtype, layout.numel),
+                    (bytes.len(), dt, numel)
+                ));
+            }
+            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)
+                .with_context(|| format!("bind fixed weight `{}`", names[0]))?;
+            wbufs.push(buf);
+            wspecs.push((eff_dt, numel));
+            Ok(())
+        };
+        for group in &weight_groups {
+            let names: Vec<&str> = group.iter().map(String::as_str).collect();
+            wload(&names)?;
+        }
+        drop(wload);
+        if e2b {
             debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
             debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
         }
@@ -3296,6 +3341,12 @@ fn generate_dense_backend_inner(
             wbufs.push(b);
             wspecs.push((DType::F32, c.hc_mult * ne));
         }
+        if let Some(batch) = allocation_batch.as_mut() {
+            batch
+                .finish()
+                .map_err(|e| anyhow!("finish fixed weight layout: {e}"))?;
+        }
+        drop(allocation_batch);
         // ── re-decide the context against what the device says is LEFT ───────────────────────
         // Every weight this session will hold is resident by now. Paged Vulkan sessions physically
         // escrow their predicted runtime workspace while those allocations land; release it before

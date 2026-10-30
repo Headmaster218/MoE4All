@@ -224,8 +224,7 @@ pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
 /// native-dtype GGUF tensor into a backend buffer + the effective dtype it now holds. Named here
 /// (rather than inlined at each call site) purely to keep clippy's `type_complexity` lint quiet —
 /// see [`upload_mtp_head_bufs`] / [`MtpHeadSession::build`].
-type BindWeightFn<'a> =
-    dyn Fn(&str, crate::seam::WBytes, DType, usize) -> Result<(Box<dyn Buffer>, DType)> + 'a;
+type BindWeightFn<'a> = crate::seam::BindWeight<'a>;
 
 /// [`upload_mtp_head_bufs`]'s return shape: the 16 uploaded weight buffers, index-parallel with
 /// their (effective dtype, element count) — the pair `build_mtp_graph` needs to declare each
@@ -1393,7 +1392,7 @@ impl<'a> MtpHeadSession<'a> {
     ) -> Result<Self> {
         Self::build(
             cpu_be,
-            &|_name, tb, dt, _n| match tb {
+            &BindWeightFn::new(|_name, tb, dt, _n| match tb {
                 crate::seam::WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
                 other => {
                     let v = other.materialize();
@@ -1405,7 +1404,7 @@ impl<'a> MtpHeadSession<'a> {
                         .map_err(|e| anyhow!("{e}"))?;
                     Ok((buf, dt))
                 }
-            },
+            }),
             g,
             cfg,
             ec,
@@ -1428,7 +1427,7 @@ impl<'a> MtpHeadSession<'a> {
     ) -> Result<Self> {
         Self::build(
             vk,
-            &|_name, tb, dt, _n| {
+            &BindWeightFn::new(|_name, tb, dt, _n| {
                 let bytes = tb.materialize();
                 let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
                 let buf = vk
@@ -1437,7 +1436,7 @@ impl<'a> MtpHeadSession<'a> {
                 vk.upload(buf.as_ref(), &padded)
                     .map_err(|e| anyhow!("{e}"))?;
                 Ok((buf, dt))
-            },
+            }),
             g,
             cfg,
             ec,
@@ -1461,14 +1460,14 @@ impl<'a> MtpHeadSession<'a> {
     ) -> Result<Self> {
         Self::build(
             mtl,
-            &|_name, tb, dt, _n| {
+            &BindWeightFn::new(|_name, tb, dt, _n| {
                 let buf = mtl
                     .alloc(tb.len().max(1), BufferUsage::Weights)
                     .map_err(|e| anyhow!("{e}"))?;
                 mtl.upload(buf.as_ref(), &tb.materialize())
                     .map_err(|e| anyhow!("{e}"))?;
                 Ok((buf, dt))
-            },
+            }),
             g,
             cfg,
             ec,

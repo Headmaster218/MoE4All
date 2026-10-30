@@ -69,7 +69,9 @@ fn forward(
     turn: Option<TurnCheckpoint>,
 ) -> Vec<f32> {
     let mut logits = Vec::new();
-    let bind = |name: &str, _, _, _| Err(anyhow!("diagnostic must not rebind {name}"));
+    let bind = crate::seam::BindWeight::new(|name: &str, _, _, _| {
+        Err(anyhow!("diagnostic must not rebind {name}"))
+    });
     runner::generate_dense_backend(
         &session.be,
         &bind,
