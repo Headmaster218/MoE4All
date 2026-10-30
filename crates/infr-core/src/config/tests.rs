@@ -2058,6 +2058,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
         "INFR_NO_NARROW_F32_GEMV",
+        "INFR_AMDVLK_HD256_FLASH",
         "INFR_RAM_BUDGET",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",

@@ -675,6 +675,15 @@ fn main() {
         // subgroups plus safe final-tile staging fit in 30,912 B; this is a separate shader so
         // the established hd=128 variants remain byte-for-byte untouched.
         ("attn_flash_warp_hd256", "attn_flash_warp_hd256_bm16", &[]),
+        (
+            // Twin WITHOUT `[[unroll]]`: the fully-unrolled IR faults amdvlk's LLPC inside
+            // vkCreateComputePipelines (0xc0000005, amdvlk64.dll+0x2b65705). The recorder picks
+            // this build on the AMD proprietary driver and the unrolled one everywhere else, so
+            // conforming drivers keep the unrolled performance.
+            "attn_flash_warp_hd256",
+            "attn_flash_warp_hd256_bm16_nounroll",
+            &["-DNO_UNROLL"],
+        ),
         ("attn_flash_reg", "attn_flash_reg", &[]),
         // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KiB shared devices (NVIDIA, MoltenVK).
         ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),
