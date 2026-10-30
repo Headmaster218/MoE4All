@@ -4076,15 +4076,7 @@ fn lower_op(
                     let w32_addr = pool[&w32]
                         .device_addr()
                         .expect("lin_w32 scratch needs a BDA device address");
-                    rec.linear_f32_tracked(
-                        w32_addr,
-                        pool[&w32].as_ref(),
-                        xb,
-                        y,
-                        m,
-                        in_f,
-                        out_f,
-                    );
+                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
@@ -9094,13 +9086,11 @@ fn lower_op(
                 let npad = n_pairs.div_ceil(64) * 64 + 64;
                 // Router logits may take the 64-row tiled GEMM at prefill rows (see
                 // `moe_router_gemm_applies`): its C store covers whole row tiles.
-                let logits = alu(
-                    moe_router_logits_rows(
-                        rows,
-                        moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
-                    ) * n_expert
-                        * 4,
-                )?;
+                let logits = alu(moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert
+                    * 4)?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
                 // Bucket arrays index the LOCAL expert shard under EP (ids are remapped to
@@ -9476,17 +9466,7 @@ fn lower_op(
             // Router logits over all experts, all `rows` tokens in one dispatch.
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
-            record_moe_router_logits(
-                be_,
-                rdt,
-                rw,
-                rxb,
-                logits.get(pool),
-                rows,
-                ne,
-                n_expert,
-                rec,
-            );
+            record_moe_router_logits(be_, rdt, rw, rxb, logits.get(pool), rows, ne, n_expert, rec);
             let bias_buf: &dyn Buffer = match exp_probs_b {
                 Some(epb) => r(*epb)?,
                 None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -17853,20 +17833,6 @@ fn sync_stream_inner<'a>(
     Ok(())
 }
 
-/// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
-/// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
-/// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
-/// route exactly — just arena-addressed. A genuine prefill chunk (m>16, past the resident mrow
-/// window) with a coopmat-warp-eligible native quant takes the GEMM; decode/small-m/verify keep the
-/// GEMV (the task's "small-m keeps the GEMV"). The one native-quant shape the resident path routes
-/// to the dp4a `mmq` GEMM instead of the coopmat-warp arm — Q4_K with out_f%128!=0 (no warp tile) —
-/// is NOT arena-converted (its shader reads the weight outside native_decode's NW chokepoint), so it
-/// too keeps the GEMV; every other native quant reaches the coopmat-warp arm `streamed_prefill_gemm`
-/// mirrors. Also mirrors the resident `warp_ok` gate's `INFR_NO_GEMM_WARP` escape hatch: with it
-/// set, the resident path drops out of the coopmat-warp arm entirely (falling to mmq/off-tier), so
-/// the streamed route must fall back to the GEMV too — otherwise a Q4_K out_f%128==0 shape would
-/// diverge (resident: mmq: streamed: still the coopmat GEMM twin), which can panic the twin-SPV
-/// lookup under that debug knob.
 /// Narrow-output streamed Linears at prefill rows: expand the (tiny) native weight to f32 and take
 /// the batched f32r GEMV instead of the native per-row GEMV. Shape/dtype half lives in
 /// [`crate::recorder::narrow_f32_gemm_eligible`] so the scratch reservation tracks it exactly.
@@ -17886,6 +17852,20 @@ fn narrow_f32_gemv_applies(
         && crate::recorder::narrow_f32_gemm_eligible(dt, m, in_f, out_f)
 }
 
+/// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
+/// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
+/// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
+/// route exactly — just arena-addressed. A genuine prefill chunk (m>16, past the resident mrow
+/// window) with a coopmat-warp-eligible native quant takes the GEMM; decode/small-m/verify keep the
+/// GEMV (the task's "small-m keeps the GEMV"). The one native-quant shape the resident path routes
+/// to the dp4a `mmq` GEMM instead of the coopmat-warp arm — Q4_K with out_f%128!=0 (no warp tile) —
+/// is NOT arena-converted (its shader reads the weight outside native_decode's NW chokepoint), so it
+/// too keeps the GEMV; every other native quant reaches the coopmat-warp arm `streamed_prefill_gemm`
+/// mirrors. Also mirrors the resident `warp_ok` gate's `INFR_NO_GEMM_WARP` escape hatch: with it
+/// set, the resident path drops out of the coopmat-warp arm entirely (falling to mmq/off-tier), so
+/// the streamed route must fall back to the GEMV too — otherwise a Q4_K out_f%128==0 shape would
+/// diverge (resident: mmq: streamed: still the coopmat GEMM twin), which can panic the twin-SPV
+/// lookup under that debug knob.
 fn streamed_gemm_applies(
     be_: &VulkanBackend,
     dt: infr_core::DType,
@@ -21276,6 +21256,29 @@ mod tests {
     ///
     /// Qwen3.8-Flash-Next's numbers: 4096-row prefill chunks (its `ubatch` is 64-aligned, so the
     /// GEMM tier wastes nothing) and `n_expert == 512`, which is why the gate's `n%64` holds.
+    #[test]
+    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
+        use super::*;
+        for rows in [1usize, 2, 8, 16, 17, 63, 64, 65, 128, 129, 4096, 30_000] {
+            assert_eq!(moe_router_logits_rows(rows, false), rows);
+            let padded = moe_router_logits_rows(rows, true);
+            assert!(padded >= rows, "{rows} -> {padded} short of the C store");
+            assert!(
+                padded.is_multiple_of(64),
+                "{rows} -> {padded} not tile-aligned"
+            );
+            assert!(
+                padded < rows + 64,
+                "{rows} -> {padded} wastes a whole extra tile"
+            );
+            assert_eq!(padded, rows.div_ceil(64) * 64);
+        }
+        // The tile store is what forces padding: an exact-multiple chunk (the engine's 64-aligned
+        // prefill ubatch) must stay unpadded, or the padded/dst row counts would disagree.
+        assert_eq!(moe_router_logits_rows(4096, true), 4096);
+        assert_eq!(moe_router_logits_rows(17, true), 64);
+    }
+
     /// The narrow-output f32 route is the only tier the Qwen3.8-Flash-Next `2560x48` /
     /// `10240x4` tensors can take (no 64-multiple in n), and it is exact, so the gate must not
     /// drift into shapes that either HAVE a tile, are decode-sized, or would expand a big weight.
@@ -21313,7 +21316,9 @@ mod tests {
         }
         // No expansion build for these dtypes.
         for dt in [DType::Q4K, DType::Q6K, DType::F32, DType::F16] {
-            assert!(!crate::recorder::narrow_f32_gemm_eligible(dt, 4096, 2560, 48));
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                dt, 4096, 2560, 48
+            ));
         }
         // K must stay on the native block grid.
         assert!(!crate::recorder::narrow_f32_gemm_eligible(
@@ -21335,23 +21340,6 @@ mod tests {
             4096,
             33
         ));
-    }
-
-    #[test]
-    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
-        use super::*;
-        for rows in [1usize, 2, 8, 16, 17, 63, 64, 65, 128, 129, 4096, 30_000] {
-            assert_eq!(moe_router_logits_rows(rows, false), rows);
-            let padded = moe_router_logits_rows(rows, true);
-            assert!(padded >= rows, "{rows} -> {padded} short of the C store");
-            assert!(padded.is_multiple_of(64), "{rows} -> {padded} not tile-aligned");
-            assert!(padded < rows + 64, "{rows} -> {padded} wastes a whole extra tile");
-            assert_eq!(padded, rows.div_ceil(64) * 64);
-        }
-        // The tile store is what forces padding: an exact-multiple chunk (the engine's 64-aligned
-        // prefill ubatch) must stay unpadded, or the padded/dst row counts would disagree.
-        assert_eq!(moe_router_logits_rows(4096, true), 4096);
-        assert_eq!(moe_router_logits_rows(17, true), 64);
     }
 
     #[test]

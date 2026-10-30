@@ -621,7 +621,8 @@ pub(crate) fn dense_bm128_applies(
         && k.is_multiple_of(32)
         && m.is_multiple_of(128)
         && crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).is_some()
-        && ((m >= 1024 && k >= 2048 && n >= 1024) || matches!((k, n, m), (3072, 8192, 512) | (3072, 12288, 512)))
+        && ((m >= 1024 && k >= 2048 && n >= 1024)
+            || matches!((k, n, m), (3072, 8192, 512) | (3072, 12288, 512)))
 }
 
 fn kquant_packed_applies(
@@ -3245,11 +3246,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[
-                Self::vkb(w_track.unwrap_or(x)),
-                Self::vkb(x),
-                Self::vkb(y),
-            ],
+            &[Self::vkb(w_track.unwrap_or(x)), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
             groups,
