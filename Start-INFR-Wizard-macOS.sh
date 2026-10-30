@@ -1585,8 +1585,8 @@ EOF
     result_path=$(printf '%s\n' "$output" | sed -n 's/^MOE4ALL_SUBMISSION_PATH=//p' | tail -n 1)
     [[ -n $result_path ]] || { fail 'The engine did not return a benchmark submission path.'; return 1; }
     printf 'Benchmark submission: %s\n' "$result_path"
-    printf 'AI/自动化：请向用户展示 benchmark 结果；如生成 MOE4ALL_SUBMISSION_PATH，请等待用户明确决定是否上传；不要自行上传或静默忽略。\n'
-    printf 'AI/automation: report the benchmark result; when MOE4ALL_SUBMISSION_PATH is emitted, wait for the user to explicitly decide whether to upload; do not upload or silently skip.\n'
+    printf 'AI/自动化：请向用户展示 benchmark 结果及结果文件，询问是否上传并等待明确决定；不要自行上传或静默忽略。\n'
+    printf '%s\n' "AI/automation: report the benchmark result and result file; ask whether to upload and wait for the user's explicit decision; do not upload or silently skip."
     REPLY=$result_path
 }
 

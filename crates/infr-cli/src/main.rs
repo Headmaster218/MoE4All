@@ -6,6 +6,7 @@ use infr_core::config::{Config, ConfigOverrides, PartialConfig};
 use std::io::Write as _;
 use std::sync::Arc;
 
+mod benchmark_artifact;
 mod benchmark_hardware;
 mod diagnostics;
 mod submission;
@@ -1218,9 +1219,9 @@ fn validate_error_payload(value: &serde_json::Value) -> anyhow::Result<()> {
 }
 
 const BENCHMARK_AI_GUIDANCE_ZH: &str =
-    "AI/自动化：请向用户展示 benchmark 结果；如生成 MOE4ALL_SUBMISSION_PATH，请等待用户明确决定是否上传；不要自行上传或静默忽略。";
+    "AI/自动化：请向用户展示 benchmark 结果及结果文件，询问是否上传并等待明确决定；不要自行上传或静默忽略。";
 const BENCHMARK_AI_GUIDANCE_EN: &str =
-    "AI/automation: report the benchmark result; when MOE4ALL_SUBMISSION_PATH is emitted, wait for the user to explicitly decide whether to upload; do not upload or silently skip.";
+    "AI/automation: report the benchmark result and result file; ask whether to upload and wait for the user's explicit decision; do not upload or silently skip.";
 
 fn print_benchmark_ai_guidance() {
     // print-ok: stable instructions for human and automated benchmark callers.
@@ -1236,6 +1237,23 @@ fn print_benchmark_result_ai_guidance(json: bool) {
         eprintln!("{BENCHMARK_AI_GUIDANCE_EN}");
     } else {
         print_benchmark_ai_guidance();
+    }
+}
+
+fn preserve_human_benchmark_result(raw: &str) {
+    match benchmark_artifact::save(raw) {
+        Ok(path) => {
+            // print-ok: local raw result, distinct from an upload-ready .m4b submission.
+            println!("Benchmark JSON: {}", path.display());
+            // print-ok: machine-readable local result path; not an upload confirmation.
+            println!("MOE4ALL_BENCHMARK_JSON={}", path.display());
+        }
+        Err(error) => {
+            eprintln!("保存 benchmark JSON 失败 / Could not save benchmark JSON: {error:#}");
+            // Keep the complete result available to a terminal/agent even when local storage
+            // fails. This is outside the timed region and never changes --json stdout.
+            eprintln!("Benchmark JSON: {raw}");
+        }
     }
 }
 
@@ -4895,6 +4913,24 @@ fn cmd_bench(
         "hardware": hardware,
         "configuration": benchmark_hardware::configured(cfg, backend_name),
     });
+    metadata["configuration"]["benchmark_kind"] = if pg.is_some() {
+        "mixed"
+    } else if n_gen > 0 {
+        "decode"
+    } else {
+        "prefill"
+    }
+    .into();
+    metadata["configuration"]["prompt_tokens"] = pg.map_or(n_prompt, |(p, _)| p).into();
+    metadata["configuration"]["decode_tokens"] = pg.map_or(n_gen, |(_, g)| g).into();
+    metadata["configuration"]["depth_tokens"] = synthetic_depth.unwrap_or(depth).into();
+    metadata["configuration"]["depth_mode"] = if synthetic_depth.is_some() {
+        "synthetic"
+    } else {
+        "real"
+    }
+    .into();
+    metadata["configuration"]["repetitions"] = reps.into();
     // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
@@ -5129,6 +5165,14 @@ fn print_bench_avg_mtp(
         spread_note(samples, avg),
         placement_note(placement),
     );
+    if metadata.is_some() {
+        preserve_human_benchmark_result(&bench_json_with_metadata(
+            samples,
+            Some(m),
+            placement,
+            metadata,
+        ));
+    }
 }
 
 /// `infr bench --json`'s one output line, as a string — the SINGLE place the machine-readable
@@ -5275,6 +5319,11 @@ fn print_bench_avg(
             spread_note(samples, avg),
             placement_note(placement),
         );
+        if metadata.is_some() {
+            preserve_human_benchmark_result(&bench_json_with_metadata(
+                samples, None, placement, metadata,
+            ));
+        }
     }
 }
 
@@ -5780,6 +5829,15 @@ fn cmd_bench_diffusion_gemma(
     } else {
         // print-ok: program OUTPUT — an `infr bench` result line (`--json` shape included).
         println!("pp{}: {:.1} t/s{tag}  ({reps} reps)", r.last_np, r.pp_ts);
+    }
+    if !json {
+        let speed = if n_gen > 0 { r.gen_ts } else { r.pp_ts };
+        preserve_human_benchmark_result(&bench_json_with_metadata(
+            &[speed],
+            None,
+            None,
+            Some(metadata),
+        ));
     }
     Ok(())
 }

@@ -1192,8 +1192,8 @@ function Write-ManualBenchmarkResult {
         throw
     }
     Write-Host "Benchmark submission: $resultPath" -ForegroundColor DarkGray
-    Write-Host 'AI/自动化：请向用户展示 benchmark 结果；如生成 MOE4ALL_SUBMISSION_PATH，请等待用户明确决定是否上传；不要自行上传或静默忽略。' -ForegroundColor Yellow
-    Write-Host 'AI/automation: report the benchmark result; when MOE4ALL_SUBMISSION_PATH is emitted, wait for the user to explicitly decide whether to upload; do not upload or silently skip.' -ForegroundColor Yellow
+    Write-Host 'AI/自动化：请向用户展示 benchmark 结果及结果文件，询问是否上传并等待明确决定；不要自行上传或静默忽略。' -ForegroundColor Yellow
+    Write-Host "AI/automation: report the benchmark result and result file; ask whether to upload and wait for the user's explicit decision; do not upload or silently skip." -ForegroundColor Yellow
     return $resultPath
 }
 
