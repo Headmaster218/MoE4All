@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Actual ordinary adapter and ACK-activated prepared C, independent of NE32/F32 fixtures.
 use super::*;
 use crate::pager::{ExpertSource, MoeHostChunkSpec, MoePagerLayout, MoePoolSpec, Role};

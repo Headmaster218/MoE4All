@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Real NEXT recording/activation plus submitted host-wait CPU faults, short horizon.
 //! Child of host_ready_combined_tests; deliberately does not call Fixture::prepare,
 //! whose legacy coverage overrides the source-certificate horizon.

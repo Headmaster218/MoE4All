@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Native diagnostic for recurrent prefix reuse across Prefill shapes. Never runs by default.
 use super::{DenseVulkanSession, SeamModel};
 use crate::seam::{runner, weights::TurnRecurrentCkpt, PlacementScope, SeamKv, TurnCheckpoint};
