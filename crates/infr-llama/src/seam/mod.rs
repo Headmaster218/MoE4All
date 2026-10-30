@@ -3490,142 +3490,7 @@ fn chunk_covered_dense_tensor(name: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MoeHostBacking {
     Full,
-    Bounded {
-        bytes: usize,
-    },
-    /// Unified-memory automatic mode: the device arena is already the only useful anonymous
-    /// cache, while misses copy from the retained GGUF mapping instead of reopening the file.
-    Mapped,
-}
-
-struct MappedMoeBank {
-    file_offset: u64,
-    bank: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
-}
-
-/// Read-only MoE bottom tier backed by the GGUF mappings already retained by `ExpertSource`.
-///
-/// This is intentionally local to the Vulkan MoE seam. File-backed paging remains the right
-/// policy when weights exceed RAM; UMA automatic mode is different because it has deliberately
-/// declined a second anonymous Host Store and must not turn that memory saving into repeated SSD
-/// reads after the model mapping is resident.
-struct MappedMoeBlockIo {
-    banks: Vec<MappedMoeBank>,
-}
-
-impl MappedMoeBlockIo {
-    fn from_registrations(registrations: &[PendingPagedExpert]) -> AResult<Self> {
-        let mut banks = Vec::with_capacity(registrations.len());
-        for registration in registrations {
-            let source = &registration.source;
-            let file = source.file.as_ref().ok_or_else(|| {
-                anyhow!("mapped MoE source received an expert bank without a file descriptor")
-            })?;
-            let [extent] = file.extents.as_slice() else {
-                return Err(anyhow!(
-                    "mapped MoE source expected one contiguous extent for expert bank {}, got {}",
-                    file.id,
-                    file.extents.len()
-                ));
-            };
-            let expected = source
-                .stride_bytes
-                .checked_mul(registration.n_expert)
-                .ok_or_else(|| anyhow!("mapped MoE expert bank size overflow"))?;
-            let bank: &(dyn AsRef<[u8]> + Send + Sync) = &*source.bank;
-            if extent.len != expected || bank.as_ref().len() != expected {
-                return Err(anyhow!(
-                    "mapped MoE expert bank {} has file/mapping sizes {}/{}, expected {} x {} = {}",
-                    file.id,
-                    extent.len,
-                    bank.as_ref().len(),
-                    registration.n_expert,
-                    source.stride_bytes,
-                    expected
-                ));
-            }
-            // `Mmap::map` is lazy on Windows. Touch one byte per base page now so the first
-            // Prefill does not become the model's actual disk-loading pass. `black_box` keeps the
-            // reads observable without retaining a checksum or another copy of the weights.
-            let mut resident_probe = 0u8;
-            for page in bank.as_ref().chunks(4096) {
-                resident_probe ^= page[0];
-            }
-            std::hint::black_box(resident_probe);
-            banks.push(MappedMoeBank {
-                file_offset: extent.offset,
-                bank: std::sync::Arc::clone(&source.bank),
-            });
-        }
-        banks.sort_unstable_by_key(|bank| bank.file_offset);
-        for pair in banks.windows(2) {
-            let previous: &(dyn AsRef<[u8]> + Send + Sync) = &*pair[0].bank;
-            let previous_end = pair[0]
-                .file_offset
-                .checked_add(previous.as_ref().len() as u64)
-                .ok_or_else(|| anyhow!("mapped MoE bank file range overflow"))?;
-            if previous_end > pair[1].file_offset {
-                return Err(anyhow!("mapped MoE bank file ranges overlap"));
-            }
-        }
-        Ok(Self { banks })
-    }
-}
-
-impl infr_core::blockio::BlockIo for MappedMoeBlockIo {
-    fn read_block(
-        &self,
-        desc: &infr_core::blockio::BlockDesc,
-        dst: &mut [u8],
-    ) -> infr_core::error::Result<()> {
-        let len = desc.nbytes();
-        if dst.len() < len {
-            return Err(infr_core::error::Error::Loader(format!(
-                "mapped MoE block {} needs {len} destination bytes, got {}",
-                desc.id,
-                dst.len()
-            )));
-        }
-        let mut dst_offset = 0usize;
-        for extent in &desc.extents {
-            let index = self
-                .banks
-                .partition_point(|bank| bank.file_offset <= extent.offset)
-                .checked_sub(1)
-                .ok_or_else(|| {
-                    infr_core::error::Error::Loader(format!(
-                        "mapped MoE block {} starts before every retained bank",
-                        desc.id
-                    ))
-                })?;
-            let mapped = &self.banks[index];
-            let bank: &(dyn AsRef<[u8]> + Send + Sync) = &*mapped.bank;
-            let source_offset =
-                usize::try_from(extent.offset - mapped.file_offset).map_err(|_| {
-                    infr_core::error::Error::Loader(format!(
-                        "mapped MoE block {} source offset exceeds usize",
-                        desc.id
-                    ))
-                })?;
-            let source_end = source_offset
-                .checked_add(extent.len)
-                .filter(|&end| end <= bank.as_ref().len())
-                .ok_or_else(|| {
-                    infr_core::error::Error::Loader(format!(
-                        "mapped MoE block {} exceeds its retained bank",
-                        desc.id
-                    ))
-                })?;
-            let dst_end = dst_offset + extent.len;
-            dst[dst_offset..dst_end].copy_from_slice(&bank.as_ref()[source_offset..source_end]);
-            dst_offset = dst_end;
-        }
-        Ok(())
-    }
-}
-
-fn should_trim_reclaimable_sources(backing: MoeHostBacking) -> bool {
-    !matches!(backing, MoeHostBacking::Mapped)
+    Bounded { bytes: usize },
 }
 
 /// Startup-frozen automatic budgets are total-process limits. Account for persistent memory
@@ -3700,13 +3565,11 @@ fn moe_host_backing_for_device(
                 | infr_core::hostmem::RamRequest::TotalProcessBudget(_)
         )
     {
-        return if requested_budget >= payload_bytes as u64 {
-            MoeHostBacking::Mapped
-        } else {
-            // The mapping cannot be kept resident inside the shared process budget. Preserve
-            // the old direct file-streaming fallback instead of prefaulting the host into paging.
-            MoeHostBacking::Bounded { bytes: 0 }
-        };
+        // The device arena already consumes system RAM on UMA. Never prefault the full
+        // GGUF source or build another host cache beneath it, even when the total-process
+        // budget could cover both copies. Reuse the existing zero-RAM file-through tier;
+        // Prefill and Decode read only the ranges they need into their upload destination.
+        return MoeHostBacking::Bounded { bytes: 0 };
     }
     // WDDM charges device-local Vulkan allocations against Windows' system commit limit. Only an
     // unresolved live Auto request may be clipped by that late snapshot. A startup-frozen budget
@@ -4661,7 +4524,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let (host_kind, host_resident_bytes) = match host_backing {
                     MoeHostBacking::Full => ("full-RAM", host_bytes),
                     MoeHostBacking::Bounded { bytes } => ("inclusive-RAM/SSD", bytes),
-                    MoeHostBacking::Mapped => ("mapped-page-cache", 0),
                 };
                 if matches!(host_backing, MoeHostBacking::Full) {
                     if let Some(bytes) = oversized_host_layer {
@@ -4720,6 +4582,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     host_resident_bytes as u64,
                 );
                 match host_backing {
+                    MoeHostBacking::Bounded { bytes: 0 }
+                        if vk.capabilities().unified_memory =>
+                    {
+                        tracing::info!(
+                            "MoE host plan: UMA zero-RAM file streaming; no full expert-source preload or permanent Host Store"
+                        )
+                    }
                     MoeHostBacking::Bounded { bytes } => tracing::info!(
                         "MoE host plan: bounded inclusive RAM/SSD tier {:.2} GiB / {:.2} GiB expert payload across {} size class(es)",
                         bytes as f64 / GIB_F64,
@@ -4730,16 +4599,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         "MoE host plan: full layer-contiguous RAM store {:.2} GiB; RAM and commit budgets cover every routed expert, runtime SSD tier disabled",
                         host_bytes as f64 / GIB_F64,
                     ),
-                    MoeHostBacking::Mapped => tracing::info!(
-                        "MoE host plan: retained GGUF mapping below the unified-memory device arena; runtime misses copy from the OS page cache without a duplicate anonymous Host Store",
-                    ),
                 }
                 // UMA uploads release only their source mappings; a process-wide trim could
                 // also evict GPU-resident shared RAM and undo the placement just completed.
-                if !vk.capabilities().unified_memory
-                    && reclaimable_fixed_host_source_bytes > 0
-                    && should_trim_reclaimable_sources(host_backing)
-                {
+                if !vk.capabilities().unified_memory && reclaimable_fixed_host_source_bytes > 0 {
                     let resident_before_trim = infr_core::hostmem::process_resident_bytes();
                     if infr_core::hostmem::trim_reclaimable_working_set() {
                         let resident_after_trim = infr_core::hostmem::process_resident_bytes();
@@ -4810,26 +4673,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                             "MoE host arena allocated after fixed uploads: {:.2} GiB / {:.2} GiB budget across {} size class(es); GPU shadows share this budget and remaining Experts stream from SSD",
                             tier.arena_bytes() as f64 / GIB_F64,
                             tier.budget_bytes() as f64 / GIB_F64,
-                            tier.classes().len(),
-                        );
-                        (Some(tier), None)
-                    }
-                    MoeHostBacking::Mapped => {
-                        let mapped_io: std::sync::Arc<dyn infr_core::blockio::BlockIo> =
-                            std::sync::Arc::new(MappedMoeBlockIo::from_registrations(
-                                &registrations,
-                            )?);
-                        let tier = std::sync::Arc::new(
-                            infr_core::hostpager::InclusiveHostTier::new(
-                                0,
-                                &host_classes,
-                                mapped_io,
-                            )
-                            .map_err(|e| anyhow!("{e}"))?,
-                        );
-                        tracing::info!(
-                            "MoE mapped source ready: {:.2} GiB anonymous host arena across {} size class(es); all misses resolve from retained GGUF mappings",
-                            tier.arena_bytes() as f64 / GIB_F64,
                             tier.classes().len(),
                         );
                         (Some(tier), None)
@@ -6688,8 +6531,8 @@ mod seam_helper_tests {
                     None,
                     payload,
                 ),
-                super::MoeHostBacking::Mapped,
-                "UMA must retain the GGUF mapping without allocating a second expert cache"
+                super::MoeHostBacking::Bounded { bytes: 0 },
+                "UMA must stream without a second expert cache or full mapped preload"
             );
         }
         assert_eq!(
@@ -6704,7 +6547,7 @@ mod seam_helper_tests {
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
-            "UMA must keep file streaming when the mapped payload does not fit its automatic budget"
+            "UMA must keep zero-RAM file streaming when the expert payload exceeds its automatic budget"
         );
         assert_eq!(
             super::moe_host_backing_for_device(
@@ -6717,23 +6560,114 @@ mod seam_helper_tests {
                 None,
                 payload,
             ),
-            super::MoeHostBacking::Mapped,
-            "an explicit total-process RAM budget must not create a second UMA expert store"
+            super::MoeHostBacking::Bounded { bytes: 0 },
+            "an explicit total-process RAM budget must use the zero-RAM file-through tier"
         );
     }
 
     #[test]
-    fn mapped_moe_source_reads_registered_experts_without_file_io() {
-        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+    fn uma_file_streaming_keeps_discrete_and_explicit_cache_policies() {
+        use infr_core::hostmem::RamRequest;
+
+        for profile in [
+            infr_core::config::AutoProfile::Conservative,
+            infr_core::config::AutoProfile::Aggressive,
+        ] {
+            for request in [
+                RamRequest::Auto,
+                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                RamRequest::TotalProcessBudget(0),
+                RamRequest::Bypass,
+            ] {
+                for available in [Some((60 * GIB) as u64), Some(GIB as u64), None] {
+                    assert_eq!(
+                        super::moe_host_backing_for_device(
+                            profile,
+                            request,
+                            true,
+                            available,
+                            Some((64 * GIB) as u64),
+                            Some((2 * GIB) as u64),
+                            Some(GIB as u64),
+                            47 * GIB,
+                        ),
+                        super::MoeHostBacking::Bounded { bytes: 0 },
+                        "UMA source policy must not depend on free RAM: {profile:?}, {request:?}"
+                    );
+                }
+            }
+            for request in [
+                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+            ] {
+                assert_eq!(
+                    super::moe_host_backing_for_device(
+                        profile,
+                        request,
+                        false,
+                        Some(GIB as u64),
+                        Some((64 * GIB) as u64),
+                        Some((2 * GIB) as u64),
+                        Some(GIB as u64),
+                        47 * GIB,
+                    ),
+                    super::MoeHostBacking::Full,
+                    "the UMA fix must not reduce a discrete GPU's frozen or explicit RAM target"
+                );
+            }
+            for unified in [false, true] {
+                assert_eq!(
+                    super::moe_host_backing_for_device(
+                        profile,
+                        RamRequest::LegacyCacheBudget((4 * GIB) as u64),
+                        unified,
+                        None,
+                        None,
+                        None,
+                        None,
+                        47 * GIB,
+                    ),
+                    super::MoeHostBacking::Bounded { bytes: 4 * GIB },
+                    "explicit legacy cache overrides keep their existing semantics"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_ram_moe_source_reads_file_only_on_demand() {
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo, FileBlockIo};
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        let bank =
-            Arc::new(vec![10u8, 11, 12, 13, 20, 21, 22, 23]) as Arc<dyn AsRef<[u8]> + Send + Sync>;
+        struct CountedFileIo {
+            file: FileBlockIo,
+            reads: AtomicUsize,
+        }
+        impl BlockIo for CountedFileIo {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> infr_core::error::Result<()> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.file.read_block(desc, dst)
+            }
+        }
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        let mut bytes = vec![0u8; 100];
+        bytes.extend_from_slice(&[10, 11, 12, 13, 20, 21, 22, 23]);
+        fixture.write_all(&bytes).unwrap();
+        fixture.flush().unwrap();
+        let io = Arc::new(CountedFileIo {
+            file: FileBlockIo::open_shards(&[(fixture.path(), bytes.len() as u64)]).unwrap(),
+            reads: AtomicUsize::new(0),
+        });
+        let tier = infr_core::hostpager::InclusiveHostTier::new(0, &[(4, 2)], io.clone()).unwrap();
         let registrations = vec![super::PendingPagedExpert {
             role: infr_vulkan::pager::Role::Gate,
             buf_id: 7,
             source: infr_vulkan::pager::ExpertSource {
-                bank,
+                // Different bytes prove that reads use the file, not the retained source bank.
+                bank: Arc::new(vec![0u8; 8]),
                 stride_bytes: 4,
                 layer_base: 0,
                 host_offset: 0,
@@ -6747,44 +6681,44 @@ mod seam_helper_tests {
             },
             n_expert: 2,
         }];
-        let io = Arc::new(super::MappedMoeBlockIo::from_registrations(&registrations).unwrap());
-        let second = BlockDesc {
-            id: 41,
-            extents: vec![BlockExtent {
-                offset: 104,
-                len: 4,
-            }],
-        };
-        let mut dst = [0u8; 6];
-        BlockIo::read_block(io.as_ref(), &second, &mut dst).unwrap();
-        assert_eq!(&dst, &[20, 21, 22, 23, 0, 0]);
-
-        let changed = BlockDesc {
-            id: 41,
-            extents: vec![BlockExtent { offset: 96, len: 4 }],
-        };
-        assert!(BlockIo::read_block(io.as_ref(), &changed, &mut dst).is_err());
-
-        let source: Arc<dyn BlockIo> = io;
-        let tier = infr_core::hostpager::InclusiveHostTier::new(0, &[(4, 2)], source).unwrap();
         super::register_bounded_moe_host_blocks(&tier, &registrations).unwrap();
         let cache = tier.cache(4).unwrap();
+        assert_eq!(cache.n_slots(), 0);
+        assert_eq!(cache.arena_bytes(), 0);
+        assert_eq!(cache.preload(&[]).unwrap(), (0, 0));
+        assert_eq!(io.reads.load(Ordering::SeqCst), 0);
+
         let mut whole_bank = [0u8; 8];
         cache.materialize_stream(40, 2, 4, &mut whole_bank).unwrap();
         assert_eq!(whole_bank, [10, 11, 12, 13, 20, 21, 22, 23]);
-    }
-
-    #[test]
-    fn mapped_sources_are_not_trimmed() {
-        assert!(!super::should_trim_reclaimable_sources(
-            super::MoeHostBacking::Mapped,
-        ));
-        assert!(super::should_trim_reclaimable_sources(
-            super::MoeHostBacking::Full,
-        ));
-        assert!(super::should_trim_reclaimable_sources(
-            super::MoeHostBacking::Bounded { bytes: 0 },
-        ));
+        assert_eq!(io.reads.load(Ordering::SeqCst), 2);
+        cache
+            .promote(41, None, |data| {
+                assert_eq!(data, &[20, 21, 22, 23]);
+                Ok(())
+            })
+            .unwrap();
+        cache
+            .promote(40, Some(41), |data| {
+                assert_eq!(data, &[10, 11, 12, 13]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(io.reads.load(Ordering::SeqCst), 4);
+        assert_eq!(cache.stats().shadow_resident, 0);
+        assert_eq!(cache.arena_bytes(), 0);
+        assert!(io
+            .read_block(
+                &BlockDesc {
+                    id: 99,
+                    extents: vec![BlockExtent {
+                        offset: 106,
+                        len: 4
+                    }]
+                },
+                &mut [0u8; 4],
+            )
+            .is_err());
     }
 
     #[test]
