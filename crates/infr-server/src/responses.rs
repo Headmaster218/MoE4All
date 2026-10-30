@@ -556,6 +556,15 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
     match input {
         Value::String(text) => messages.push(message("user", Some(Value::String(text.clone())))),
         Value::Array(items) => {
+            // ONE assistant turn arrives as several Responses items: a `reasoning` item, the text
+            // `message`, and one item per (parallel) `function_call`. The chat template renders one
+            // `<|im_start|>assistant … <|im_end|>` block per MESSAGE and always emits a closed
+            // `<think>` block for it, so pushing those items separately produced three assistant
+            // turns per real turn — several of them "thinking then ending", the exact pattern the
+            // model then imitates by answering with an empty turn instead of calling a tool. Merge
+            // them back into the turn they came from.
+            let mut pending_reasoning: Option<String> = None;
+            let mut open_turn: Option<usize> = None;
             for item in items {
                 let kind = item
                     .get("type")
@@ -571,10 +580,23 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                         if !matches!(role, "user" | "assistant" | "system" | "developer") {
                             return Err(invalid("input", format!("unsupported role {role:?}")));
                         }
-                        let content = item
-                            .get("content")
-                            .ok_or_else(|| invalid("input", "message item requires content"))?;
-                        messages.push(message(role, Some(input_content(content)?)));
+                        let content = match item.get("content") {
+                            Some(content) => Some(input_content(content)?),
+                            // An assistant turn that only carried reasoning (or only calls) has
+                            // nothing to say; OpenAI omits the field rather than sending [].
+                            None if role == "assistant" => None,
+                            None => return Err(invalid("input", "message item requires content")),
+                        };
+                        if role == "assistant" {
+                            let mut m = message("assistant", content);
+                            m.reasoning_content = pending_reasoning.take();
+                            messages.push(m);
+                            open_turn = Some(messages.len() - 1);
+                        } else {
+                            flush_reasoning(messages, &mut pending_reasoning);
+                            messages.push(message(role, content));
+                            open_turn = None;
+                        }
                     }
                     "function_call" => {
                         let name = item
@@ -591,11 +613,25 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                             .get("call_id")
                             .and_then(Value::as_str)
                             .ok_or_else(|| invalid("input", "function_call requires call_id"))?;
-                        let mut m = message("assistant", None);
-                        m.tool_calls = Some(
-                            json!([{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]),
-                        );
-                        messages.push(m);
+                        let call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
+                        match open_turn {
+                            Some(index) => {
+                                let calls = messages[index]
+                                    .tool_calls
+                                    .get_or_insert_with(|| json!([]));
+                                calls
+                                    .as_array_mut()
+                                    .expect("tool_calls is always an array")
+                                    .push(call);
+                            }
+                            None => {
+                                let mut m = message("assistant", None);
+                                m.reasoning_content = pending_reasoning.take();
+                                m.tool_calls = Some(json!([call]));
+                                messages.push(m);
+                                open_turn = Some(messages.len() - 1);
+                            }
+                        }
                     }
                     "function_call_output" => {
                         let call_id =
@@ -626,37 +662,32 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                                 .filter_map(|p| p["text"].as_str())
                                 .collect::<String>()
                         };
+                        flush_reasoning(messages, &mut pending_reasoning);
                         let mut m = message("tool", Some(Value::String(text)));
                         m.tool_call_id = Some(call_id.into());
                         messages.push(m);
+                        open_turn = None;
                     }
                     "reasoning" => {
-                        let summaries =
-                            item.get("summary")
-                                .and_then(Value::as_array)
-                                .ok_or_else(|| {
-                                    invalid("input", "reasoning item requires readable summary")
-                                })?;
-                        let mut text = String::new();
-                        for summary in summaries {
-                            if summary["type"] != "summary_text" {
-                                return Err(invalid(
-                                    "input",
-                                    "only summary_text reasoning can be replayed",
-                                ));
-                            }
-                            text.push_str(
-                                summary["text"].as_str().ok_or_else(|| {
-                                    invalid("input", "summary_text requires text")
-                                })?,
-                            );
-                        }
+                        // A reasoning item is replayable from EITHER wire shape: the user-visible
+                        // `summary[]` (summary_text) that this server emits, or the raw
+                        // `content[]` (reasoning_text) that pi-ai-style clients keep and echo back
+                        // instead — they drop `summary` and resend the reasoning as content. An
+                        // item carrying neither has nothing to replay, so it is skipped rather
+                        // than failing the whole turn over auxiliary context.
+                        let text = replayable_reasoning(item)?;
                         if text.is_empty() {
-                            return Err(invalid("input", "opaque reasoning cannot be replayed"));
+                            continue;
                         }
-                        let mut m = message("assistant", None);
-                        m.reasoning_content = Some(text);
-                        messages.push(m);
+                        // Belongs to the assistant turn that FOLLOWS it, never a turn of its own.
+                        open_turn = None;
+                        match &mut pending_reasoning {
+                            Some(pending) => {
+                                pending.push('\n');
+                                pending.push_str(&text);
+                            }
+                            None => pending_reasoning = Some(text),
+                        }
                     }
                     other => {
                         return Err(invalid(
@@ -666,10 +697,21 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                     }
                 }
             }
+            flush_reasoning(messages, &mut pending_reasoning);
         }
         _ => return Err(invalid("input", "input must be text or an array of items")),
     }
     Ok(())
+}
+
+/// Attach reasoning that had no assistant turn to merge into (a reasoning item sent without one)
+/// as a standalone assistant message, which is the shape this server used to emit for every turn.
+fn flush_reasoning(messages: &mut Vec<ChatMessageDto>, pending: &mut Option<String>) {
+    if let Some(text) = pending.take() {
+        let mut m = message("assistant", None);
+        m.reasoning_content = Some(text);
+        messages.push(m);
+    }
 }
 
 /// The inverse of [`input_messages`]: the prompt's message DTOs back into Responses items, so
@@ -1182,9 +1224,10 @@ fn chat_wire_format(format: &ResponseFormat) -> Option<Value> {
 }
 
 /// Replace input items that carry no content of their own — `{"type":"item_reference","id":...}`
-/// and a `reasoning` item sent back with only its `encrypted_content` handle — with the stored items
-/// they name, so `input_messages` converts the real item. A reasoning item that already has a
-/// readable `summary` is left alone: it replays without the store, as it always has.
+/// and a `reasoning` item sent back with only its `encrypted_content` handle (or only its id) —
+/// with the stored items they name, so `input_messages` converts the real item. A reasoning item
+/// that already carries text (`summary[]` or `content[]`) is left alone: it replays without the
+/// store, as it always has. A reasoning item carrying neither text nor a reference is dropped.
 fn resolve_references(
     store: &Arc<Mutex<ResponseStore>>,
     enabled: bool,
@@ -1193,7 +1236,8 @@ fn resolve_references(
     let Some(items) = input.as_array_mut() else {
         return Ok(());
     };
-    for item in items.iter_mut() {
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
         let lookup = match item["type"].as_str() {
             Some("item_reference") => {
                 if !enabled {
@@ -1207,26 +1251,61 @@ fn resolve_references(
                     .ok_or_else(|| invalid("input", "item_reference requires a string id"))?
                     .to_owned()
             }
-            Some("reasoning") if has_readable_summary(item) => continue,
+            Some("reasoning") if has_readable_reasoning(&item) => {
+                kept.push(item);
+                continue;
+            }
             Some("reasoning") => {
-                let handle = item
+                // Text-less reasoning: a handle this server issued, else the id of a stored
+                // reasoning item (OpenAI resolves replayed items by id). An item with neither
+                // carries nothing — drop it; reasoning is auxiliary context and failing the turn
+                // over it would break an otherwise complete conversation.
+                let from_handle = item
                     .get("encrypted_content")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| invalid("input", "reasoning item requires readable summary"))?;
-                if !enabled {
-                    return Err(invalid(
-                        "input",
-                        "a reasoning handle needs server-side response state; enable serve.response_store_entries",
-                    ));
+                    .map(|handle| {
+                        reasoning_item_id(handle).ok_or_else(|| {
+                            invalid(
+                                "input",
+                                format!("{handle:?} is not a reasoning handle this server issued"),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                if let Some(id) = from_handle {
+                    if !enabled {
+                        return Err(invalid(
+                            "input",
+                            "a reasoning handle needs server-side response state; enable serve.response_store_entries",
+                        ));
+                    }
+                    // An explicit handle is a promise: a client that sends one back expects the
+                    // reasoning it names, so an unresolvable one stays a loud 400.
+                    let resolved = store.lock().unwrap().resolve_item(&id).ok_or_else(|| {
+                        invalid(
+                            "input",
+                            format!(
+                                "no stored item {id:?} (state is LRU-bounded; without \
+                                 serve.response_store_path a restart loses it)"
+                            ),
+                        )
+                    })?;
+                    kept.push(resolved);
+                    continue;
                 }
-                reasoning_item_id(handle).ok_or_else(|| {
-                    invalid(
-                        "input",
-                        format!("{handle:?} is not a reasoning handle this server issued"),
-                    )
-                })?
+                let lookup = match item.get("id").and_then(Value::as_str) {
+                    Some(id) if enabled => id.to_owned(),
+                    _ => continue,
+                };
+                if let Some(resolved) = store.lock().unwrap().resolve_item(&lookup) {
+                    kept.push(resolved);
+                }
+                continue;
             }
-            _ => continue,
+            _ => {
+                kept.push(item);
+                continue;
+            }
         };
         let mut guard = store.lock().unwrap();
         let resolved = guard.resolve_item(&lookup).ok_or_else(|| {
@@ -1238,20 +1317,57 @@ fn resolve_references(
                 ),
             )
         })?;
-        *item = resolved;
+        drop(guard);
+        kept.push(resolved);
     }
+    *items = kept;
     Ok(())
 }
 
-/// A reasoning item that can be replayed from its `summary` alone — the pre-handle wire shape.
-fn has_readable_summary(item: &Value) -> bool {
-    item.get("summary")
-        .and_then(Value::as_array)
-        .is_some_and(|summaries| {
-            summaries
-                .iter()
-                .any(|summary| summary["type"] == "summary_text")
-        })
+/// The reasoning text an input `reasoning` item carries, from either wire shape: `summary[]`
+/// (`summary_text` parts, what this server emits) or `content[]` (`reasoning_text` parts, which
+/// clients such as pi-ai keep and echo back INSTEAD of the summary). Empty when the item carries
+/// no text at all.
+fn replayable_reasoning(item: &Value) -> Result<String, ParamError> {
+    let mut text = String::new();
+    if let Some(summaries) = item.get("summary").and_then(Value::as_array) {
+        for summary in summaries {
+            if summary["type"] != "summary_text" {
+                return Err(invalid(
+                    "input",
+                    "only summary_text reasoning can be replayed",
+                ));
+            }
+            text.push_str(
+                summary["text"]
+                    .as_str()
+                    .ok_or_else(|| invalid("input", "summary_text requires text"))?,
+            );
+        }
+    }
+    if text.is_empty() {
+        if let Some(parts) = item.get("content").and_then(Value::as_array) {
+            for part in parts {
+                // `reasoning_text` is the only content part OpenAI defines; taking just its
+                // `text` also replays a richer client shape that carries extra fields.
+                if let Some(part_text) = part["text"].as_str() {
+                    text.push_str(part_text);
+                }
+            }
+        }
+    }
+    Ok(text)
+}
+
+/// Whether a reasoning item already carries replayable text, so the store is not consulted. Any
+/// part with a string `text` counts under either field — a malformed summary still reaches
+/// [`replayable_reasoning`] and gets its precise error instead of being mistaken for a handle.
+fn has_readable_reasoning(item: &Value) -> bool {
+    ["summary", "content"].iter().any(|field| {
+        item.get(*field)
+            .and_then(Value::as_array)
+            .is_some_and(|parts| parts.iter().any(|part| part["text"].as_str().is_some()))
+    })
 }
 
 pub(super) async fn handler(
@@ -2809,13 +2925,45 @@ mod tests {
         })).unwrap();
         let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
         assert_eq!(chat.reasoning_effort, Some(json!("high")));
+        // Reasoning + call are ONE assistant turn, not two: the chat template ends a turn at every
+        // message, and split turns taught the model to answer with an empty turn after thinking.
+        assert_eq!(chat.messages.len(), 3);
         assert_eq!(chat.messages[1].reasoning_content.as_deref(), Some("plan"));
         assert_eq!(
-            chat.messages[2].tool_calls.as_ref().unwrap()[0]["id"],
+            chat.messages[1].tool_calls.as_ref().unwrap()[0]["id"],
             "call_1"
         );
-        assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(meta.reasoning["effort"], "high");
+    }
+
+    #[test]
+    fn parallel_calls_and_text_merge_into_one_assistant_turn() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"run"}]},
+                {"type":"reasoning","content":[{"type":"reasoning_text","text":"plan"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"working"}]},
+                {"type":"function_call","call_id":"call_1","name":"a","arguments":"{}"},
+                {"type":"function_call","call_id":"call_2","name":"b","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"1"},
+                {"type":"function_call_output","call_id":"call_2","output":"2"}
+            ]
+        }))
+        .unwrap();
+        let Prepared { chat, .. } = request.into_chat(None, None, None, false).unwrap();
+        assert_eq!(chat.messages.len(), 4, "user, one assistant turn, two tool results");
+        let turn = &chat.messages[1];
+        assert_eq!(turn.role, "assistant");
+        assert_eq!(turn.reasoning_content.as_deref(), Some("plan"));
+        assert!(turn.content.as_ref().unwrap().to_string().contains("working"));
+        let calls = turn.tool_calls.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[1]["id"], "call_2");
+        assert_eq!(chat.messages[2].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(chat.messages[3].tool_call_id.as_deref(), Some("call_2"));
     }
 
     #[tokio::test]
@@ -3303,6 +3451,60 @@ mod tests {
         let plain =
             json_body(post_to(&router, json!({"model":"fixture","input":"third"})).await).await;
         assert!(plain["output"][0].get("encrypted_content").is_none());
+    }
+
+    /// pi-ai (and dsh on top of it) drops the `summary[]` we emit and replays the reasoning as
+    /// `content[].reasoning_text` — that shape must reach the prompt, and an item carrying neither
+    /// text nor a store reference must be dropped instead of failing the whole turn.
+    #[tokio::test]
+    async fn reasoning_content_parts_replay_and_text_less_items_are_dropped() {
+        let router = router_entries(Arc::new(ReasoningEcho), 8);
+        let replayed = json_body(
+            post_to(
+                &router,
+                json!({"model":"fixture","input":[
+                    {"type":"reasoning","content":[{"type":"reasoning_text","text":"plan"}]},
+                    {"role":"user","content":"second"}
+                ]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(replayed["status"], "completed");
+        let answer = replayed["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("the answer item")
+            .clone();
+        assert_eq!(answer["content"][0]["text"], "plan");
+
+        for opaque in [
+            json!({"type":"reasoning","summary":[]}),
+            json!({"type":"reasoning","id":"rs_unknown"}),
+        ] {
+            let response = json_body(
+                post_to(
+                    &router,
+                    json!({"model":"fixture","input":[
+                        opaque,
+                        {"role":"user","content":"third"}
+                    ]}),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(response["status"], "completed");
+            let answer = response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "message")
+                .expect("the answer item")
+                .clone();
+            assert_eq!(answer["content"][0]["text"], "", "nothing was replayed");
+        }
     }
 
     #[tokio::test]

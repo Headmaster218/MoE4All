@@ -3943,10 +3943,12 @@ fn generate_dense_backend_inner(
     // and decode. Adding it to the full prompt would count that tail twice. The parallel branch
     // below validates every lane against its current cached depth instead.
     if dense_request_exceeds_capacity(prompt.len(), max_new, max_ctx, parallel_decode.is_some()) {
-        return Err(anyhow!(
-            "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
-            prompt.len(),
-            max_new
+        return Err(anyhow::Error::new(
+            infr_core::error::ContextLengthExceeded {
+                prompt: prompt.len(),
+                max_new,
+                capacity: max_ctx,
+            },
         ));
     }
     macro_rules! ensure_kv_depth {

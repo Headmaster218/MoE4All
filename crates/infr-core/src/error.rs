@@ -8,6 +8,17 @@ use thiserror::Error;
 #[error("{0}")]
 pub struct InvalidInput(pub String);
 
+/// `prompt + generation` does not fit the session's KV window. The request is answerable from a
+/// different window or a shorter conversation — a client-fixable condition — so API adapters map
+/// it to 400 (`context_length_exceeded`), never to a 500 that reads as a server fault.
+#[derive(Debug, Error)]
+#[error("prompt {prompt} + gen {max_new} exceeds the session KV capacity {capacity}")]
+pub struct ContextLengthExceeded {
+    pub prompt: usize,
+    pub max_new: usize,
+    pub capacity: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("backend: {0}")]

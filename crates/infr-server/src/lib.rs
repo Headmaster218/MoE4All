@@ -3483,6 +3483,9 @@ fn invalid_request_input(error: &anyhow::Error) -> bool {
         .downcast_ref::<infr_core::error::InvalidInput>()
         .is_some()
         || error
+            .downcast_ref::<infr_core::error::ContextLengthExceeded>()
+            .is_some()
+        || error
             .downcast_ref::<infr_engine::TemplateError>()
             .is_some_and(infr_engine::TemplateError::is_invalid_input)
 }
@@ -3877,6 +3880,24 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// A prompt that outgrew the KV window is the CLIENT's request shape to fix (shorten the
+    /// conversation or raise `--ctx`), so it must not surface as a 500 "server_error": this is the
+    /// marker the handlers branch on for 400 / `invalid_request_error`.
+    #[test]
+    fn context_overflow_is_flagged_as_client_input() {
+        let overflow = anyhow::Error::new(infr_core::error::ContextLengthExceeded {
+            prompt: 33_676,
+            max_new: 0,
+            capacity: 32_768,
+        });
+        assert!(invalid_request_input(&overflow));
+        assert_eq!(
+            overflow.to_string(),
+            "prompt 33676 + gen 0 exceeds the session KV capacity 32768"
+        );
+        assert!(!invalid_request_input(&anyhow::anyhow!("backend: device lost")));
+    }
 
     /// Router backed by a headless state — no Engine, so /health and /v1/models work
     /// but /v1/chat/completions would return 500.  That's fine: we never call it here.
