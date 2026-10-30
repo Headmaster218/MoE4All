@@ -6,7 +6,7 @@
 //! 3847d57b6bdf2dd8875cb1508d2af43d80a16bf7 on Hugging Face.
 //! am.mvn contains these same 80 coefficients repeated seven times after LFR.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use infr_core::{MetaValue, Metadata};
 
 use crate::frontend::FrontendConfig;

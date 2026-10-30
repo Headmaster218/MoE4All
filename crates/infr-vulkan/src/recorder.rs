@@ -46,6 +46,9 @@ mod segmented_attention_contract;
 #[cfg(test)]
 #[path = "flash_pv_reuse_contract.rs"]
 mod flash_pv_reuse_contract;
+#[cfg(test)]
+#[path = "hd256_flash_ports_contract.rs"]
+mod hd256_flash_ports_contract;
 
 #[cfg(test)]
 #[path = "g01_cold_state_contract.rs"]
@@ -3720,7 +3723,7 @@ impl<'a> Recorder<'a> {
     /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
     /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged. The Q8_0
-    /// N64 variant also accepts `n%64==0 && n%128!=0`; all other variants still require n%128.
+    /// and BF16 N64 variants also accept `n%64==0 && n%128!=0`; other variants require n%128.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_f16a(
         &self,

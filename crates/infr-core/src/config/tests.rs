@@ -22,6 +22,20 @@ fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
 }
 
 #[test]
+fn amdvlk_hd256_flash_has_value_aware_env_and_config_fallbacks() {
+    assert!(Config::default().kernels.vulkan.amdvlk_hd256_flash);
+    for (value, expected) in [("", false), ("0", false), ("1", true)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_AMDVLK_HD256_FLASH", value)])]);
+        assert_eq!(cfg.kernels.vulkan.amdvlk_hd256_flash, expected);
+    }
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[("INFR_AMDVLK_HD256_FLASH", "1")]),
+        cli_layer(&["kernels.vulkan.amdvlk_hd256_flash=false"]),
+    ]);
+    assert!(!cfg.kernels.vulkan.amdvlk_hd256_flash);
+}
+
+#[test]
 fn narrow_f32_gemv_default_and_presence_inverted_fallback() {
     assert!(Config::default().kernels.vulkan.narrow_f32_gemv);
     for value in ["", "0", "1"] {

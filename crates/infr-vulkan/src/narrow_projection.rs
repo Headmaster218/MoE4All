@@ -46,7 +46,7 @@ pub(crate) fn scratch_bytes(
     // keeps native_decode's packed-word byte offsets below 4 GiB for both dtypes.
     if m < min_m
         || m.checked_mul(k)? > u32::MAX as usize
-        || w_off % k != 0
+        || !w_off.is_multiple_of(k)
         || w_off.checked_add(elems)? > (u32::MAX as usize / 2)
         || bytes > MAX_SCRATCH_BYTES
     {

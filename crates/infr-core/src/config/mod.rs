@@ -545,7 +545,7 @@ cfg_struct! {
         flash_dequant: bool = false,
         /// `INFR_NO_FLASH_WARP` (inverted).
         flash_warp: bool = true,
-        /// `INFR_AMDVLK_HD256_FLASH` — value-aware (only `0` turns it off). hd256 prefill on the AMD
+        /// `INFR_AMDVLK_HD256_FLASH` — value-aware (empty or `0` turns it off). hd256 prefill on the AMD
         /// proprietary driver (amdvlk / LLPC) uses the fused flash warp kernel. LLPC faults
         /// (`0xc0000005` inside `vkCreateComputePipelines`, `amdvlk64.dll+0x2b65705`) when it
         /// compiles that shader's FULLY-UNROLLED IR, so `attn_flash_warp_hd256.comp` now ships two

@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Routed the MoE router (`ffn_gate_inp`) at prefill rows through the same tiled cooperative-matrix GEMM a dense `Op::Linear` of that shape takes, instead of the per-row GEMV that re-reads the whole router weight once per token, and added the missing bf16 A_GLOBAL warptiles so the tier is reachable for bf16 weights (the BN=64 twin covers the Qwen3.8 hyper-connection widths, `10240x320` / `320x10240`, which used to fall back to the legacy 64x64 bf16 GEMM). Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S (bf16 router + bf16 HC), paired `pp30000 --ctx 32768`: 1222.4 / 1217.5 → **1276.0 / 1272.4 t/s (+4.4%)**. Models whose router ships F32 and whose HC tensors are not bf16 keep the unchanged path — Qwen3.8-Flash-Next base measured 1565.8 → 1568.4 t/s (+0.2%, within noise). The logits buffer is padded to whole 64-row tiles only when the GEMM tier is chosen, so the GEMV route stays byte-identical.
+
 ### Fixed
 
 - Made the hd256 fused flash-attention prefill kernel compile on the AMD proprietary driver instead of crashing it. `attn_flash_warp_hd256_bm16` faulted LLPC inside `vkCreateComputePipelines` (`0xc0000005` at `amdvlk64.dll+0x2b65705`) whenever it was handed the shader's FULLY-UNROLLED IR — reproducible on amdvlk 26.10.1 as the first full-attention layer of a ragged 4K prefill (4001 query rows). `[[unroll]]` is now a build variant: the kernel ships as the unrolled default plus a `-DNO_UNROLL` twin, and the recorder selects the twin on `VK_DRIVER_ID_AMD_PROPRIETARY` only, so RADV and every other driver keep the unrolled IR and the math and dispatch shape are identical in both. The tier is therefore enabled on amdvlk; `INFR_AMDVLK_HD256_FLASH=0` (`--set kernels.vulkan.amdvlk_hd256_flash=false`) still drops hd256 prefill back to the coopmat `attn_qk`/`softmax`/`attn_pv` tier for a driver that faults anyway. Measured on Qwen3.6-35B at 26.10.1: paired 4001-row runs 3824.4 vs 3767.4 t/s for non-FA, and in a fast-clock window 4001 / 8000 / 12001 rows ran 4643 / 4532 / 4062 against 3834 / 3646 / 3703 (+21% / +24% / +10%).
