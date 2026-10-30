@@ -14,6 +14,8 @@ $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
+$script:benchmarkPnpEntities = $null
+$script:benchmarkPnpProperties = @{}
 
 function Set-ProbeStatus {
     param([string]$Probe, [string]$Status, [string]$Reason, [string]$Source)
@@ -93,9 +95,40 @@ function ConvertTo-PciId {
     return $Matches[1].PadLeft(4, '0').ToUpperInvariant()
 }
 
+function Get-NativePnpProperties {
+    [CmdletBinding()]
+    param([string]$InstanceId, [string[]]$KeyName)
+    # Get-PnpDeviceProperty's CDXML adapter re-enumerates devices for each request.
+    # Enumerate DeviceID keys once, then invoke that same native method only on the
+    # selected GPU and its parents. Cache allowed properties for this collection only.
+    if ($null -eq $script:benchmarkPnpEntities) {
+        $script:benchmarkPnpEntities = @{}
+        $entities = @(Get-CimInstance -ClassName Win32_PnPEntity -Property DeviceID -OperationTimeoutSec 3 -ErrorAction Stop | Select-Object -First 4097)
+        if ($entities.Count -gt 4096) { throw 'The PnP device list exceeds the probe limit.' }
+        foreach ($entity in $entities) {
+            $id = [string]$entity.DeviceID
+            if ($id) {
+                if ($script:benchmarkPnpEntities.ContainsKey($id)) { throw 'The PnP entity is not unique.' }
+                $script:benchmarkPnpEntities[$id] = $entity
+            }
+        }
+    }
+    if (-not $script:benchmarkPnpEntities.ContainsKey($InstanceId)) { throw 'The selected PnP entity is unavailable.' }
+    if (-not $script:benchmarkPnpProperties.ContainsKey($InstanceId)) {
+        $allowed = [string[]]@('DEVPKEY_Device_Parent', 'DEVPKEY_Device_BusNumber', 'DEVPKEY_Device_Address', 'DEVPKEY_Device_LocationPaths',
+            'DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth', 'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth')
+        $response = Invoke-CimMethod -InputObject $script:benchmarkPnpEntities[$InstanceId] -MethodName GetDeviceProperties -Arguments @{ devicePropertyKeys = $allowed } -OperationTimeoutSec 3 -ErrorAction Stop
+        if ($null -eq $response -or $null -eq $response.ReturnValue -or [uint32]$response.ReturnValue -ne 0) {
+            throw 'The selected PnP properties are unavailable.'
+        }
+        $script:benchmarkPnpProperties[$InstanceId] = @($response.deviceProperties)
+    }
+    return @($script:benchmarkPnpProperties[$InstanceId] | Where-Object { $KeyName -contains $_.KeyName })
+}
+
 function Get-NativePciAddress {
     param([string]$InstanceId)
-    $properties = @(Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName @(
+    $properties = @(Get-NativePnpProperties -InstanceId $InstanceId -KeyName @(
         'DEVPKEY_Device_BusNumber', 'DEVPKEY_Device_Address'
     ) -ErrorAction Stop)
     $bus = @($properties | Where-Object KeyName -eq 'DEVPKEY_Device_BusNumber')
@@ -130,7 +163,7 @@ function Get-WindowsPciePath {
     $topologyComplete = $false
     for ($depth = 0; $depth -lt 16; $depth++) {
         if ($instanceId -notlike 'PCI\*') { $topologyComplete = $true; break }
-        $properties = @(Get-PnpDeviceProperty -InstanceId $instanceId -KeyName @(
+        $properties = @(Get-NativePnpProperties -InstanceId $instanceId -KeyName @(
             'DEVPKEY_Device_Parent',
             'DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth',
             'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth'
@@ -174,7 +207,7 @@ function Get-WindowsPciePath {
 
 function Get-WindowsPcieSlot {
     param([string]$EndpointInstanceId)
-    $properties = @(Get-PnpDeviceProperty -InstanceId $EndpointInstanceId -KeyName @(
+    $properties = @(Get-NativePnpProperties -InstanceId $EndpointInstanceId -KeyName @(
         'DEVPKEY_Device_LocationPaths'
     ) -ErrorAction Stop)
     $locationPaths = @(Get-PnpPropertyData $properties 'DEVPKEY_Device_LocationPaths')
@@ -240,6 +273,11 @@ function Get-WindowsSelectedGpu {
             if ($instanceId -notlike 'PCI\*') { continue }
             $native = Get-NativePciAddress $instanceId
             if ($native -ceq $bdf) { $found += [pscustomobject]@{ device = $candidate; bdf = $native } }
+        } elseif ($vendorKey -and $deviceKey) {
+            # Vulkan and the OS driver need not use the same marketing name. A PCI ID pair
+            # is stronger than a display name; the unique-match check below still rejects
+            # two cards with the same IDs when no BDF is available.
+            $found += [pscustomobject]@{ device = $candidate; bdf = $null }
         } elseif ([string]$candidate.Name -ceq $Name) {
             $found += [pscustomobject]@{ device = $candidate; bdf = $null }
         }
@@ -419,6 +457,8 @@ function Invoke-BenchmarkHardwareCollector {
         [string]$GpuVendorId, [string]$GpuDeviceId, [string]$GpuVulkanIndex
     )
     $script:diagnostics = [ordered]@{}
+    $script:benchmarkPnpEntities = $null
+    $script:benchmarkPnpProperties = @{}
     foreach ($probe in @('cpu', 'ram.total', 'ram.modules', 'gpu.selection', 'gpu.pcie', 'gpu.pcie_path', 'gpu.pcie_slot', 'model_storage.metadata', 'model_storage.media', 'model_storage.sequential', 'model_storage.random_64k', 'model_storage.physical_reads')) {
         Set-ProbeStatus $probe 'unsupported' 'native_data_unavailable' 'windows_native'
     }

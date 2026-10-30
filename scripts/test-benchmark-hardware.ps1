@@ -20,9 +20,11 @@ if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 . (Join-Path $PSScriptRoot 'benchmark-hardware.ps1')
 $script:mode = 'normal'
 $script:gpuNames = @('Fixture GPU', 'Fixture GPU')
+$script:pnpEnumerations = 0
+$script:pnpPropertyCalls = 0
 function Assert-True { param($Condition, [string]$Message) if (-not $Condition) { throw $Message } }
 function Get-CimInstance {
-    param($ClassName, $Filter, $Namespace, $OperationTimeoutSec, $ErrorAction)
+    param($ClassName, $Filter, $Namespace, $Property, $OperationTimeoutSec, $ErrorAction)
     switch ($ClassName) {
         Win32_Processor { [pscustomobject]@{ Name = 'Fixture CPU'; NumberOfLogicalProcessors = 16; SystemName = 'machine-private' } }
         Win32_ComputerSystem { [pscustomobject]@{ TotalPhysicalMemory = 34359738368; UserName = 'private-user' } }
@@ -32,11 +34,18 @@ function Get-CimInstance {
         }
         Win32_VideoController {
             for ($i=0; $i -lt $script:gpuNames.Count; $i++) {
-                $device = if ($i -eq 0) { '744C' } else { '6611' }
+                $device = if ($i -eq 0 -or $script:mode -eq 'duplicate-pci') { '744C' } else { '6611' }
                 [pscustomobject]@{ Name = $script:gpuNames[$i]; PNPDeviceID = "PCI\VEN_1002&DEV_$device&FIXTURE$i" }
             }
         }
         Win32_SystemSlot { [pscustomobject]@{ SlotDesignation = 'PCIEX1_1'; CurrentUsage = 4 } }
+        Win32_PnPEntity {
+            $script:pnpEnumerations++
+            if ($script:mode -eq 'pnp-denied') { throw [UnauthorizedAccessException]::new('private-user') }
+            foreach ($id in @('PCI\VEN_1002&DEV_744C&FIXTURE0', 'PCI\VEN_1002&DEV_6611&FIXTURE1', 'PCI\VEN_1002&DEV_744C&FIXTURE1', 'PCI\VEN_1234&DEV_0001&BRIDGE0', 'PCI\VEN_1234&DEV_0002&BRIDGE1')) {
+                [pscustomobject]@{ DeviceID = $id }
+            }
+        }
         Win32_LogicalDisk {
             if ($script:mode -eq 'disk-denied') { throw [UnauthorizedAccessException]::new($model) }
             [pscustomobject]@{ FileSystem = 'NTFS' }
@@ -73,7 +82,21 @@ function Get-PnpDeviceProperty {
     }
 }
 
+function Invoke-CimMethod {
+    param($InputObject, $MethodName, $Arguments, $OperationTimeoutSec, $ErrorAction)
+    if ($MethodName -ne 'GetDeviceProperties') { throw 'Unexpected fixture method' }
+    $script:pnpPropertyCalls++
+    [pscustomobject]@{ ReturnValue = 0; deviceProperties = @(Get-PnpDeviceProperty -InstanceId $InputObject.DeviceID -KeyName $Arguments.devicePropertyKeys -ErrorAction Stop) }
+}
+
 $checks = 0
+$enumerationsBefore = $script:pnpEnumerations
+$propertiesBefore = $script:pnpPropertyCalls
+$cacheResult = Invoke-BenchmarkHardwareCollector $model 'Vulkan' 'Fixture GPU' '' '1002' '744c' '0'
+Assert-True ($script:pnpEnumerations - $enumerationsBefore -eq 1) 'PnP inventory must be queried once per collection'
+Assert-True ($script:pnpPropertyCalls - $propertiesBefore -eq 2) 'Endpoint, its PCI address and slot must share cached native properties; each parent queried once'
+Assert-True ($cacheResult.hardware.gpu.pcie_path.Count -eq 2) 'Caching lost a PCI parent'
+$checks++
 Assert-True ((ConvertFrom-SmbiosMemoryType 26) -eq 'DDR4' -and (ConvertFrom-SmbiosMemoryType 34) -eq 'DDR5') 'Legacy SMBIOS generation mapping changed'
 Assert-True ((ConvertFrom-StorageBusType 17) -eq 'NVMe' -and (ConvertFrom-StorageMediaType 4) -eq 'SSD') 'Legacy storage enum mapping changed'
 Assert-True ((Get-PcieTheoreticalBandwidthGbps 4 16) -eq 31.504) 'Legacy PCIe bandwidth mapping changed'
@@ -106,6 +129,22 @@ $selected = Get-WindowsSelectedGpu 'Fixture GPU' '' '1002' '744c' '0'
 Assert-True ($selected.device_id -eq 0x744c -and $selected.vulkan_index -eq 0) 'PCI identity did not disambiguate duplicate names'
 $checks++
 $script:gpuNames = @('Fixture GPU')
+$selected = Get-WindowsSelectedGpu 'Different Vulkan marketing name' '' '1002' '744c' '0'
+Assert-True ($null -ne $selected -and $selected.device_id -eq 0x744c) 'Unique PCI identity must not require matching marketing names'
+$checks++
+$script:gpuNames = @('Fixture GPU', 'Different OS driver name')
+$script:mode = 'duplicate-pci'
+$selected = Get-WindowsSelectedGpu 'Fixture GPU' '' '1002' '744c' '0'
+Assert-True ($null -eq $selected -and $script:diagnostics['gpu.selection'].reason -eq 'ambiguous_selected_gpu') 'Duplicate PCI identities must not select a card by display name'
+$script:mode = 'normal'
+$script:gpuNames = @('Fixture GPU')
+$checks++
+$script:mode = 'pnp-denied'
+$result = Invoke-BenchmarkHardwareCollector $model 'Vulkan' 'Fixture GPU' '' '1002' '744c' '0'
+Assert-True ($result.collection.probes['gpu.pcie'].status -eq 'permission_denied') 'Denied PCI properties must be diagnosed'
+Assert-True ($result.hardware.cpu.name -eq 'Fixture CPU' -and $result.hardware.model_storage.read_probe.sequential.bytes -gt 0) 'Denied PCI properties must not discard CPU, memory or storage probes'
+$script:mode = 'normal'
+$checks++
 $selected = Get-WindowsSelectedGpu 'fixture gpu' ''
 Assert-True ($null -eq $selected) 'GPU name selection must be exact and case sensitive'
 $selected = Get-WindowsSelectedGpu 'Fixture GPU' 'not-a-bdf'
