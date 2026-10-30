@@ -161,6 +161,13 @@ void main() {
         // PV: each subgroup owns all 16 rows and one 64-dimension output band. The tail arm stages
         // one 16-dimension fragment per subgroup (64 dimensions total) before each fragment GEMM.
         if (tail) {
+            // PV_REUSE port (attn_flash_reg.comp's -DPV_REUSE idea): Ps is immutable for this whole
+            // arm — the only writes inside the loop are to KVtail, separated by barriers — so load
+            // the four P fragments ONCE instead of once per output-column tile.
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> pvA[BN / 16u];
+            UNROLL for (uint kf = 0u; kf < BN; kf += 16u) {
+                coopMatLoad(pvA[kf / 16u], Ps, kf, BN, gl_CooperativeMatrixLayoutRowMajor);
+            }
             UNROLL for (uint j = 0u; j < PV_CMS_N; j++) {
                 uint col = warp_c * (HD / WARPS_N) + j * 16u;
                 for (uint i = li; i < BN * 64u; i += gl_WorkGroupSize.x) {
@@ -177,12 +184,10 @@ void main() {
                 coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
                 coopMatLoad(acc, Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
                 UNROLL for (uint kf = 0u; kf < BN; kf += 16u) {
-                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
-                    coopMatLoad(A, Ps, kf, BN, gl_CooperativeMatrixLayoutRowMajor);
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
                     coopMatLoad(B, KVtail, kf * 64u + warp_c * 16u, 64u,
                                 gl_CooperativeMatrixLayoutRowMajor);
-                    acc = coopMatMulAdd(A, B, acc);
+                    acc = coopMatMulAdd(pvA[kf / 16u], B, acc);
                 }
                 coopMatStore(acc, Os, col, HD, gl_CooperativeMatrixLayoutRowMajor);
                 barrier();
