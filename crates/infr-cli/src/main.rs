@@ -4475,7 +4475,6 @@ fn cmd_bench_suite(
     );
 
     let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let footprint = infr_llama::weight_footprint(loaded.gguf());
     let required_ctx = suite.required_context_tokens();
     let want_ctx = cfg
         .device
@@ -4494,6 +4493,7 @@ fn cmd_bench_suite(
     let load_started = std::time::Instant::now();
     let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
     let startup_seconds = load_started.elapsed().as_secs_f64();
+    let footprint = engine.weight_footprint()?;
     // The initialized device supplies the PCI identity; probing finishes before suite warmup.
     let initialized = engine.benchmark_configuration();
     let collected_hardware = benchmark_hardware::collect(
