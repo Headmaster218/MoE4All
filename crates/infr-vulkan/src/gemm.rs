@@ -2192,8 +2192,10 @@ const ATTN_FLASH_WARP_BM32_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bm32.spv"));
 const ATTN_FLASH_WARP_HD256_BM16_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_hd256_bm16.spv"));
-const ATTN_FLASH_WARP_HD256_BM16_NOUNROLL_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_hd256_bm16_nounroll.spv"));
+const ATTN_FLASH_WARP_HD256_BM16_NOUNROLL_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_warp_hd256_bm16_nounroll.spv"
+));
 // Lever 2 on the warp kernel: dequant-in-flash builds that keep the register-tiled warp path.
 const ATTN_FLASH_WARP_DEQ_Q4_0_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q4_0.spv"));

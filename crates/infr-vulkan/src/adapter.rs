@@ -9081,13 +9081,11 @@ fn lower_op(
 
                 // Router logits may take the 64-row tiled GEMM at prefill rows (see
                 // `moe_router_gemm_applies`): its C store covers whole row tiles.
-                let logits = alu(
-                    moe_router_logits_rows(
-                        rows,
-                        moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
-                    ) * n_expert
-                        * 4,
-                )?;
+                let logits = alu(moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert
+                    * 4)?;
                 // Router logits for all rows (on `router_x`, NOT `x`), then GPU routing.
                 let rdt = graph.desc(*router).dtype;
                 let rw = r(*router)?;
@@ -9430,17 +9428,7 @@ fn lower_op(
             // Router logits over all experts, all `rows` tokens in one dispatch.
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
-            record_moe_router_logits(
-                be_,
-                rdt,
-                rw,
-                rxb,
-                logits.get(pool),
-                rows,
-                ne,
-                n_expert,
-                rec,
-            );
+            record_moe_router_logits(be_, rdt, rw, rxb, logits.get(pool), rows, ne, n_expert, rec);
             let bias_buf: &dyn Buffer = match exp_probs_b {
                 Some(epb) => r(*epb)?,
                 None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -20894,7 +20882,10 @@ mod tests {
         for rows in [1usize, 17, 63, 64, 65, 4096, 5120] {
             assert_eq!(super::moe_router_logits_rows(rows, false), rows);
             let padded = super::moe_router_logits_rows(rows, true);
-            assert!(padded >= rows && padded % 64 == 0, "rows {rows} → {padded}");
+            assert!(
+                padded >= rows && padded.is_multiple_of(64),
+                "rows {rows} → {padded}"
+            );
         }
         assert_eq!(super::moe_router_logits_rows(4096, true), 4096);
         assert_eq!(super::moe_router_logits_rows(17, true), 64);
