@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Fixture-only collector and package tests. Runtime collectors need no Python.
 
-Run on Linux (including WSL) with an explicit --fixture-root. If MOE4ALL_WORK_ROOT
-is set, fixtures must be inside its tmp/moe4all directory. Darwin tests mock
-native metadata and are not Mac hardware tests.
+Run on Linux (including WSL) or macOS with an explicit --fixture-root. If
+MOE4ALL_WORK_ROOT is set, fixtures must be inside its tmp/moe4all directory.
+Linux stat and Darwin metadata are fixtures, not real hardware acceptance tests.
 """
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -71,8 +70,9 @@ class HardwareTests(unittest.TestCase):
         memory[23:27] = bytes([1, 2, 0, 3])
         struct.pack_into("<H", memory, 32, 5600)
         raw.write_bytes(memory + b'Fixture Manufacturer\0SECRET_SERIAL\0Fixture Part\0\0')
-        stat = self.model.stat()
-        disk = self.sys / f"dev/block/{os.major(stat.st_dev)}:{os.minor(stat.st_dev)}"
+        # Linux dev_t and GNU stat are fixture inputs, even on the macOS runner.
+        self.linux_device_number = 8 * 256 + 1
+        disk = self.sys / "dev/block/8:1"
         (disk / "device").mkdir(parents=True)
         (disk / "queue").mkdir()
         (disk / "device/model").write_text("Fixture SSD\n")
@@ -99,7 +99,16 @@ class HardwareTests(unittest.TestCase):
     def collect_fixture(self, gpu_name="Fixture GPU", bdf="", model=None, extra="", vendor="", device=""):
         bindings = {"os": "Linux", "backend": "vulkan", "proc_root": str(self.proc), "sys_root": str(self.sys), "pci_ids": str(self.ids), "model_path": str(self.model if model is None else model), "gpu_name": gpu_name, "pci_address": bdf, "gpu_vendor_id": vendor, "gpu_device_id": device, "vulkan_index": "0"}
         setup = "\n".join(f"{key}={shlex.quote(value)}" for key, value in bindings.items())
-        return self.run_script(LIBRARY + '\ndiagnostics=; diagnostic_separator=\n' + setup + '\n' + extra + '\nlinux_memory\nlinux_gpu\nmodel_storage\nemit_result\n')
+        native_stat = f'''\nstat() {{
+    case "$1:$2" in
+        -Lc:%d) printf '%s\\n' {self.linux_device_number} ;;
+        -Lc:%s) printf '%s\\n' {self.model.stat().st_size} ;;
+        -f:-c) printf '%s\\n' fixturefs ;;
+        *) return 1 ;;
+    esac
+}}
+'''
+        return self.run_script(LIBRARY + '\ndiagnostics=; diagnostic_separator=\n' + setup + native_stat + '\n' + extra + '\nlinux_memory\nlinux_gpu\nmodel_storage\nemit_result\n')
 
     def test_posix_stdin_and_missing_path_retains_cpu_memory(self):
         value = self.run_script(SOURCE, ["--model", str(self.root / "missing fixture.bin")])
@@ -187,7 +196,7 @@ ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRE
         self.assertNotIn("vram_total_bytes", value["hardware"]["gpu"])
         self.assertEqual(value["collection"]["probes"]["gpu.pcie"]["status"], "not_applicable")
 
-    def test_unix_packages_include_exact_collector_and_manifest(self):
+    def test_unix_packages_use_embedded_collector_and_old_updater_layout(self):
         for module in (linux_release, macos_release):
             root = self.root / module.PLATFORM
             root.mkdir()
@@ -199,23 +208,21 @@ ioreg() { printf '  "model" = <"Apple Fixture GPU">\\n  "serial-number" = "SECRE
             with tarfile.open(archive) as bundle:
                 prefix = module.package_name("1.0.0-test")
                 members = {member.name.rstrip("/") for member in bundle.getmembers()}
-                self.assertIn(prefix + "/scripts", members, module.PLATFORM)
-                collector = bundle.extractfile(prefix + "/scripts/benchmark-hardware.sh").read()
-                self.assertEqual(collector, SCRIPT.read_bytes())
+                self.assertNotIn(prefix + "/scripts", members, module.PLATFORM)
+                self.assertNotIn(prefix + "/scripts/benchmark-hardware.sh", members, module.PLATFORM)
                 manifest = json.load(bundle.extractfile(prefix + "/install-manifest.json"))
-                entry = next(entry for entry in manifest["files"] if entry["path"] == "scripts/benchmark-hardware.sh")
-                self.assertEqual(entry["sha256"], hashlib.sha256(collector).hexdigest())
+                self.assertFalse(any(entry["path"].startswith("scripts/") for entry in manifest["files"]))
+                required = {"infr", "Start-INFR-Wizard-" + ("Linux" if module is linux_release else "macOS") + ".sh"}
+                self.assertTrue(required.issubset({entry["path"] for entry in manifest["files"]}))
                 stage_root = root / "stage"
                 bundle.extractall(stage_root)
             stage = stage_root / prefix
-            manifest_path = stage / "install-manifest.json"
-            manifest["files"] = [entry for entry in manifest["files"] if entry["path"] != "scripts/benchmark-hardware.sh"]
-            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            (stage / "scripts/benchmark-hardware.sh").unlink()
-            with self.assertRaisesRegex(ValueError, "missing runtime files", msg=module.PLATFORM):
-                module.validate_package(stage, "1.0.0-test")
+            module.validate_package(stage, "1.0.0-test")
             self.assertTrue(module.managed("scripts/benchmark-hardware.sh"))
             self.assertFalse(module.managed("scripts/not-allowed.sh"))
+
+        embedded = (SCRIPT.parent.parent / "crates/infr-cli/src/benchmark_hardware.rs").read_text()
+        self.assertIn('include_bytes!("../../../scripts/benchmark-hardware.sh")', embedded)
 
     def test_launcher_allowlists_accept_collector_and_parent_directory(self):
         for name in ("Start-INFR-Wizard-Linux.sh", "Start-INFR-Wizard-macOS.sh"):

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! v65 hardware admission probe only: host latency, not a GPU-end or model-speed measurement.
 use super::*;
 use std::time::{Duration, Instant};

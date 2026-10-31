@@ -1251,6 +1251,7 @@ const BENCHMARK_AI_GUIDANCE_EN: &str =
 fn print_benchmark_ai_guidance() {
     // print-ok: stable instructions for human and automated benchmark callers.
     println!("{BENCHMARK_AI_GUIDANCE_ZH}");
+    // print-ok: English benchmark instructions are part of the same user-facing output.
     println!("{BENCHMARK_AI_GUIDANCE_EN}");
 }
 
@@ -1258,7 +1259,9 @@ fn print_benchmark_result_ai_guidance(json: bool) {
     // Preserve `infr bench --json`'s one-JSON-value stdout contract; launchers and agents still see
     // the guidance on stderr. Human-format benchmark output can keep everything on stdout.
     if json {
+        // print-ok: user-facing guidance goes to stderr to preserve JSON-only stdout.
         eprintln!("{BENCHMARK_AI_GUIDANCE_ZH}");
+        // print-ok: English guidance also preserves JSON-only stdout.
         eprintln!("{BENCHMARK_AI_GUIDANCE_EN}");
     } else {
         print_benchmark_ai_guidance();
@@ -1274,9 +1277,11 @@ fn preserve_human_benchmark_result(raw: &str) {
             println!("MOE4ALL_BENCHMARK_JSON={}", path.display());
         }
         Err(error) => {
+            // print-ok: report failure to save the benchmark's user-requested result file.
             eprintln!("保存 benchmark JSON 失败 / Could not save benchmark JSON: {error:#}");
             // Keep the complete result available to a terminal/agent even when local storage
             // fails. This is outside the timed region and never changes --json stdout.
+            // print-ok: preserve the complete benchmark result when its file cannot be saved.
             eprintln!("Benchmark JSON: {raw}");
         }
     }
@@ -4595,7 +4600,6 @@ fn cmd_bench_suite(
     );
 
     let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let footprint = infr_llama::weight_footprint(loaded.gguf());
     let required_ctx = suite.required_context_tokens();
     let want_ctx = cfg
         .device
@@ -4614,6 +4618,7 @@ fn cmd_bench_suite(
     let load_started = std::time::Instant::now();
     let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
     let startup_seconds = load_started.elapsed().as_secs_f64();
+    let footprint = engine.weight_footprint()?;
     // The initialized device supplies the PCI identity; probing finishes before suite warmup.
     let initialized = engine.benchmark_configuration();
     let collected_hardware = benchmark_hardware::collect(

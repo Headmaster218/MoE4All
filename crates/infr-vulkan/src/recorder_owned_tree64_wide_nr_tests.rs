@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Child of recorder_owned_fused_tests; parent registers the module separately.
 //! Built-in NR4/NR8 GU only. No copy, FullHit or Down pipeline is needed.
 use super::*;

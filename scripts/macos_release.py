@@ -26,7 +26,9 @@ ROOT_FILES = {
     "NOTICE",
 }
 DOC_SUFFIXES = {".md", ".png", ".jpg", ".svg", ".webp"}
-SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
+# Runtime collectors are embedded in infr; 1.1.0 launchers reject scripts/ in an update.
+SCRIPT_FILES = set()
+MANAGED_SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
 
 
 def package_name(version):
@@ -48,7 +50,7 @@ def managed(name):
         part in ("", ".", "..") for part in name.split("/")
     ):
         return False
-    return name in ROOT_FILES | SCRIPT_FILES | {"install-manifest.json"} or (
+    return name in ROOT_FILES | MANAGED_SCRIPT_FILES | {"install-manifest.json"} or (
         name.startswith("documentation/") and path.suffix.lower() in DOC_SUFFIXES
     )
 

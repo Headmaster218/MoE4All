@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Split/fused owner preparation differential probes; TopK routing stays separate.
 use super::*;
 

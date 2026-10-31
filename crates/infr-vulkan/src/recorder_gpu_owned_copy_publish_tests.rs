@@ -1,4 +1,5 @@
 // Included only in recorder::gpu_owned_tests. The production recorder is not switched here.
+#[cfg(test)]
 struct CopyPublishFixture {
     fixture: Fixture,
     ordinal: u32,

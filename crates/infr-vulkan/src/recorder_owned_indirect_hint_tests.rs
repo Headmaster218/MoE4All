@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Explicit destination-residency hint probes; no runtime policy or external shader changes.
 use super::*;
 use crate::indirect_copy::{

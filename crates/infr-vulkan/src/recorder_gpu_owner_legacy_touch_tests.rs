@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Touch-order oracle only: physical admission still protects the entire routed union.
 use super::*;
 

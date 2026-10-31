@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Real adapter qualification with routes above the standalone module's ten-expert set.
 use super::*;
 

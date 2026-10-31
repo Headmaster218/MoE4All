@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! NEW adapter child, mounted only by the proposed O07 integration artifact.
 //! Portable tests call production pure helpers. Ignored tests execute real Graphs.
 use super::*;

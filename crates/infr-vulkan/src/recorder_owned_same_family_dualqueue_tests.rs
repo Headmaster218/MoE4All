@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Ignored module experiment, never part of the production queue scheduler.
 //! Child of recorder::owned_indirect_tests::fused::splitk_hit_v2.
 //! No external SPIR-V, event, fused FFN, ownership transfer, or runtime integration.

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Child of adapter_owned_upload_tests: reuse its real pager/producer/recovery fixture.
 use super::*;
 use crate::host_ready_combined_test_support::{Fault, Registration};

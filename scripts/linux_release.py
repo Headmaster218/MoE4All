@@ -21,7 +21,10 @@ ROOT_FILES = {
     "infr", "Start-INFR-Wizard-Linux.sh", "README.md", "README_EN.md", "CHANGELOG.md",
     "infr.example.toml", "LICENSE", "LICENSE-MIT", "NOTICE",
 }
-SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
+# Collectors are embedded in infr. The released 1.1.0 updater cannot extract scripts/;
+# keep new archives within its layout, while still managing earlier preview installs.
+SCRIPT_FILES = set()
+MANAGED_SCRIPT_FILES = {"scripts/benchmark-hardware.sh"}
 CODEC_FILES = {"libheif.so.1", "libde265.so.0", "libdav1d.so.7", "libheif-LICENSE.txt",
                "libde265-LICENSE.txt", "dav1d-LICENSE.txt", "SOURCES.txt"}
 MAX_BYTES = 1024 * 1024 * 1024
@@ -67,7 +70,7 @@ def managed(name):
     path = PurePosixPath(name)
     if not name or "\\" in name or path.is_absolute() or any(p in (".", "..") for p in name.split("/")):
         return False
-    return name in ROOT_FILES | SCRIPT_FILES | {"install-manifest.json"} or name in {"image-codecs/" + n for n in CODEC_FILES} or (
+    return name in ROOT_FILES | MANAGED_SCRIPT_FILES | {"install-manifest.json"} or name in {"image-codecs/" + n for n in CODEC_FILES} or (
         name.startswith("documentation/") and path.suffix.lower() in {".md", ".png", ".jpg", ".svg", ".webp"})
 
 

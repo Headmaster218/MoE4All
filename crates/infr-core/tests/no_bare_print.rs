@@ -7,7 +7,8 @@
 //! Four categories are sanctioned, and this test knows all four:
 //!
 //! 1. **In-crate `#[cfg(test)]` modules.** Each file is cut at its FIRST `#[cfg(test)]` and only
-//!    the half above it is scanned — that is test output, and `cargo test` captures it.
+//!    the half above it is scanned. A file-level `#![cfg(test)]` also excludes a standalone
+//!    test-only module — that is test output, and `cargo test` captures it.
 //! 2. **`build.rs`.** `cargo:rerun-if-changed` is a build protocol, not logging. Not scanned.
 //! 3. **Program OUTPUT**, marked at the site with a `// print-ok: <reason>` comment: generated
 //!    tokens, `infr bench` / `infr compare` tables, `--json`, `infr devices`, the serve banner.
@@ -143,7 +144,10 @@ fn scan_file(
     // non-test builds.
     let end = lines
         .iter()
-        .position(|l| l.trim_start().starts_with("#[cfg(test)]"))
+        .position(|l| {
+            let code = l.trim_start();
+            code.starts_with("#[cfg(test)]") || code.starts_with("#![cfg(test)]")
+        })
         .unwrap_or(lines.len());
 
     for (i, line) in lines[..end].iter().enumerate() {
@@ -204,4 +208,35 @@ fn contains_macro_call(code: &str, mac: &str) -> bool {
         from = at + 1;
     }
     false
+}
+
+#[test]
+fn standalone_test_only_modules_are_excluded_without_hiding_production_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("fixture.rs");
+    for (source, expected_offenders) in [
+        ("#![cfg(test)]\nprintln!(\"test output\");\n", 0),
+        (
+            "#[cfg(test)]\nmod tests { println!(\"test output\"); }\n",
+            0,
+        ),
+        ("//! Example: #![cfg(test)]\nprintln!(\"production\");\n", 1),
+        (
+            "#![cfg(any(test, windows))]\nprintln!(\"production\");\n",
+            1,
+        ),
+        ("println!(\"production\");\n#[cfg(test)]\nmod tests {}\n", 1),
+    ] {
+        std::fs::write(&path, source).unwrap();
+        let mut offenders = Vec::new();
+        let mut marked = 0;
+        scan_file(
+            &path,
+            "fixture",
+            directory.path(),
+            &mut offenders,
+            &mut marked,
+        );
+        assert_eq!(offenders.len(), expected_offenders, "{source}");
+    }
 }

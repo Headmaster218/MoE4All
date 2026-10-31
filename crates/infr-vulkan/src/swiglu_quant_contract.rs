@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Self-contained Recorder child; parent mounts with #[cfg(test)] only.
 //! No campaign modules, external SPVs, model files, environment probes, filesystem
 //! output, timing or additional dependencies. GPU tests are ignored and must run

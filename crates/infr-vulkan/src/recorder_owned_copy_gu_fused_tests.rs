@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Private child of recorder_owned_sparse_pipeline_tests.rs; external SPIR-V only.
 //! Host proofs apply to this immutable synthetic ABI, NOT arbitrary owner metadata.
 use super::*;

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Child of recorder_owned_fused_tests; parent registers this module separately.
 //! Test-only NFF-chunk UG+SiLU+Down partial, INCLUDING the final reduction cost.
 use super::*;

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Parent-mounted actual adapter Graph + Recorder parity, not a dispatch simulation.
 use super::*;
 use infr_core::{DType, TensorDesc};

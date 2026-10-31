@@ -83,10 +83,6 @@ pub struct SeamModel {
     token_embd: std::sync::OnceLock<Vec<f32>>,
     per_layer_embd: Option<PerLayerEmbd>,
     tokenizer: Tokenizer,
-    /// Memoized resident weight footprint (a full tensor-metadata scan). The session-open clamp
-    /// path recomputes this 2-3× (`kv_fit_ctx` → `kv_fit_ctx_fmt`, the auto-q8 re-probe, then the
-    /// clamp log line) — cache it so the scan runs once per model. See [`SeamModel::footprint`].
-    footprint: std::sync::OnceLock<crate::weights::WeightFootprint>,
 }
 
 /// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
@@ -461,7 +457,6 @@ impl SeamModel {
             token_embd: std::sync::OnceLock::new(),
             per_layer_embd,
             tokenizer,
-            footprint: std::sync::OnceLock::new(),
         })
     }
 
@@ -472,22 +467,13 @@ impl SeamModel {
         &self.ecfg
     }
 
-    /// The model's resident weight footprint, computed once and memoized (see the `footprint`
-    /// field). `WeightFootprint` is `Copy`, so callers get it by value.
-    fn footprint(&self) -> crate::weights::WeightFootprint {
-        *self
-            .footprint
-            .get_or_init(|| crate::weights::weight_footprint(&self.gguf))
-    }
-
     /// Bytes the pre-load context fit must hold aside before KV. Dense models keep every weight;
     /// MoE sessions keep only fixed weights/reserves and require one pageable Expert layer in the
     /// elastic arena. The production binder uses these same reserve terms.
-    fn ctx_fit_reserves(&self, fp: crate::weights::WeightFootprint) -> (u64, u64) {
+    fn ctx_fit_reserves(&self, plan: &super::VulkanWeightPlan) -> (u64, u64) {
         if self.cfg.moe.is_some() {
-            let fixed = fp
-                .dense
-                .saturating_add(crate::seam::resident_weight_packing_margin(fp.dense))
+            let fixed = plan
+                .fixed_bytes
                 .saturating_add(crate::seam::session_load_driver_reserve(
                     &self.cfg, &self.ecfg,
                 ))
@@ -497,7 +483,7 @@ impl SeamModel {
                 crate::seam::moe_prefill_floor_bytes(&self.gguf, &self.cfg),
             )
         } else {
-            (fp.total(), 0)
+            (plan.resident_bytes, 0)
         }
     }
 
@@ -583,7 +569,7 @@ impl SeamModel {
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
-        let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);
+        let fit = self.kv_fit_ctx(&vk)?.unwrap_or(self.cfg.n_ctx_train);
         drop(scope);
         let max_ctx = ((fit as f64 * frac) as usize).max(1024);
         Ok(DenseVulkanSession {
@@ -620,7 +606,10 @@ impl SeamModel {
     /// the backstop for those. MoE expert paging is modeled as its fixed resident bytes plus the
     /// one-layer Expert arena floor; runtime scratch reuses that same elastic arena.
     fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> Result<usize> {
-        let Some(fit) = self.kv_fit_ctx(vk) else {
+        let plan = super::vulkan_weight_plan(vk, &self.gguf, &self.cfg, &self.ecfg)?;
+        let room = vk.alloc_room();
+        let Some(fit) = self.kv_fit_ctx_fmt_in_plan(vk, crate::seam::kv_auto_q8(), &plan, room)
+        else {
             return Ok(want); // pure recurrent-state arch: no per-token KV to size.
         };
         if fit >= want {
@@ -634,7 +623,9 @@ impl SeamModel {
             && !crate::seam::kv_default_q8(&self.cfg, &self.ecfg)
             && crate::seam::kv_unset(&self.ecfg)
             && crate::seam::kv_q8_layout_ok(&self.cfg);
-        let fit_q8 = may_auto_q8.then(|| self.kv_fit_ctx_fmt(vk, true)).flatten();
+        let fit_q8 = may_auto_q8
+            .then(|| self.kv_fit_ctx_fmt_in_plan(vk, true, &plan, room))
+            .flatten();
         if fit_q8.is_some_and(|f| f >= want) {
             crate::seam::pin_kv_auto_q8();
             tracing::warn!(
@@ -681,14 +672,12 @@ impl SeamModel {
             );
             return Ok(f8);
         }
-        let vram = vk.vram();
-        let fp = self.footprint();
+        let (fixed, _) = self.ctx_fit_reserves(&plan);
         // Refuse rung: the BEST cache this model may pick on its own (q8_0 when the user set no
         // format, else the format they did set) cannot serve even a minimally-useful window.
         let best = fit.max(fit_q8.unwrap_or(0));
         if best < crate::seam::MIN_SESSION_CTX {
-            let (fixed, _) = self.ctx_fit_reserves(fp);
-            let free = vram.available.saturating_sub(fixed);
+            let free = room.saturating_sub(fixed);
             let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
             let (k_fmt, v_fmt) = self.kv_fit_fmts(false);
             let need = crate::seam::kv_bytes_estimate_fmt(
@@ -705,7 +694,7 @@ impl SeamModel {
                  fits at {k_fmt:?}/{v_fmt:?} KV : {fit} tokens\n  \
                  fits at q8_0 KV     : {}\n  \
                  KV cache needed     : {:.2} GiB at {want} tokens in {k_fmt:?}/{v_fmt:?}\n  \
-                 free after fixed    : {:.2} GiB ({:.2} GiB {} - {:.2} GiB fixed/reserved)\n\
+                 free after fixed    : {:.2} GiB ({:.2} GiB allocatable - {:.2} GiB fixed/reserved)\n\
                  Try a smaller window (--ctx N / INFR_CTX=N), an explicitly quantized cache \
                  (INFR_KV_TYPE_K=q8_0 INFR_KV_TYPE_V=q8_0), INFR_KV_OVERFLOW=1 to place the cache \
                  in system RAM, or a smaller quant of the model.",
@@ -715,24 +704,22 @@ impl SeamModel {
                 },
                 gib(need),
                 gib(free),
-                gib(vram.available),
-                if vram.live { "free, live" } else { "heap" },
+                gib(room),
                 gib(fixed),
             ));
         }
         tracing::warn!(
             "ctx clamp: default context {want} -> {fit} to fit VRAM (fixed/reserved {:.2} GiB vs \
-             {:.2} GiB available{}); set INFR_CTX to override",
-            self.ctx_fit_reserves(fp).0 as f64 / (1u64 << 30) as f64,
-            vram.available as f64 / (1u64 << 30) as f64,
-            if vram.live { ", live" } else { ", total heap" },
+             {:.2} GiB allocatable); set INFR_CTX to override",
+            fixed as f64 / (1u64 << 30) as f64,
+            room as f64 / (1u64 << 30) as f64,
         );
         Ok(fit)
     }
 
     /// The VRAM-fit KV capacity in tokens: the LARGEST context whose KV cache — priced as the
     /// exact allocation the runner will make — plus activation/runtime room still fits the
-    /// device's AVAILABLE memory. Dense models reserve the full weight footprint. MoE models
+    /// device's allocatable room. Dense models reserve the exact resident weight layout. MoE models
     /// reserve only their fixed resident footprint and the pager's exact one-layer elastic floor;
     /// pageable expert payload bytes do not masquerade as resident VRAM here.
     ///
@@ -741,7 +728,7 @@ impl SeamModel {
     /// rung is the reader of that. `None` for a pure recurrent-state arch (no per-token KV).
     /// Extra KV slots (INFR_KV_SLOTS forks) aren't modeled — the alloc-time budget guard remains
     /// the backstop.
-    fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
+    fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Result<Option<usize>> {
         // Price whatever the runner will actually allocate: the auto-q8 pin (if the placement
         // ladder set it earlier in this process) or the automatic/explicit formats.
         self.kv_fit_ctx_fmt(vk, crate::seam::kv_auto_q8())
@@ -752,39 +739,45 @@ impl SeamModel {
     /// clamp's auto-q8 rung asks "would the trained window fit if we quantized the cache?"
     /// BEFORE pinning that choice process-wide.
     ///
-    /// All the arithmetic lives in [`crate::seam::kv_fit_ctx_for`] (GPU-free, unit-tested); this
-    /// only collects the device's VRAM figures and this model's weight footprint and dtypes.
-    fn kv_fit_ctx_fmt(&self, vk: &infr_vulkan::VulkanBackend, auto_q8: bool) -> Option<usize> {
-        let vram = vk.vram();
-        let fp = self.footprint();
+    /// Collect the exact upload layout and the backend's allocatable room before fitting KV.
+    fn kv_fit_ctx_fmt(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        auto_q8: bool,
+    ) -> Result<Option<usize>> {
+        let plan = super::vulkan_weight_plan(vk, &self.gguf, &self.cfg, &self.ecfg)?;
+        Ok(self.kv_fit_ctx_fmt_in_plan(vk, auto_q8, &plan, vk.alloc_room()))
+    }
+
+    /// Reuse one device-specific layout and room snapshot across the default/Q8 fit and diagnostics.
+    fn kv_fit_ctx_fmt_in_plan(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        auto_q8: bool,
+        plan: &super::VulkanWeightPlan,
+        room: u64,
+    ) -> Option<usize> {
         let (k_fmt, v_fmt) = self.kv_fit_fmts(auto_q8);
-        // The snapshot goes in whole: `kv_fit_ctx_for` derives its budget from the allocator's OWN
-        // ceiling (`VramInfo::alloc_room`), not from the raw free figure — the VRAM guard reserves
-        // a fixed headroom below it and refuses anything reaching into it. Budgeting against
-        // `vram.available` planned a context 256 MiB past what could ever be allocated, and — now
-        // that the rest of this math is exact rather than 5%-shy — that overhang landed as a
-        // mid-prefill alloc failure. The placement sweeps derive from the same function, so the
-        // context this validates is one placement will actually take (`seam`'s drift tests).
         let caps = vk.capabilities();
         if self.cfg.moe.is_some() {
-            let (fixed, minimum_elastic) = self.ctx_fit_reserves(fp);
-            crate::seam::kv_fit_ctx_for_moe(
+            let (fixed, minimum_elastic) = self.ctx_fit_reserves(plan);
+            crate::seam::kv_fit_ctx_for_moe_in_room(
                 &self.cfg,
                 &caps,
                 &self.ecfg,
                 fixed,
                 minimum_elastic,
-                &vram,
+                room,
                 k_fmt,
                 v_fmt,
             )
         } else {
-            crate::seam::kv_fit_ctx_for(
+            crate::seam::kv_fit_ctx_for_in_room(
                 &self.cfg,
                 &caps,
                 &self.ecfg,
-                fp.total(),
-                &vram,
+                plan.resident_bytes,
+                room,
                 k_fmt,
                 v_fmt,
             )
@@ -1059,7 +1052,7 @@ impl SeamModel {
             return self.clamp_default_ctx(vk, self.cfg.n_ctx_train);
         }
         let trained = self.cfg.n_ctx_train;
-        let Some(fit) = self.kv_fit_ctx(vk) else {
+        let Some(fit) = self.kv_fit_ctx(vk)? else {
             return Ok(trained); // pure recurrent-state arch: no per-token KV to divide.
         };
         let fitted = match want {
@@ -2169,7 +2162,7 @@ impl DiffusionGemmaCpuSession {
         let bind = crate::seam::cpu_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2213,7 +2206,7 @@ impl DiffusionGemmaCpuSession {
         let bind = crate::seam::cpu_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2266,7 +2259,7 @@ impl DiffusionGemmaVulkanSession {
         )?;
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2329,7 +2322,7 @@ impl DiffusionGemmaVulkanSession {
         )?;
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2381,7 +2374,7 @@ impl DiffusionGemmaMetalSession {
         let bind = crate::seam::metal_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,
@@ -2419,7 +2412,7 @@ impl DiffusionGemmaMetalSession {
         let bind = crate::seam::metal_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &*bind,
+            &bind,
             &model.gguf,
             &model.cfg,
             &model.ecfg,

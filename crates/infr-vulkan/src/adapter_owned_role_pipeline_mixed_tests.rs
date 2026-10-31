@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Child of adapter_owned_role_pipeline_tests; one auto-C mixed-source success case.
 use super::*;
 use crate::host_ready_combined_test_support::{Fault, Registration};

@@ -1731,7 +1731,7 @@ impl Qwen4MtpSession {
         sidecar_path: &Path,
         cfg: &crate::Config,
     ) -> Result<Arc<Qwen4MtpFixed>> {
-        let bind: &BindWeightFn = &|_name, bytes, dtype, _numel| {
+        let bind: &BindWeightFn = &BindWeightFn::new(|_name, bytes, dtype, _numel| {
             let materialized = bytes.materialize();
             let padded = infr_vulkan::linear::pad_to_u32_align(&materialized);
             let buffer = vk
@@ -1740,7 +1740,7 @@ impl Qwen4MtpSession {
             vk.upload(buffer.as_ref(), &padded)
                 .map_err(|e| anyhow!("{e}"))?;
             Ok((buffer, dtype))
-        };
+        });
         let mut fixed = Self::load_fixed(
             bind,
             sidecar_path,
@@ -2797,7 +2797,7 @@ impl Qwen4MtpRuntime {
         )?;
         let (mut pending_token, mut pending_logits) = super::run_qwen4_prime_frontier_with_finish(
             vk,
-            &*target_bind,
+            &target_bind,
             model.gguf(),
             cfg,
             ec,
@@ -2900,7 +2900,7 @@ impl Qwen4MtpRuntime {
             )?;
             let (mut verify_ids, mut verify_logits, verify_h) = super::run_verify_with_finish(
                 vk,
-                &*target_bind,
+                &target_bind,
                 model.gguf(),
                 cfg,
                 ec,

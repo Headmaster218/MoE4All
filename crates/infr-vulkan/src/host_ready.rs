@@ -65,7 +65,7 @@ fn fatal(error: impl std::fmt::Display) -> ! {
     // signal success, and failed signaling cannot safely unwind into fence destructors.
     // Do not retry a callback/host signal or treat DEVICE_LOST as recoverable here:
     // that would require a backend-wide proof that no device work can execute again.
-    eprintln!("[infr] fatal host-ready release failure: {error}");
+    tracing::error!(%error, "fatal host-ready release failure");
     std::process::abort()
 }
 
