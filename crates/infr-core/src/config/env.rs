@@ -276,6 +276,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.flash_stage = presence(get, "INFR_FLASH_STAGE");
     v.flash_dequant = presence(get, "INFR_FLASH_DEQUANT");
     v.flash_warp = presence_inv(get, "INFR_NO_FLASH_WARP");
+    v.amdvlk_hd256_flash = flag(get, "INFR_AMDVLK_HD256_FLASH");
     v.nc_fa = presence_inv(get, "INFR_NO_NC_FA");
     v.qk_warp = presence_inv(get, "INFR_NO_QK_WARP");
     v.pv_warp = presence_inv(get, "INFR_NO_PV_WARP");

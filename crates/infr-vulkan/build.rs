@@ -675,6 +675,15 @@ fn main() {
         // subgroups plus safe final-tile staging fit in 30,912 B; this is a separate shader so
         // the established hd=128 variants remain byte-for-byte untouched.
         ("attn_flash_warp_hd256", "attn_flash_warp_hd256_bm16", &[]),
+        (
+            // Twin WITHOUT `[[unroll]]`: the fully-unrolled IR faults amdvlk's LLPC inside
+            // vkCreateComputePipelines (0xc0000005, amdvlk64.dll+0x2b65705). The recorder picks
+            // this build on the AMD proprietary driver and the unrolled one everywhere else, so
+            // conforming drivers keep the unrolled performance.
+            "attn_flash_warp_hd256",
+            "attn_flash_warp_hd256_bm16_nounroll",
+            &["-DNO_UNROLL"],
+        ),
         ("attn_flash_reg", "attn_flash_reg", &[]),
         // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KiB shared devices (NVIDIA, MoltenVK).
         ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),
@@ -1348,6 +1357,11 @@ fn main() {
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
+        // Expand a NARROW-output native weight into f32 scratch once per Prefill chunk so the
+        // mrow8/vec4 f32 GEMV can contract it (see `narrow_f32_gemm_eligible`). Only the formats
+        // Qwen3.8-Flash-Next's narrow tensors actually ship in are built.
+        ("weight_f32", "weight_f32_q8_0", &["-DFMT_Q8_0"]),
+        ("weight_f32", "weight_f32_bf16", &["-DFMT_BF16"]),
         // Quantize a KV row into the Q8_0 cache. f32 source (V) + f16 source (un-fused roped K),
         // each with a record-once (pos from params) variant.
         ("store_q8", "store_q8", &[]),
@@ -4105,6 +4119,57 @@ fn main() {
             "native_gemm_warp_q8_0_n128_ag_bm128",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
         ),
+        // BM128 (128x128 single-buffer) warptile for the rest of the native-dense formats. The
+        // tile itself is format-agnostic — A_GLOBAL only changes how the A fragment is loaded and
+        // the dequant path is unchanged — so each is the SAME -DBM128 switch on its own FMT define.
+        // The recorder's `dense_bm128_applies` decides when it is taken (measured-large m with
+        // wide k/n; the bench loses at m=128 and several short-k/narrow-n shapes regressed in
+        // isolated BAAB, so this is not a blanket "always on").
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n128_ag_bm128",
+            &["-DFMT_BF16", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_n128_ag_bm128",
+            &["-DFMT_IQ4NL", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4xs_n128_ag_bm128",
+            &["-DFMT_IQ4XS", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q2k_n128_ag_bm128",
+            &["-DFMT_Q2K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_n128_ag_bm128",
+            &["-DFMT_Q3K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4_0_n128_ag_bm128",
+            &["-DFMT_Q4_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_ag_bm128",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_ag_bm128",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_ag_bm128",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
         (
             // Qwen3.8 recurrent projection: N=320 is divisible by 64 but not 128, so it used to
             // miss every warptile and fall back to the legacy BN=64/BK=32 kernel. Keep BN=64,
@@ -4134,6 +4199,26 @@ fn main() {
             "native_gemm_warp_bf16_n128",
             &["-DFMT_BF16", "-DNARROW_N"],
         ),
+        // A_GLOBAL twins of the bf16 warptiles. Bf16 is the Qwen3.8-Flash-Next IQ3_S mix's dense
+        // weight type (HC projections 10240x320 / 320x10240, MoE router 2560x512): without these
+        // the HC GEMMs sat on the 64x64 `native_gemm_bf16` fallback (2.6 ms per 10240x320 dispatch
+        // at m=4096, 254 ms over the model) while the f16-clamp decode is unchanged — A_GLOBAL only
+        // lifts occupancy (LDS to Bs-only, 2->3 wgs/WGP) exactly as for every quant sibling.
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_ag",
+            &["-DFMT_BF16", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n128_ag",
+            &["-DFMT_BF16", "-DNARROW_N", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n64_ag",
+            &["-DFMT_BF16", "-DN64", "-DA_GLOBAL", "-DWG_THREADS=128"],
+        ),
         // NATIVE bf16 cooperative-matrix (WMMA) variant of the SAME production warptile above —
         // gated behind INFR_BF16_COOPMAT=1 + caps.bf16_coopmat (RDNA4 native bf16 WMMA; see
         // adapter.rs `bf16cm_ok` / native_gemm_warp.comp's BF16CM doc). -DBF16CM swaps ONLY the
@@ -4143,9 +4228,9 @@ fn main() {
         // speed while keeping bf16's full exponent range. Replaces the old standalone
         // native_gemm_bf16cm.comp measurement kernel (retired: this variant subsumes it).
         // Default-off; correctness UNVALIDATED on this box (no bf16 coopmat hardware here —
-        // compile-checked only), pending an RDNA4 run. No A_GLOBAL variant: the existing
-        // `native_gemm_warp_bf16` f16-clamp path doesn't use A_GLOBAL either (Bf16 isn't in
-        // `native_gemm_warp_ag_build_spv`'s dtype match), so there's nothing to mirror there.
+        // compile-checked only), pending an RDNA4 run. No A_GLOBAL variant of THIS one: the bf16
+        // A_GLOBAL twins above are the f16-clamp path (plain `-DFMT_BF16`), which is what the
+        // 7900 XTX actually dispatches; a BF16CM+AGLOBAL combination has no caller yet.
         (
             "native_gemm_warp",
             "native_gemm_warp_bf16cm",

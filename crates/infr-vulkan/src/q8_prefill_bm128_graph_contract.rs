@@ -324,13 +324,14 @@ fn q8_prefill_bm128_six_gate_and_graph_contract_cpu() {
                     for dtype in [DType::Q8_0, DType::Q6K, DType::Q5K, DType::Q3K, DType::F16] {
                         for rows in [m - 1, m, m + 1] {
                             assert_eq!(
-                                crate::recorder::q8_prefill_bm128_applies(
+                                crate::recorder::dense_bm128_applies(
                                     enabled, measured, default_ag, dtype, rows, k, n
                                 ),
                                 enabled
                                     && measured
                                     && default_ag
-                                    && dtype == DType::Q8_0
+                                    // Every native-dense format owns a bm128 build; F16 does not.
+                                    && dtype != DType::F16
                                     && rows == m
                             );
                         }
@@ -386,9 +387,14 @@ fn q8_prefill_bm128_six_gate_and_graph_contract_cpu() {
         for m in [
             1, 384, 511, 512, 513, 896, 1023, 1024, 1025, 1920, 2048, 2049, 3968, 4096, 4097,
         ] {
-            let expected = QUALIFIED.contains(&(k, n, m));
+            // The general gate: any native-dense dtype, measured-large m, whole 128-row tiles, and
+            // the shape guards that keep this tree's BAAB losers (short-K / narrow-N) on BM64.
+            let expected = m % 128 == 0
+                && n % 128 == 0
+                && (m >= 1024 && k >= 2048 && n >= 1024
+                    || matches!((k, n, m), (3072, 8192, 512) | (3072, 12288, 512)));
             assert_eq!(
-                crate::recorder::q8_prefill_bm128_applies(true, true, true, DType::Q8_0, m, k, n),
+                crate::recorder::dense_bm128_applies(true, true, true, DType::Q8_0, m, k, n),
                 expected
             );
             if split_k_plan(m, k, n) > 1 {
@@ -402,7 +408,7 @@ fn q8_prefill_bm128_six_gate_and_graph_contract_cpu() {
     for (k, n, m) in EXCLUDED_FLASH_M512 {
         assert!(!QUALIFIED.contains(&(k, n, m)));
         assert!(
-            !crate::recorder::q8_prefill_bm128_applies(true, true, true, DType::Q8_0, m, k, n),
+            !crate::recorder::dense_bm128_applies(true, true, true, DType::Q8_0, m, k, n),
             "Flash M512 tuples excluded after isolated warm BAAB must stay baseline"
         );
     }
@@ -415,7 +421,7 @@ fn q8_prefill_bm128_six_gate_and_graph_contract_cpu() {
         (2560, 640, 4096),
     ] {
         assert!(
-            !crate::recorder::q8_prefill_bm128_applies(true, true, true, DType::Q8_0, m, k, n),
+            !crate::recorder::dense_bm128_applies(true, true, true, DType::Q8_0, m, k, n),
             "old six failed independent BAAB and must stay baseline"
         );
     }
@@ -504,7 +510,7 @@ fn q8_prefill_bm128_graph_neighbor_fallback() {
     assert_eq!(QUALIFIED.len() + EXCLUDED_FLASH_M512.len(), 9);
     for &(k, n, m) in QUALIFIED.iter().chain(EXCLUDED_FLASH_M512.iter()) {
         assert!(!QUALIFIED.contains(&(k, n, m - 128)));
-        assert!(!crate::recorder::q8_prefill_bm128_applies(
+        assert!(!crate::recorder::dense_bm128_applies(
             true,
             true,
             true,
@@ -523,7 +529,7 @@ fn q8_prefill_bm128_graph_neighbor_fallback() {
 fn q8_prefill_bm128_graph_excluded_flash_m512_fallback() {
     assert_eq!(EXCLUDED_FLASH_M512.len(), 3);
     for (k, n, m) in EXCLUDED_FLASH_M512 {
-        assert!(!crate::recorder::q8_prefill_bm128_applies(
+        assert!(!crate::recorder::dense_bm128_applies(
             true,
             true,
             true,

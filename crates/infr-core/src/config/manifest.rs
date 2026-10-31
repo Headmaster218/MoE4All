@@ -217,6 +217,7 @@ knobs! {
     "INFR_FLASH_STAGE"    => "kernels.vulkan.flash_stage",      Presence,         Ignored, "1",  migrated;
     "INFR_FLASH_DEQUANT"  => "kernels.vulkan.flash_dequant",    Presence,         Ignored, "1",  migrated;
     "INFR_NO_FLASH_WARP"  => "kernels.vulkan.flash_warp",       PresenceInv,      Ignored, "1",  migrated;
+    "INFR_AMDVLK_HD256_FLASH" => "kernels.vulkan.amdvlk_hd256_flash", Flag,      Ignored, "1",  migrated;
     "INFR_NO_NC_FA"       => "kernels.vulkan.nc_fa",            PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_QK_WARP"     => "kernels.vulkan.qk_warp",          PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  migrated;
