@@ -2047,6 +2047,23 @@ impl ParallelSeam {
         self.vk.unified_vram().map(|pool| pool.stats())
     }
 
+    /// Bytes still allocatable under the backend's live unified VRAM guard.
+    pub fn unified_alloc_room(&self) -> u64 {
+        self.vk.alloc_room()
+    }
+
+    /// Fork Vision with a private unified arena when the primary session kept every MoE expert
+    /// resident (the pager only builds its arena when experts are actually paged). The primary
+    /// LLM keeps its normal allocation path; only the vision client allocates from this arena.
+    pub fn fork_vision_backend_with_arena(
+        &self,
+        bytes: usize,
+    ) -> Result<infr_vulkan::VulkanBackend> {
+        self.vk
+            .fork_vision_client_with_arena(bytes)
+            .map_err(|error| anyhow!("derive unified Vision backend: {error}"))
+    }
+
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
     /// rest off it. `&mut self` — this runs at startup, before the engine is shared.
     fn init_slots(&mut self, n_slots: usize) -> Result<()> {
