@@ -7128,7 +7128,29 @@ fn cmd_serve(
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
         let vision = mmproj
             .map(|path| {
-                let backend = engine.fork_vision_backend()?;
+                let backend = if engine.unified_vram_stats().is_none() {
+                    // The primary session loaded every MoE expert resident, so the pager never
+                    // built its arena. Give the vision client a private one; the LLM keeps its
+                    // normal allocation path and is not re-routed through a late arena.
+                    let projector_bytes = std::fs::metadata(path).map_or(0u64, |meta| meta.len());
+                    let desired = (projector_bytes + (3u64 << 30)).next_multiple_of(256u64 << 20);
+                    let room = engine.unified_alloc_room();
+                    let bytes = desired.min(room.saturating_sub(512u64 << 20));
+                    if bytes < projector_bytes + (1u64 << 30) {
+                        anyhow::bail!(
+                            "vision needs a private unified VRAM arena, but only {} MiB of the \
+                             device budget is free; lower --ctx, close other GPU processes, or \
+                             reserve an expert cache with --set paging.cache",
+                            room >> 20
+                        );
+                    }
+                    engine.fork_vision_backend_with_arena(
+                        usize::try_from(bytes)
+                            .context("vision arena exceeds the host address space")?,
+                    )?
+                } else {
+                    engine.fork_vision_backend()?
+                };
                 let vision =
                     infr_vision::NativeVisionEngine::load_vulkan_with_backend(path, backend)?;
                 let llm_dim = engine.model().config().n_embd;

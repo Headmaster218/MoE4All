@@ -6806,10 +6806,45 @@ impl VulkanBackend {
         self.fork_auxiliary_client(UnifiedClient::Vision, "Vision")
     }
 
+    /// Fork Vision with a private unified arena when the primary session kept every MoE expert
+    /// resident and therefore has no pager arena. The private cell is essential: installing an
+    /// arena on the primary backend after initialization would re-route the LLM's own runtime
+    /// allocations through it.
+    pub fn fork_vision_client_with_arena(&self, arena_bytes: usize) -> Result<Self> {
+        if self.unified_vram().is_some() {
+            return self.fork_auxiliary_client(UnifiedClient::Vision, "Vision");
+        }
+        if arena_bytes == 0 {
+            return Err(be("vision requires a non-zero private unified VRAM arena"));
+        }
+        self.check_vram_budget(arena_bytes as u64)?;
+        let pool = crate::unified::UnifiedVramPool::new(self, arena_bytes)?;
+        tracing::info!(
+            arena_bytes,
+            "[infr] vision client owns a private unified VRAM arena (primary MoE is all-resident)"
+        );
+        let cell = Arc::new(Mutex::new(Some(pool)));
+        self.fork_auxiliary_client_with_pool_cell(UnifiedClient::Vision, "Vision", cell)
+    }
+
     fn fork_auxiliary_client(&self, client: UnifiedClient, label: &str) -> Result<Self> {
         if self.unified_vram().is_none() {
             return Err(be(format!(
                 "cannot fork a unified {label} backend before the MoE arena is initialized"
+            )));
+        }
+        self.fork_auxiliary_client_with_pool_cell(client, label, Arc::clone(&self.unified_pool))
+    }
+
+    fn fork_auxiliary_client_with_pool_cell(
+        &self,
+        client: UnifiedClient,
+        label: &str,
+        unified_pool: Arc<Mutex<Option<Arc<crate::unified::UnifiedVramPool>>>>,
+    ) -> Result<Self> {
+        if unified_pool.lock().unwrap().is_none() {
+            return Err(be(format!(
+                "cannot fork a unified {label} backend before its unified VRAM arena is initialized"
             )));
         }
         let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
@@ -6827,7 +6862,7 @@ impl VulkanBackend {
             iq2s_grid: self.iq2s_grid.clone(),
             iq3s_grid: self.iq3s_grid.clone(),
             iq3xxs_grid: self.iq3xxs_grid.clone(),
-            unified_pool: Arc::clone(&self.unified_pool),
+            unified_pool,
             unified_exec: Arc::clone(&self.unified_exec),
             unified_phases: Arc::clone(&self.unified_phases),
             unified_phase_id,
