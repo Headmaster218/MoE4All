@@ -13627,12 +13627,29 @@ fn execute_static_walk(
             match result {
                 Ok(result) => {
                     if result.is_err() {
+                        if let Err(cleanup) = pstream.finish_prefill_uploads(be_) {
+                            tracing::warn!(%cleanup, "Prefill producer cleanup after forward failure also failed");
+                        }
                         pair_windows.clear();
                     }
                     result
                 }
                 Err(panic) => {
                     // Execute/recorder leases still protect any readers while error paths drain.
+                    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let result = pstream.finish_prefill_uploads(be_);
+                        // A synchronous producer may have unwound before clearing its marker,
+                        // even though no uploader exists. Its job has already left the scope.
+                        if let Ok(mut pager) = be_.moe_pager().lock() {
+                            if let Some(session) = pager.as_mut() {
+                                session.abort_pending_prefill_layers_cpu();
+                            }
+                        }
+                        result
+                    }));
+                    if !matches!(cleanup, Ok(Ok(()))) {
+                        tracing::warn!("Prefill producer cleanup failed while preserving the original forward panic");
+                    }
                     pair_windows.clear();
                     std::panic::resume_unwind(panic)
                 }
@@ -17487,9 +17504,17 @@ impl PagedStream {
         be_: &VulkanBackend,
         completion: PrefillUploadCompletion,
     ) -> Result<()> {
-        completion
-            .result
-            .map_err(|e| be(format!("async Prefill upload dependency failed: {e}")))?;
+        if let Err(error) = completion.result {
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("paged execution requires a session")
+                .abort_prefill_layer_cpu(completion.buf_id);
+            return Err(be(format!(
+                "async Prefill upload dependency failed: {error}"
+            )));
+        }
         be_.moe_pager()
             .lock()
             .unwrap()
@@ -17514,7 +17539,12 @@ impl PagedStream {
             let Ok(completion) = completion else {
                 break;
             };
-            self.apply_prefill_completion(be_, completion)?;
+            if let Err(error) = self.apply_prefill_completion(be_, completion) {
+                if let Err(cleanup) = self.finish_prefill_uploads(be_) {
+                    tracing::warn!(%cleanup, "Prefill producer cleanup also failed");
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -17548,12 +17578,25 @@ impl PagedStream {
                 .as_ref()
                 .ok_or_else(|| be("Prefill layer is pending without an uploader"))?
                 .rx
-                .recv()
-                .map_err(|_| be("Prefill uploader disconnected before layer became ready"))?;
+                .recv();
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(_) => {
+                    let _ = self.finish_prefill_uploads(be_);
+                    return Err(be(
+                        "Prefill uploader disconnected before layer became ready",
+                    ));
+                }
+            };
             if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
                 infr_core::pager_profile::record_staging_wait(elapsed);
             }
-            self.apply_prefill_completion(be_, completion)?;
+            if let Err(error) = self.apply_prefill_completion(be_, completion) {
+                if let Err(cleanup) = self.finish_prefill_uploads(be_) {
+                    tracing::warn!(%cleanup, "Prefill producer cleanup also failed");
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -17563,25 +17606,47 @@ impl PagedStream {
         job: crate::pager::PrefillCopyJob,
         after: Option<crate::recorder::PendingSegment>,
     ) -> Result<()> {
+        let buf_id = job.buf_id();
         if self.prefill_uploader.is_none() {
             let executor = crate::transfer::BackgroundTransferExecutor::from_backend(be_);
             self.prefill_uploader = Some(PrefillUploader::new(executor));
         }
-        self.prefill_uploader
+        let result = self
+            .prefill_uploader
             .as_ref()
             .expect("Prefill uploader was initialized")
-            .enqueue(PrefillUploadCommand { job, after })
+            .enqueue(PrefillUploadCommand { job, after });
+        if result.is_err() {
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("paged execution requires a session")
+                .abort_prefill_layer_cpu(buf_id);
+        }
+        result
     }
 
     fn finish_prefill_uploads(&mut self, be_: &VulkanBackend) -> Result<()> {
         let Some(mut uploader) = self.prefill_uploader.take() else {
             return Ok(());
         };
+        let mut result = Ok(());
         uploader.finish();
         while let Ok(completion) = uploader.rx.try_recv() {
-            self.apply_prefill_completion(be_, completion)?;
+            if let Err(error) = self.apply_prefill_completion(be_, completion) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
-        Ok(())
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .abort_pending_prefill_layers_cpu();
+        result
     }
 }
 
@@ -17928,7 +17993,15 @@ fn stage_layer_and_window<'a>(
 
 fn run_prefill_job_sync(be_: &VulkanBackend, job: crate::pager::PrefillCopyJob) -> Result<()> {
     let buf_id = job.buf_id();
-    job.execute(be_)?;
+    if let Err(error) = job.execute(be_) {
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .abort_prefill_layer_cpu(buf_id);
+        return Err(error);
+    }
     be_.moe_pager()
         .lock()
         .unwrap()
@@ -17950,75 +18023,96 @@ fn prefetch_next_moe_layer<'a>(
     current_gate_id: usize,
     next_chunk: bool,
 ) -> Result<()> {
-    ps.finish_cpu_miss(be_, pool)?;
-    ps.wait_cpu_promotion(be_)?;
-    ps.poll_prefill_uploads(be_)?;
-    // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
-    // that cannot run on the existing host producer also takes the synchronous correctness path.
-    // This property is frozen during model setup, so previous uploads are drained before the next
-    // layer reserves a lane exactly as they were before transport was abstracted.
-    let synchronous = !be_.cfg().paging.prefill_upload_async
-        || !be_
-            .moe_pager()
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("paged execution requires a session")
-            .prefill_host_worker_ready();
-    if synchronous {
-        ps.finish_prefill_uploads(be_)?;
-    }
+    let result = (|| -> Result<()> {
+        ps.finish_cpu_miss(be_, pool)?;
+        ps.wait_cpu_promotion(be_)?;
+        ps.poll_prefill_uploads(be_)?;
+        // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
+        // that cannot run on the existing host producer also takes the synchronous correctness path.
+        // This property is frozen during model setup, so previous uploads are drained before the next
+        // layer reserves a lane exactly as they were before transport was abstracted.
+        let synchronous = !be_.cfg().paging.prefill_upload_async
+            || !be_
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("paged execution requires a session")
+                .prefill_host_worker_ready();
+        if synchronous {
+            ps.finish_prefill_uploads(be_)?;
+        }
 
-    let (initial, replacement) = {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.enter_prefill_layer(be_)?;
-        sess.prefill_successors(current_gate_id, next_chunk)?
-    };
-    let (initial_jobs, replacement_job) = {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_mut().expect("paged execution requires a session");
-        let mut jobs = Vec::with_capacity(initial.len());
-        for next in initial {
-            if let Some(job) = sess.prepare_prefill_layer_cpu(be_, next)? {
-                jobs.push(job);
+        let (initial, replacement) = {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().expect("paged execution requires a session");
+            sess.enter_prefill_layer(be_)?;
+            sess.prefill_successors(current_gate_id, next_chunk)?
+        };
+        let segment = rec
+            .take()
+            .expect("segment always Some between ops")
+            .finish_nowait()
+            .map_err(|e| be(e.to_string()))?;
+        if synchronous {
+            segment.wait().map_err(|e| be(e.to_string()))?;
+            ps.cursor = 0;
+            for next in initial.into_iter().chain(replacement) {
+                let job = be_
+                    .moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("paged execution requires a session")
+                    .prepare_prefill_layer_cpu(be_, next)?;
+                if let Some(job) = job {
+                    run_prefill_job_sync(be_, job)?;
+                }
+            }
+        } else {
+            for next in initial {
+                let job = be_
+                    .moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("paged execution requires a session")
+                    .prepare_prefill_layer_cpu(be_, next)?;
+                if let Some(job) = job {
+                    ps.enqueue_prefill_upload(be_, job, None)?;
+                }
+            }
+            let replacement_job = replacement
+                .map(|next| {
+                    be_.moe_pager()
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .expect("paged execution requires a session")
+                        .prepare_prefill_layer_cpu(be_, next)
+                })
+                .transpose()?
+                .flatten();
+            if let Some(job) = replacement_job {
+                ps.enqueue_prefill_upload(be_, job, Some(segment))?;
+            } else {
+                retain_prefill_compute(ps, segment)?;
             }
         }
-        let replacement = replacement
-            .map(|next| sess.prepare_prefill_layer_cpu(be_, next))
-            .transpose()?
-            .flatten();
-        (jobs, replacement)
-    };
 
-    let segment = rec
-        .take()
-        .expect("segment always Some between ops")
-        .finish_nowait()
-        .map_err(|e| be(e.to_string()))?;
-    if synchronous {
-        segment.wait().map_err(|e| be(e.to_string()))?;
-        ps.cursor = 0;
-        for job in initial_jobs {
-            run_prefill_job_sync(be_, job)?;
+        let compute = be_.recorder()?;
+        compute.seed_barrier();
+        *rec = Some(compute);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Resolve every already-enqueued sibling before returning the original failure. Jobs are
+        // prepared one at a time, so no unsubmitted siblings can leave phantom pending lanes.
+        if let Err(cleanup) = ps.finish_prefill_uploads(be_) {
+            tracing::warn!(%cleanup, "Prefill producer cleanup also failed");
         }
-        if let Some(job) = replacement_job {
-            run_prefill_job_sync(be_, job)?;
-        }
-    } else {
-        for job in initial_jobs {
-            ps.enqueue_prefill_upload(be_, job, None)?;
-        }
-        if let Some(job) = replacement_job {
-            ps.enqueue_prefill_upload(be_, job, Some(segment))?;
-        } else {
-            retain_prefill_compute(ps, segment)?;
-        }
+        return Err(error);
     }
-
-    let compute = be_.recorder()?;
-    compute.seed_barrier();
-    *rec = Some(compute);
     Ok(())
 }
 
