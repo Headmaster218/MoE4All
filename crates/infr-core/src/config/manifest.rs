@@ -128,6 +128,9 @@ knobs! {
     "INFR_AUTO_PROFILE"         => "device.auto_profile",      Literal, Error, "aggressive", migrated;
     "INFR_VRAM_BUDGET"          => "device.vram_budget",       Size, Ignored, "23GiB",   migrated;
     "INFR_RAM_BUDGET"           => "device.ram_budget",        Size, Ignored, "50GiB",   migrated;
+    "INFR_MEM_GUARD_HEADROOM"   => "device.mem_guard_headroom", Size, Ignored, "8GiB",   migrated;
+    "INFR_MEM_GUARD_RAM_HEADROOM"  => "device.mem_guard_ram_headroom", Size, Ignored, "4GiB",  migrated;
+    "INFR_MEM_GUARD_POLL_MS"    => "device.mem_guard_poll_ms", Int,  Ignored, "500",     migrated;
     "INFR_VRAM_RESERVE"         => "device.vram_reserve",      Size, Ignored, "512MiB",  migrated;
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
@@ -152,8 +155,14 @@ knobs! {
     "INFR_KV_SESSION_IDLE_SECS"  => "kv.session_idle_secs",   Int,         Ignored, "120",  migrated;
     "INFR_KV_SESSION_CACHE_MAX"  => "kv.session_cache_max",   Size,        Ignored, "5GiB",  migrated;
     "INFR_KV_SESSION_CACHE_TTL_HOURS" => "kv.session_cache_ttl_hours", Int,  Ignored, "24",   migrated;
+    "INFR_KV_RAM_CACHE_MAX"      => "kv.ram_cache_max",        Size,        Ignored, "16GiB",  migrated;
     "INFR_NO_KV_RING"           => "kv.ring",                PresenceInv, Ignored, "1",    migrated;
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
+    "INFR_KV_PAGED"             => "kv.paged",               Flag,        Ignored, "1",    migrated;
+    "INFR_KV_PAGED_PAGE_TOKENS" => "kv.paged_page_tokens",    Int,         Ignored, "64",   migrated;
+    "INFR_KV_PAGED_CACHE_MAX"   => "kv.paged_cache_max",      Size,        Ignored, "16GiB", migrated;
+    "INFR_KV_DISK_CACHE_MAX"    => "kv.disk_cache_max",       Size,        Ignored, "64GiB", migrated;
+    "INFR_KV_DISK_CACHE_PATH"   => "kv.disk_cache_path",      Path,        Ignored, "D:\\infr-kv-disk.bin", migrated;
     "INFR_KV_INLINE"            => "kv.inline_decode",       Presence,    Ignored, "1",    migrated;
     "INFR_KV_COOPMAT_BDA"       => "kv.coopmat_bda",         Presence,    Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
@@ -217,6 +226,7 @@ knobs! {
     "INFR_FLASH_STAGE"    => "kernels.vulkan.flash_stage",      Presence,         Ignored, "1",  migrated;
     "INFR_FLASH_DEQUANT"  => "kernels.vulkan.flash_dequant",    Presence,         Ignored, "1",  migrated;
     "INFR_NO_FLASH_WARP"  => "kernels.vulkan.flash_warp",       PresenceInv,      Ignored, "1",  migrated;
+    "INFR_AMDVLK_HD256_FLASH" => "kernels.vulkan.amdvlk_hd256_flash", Flag,      Ignored, "1",  migrated;
     "INFR_NO_NC_FA"       => "kernels.vulkan.nc_fa",            PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_QK_WARP"     => "kernels.vulkan.qk_warp",          PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  migrated;
@@ -308,6 +318,7 @@ knobs! {
     "INFR_NO_MTP_PLE_OVERLAP" => "spec.mtp_ple_overlap", PresenceInv, Ignored, "1",         migrated;
     "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", migrated;
     "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         migrated;
+    "INFR_SPEC_MTP_MIN_ALPHA" => "spec.mtp_min_alpha",   Float,       Ignored, "0.9",       migrated;
     "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         migrated;
     "INFR_DECODE_CHAIN"       => "spec.decode_chain",    Int,         Ignored, "4",         migrated;
     "INFR_NO_GPU_DRAFT_PROB"  => "spec.gpu_draft_prob",  PresenceInv, Ignored, "1",         migrated;
@@ -364,6 +375,11 @@ knobs! {
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
     "INFR_SHUTDOWN_FILE" => "serve.shutdown_file", Path, Ignored, "worker.stop", migrated;
     "INFR_EMBEDDING_RUNNER" => "serve.embedding_runner", Path, Ignored, "llama-server", migrated;
+    // `0` = response state OFF (the stateless 400 path), a VALUE like the two knobs above —
+    // the env layer must not filter non-positive values. See `ServeCfg::response_store_entries`.
+    "INFR_RESPONSE_STORE_ENTRIES" => "serve.response_store_entries", Int, Ignored, "64", migrated;
+    // Unset = memory-only store; the file is written only when the operator names one.
+    "INFR_RESPONSE_STORE_PATH" => "serve.response_store_path", Path, Ignored, "responses.json", migrated;
 
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
     "INFR_HF_ENDPOINT" => "hub.endpoint", Text, Ignored, "https://hf-mirror.com", migrated;
@@ -414,6 +430,16 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
         "Vulkan validation escape hatch for same-binary A/B of the shared-expert slot peephole. \
          It is backend-private and deliberately remains a direct presence check rather than user \
          configuration.",
+    ),
+    (
+        "INFR_TIMELINE_RAW_KERNELS",
+        "trace-dump filter read directly by infr-vulkan/src/timeline.rs; it shapes chrome-trace \
+         output only and is not a runtime Config knob.",
+    ),
+    (
+        "INFR_TIMELINE_RAW_UNKNOWN",
+        "trace-dump filter read directly by infr-vulkan/src/timeline.rs; it shapes chrome-trace \
+         output only and is not a runtime Config knob.",
     ),
 ];
 

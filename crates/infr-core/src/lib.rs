@@ -24,6 +24,9 @@ pub mod iquant_grids;
 /// envelope, durability, and the poisoned-blob tripwire, once.
 pub mod kernel_cache;
 pub mod loader;
+/// The commit-charge circuit breaker — exit the process at the water line instead of letting a
+/// miss storm page the box or AV the driver (2026-10-19 conviction).
+pub mod memguard;
 pub mod pager;
 pub mod pager_profile;
 /// The per-op profiling seam every backend reports through — one collector, one label grammar,

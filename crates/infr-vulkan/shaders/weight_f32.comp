@@ -1,0 +1,35 @@
+#version 460
+// Expand `n` elements of a standard-GGUF-block weight (-DFMT_*: Q8_0/BF16/F16) into a contiguous
+// f32 scratch, reusing the shared native_decode per-element `dq()` decode. 1 thread/element.
+//
+// Why this exists: at Prefill rows the narrow-output projections (out_f = 4 and 48 on
+// Qwen3.8-Flash-Next's hyper-connection inject / ssm_alpha / ssm_beta tensors) are reachable by no
+// tiled GEMM tile (n is not a multiple of 64) AND by no mrow-batched GEMV in their native format,
+// so they land on the streamed per-row GEMV, which re-reads the whole weight once per row. Those
+// weights are tiny (<= ~500 KiB), so expanding one to f32 per chunk costs a few microseconds and
+// lets the SAME contraction run through the f32r mrow8/vec4 GEMV, which batches rows and measured
+// ~4x faster on exactly these shapes (base: 0.96 ms -> 0.25 ms for 10240x4, 1.5 ms -> ~0.25 ms for
+// 2560x48 at m=4096).
+//
+// Numerics: the expansion is EXACT. Q8_0 decodes to d(f16) * int8 — every such product is
+// representable in f32 (24-bit mantissa holds d up to 2^-14..2^15 times 7-bit ints exactly); bf16
+// and f16 widen exactly as the f32 kernels' own loads would. The f32 GEMV accumulates f32 x f32
+// exactly as it does for a model that ships these tensors in F32 (Qwen3.8-Flash-Next UD does).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// arena_lo/arena_hi carry the weight's base BYTE address (native_weight_addr.glsl); `w_off` is the
+// op's within-slot ELEMENT offset (0 for every caller — these tensors are never fused slices).
+layout(push_constant) uniform PC { uint n; uint w_off; uint arena_lo; uint arena_hi; } pc;
+layout(binding = 1) writeonly buffer DB { float dst[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+void main() {
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    dst[i] = dq(i + pc.w_off);
+}

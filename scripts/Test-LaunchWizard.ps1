@@ -168,7 +168,7 @@ try {
     function Show-EngineReleaseNotes { param($Release) [void]$script:Events.Add('release notes') }
     Test-UpdateAction 'release notes then skip' @('1', '') 'skip'
 
-    Test-Flow 'fresh chat defaults' -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh chat defaults' -Inputs @('',  $model,  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert ($nativeArgs[0] -eq 'run') 'Expected chat'
         Assert ('65536' -in $nativeArgs -and $state.kv_preset -eq 'auto') 'Fresh defaults changed'
         Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv.type_[kv]=' }).Count)) 'Automatic defaults must defer KV format to the engine'
@@ -176,40 +176,64 @@ try {
         Assert (@($script:Events | Where-Object { $_ -match 'Compute device' }).Count -eq 1) 'One GPU still needs manual selection'
         Assert (($script:Output -join "`n") -notmatch 'CPU: Fixture CPU') 'CPU must not be a compute-device option'
     }
-    Test-Flow 'homogeneous CPU miss defaults to physical minus two' -Inputs @('', $model, '', '', '', '', '', 'y', '', '', '') -Check {
+    Test-Flow 'homogeneous CPU miss defaults to physical minus two' -Inputs @('',  $model,  '',  '',  '',  '',  '',  'y',  '',  '',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=4' -in $nativeArgs) 'Six physical cores should default to four compute cores'
         Assert ('kernels.vulkan.cpu_miss_max=1' -in $nativeArgs) 'CPU miss count default changed'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kernels\.vulkan\.amdvlk_hd256_flash=' }).Count)) 'The wizard must not pin amdvlk_hd256_flash; the engine default decides'
     }
     $script:CpuTopology = [pscustomobject]@{ Physical = 24; Preferred = 8; Detected = $true }
-    Test-Flow 'hybrid CPU miss defaults to total physical minus two' -Inputs @('', $model, '', '', '', '', '', 'y', '', '', '') -Check {
+    Test-Flow 'hybrid CPU miss defaults to total physical minus two' -Inputs @('',  $model,  '',  '',  '',  '',  '',  'y',  '',  '',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=22' -in $nativeArgs) 'Hybrid default should include efficiency cores while reserving two performance cores'
     }
-    Test-Flow 'hybrid CPU miss allows selecting all physical cores' -Inputs @('', $model, '', '', '', '', '', 'y', '', '24', '') -Check {
+    Test-Flow 'hybrid CPU miss allows selecting all physical cores' -Inputs @('',  $model,  '',  '',  '',  '',  '',  'y',  '',  '24',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=24' -in $nativeArgs) 'Explicit all-core selection must be honored'
     }
     $cpuSaved = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = $model; device = 'Vulkan0'; cpu_miss_enabled = $true; cpu_miss_cores = '8'; cpu_miss_max = '2' }
-    Test-Flow 'saved CPU miss count survives reconfiguration' -Saved $cpuSaved -Inputs @('n', '', '', '', '', '', '', '', '', '', '', '') -Check {
+    Test-Flow 'saved CPU miss count survives reconfiguration' -Saved $cpuSaved -Inputs @('n',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=8' -in $nativeArgs) 'Saved custom CPU core count lost'
         Assert ('kernels.vulkan.cpu_miss_max=2' -in $nativeArgs) 'Saved CPU miss limit lost'
     }
     $script:CpuTopology = [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true }
-    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', $model, '', '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2',  $model,  '',  '',  '',  '2',  '',  '',  '',  '',  '3',  '100k',  'y',  '',  '',  '',  '',  '') -Check {
         Assert ($nativeArgs[0] -eq 'serve' -and 'device.auto_profile=aggressive' -in $nativeArgs) 'Expected aggressive API'
         Assert ($state.server_parallel -eq '3' -and $state.context -eq '100k') 'Parallel/context prompts shifted'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Cache must default to the install directory'
         Assert ('serve.api_key=' -in $nativeArgs) 'Explicit no-auth override lost'
+        Assert (-not ('kv.paged=true' -in $nativeArgs)) 'The paged radix tree must stay opt-in'
     }
-    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', $model, '', '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh API enables local cache by default' -Inputs @('2',  $model,  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert ($state.server_session_cache) 'Fresh API installs should enable SSD KV caching'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Default SSD KV cache path was not emitted'
     }
-    Test-Flow 'manual hardware and sampling' -Inputs @('', $model, '', '3', '3072', '4', '', '', 'n', '3', '256', 'n', 'paging.expert_prefetch=false', 'n', '2048', 'y', '0.7', '20', '0.95', '9', 'n', '20k') -Check {
+    Test-Flow 'API paged tree with no RAM pool' -Inputs @('2',  $model,  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  'y',  'n',  '',  '',  '') -Check {
+        Assert ('kv.paged=true' -in $nativeArgs) 'The corridor-only paged tree was not emitted'
+        Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The corridor-only tree lost the frame page size'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv\.paged_cache_max=' }).Count)) 'Declining the RAM pool must not emit a pool budget'
+        Assert ($state.kv_paged_tree -and -not $state.kv_paged_cache_max) 'The corridor-only tree choice was not saved'
+        Assert (-not $state.server_session_cache) 'The paged tree must turn off the mutually exclusive disk session cache'
+    }
+    # The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout, so a saved profile that
+    # pairs it with another KV format must heal rather than emit a command line the engine refuses.
+    $f16TreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'f16'; kv_type_k = 'f16'; kv_type_v = 'f16'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'a saved F16 KV profile turns the paged tree off' -Saved $f16TreeSettings -Inputs @('') -Check {
+        Assert ($reuseSavedSettings) 'Saved profile should not reconfigure'
+        Assert ('kv.type_k=f16' -in $nativeArgs) 'The saved F16 KV profile was not the one under test'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv\.paged' }).Count)) 'An F16 profile still emitted the paged KV tree'
+        Assert (-not $state.kv_paged_tree) 'The healed profile kept the paged tree saved'
+        Assert (@($script:Output | Where-Object { $_ -match 'segmented Q8_0/Q8_0' }).Count) 'Turning the tree off was not explained'
+    }
+    $customQ8TreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = ''; kv_paged_page_tokens = '64'; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'an explicit Q8_0/Q8_0 profile keeps its paged tree' -Saved $customQ8TreeSettings -Inputs @('') -Check {
+        Assert ('kv.paged=true' -in $nativeArgs) 'A Q8_0/Q8_0 profile lost the corridor-only tree'
+        Assert ($state.kv_paged_tree) 'The eligible profile must keep the tree saved'
+    }
+    Test-Flow 'manual hardware and sampling' -Inputs @('',  $model,  '',  '3',  '3072',  '4',  '',  '',  'n',  '3',  '256',  'n',  'paging.expert_prefetch=false',  'n',  '2048',  'y',  '0.7',  '20',  '0.95',  '9',  'n',  '20k') -Check {
         foreach ($value in @('--ubatch', '3072', '--threads', '4', 'device.submit_dispatches=256', 'paging.expert_prefetch=false', '--temp', '0.7', '--seed', '9')) {
             Assert ($value -in $nativeArgs) "Missing manual setting $value"
         }
         Assert ($state.context -eq '20k') 'Manual context should be asked once at the common step'
     }
-    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', $model, 'y', $aux, 'y', $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '') -Check {
+    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2',  $model,  'y',  $aux,  'y',  $aux,  '17',  '',  '',  '',  '',  '',  '',  '2',  '20k',  'y',  '',  '',  '',  '',  '') -Check {
         foreach ($value in @('spec.mtp=false', '--mmproj', '--embedding-model')) {
             Assert ($value -in $nativeArgs) "Missing auxiliary setting $value"
         }
@@ -223,27 +247,27 @@ try {
             $previous = $position
         }
     }
-    Test-Flow 'FlashNext native reasoning effort' -Inputs @('', $model, '', '', 'y', 'y', '4', '', '', '', '') -Check {
+    Test-Flow 'FlashNext native reasoning effort' -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '') -Check {
         Assert ('--think' -in $nativeArgs -and 'xhigh' -in $nativeArgs) 'FlashNext reasoning effort was not emitted'
     }
-    Test-Flow '35B prompt reasoning effort' -Inputs @('', $model35, '', '', 'y', 'y', '5', '', '', '', '') -Check {
+    Test-Flow '35B prompt reasoning effort' -Inputs @('',  $model35,  '',  '',  'y',  'y',  '5',  '',  '',  '',  '') -Check {
         Assert ('--think' -in $nativeArgs -and '--reasoning-effort' -in $nativeArgs -and 'max' -in $nativeArgs) '35B reasoning effort was not emitted'
     }
-    Test-Flow 'default reasoning disabled' -Inputs @('', $model, '', '', 'y', 'n', '', '', '', '') -Check {
+    Test-Flow 'default reasoning disabled' -Inputs @('',  $model,  '',  '',  'y',  'n',  '',  '',  '',  '') -Check {
         Assert ('--no-think' -in $nativeArgs -and -not ('--reasoning-effort' -in $nativeArgs)) 'Disable reasoning failed'
     }
-    Test-Flow 'benchmark skips API and generation defaults' -Inputs @('3', $model, '', '', '', '4', '3', '1024', '64', '3', '2048', '2') -Check {
+    Test-Flow 'benchmark skips API and generation defaults' -Inputs @('3',  $model,  '',  '',  '',  '4',  '3',  '1024',  '64',  '3',  '2048',  '2') -Check {
         Assert ($nativeArgs[0] -eq 'bench' -and '--pg' -in $nativeArgs -and '--json' -in $nativeArgs) 'Benchmark flags lost'
         Assert (-not ('--max-new' -in $nativeArgs) -and -not ('spec.mtp=false' -in $nativeArgs) -and -not ('--ctx' -in $nativeArgs)) 'Benchmark received chat or context settings'
         Assert (($script:Output -join "`n") -match 'Current plan') 'Manual benchmark did not show the incremental plan'
     }
-    Test-Flow 'manual mode changes restore positive defaults' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '0'; gen_tokens = '0'; depth_tokens = '0' }) -Inputs @('3', $model, '', '1', '', '4', '3', '', '', '2', '', '1') -Check {
+    Test-Flow 'manual mode changes restore positive defaults' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '0'; gen_tokens = '0'; depth_tokens = '0' }) -Inputs @('3',  $model,  '',  '1',  '',  '4',  '3',  '',  '',  '2',  '',  '1') -Check {
         Assert ('6144,512' -in $nativeArgs -and '-d' -in $nativeArgs -and '6144' -in $nativeArgs) 'Zero defaults survived switching manual modes'
     }
-    Test-Flow 'manual positive defaults stay unchanged' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '1024'; gen_tokens = '64'; depth_tokens = '2048' }) -Inputs @('3', $model, '', '1', '', '4', '3', '', '', '2', '', '1') -Check {
+    Test-Flow 'manual positive defaults stay unchanged' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '1024'; gen_tokens = '64'; depth_tokens = '2048' }) -Inputs @('3',  $model,  '',  '1',  '',  '4',  '3',  '',  '',  '2',  '',  '1') -Check {
         Assert ('1024,64' -in $nativeArgs -and '-d' -in $nativeArgs -and '2048' -in $nativeArgs) 'Valid manual defaults were overwritten'
     }
-    Test-Flow 'automatic standard benchmark' -Inputs @('3', $model, '', '', '', '2', '3') -Check {
+    Test-Flow 'automatic standard benchmark' -Inputs @('3',  $model,  '',  '',  '',  '2',  '3') -Check {
         $joinedOutput = $script:Output -join "`n"
         Assert ($nativeArgs[0] -eq 'bench' -and '--suite' -in $nativeArgs -and 'standard' -in $nativeArgs) 'Automatic suite flags lost'
         Assert ('--parallel' -in $nativeArgs -and '3' -in $nativeArgs -and '--result-dir' -in $nativeArgs) 'Automatic concurrency or result directory lost'
@@ -282,7 +306,7 @@ try {
         Assert ('device.auto_profile=conservative' -in $nativeArgs) 'Legacy quick profile must migrate'
         Assert (-not ($commandText -match 'NEVER EXECUTE')) 'Saved command text must not execute'
     }
-    Test-Flow 'decline saved launch keeps defaults' -Saved $chatSettings -Inputs @('n', '', '', '', '', '', '', 'y', 'y', '', '', '', '', '') -Check {
+    Test-Flow 'decline saved launch keeps defaults' -Saved $chatSettings -Inputs @('n',  '',  '',  '',  '',  '',  '',  '',  'y',  'y',  '',  '',  '',  '') -Check {
         Assert (-not $reuseSavedSettings -and $state.reasoning_effort -eq 'medium') 'Saved defaults were discarded'
     }
     $legacy = [pscustomobject]@{ launch_mode = 'chat'; model = $model; device = 'Vulkan0'; configure_memory = $true; dram_cache = '48g'; ubatch = '3072'; submit_mode = 'fixed'; submit_cap = '256'; max_new = '' }
@@ -295,7 +319,7 @@ try {
         Assert ($script:Events.Count -eq 2 -and $serverApiKey -eq 'fixture-secret-not-a-real-key') 'Saved authentication prompt changed'
         Assert (-not (($state | ConvertTo-Json) -match 'fixture-secret')) 'Secret leaked into saved settings'
     }
-    Test-Flow 'explicit launcher model overrides previous model' -Saved $chatSettings -InitialPath $model35 -Inputs @('', '', '', '', 'y', 'y', '', '', '', '', '') -Check {
+    Test-Flow 'explicit launcher model overrides previous model' -Saved $chatSettings -InitialPath $model35 -Inputs @('',  '',  '',  '',  'y',  'y',  '',  '',  '',  '',  '') -Check {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model35) 'Launcher model must win'
         Assert ('--reasoning-effort' -in $nativeArgs -and 'medium' -in $nativeArgs) 'A reasoning effort supported by both models should survive the switch'
         Assert (@($state.model_history).Count -eq 2 -and $state.model_history[0] -eq $model35 -and $state.model_history[1] -eq $model) 'Model history must retain every valid selected model'
@@ -573,11 +597,11 @@ try {
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS error report description review and launcher wiring'
     $missingSettings = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = (Join-Path $testRoot 'missing.gguf') }
-    Test-Flow 'missing saved model goes through model selection' -Saved $missingSettings -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
+    Test-Flow 'missing saved model goes through model selection' -Saved $missingSettings -Inputs @('',  $model,  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model) 'Missing model should not launch directly'
         Assert (@($script:Events | Where-Object { $_ -match 'Start with the previous settings' }).Count -eq 0) 'Missing model should not offer direct launch'
     }
-    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', $model, 'y', $aux, 'n', '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2',  $model,  'y',  $aux,  'n',  '',  '',  '',  '',  '',  '',  '1',  '100k',  'y',  '',  '',  '',  '',  '') -Check {
         Assert ($state.server_parallel -eq '1' -and $state.server_session_cache) 'Vision serving should keep SSD KV caching available'
     }
     $script:Saved = $null

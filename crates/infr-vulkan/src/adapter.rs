@@ -1297,7 +1297,18 @@ fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> RuntimePhase
 /// Decode while selecting Prefill for the wide batches that switch residency strategy. `None`
 /// keeps graphs with no MoE work on the established local-pool path even when their backend also
 /// happens to own a pager.
+///
+/// A stamped `prefill_runtime_reserve_bytes` makes the WHOLE graph Prefill regardless of its row
+/// height: the runner only stamps a reserve on rounds where it already ran `prepare_prefill` and
+/// crushed the expert corridor to price the ring (2026-10-19 memory-bomb fix — a gray chunk that
+/// executes Decode on a paid round storm-misses hundreds of experts per layer through the emptied
+/// corridor into unbounded staging, and with no Prefill transition the corridor is never restored).
+/// The ring layout is row-count agnostic (`build_prefill_layout` sizes lanes by layer banks), so a
+/// short paid chunk rides the ring correctly, it just amortizes the lane streaming less well.
 fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
+    let paid_round = graph
+        .prefill_runtime_reserve_bytes
+        .is_some_and(|bytes| bytes > 0);
     let mut phase = None;
     for op in &graph.ops {
         let Op::MoeFfn {
@@ -1311,7 +1322,11 @@ fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
             continue;
         };
         let rows = graph.desc(*x).numel() / *ne as usize;
-        let op_phase = moe_static_phase(rows, *n_used as usize, *n_expert as usize);
+        let op_phase = if paid_round {
+            RuntimePhase::Prefill
+        } else {
+            moe_static_phase(rows, *n_used as usize, *n_expert as usize)
+        };
         phase = Some(op_phase);
         if op_phase == RuntimePhase::Prefill {
             return Some(RuntimePhase::Prefill);
@@ -4051,6 +4066,17 @@ fn lower_op(
                         be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
                         transient,
                     )?;
+                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
+                    // Narrow output: no tile exists, and the native per-row GEMV re-reads the whole
+                    // weight once per row. Expand it to f32 into pooled scratch and let the batched
+                    // f32r GEMV contract it — a few microseconds of cast per chunk.
+                    let elems = in_f * out_f;
+                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
+                    rec.dequant_weight_f32(dt, arena_addr, w_off, xb, pool[&w32].as_ref(), elems);
+                    let w32_addr = pool[&w32]
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
@@ -4807,6 +4833,21 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
+                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
+                    // Resident twin of the streamed narrow-f32 route (adapter.rs's arena branch):
+                    // expand the narrow native weight to f32 once per chunk and contract it with
+                    // the batched f32r GEMV instead of the per-row native GEMV. `w_off` rides as
+                    // an ELEMENT offset into `dq()` exactly as `linear_native` uses it.
+                    let w_addr = w.device_addr().ok_or_else(|| {
+                        be("vulkan adapter: narrow-f32 Linear needs a BDA weight address")
+                    })?;
+                    let elems = in_f * out_f;
+                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
+                    rec.dequant_weight_f32(dt, w_addr, w_off, xb, pool[&w32].as_ref(), elems);
+                    let w32_addr = pool[&w32]
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
@@ -7293,6 +7334,25 @@ fn lower_op(
                 };
                 let scratch_ne = scratch_rows * nkv * hd;
                 let scratch_tail_bytes = (scratch_ne - ne) * 2;
+                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) USED to fault with 0xc0000005 INSIDE
+                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first FUSED flash use
+                // of a ragged 4K prefill, e.g. 4001 query rows, at amdvlk64.dll+0x2b65705). The
+                // trigger was the fully-unrolled IR: `attn_flash_warp_hd256.comp` no longer forces
+                // `[[unroll]]`, the SAME kernel compiles, and it measured +21% / +24% / +10% pp
+                // over the coopmat non-FA tier (Qwen3.6-35B, 4001 / 8000 / 12001 rows, 26.10.1).
+                // So the fused build is ENABLED by default now; `INFR_AMDVLK_HD256_FLASH=0`
+                // (`--set kernels.vulkan.amdvlk_hd256_flash=false`) restores the coopmat
+                // `attn_qk`/`softmax`/`attn_pv` tier for a driver that still faults. The register-O
+                // build is a different pipeline and stays available for its 128-row contract.
+                let required_kv_rows = flash_kv_storage_rows(kv_len);
+                let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
+                let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
+                let register_o_tail_safe =
+                    k_storage_rows >= required_kv_rows && v_storage_rows >= required_kv_rows;
+                let amdvlk_hd256_flash_avoided = hd == 256
+                    && be_.is_amd_proprietary_driver()
+                    && !be_.cfg().kernels.vulkan.amdvlk_hd256_flash
+                    && !(register_o_candidate && register_o_tail_safe);
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
                 // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
@@ -7371,7 +7431,10 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                let flash_ok = flash_geom && !segmented_read && !(k_q8_eff || v_q8_eff);
+                let flash_ok = flash_geom
+                    && !segmented_read
+                    && !(k_q8_eff || v_q8_eff)
+                    && !amdvlk_hd256_flash_avoided;
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
@@ -7433,7 +7496,13 @@ fn lower_op(
                 // requirement: the kernel guards pad-row reads/writes itself. Exercisable on
                 // coopmat hardware via INFR_NO_COOPMAT=1; INFR_NO_NC_FA=1 disables the arm (A/B
                 // against the scalar/split floor).
-                let nc_fa_ok = !flash_ok
+                //
+                // NOT used as the amdvlk hd256 workaround: the hd256 build declares 54016 B of
+                // workgroup storage against the 32768 B this driver reports (`VUID-RuntimeSpirv-
+                // Workgroup-06530`). The workaround routes to `nonfa_ok` instead, whose qk/pv
+                // tiles stay around 10 KiB; the budget gate below keeps this arm off any device
+                // that reports less than the selected build declares.
+                let nc_fa_armed = !flash_ok
                     && !nonfa_ok
                     && !segmented_read
                     && !be_.caps().f16_coopmat()
@@ -7443,6 +7512,23 @@ fn lower_op(
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
                     && be_.cfg().kernels.vulkan.nc_fa;
+                // The selected build declares 37632 B (hd128) / 54016 B (hd256) / 47616 B
+                // (hd512) of workgroup storage; a device that reports less must not get it
+                // (VUID-RuntimeSpirv-Workgroup-06530). Keep the arm inside the budget and say
+                // why when the budget alone is what skips it.
+                let nc_fa_shared = crate::gemm::attn_nc_fa_shared_bytes(hd);
+                let nc_fa_shared_ok =
+                    nc_fa_shared.is_some_and(|bytes| be_.max_shared_memory_bytes() >= bytes);
+                if nc_fa_armed && !nc_fa_shared_ok {
+                    if let Some(requested) = nc_fa_shared {
+                        tracing::warn!(
+                            "nc_fa skipped: requested shared memory {requested} B exceeds \
+                             device limit {} B (VUID-RuntimeSpirv-Workgroup-06530)",
+                            be_.max_shared_memory_bytes()
+                        );
+                    }
+                }
+                let nc_fa_ok = nc_fa_armed && nc_fa_shared_ok;
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
                 // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
                 // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
@@ -7621,11 +7707,6 @@ fn lower_op(
                         _ => None,
                     };
                     if hd == 256 {
-                        let required_kv_rows = flash_kv_storage_rows(kv_len);
-                        let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
-                        let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
-                        let register_o_tail_safe = k_storage_rows >= required_kv_rows
-                            && v_storage_rows >= required_kv_rows;
                         rec.attention_prefill_flash_hd256(
                             r(*q)?,
                             kcb,
@@ -9003,7 +9084,13 @@ fn lower_op(
                 // discarded) — pad the packed row dimension so the LAST expert's overread stays
                 // in-bounds.
                 let npad = n_pairs.div_ceil(64) * 64 + 64;
-                let logits = alu(rows * n_expert * 4)?;
+                // Router logits may take the 64-row tiled GEMM at prefill rows (see
+                // `moe_router_gemm_applies`): its C store covers whole row tiles.
+                let logits = alu(moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert
+                    * 4)?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
                 // Bucket arrays index the LOCAL expert shard under EP (ids are remapped to
@@ -9040,13 +9127,17 @@ fn lower_op(
                 // Router logits for all rows (on `router_x`, NOT `x`), then GPU routing.
                 let rdt = graph.desc(*router).dtype;
                 let rw = r(*router)?;
-                if native_dense_supported(rdt) {
-                    rec.linear_native(rdt, rw, 0, rxb, logits.as_ref(), rows, ne, n_expert);
-                } else if matches!(rdt, infr_core::DType::F32) {
-                    rec.linear_f32(rw, rxb, logits.as_ref(), rows, ne, n_expert);
-                } else {
-                    rec.linear(rw, rxb, logits.as_ref(), rows, ne, n_expert);
-                }
+                record_moe_router_logits(
+                    be_,
+                    rdt,
+                    rw,
+                    rxb,
+                    logits.as_ref(),
+                    rows,
+                    ne,
+                    n_expert,
+                    rec,
+                );
                 let bias_buf: &dyn Buffer = match exp_probs_b {
                     Some(epb) => r(*epb)?,
                     None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -9331,7 +9422,18 @@ fn lower_op(
             // `INFR_NO_MOE_SM_POOL=1` restores the per-layer zeroed allocs (A/B correctness oracle).
             let no_pool = be_.cfg().kernels.vulkan.no_moe_sm_pool;
             let n_slots = rows * n_used;
-            let logits = sm_buf(pool, be_, no_pool, "moe_sm_logits", rows * n_expert)?;
+            // Router logits may take the 64-row tiled GEMM at prefill rows (see
+            // `moe_router_gemm_applies`): its C store covers whole row tiles.
+            let logits = sm_buf(
+                pool,
+                be_,
+                no_pool,
+                "moe_sm_logits",
+                moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert,
+            )?;
             let ids = sm_buf(pool, be_, no_pool, "moe_sm_ids", n_slots)?;
             let wts = sm_buf(pool, be_, no_pool, "moe_sm_wts", n_slots)?;
             // Fused: one [n_slots, 2*nff] gate|up buffer (gate half first, up half second per row —
@@ -9364,15 +9466,7 @@ fn lower_op(
             // Router logits over all experts, all `rows` tokens in one dispatch.
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
-            if native_dense_supported(rdt) {
-                rec.linear_native(rdt, rw, 0, rxb, logits.get(pool), rows, ne, n_expert);
-            } else if matches!(rdt, infr_core::DType::F32) {
-                // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
-                // bytes as f16 garbage and route to arbitrary experts.
-                rec.linear_f32(rw, rxb, logits.get(pool), rows, ne, n_expert);
-            } else {
-                rec.linear(rw, rxb, logits.get(pool), rows, ne, n_expert);
-            }
+            record_moe_router_logits(be_, rdt, rw, rxb, logits.get(pool), rows, ne, n_expert, rec);
             let bias_buf: &dyn Buffer = match exp_probs_b {
                 Some(epb) => r(*epb)?,
                 None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -17739,6 +17833,25 @@ fn sync_stream_inner<'a>(
     Ok(())
 }
 
+/// Narrow-output streamed Linears at prefill rows: expand the (tiny) native weight to f32 and take
+/// the batched f32r GEMV instead of the native per-row GEMV. Shape/dtype half lives in
+/// [`crate::recorder::narrow_f32_gemm_eligible`] so the scratch reservation tracks it exactly.
+///
+/// Measured on Qwen3.8-Flash-Next base (pp4096, the two families sum to 168 dispatches): the
+/// native GEMV spent 1.5 ms per `2560x48` and 0.96 ms per `10240x4`; the same contraction on the
+/// f32 path (as the UD variant runs it natively) takes ~0.25 ms — 202 ms of a 2.15 s chunk. The
+/// Q8_0/BF16 decode is exact in f32, so this changes speed only.
+fn narrow_f32_gemv_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    be_.cfg().kernels.vulkan.narrow_f32_gemv
+        && crate::recorder::narrow_f32_gemm_eligible(dt, m, in_f, out_f)
+}
+
 /// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
 /// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
 /// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
@@ -17770,6 +17883,76 @@ fn streamed_gemm_applies(
             && !out_f.is_multiple_of(128)
             && be_.caps().i8_dot
             && be_.cfg().kernels.vulkan.mmq)
+}
+
+/// Router logits tier for prefill rows. The MoE router is a plain dense [n_expert, in_f] matrix,
+/// and every router site used to record it through the scalar GEMV family — which, past
+/// `rows == 1`, re-reads the whole router weight once per row. Measured on Qwen3.8-Flash-Next
+/// IQ3_S (`ffn_gate_inp`, bf16 2560x512 at m=4096): the streamed GEMV took 15.5 ms/layer, 48
+/// layers = 746 ms, 24.4% of the whole pp30k device time; the tiled GEMM a dense `Op::Linear` of
+/// the same shape takes runs it in ~1.4 ms (the base model's F32 router already takes its own
+/// `linear_f32` mrow tile at 1.9 ms for the same reason).
+///
+/// Gate mirrors `streamed_gemm_applies` (m > 16, n%64, k%32, coopmat f16 tiles, native dense
+/// dtype, `INFR_NO_GEMM_WARP` honored) with one deliberate difference: Q4_K is NOT excluded. That
+/// exclusion exists on the Linear path because a resident dense Q4_K GEMM would diverge from the
+/// dp4a `mmq` tier the dense arm prefers; the router has no mmq arm — its only alternative is the
+/// per-row GEMV, which even the 64x64 native-GEMM floor beats ~64x on weight traffic.
+fn moe_router_gemm_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+) -> bool {
+    rows > 16
+        && n_expert.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && be_.caps().f16_coopmat()
+        && native_dense_supported(dt)
+        && be_.cfg().kernels.vulkan.gemm_warp
+}
+
+/// Router logits buffer rows: the tiled GEMM stores whole 64-row C tiles (the padded-dst
+/// convention every prefill GEMM follows), so the buffer must cover `ceil(rows/64)*64` rows;
+/// `moe_topk` still reads only the `rows` real ones.
+fn moe_router_logits_rows(rows: usize, gemm: bool) -> usize {
+    if gemm {
+        rows.div_ceil(64) * 64
+    } else {
+        rows
+    }
+}
+
+/// Record a MoE layer's router logits (all `rows` tokens at once) into `logits` — the prefill
+/// tiled-GEMM tier or the scalar GEMV family, see `moe_router_gemm_applies`. Shared by the
+/// batched, small-m and paged MoE arms so all three pick the same tier for the same shape.
+#[allow(clippy::too_many_arguments)]
+fn record_moe_router_logits(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    w: &dyn Buffer,
+    x: &dyn Buffer,
+    logits: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+    rec: &Recorder<'_>,
+) {
+    if moe_router_gemm_applies(be_, dt, rows, in_f, n_expert) {
+        let w_addr = w
+            .device_addr()
+            .expect("resident-BDA router weight: the prefill GEMM reads it by u64 address");
+        rec.matmul_native_off(dt, x, w_addr, 0, logits, rows, in_f, n_expert);
+    } else if native_dense_supported(dt) {
+        rec.linear_native(dt, w, 0, x, logits, rows, in_f, n_expert);
+    } else if matches!(dt, infr_core::DType::F32) {
+        // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its bytes as
+        // f16 garbage and route to arbitrary experts.
+        rec.linear_f32(w, x, logits, rows, in_f, n_expert);
+    } else {
+        rec.linear(w, x, logits, rows, in_f, n_expert);
+    }
 }
 
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
@@ -18472,7 +18655,18 @@ fn execute_paged_moe<'a>(
     // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
     // split path below — is then a mapped memcpy after `sync_stream`, no one-shot copy submit
     // and no fresh readback allocation per layer.
-    let logits = pooled(pool, be_, "moe_paged_logits", rows * n_expert * 4)?;
+    // Router logits may take the 64-row tiled GEMM at prefill rows (see
+    // `moe_router_gemm_applies`): its C store covers whole row tiles.
+    let logits = pooled(
+        pool,
+        be_,
+        "moe_paged_logits",
+        moe_router_logits_rows(
+            rows,
+            moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+        ) * n_expert
+            * 4,
+    )?;
     let ids_key = pooled_usage(
         pool,
         be_,
@@ -18634,13 +18828,17 @@ fn execute_paged_moe<'a>(
         let rxb = r(*router_x)?;
         let rw = r(*router)?;
         let rdt = graph.desc(*router).dtype;
-        if native_dense_supported(rdt) {
-            rc.linear_native(rdt, rw, 0, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
-        } else if matches!(rdt, infr_core::DType::F32) {
-            rc.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
-        } else {
-            rc.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
-        }
+        record_moe_router_logits(
+            be_,
+            rdt,
+            rw,
+            rxb,
+            pool[&logits].as_ref(),
+            rows,
+            ne,
+            n_expert,
+            rc,
+        );
         let bias_buf: &dyn Buffer = match exp_probs_b {
             Some(epb) => r(*epb)?,
             None => pool[dummy_key.as_ref().expect("absent bias allocated dummy")].as_ref(),
@@ -21047,6 +21245,101 @@ mod tests {
         truncated.ops.pop();
         assert_eq!(paged_moe_shared_candidates(&truncated, false).count(), 0);
         assert_eq!(paged_moe_shared_candidates(&Graph::new(), false).count(), 0);
+    }
+
+    /// The prefill router tier stores whole 64-row C tiles, so the logits buffer every one of the
+    /// three MoE arms allocates must round UP to the tile; `moe_topk` still reads only `rows` real
+    /// ones. Under-padding is an out-of-bounds write into the next pool slot, so the three
+    /// invariants (covers `rows`, 64-aligned, at most one tile of waste) are pinned here, along
+    /// with the small-rows half where the GEMV tier writes exactly `rows` and padding would only
+    /// cost buffer bytes.
+    ///
+    /// Qwen3.8-Flash-Next's numbers: 4096-row prefill chunks (its `ubatch` is 64-aligned, so the
+    /// GEMM tier wastes nothing) and `n_expert == 512`, which is why the gate's `n%64` holds.
+    #[test]
+    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
+        use super::*;
+        for rows in [1usize, 2, 8, 16, 17, 63, 64, 65, 128, 129, 4096, 30_000] {
+            assert_eq!(moe_router_logits_rows(rows, false), rows);
+            let padded = moe_router_logits_rows(rows, true);
+            assert!(padded >= rows, "{rows} -> {padded} short of the C store");
+            assert!(
+                padded.is_multiple_of(64),
+                "{rows} -> {padded} not tile-aligned"
+            );
+            assert!(
+                padded < rows + 64,
+                "{rows} -> {padded} wastes a whole extra tile"
+            );
+            assert_eq!(padded, rows.div_ceil(64) * 64);
+        }
+        // The tile store is what forces padding: an exact-multiple chunk (the engine's 64-aligned
+        // prefill ubatch) must stay unpadded, or the padded/dst row counts would disagree.
+        assert_eq!(moe_router_logits_rows(4096, true), 4096);
+        assert_eq!(moe_router_logits_rows(17, true), 64);
+    }
+
+    /// The narrow-output f32 route is the only tier the Qwen3.8-Flash-Next `2560x48` /
+    /// `10240x4` tensors can take (no 64-multiple in n), and it is exact, so the gate must not
+    /// drift into shapes that either HAVE a tile, are decode-sized, or would expand a big weight.
+    #[test]
+    fn narrow_f32_gate_is_bounded_to_the_measured_shapes() {
+        use infr_core::DType;
+        for (dt, k, n) in [
+            (DType::Q8_0, 2560usize, 48usize),
+            (DType::Q8_0, 10240, 4),
+            (DType::Bf16, 2560, 48),
+            (DType::Bf16, 10240, 4),
+        ] {
+            assert!(
+                crate::recorder::narrow_f32_gemm_eligible(dt, 4096, k, n),
+                "{dt:?} {k}x{n} at prefill rows must take the f32 route"
+            );
+        }
+        // Decode keeps the native GEMV: one row is exactly what it is good at.
+        for m in [1usize, 2, 16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                m,
+                2560,
+                48
+            ));
+        }
+        // 64-multiple widths have a tiled GEMM tile; they must never come here.
+        for n in [64usize, 128, 2560] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                4096,
+                2560,
+                n
+            ));
+        }
+        // No expansion build for these dtypes.
+        for dt in [DType::Q4K, DType::Q6K, DType::F32, DType::F16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                dt, 4096, 2560, 48
+            ));
+        }
+        // K must stay on the native block grid.
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560 + 1,
+            48
+        ));
+        // Expansion ceiling: 128 Ki elements of f32 scratch.
+        assert!(crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560,
+            48
+        ));
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            4096,
+            33
+        ));
     }
 
     #[test]

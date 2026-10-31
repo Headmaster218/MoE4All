@@ -18,7 +18,24 @@ pub fn prompt_prefills_think(prompt: &str) -> bool {
 pub enum Delta {
     Reasoning(String),
     Content(String),
-    ToolCall { name: String, arguments: String },
+    /// The call's name, as soon as it is readable from a still-generating call. Advisory: pairs with
+    /// [`Delta::ToolCallArgs`] and always precedes them for that call.
+    ToolCallBegin {
+        name: String,
+    },
+    /// One newly-completed member of the generating call's arguments. The concatenation of every
+    /// fragment is guaranteed to be a byte PREFIX of the `arguments` in the [`Delta::ToolCall`] that
+    /// `finish()` delivers — never a superset, never a rewrite — so a consumer can stream these as
+    /// OpenAI `function_call_arguments.delta` and top up with the remainder at the end.
+    ToolCallArgs {
+        fragment: String,
+    },
+    /// The finished, authoritative call. Consumers that already streamed fragments for it must emit
+    /// only `arguments` beyond what was streamed, or the client receives its arguments twice.
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
 }
 
 /// Incremental splitter for the streaming server path. Accumulates the raw decoded text and, on each
@@ -28,11 +45,20 @@ pub enum Delta {
 /// dialect `finish()` parses (Hermes `<tool_call>`, the pipe form `<|tool_call>`, and a Llama-3
 /// bare-JSON `{…}` body), so non-Hermes calls can't leak as content while also firing as a ToolCall.
 /// `finish()` flushes the held-back tails and parses the buffered tool call(s) into ToolCall deltas.
+/// While a call is still generating it also reads ahead with [`crate::tools::tool_call_progress`], so
+/// clients see a call's arguments arrive member by member instead of all in one delta at the end.
 pub struct ChatStream {
     raw: String,
     sent_r: usize, // reasoning bytes already emitted (offset within the reasoning region)
     sent_c: usize, // content bytes already emitted (offset within the content region)
     allow_tools: bool,
+    // Progressive reading of the call the content region opened first: its opener offset (so the same
+    // region is re-read on every push), whether the name went out, and how many argument bytes did.
+    // Only that earliest region is read because only it can still be growing — once its own close
+    // marker arrives the prefix is final, and a second call in the same response stays whole-call.
+    call_at: Option<usize>,
+    call_begun: bool,
+    sent_args: usize,
     // Per-marker cursors so `emit` doesn't re-`find` from offset 0 over the whole buffer on every
     // pushed piece (that was O(n²) across a response). Each caches the first hit once found and
     // otherwise resumes scanning from the previously-scanned tail.
@@ -87,6 +113,9 @@ impl ChatStream {
             sent_r: 0,
             sent_c: 0,
             allow_tools,
+            call_at: None,
+            call_begun: false,
+            sent_args: 0,
             cur_think_open: Cursor::default(),
             cur_think_close: Cursor::default(),
             cur_tool: Cursor::default(),
@@ -155,6 +184,34 @@ impl ChatStream {
         Some(i)
     }
 
+    /// Read the still-generating call opened at `at` and emit whatever of it has newly become final:
+    /// the name once, then one fragment per completed argument member. Runs on every push and on the
+    /// final flush, so a client that received the whole object in fragments still gets the
+    /// authoritative `ToolCall` from `finish()` — whose `arguments` it then sends only as the
+    /// (usually empty) remainder.
+    fn progress(&mut self, at: usize, final_flush: bool, on_delta: &mut dyn FnMut(Delta)) {
+        if self.call_at != Some(at) {
+            // A different region (the content start moved when a reasoning block closed): the old
+            // call's fragments are already out, so cursors restart rather than re-emitting them.
+            self.call_at = Some(at);
+            self.call_begun = false;
+            self.sent_args = 0;
+        }
+        let (name, prefix) = crate::tools::tool_call_progress(&self.raw[at..], final_flush);
+        if !self.call_begun {
+            let Some(name) = name else {
+                return; // fragments are addressed to an item; hold them until the name is readable
+            };
+            self.call_begun = true;
+            on_delta(Delta::ToolCallBegin { name });
+        }
+        if prefix.len() > self.sent_args {
+            let fragment = prefix[self.sent_args..].to_owned();
+            self.sent_args = prefix.len();
+            on_delta(Delta::ToolCallArgs { fragment });
+        }
+    }
+
     fn emit(&mut self, final_flush: bool, on_delta: &mut dyn FnMut(Delta)) {
         const TO: &str = "<think>";
         const TC: &str = "</think>";
@@ -184,6 +241,9 @@ impl ChatStream {
                     false,
                     on_delta,
                 );
+                if let Some(t) = tool_open.filter(|t| *t >= cs) {
+                    self.progress(t, final_flush, on_delta);
+                }
             }
             return;
         }
@@ -229,6 +289,9 @@ impl ChatStream {
                 false,
                 on_delta,
             );
+            if let Some(t) = tool_open.filter(|t| *t >= cs) {
+                self.progress(t, final_flush, on_delta);
+            }
         }
     }
 }
@@ -277,8 +340,16 @@ fn emit_region(
 mod chat_stream_tests {
     use super::*;
 
+    /// A `(name, arguments)` list — both the finished calls and, coalesced per call, the advisory stream.
+    type Calls = Vec<(String, String)>;
+
     /// Feed `pieces` through a `ChatStream` and collect every emitted delta (streaming + finish).
-    fn run(pieces: &[&str], allow_tools: bool) -> (String, String, Vec<(String, String)>) {
+    ///
+    /// The 4th field coalesces the ADVISORY progressive stream into one `(name, arguments)` entry per
+    /// `ToolCallBegin`, because where a fragment happens to break is a property of the push boundaries
+    /// while its CONTENT is a property of the response — so fragmentation-equality asserts on the
+    /// concatenation, and the strict prefix contract against the finished call is tested separately.
+    fn run_all(pieces: &[&str], allow_tools: bool) -> (String, String, Calls, Calls) {
         let mut out: Vec<Delta> = Vec::new();
         let mut s = ChatStream::new(allow_tools);
         {
@@ -289,13 +360,25 @@ mod chat_stream_tests {
         }
         s.finish(&mut |d: Delta| out.push(d));
         let (mut r, mut c, mut t) = (String::new(), String::new(), Vec::new());
+        let mut progressive: Vec<(String, String)> = Vec::new();
         for d in &out {
             match d {
                 Delta::Reasoning(x) => r.push_str(x),
                 Delta::Content(x) => c.push_str(x),
                 Delta::ToolCall { name, arguments } => t.push((name.clone(), arguments.clone())),
+                Delta::ToolCallBegin { name } => progressive.push((name.clone(), String::new())),
+                Delta::ToolCallArgs { fragment } => progressive
+                    .last_mut()
+                    .expect("argument fragment before its call name")
+                    .1
+                    .push_str(fragment),
             }
         }
+        (r, c, t, progressive)
+    }
+
+    fn run(pieces: &[&str], allow_tools: bool) -> (String, String, Vec<(String, String)>) {
+        let (r, c, t, _) = run_all(pieces, allow_tools);
         (r, c, t)
     }
 
@@ -303,14 +386,32 @@ mod chat_stream_tests {
         text: &str,
         allow_tools: bool,
     ) -> (String, String, Vec<(String, String)>) {
-        let expected = run(&[text], allow_tools);
+        let expected = run_all(&[text], allow_tools);
+        // Each argument delta must EXTEND what already went out and the finished call must carry the
+        // whole of it — that is what lets a consumer send only the remainder. Asserted on the one-piece
+        // feed, because the loop below only compares streams against each other and would happily pass
+        // a stream that was never a prefix of the call it belongs to.
+        for (name, streamed) in &expected.3 {
+            let call = expected
+                .2
+                .iter()
+                .find(|(finished, _)| finished == name)
+                .unwrap_or_else(|| {
+                    panic!("`{name}` streamed fragments but `finish()` dispatched none")
+                });
+            assert!(
+                call.1.starts_with(streamed),
+                "streamed {streamed:?} is not a prefix of {:?}",
+                call.1
+            );
+        }
         for split in text
             .char_indices()
             .map(|(i, _)| i)
             .chain(std::iter::once(text.len()))
         {
             assert_eq!(
-                run(&[&text[..split], &text[split..]], allow_tools),
+                run_all(&[&text[..split], &text[split..]], allow_tools),
                 expected,
                 "split at {split}"
             );
@@ -319,8 +420,12 @@ mod chat_stream_tests {
             .char_indices()
             .map(|(i, c)| &text[i..i + c.len_utf8()])
             .collect();
-        assert_eq!(run(&chars, allow_tools), expected, "character fragments");
-        expected
+        assert_eq!(
+            run_all(&chars, allow_tools),
+            expected,
+            "character fragments"
+        );
+        (expected.0, expected.1, expected.2)
     }
 
     #[test]
@@ -475,6 +580,106 @@ mod chat_stream_tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].0, "run_bash");
         assert!(t[0].1.contains("ls"));
+    }
+
+    /// A call that is still generating streams out: the name once, then one fragment per COMPLETED
+    /// argument member — and never a fragment the finished call does not carry.
+    #[test]
+    fn arguments_stream_as_their_members_complete() {
+        // One push per character, so every intermediate state is visited: the arguments must appear
+        // member by member, never as a single delta at the end.
+        let open = format!("{}{}{}", "<", "tool_ca", "ll>");
+        let close = format!("{}{}{}", "</tool_c", "all", ">");
+        let text = format!(
+            "{open}{{\"name\": \"run_bash\", \"arguments\": {{\"command\": \"ls -la\", \"timeout\": \
+             30}}}}{close}"
+        );
+        let mut s = ChatStream::new(true);
+        let mut out: Vec<Delta> = Vec::new();
+        {
+            let mut od = |d: Delta| out.push(d);
+            for c in text.chars() {
+                let mut buf = [0u8; 4];
+                s.push(c.encode_utf8(&mut buf), &mut od);
+            }
+        }
+        s.finish(&mut |d: Delta| out.push(d));
+        let got: Vec<String> = out
+            .iter()
+            .map(|d| match d {
+                Delta::ToolCallBegin { name } => format!("begin {name}"),
+                Delta::ToolCallArgs { fragment } => format!("args {fragment}"),
+                Delta::ToolCall { name, arguments } => format!("done {name} {arguments}"),
+                Delta::Reasoning(t) => format!("think {t}"),
+                Delta::Content(t) => format!("text {t}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "begin run_bash",
+                "args {",
+                "args \"command\":\"ls -la\"",
+                "args ,\"timeout\":30}",
+                "done run_bash {\"command\":\"ls -la\",\"timeout\":30}"
+            ]
+        );
+    }
+
+    /// The FORCED `tool_choice` path primes the `<tool_call>` opener into the PROMPT and feeds the
+    /// grammar-constrained body here, so the body starts at `{` with no markers around it. It must
+    /// still stream the name and each argument member while generating — one frame at the end would
+    /// leave a forced call indistinguishable from a non-streamed response.
+    #[test]
+    fn forced_bare_json_body_streams_members() {
+        let text = "{\"name\":\"ls\",\"arguments\":{\"path\":\".\",\"depth\":2}}";
+        let mut s = ChatStream::new(true);
+        let mut out: Vec<Delta> = Vec::new();
+        {
+            let mut od = |d: Delta| out.push(d);
+            for c in text.chars() {
+                let mut buf = [0u8; 4];
+                s.push(c.encode_utf8(&mut buf), &mut od);
+            }
+        }
+        s.finish(&mut |d| out.push(d));
+        let begins: Vec<&str> = out
+            .iter()
+            .filter_map(|d| match d {
+                Delta::ToolCallBegin { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let fragments: Vec<&str> = out
+            .iter()
+            .filter_map(|d| match d {
+                Delta::ToolCallArgs { fragment } => Some(fragment.as_str()),
+                _ => None,
+            })
+            .collect();
+        let done: Vec<(&str, &str)> = out
+            .iter()
+            .filter_map(|d| match d {
+                Delta::ToolCall { name, arguments } => Some((name.as_str(), arguments.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !out.iter().any(|d| matches!(d, Delta::Content(_))),
+            "forced body leaked as content: {out:?}"
+        );
+        assert_eq!(begins, ["ls"]);
+        assert!(
+            fragments.len() >= 2,
+            "arguments did not stream member by member: {fragments:?}"
+        );
+        assert_eq!(done, [("ls", "{\"path\":\".\",\"depth\":2}")]);
+        let streamed = fragments.concat();
+        assert!(
+            done[0].1.starts_with(&streamed),
+            "streamed {streamed:?} is not a prefix of {:?}",
+            done[0].1
+        );
     }
 
     #[test]

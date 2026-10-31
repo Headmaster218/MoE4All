@@ -8,10 +8,11 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::token_delivery::ParallelTokenCallback;
 use super::weights::{
-    alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
-    FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
-    MtpDeltaCkpt, QsaW, QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights,
-    SegmentedKvState, SessionStable, TurnRecurrentCkpt,
+    alloc_segmented_plane, capture_paged_ckpt, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW,
+    Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
+    MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW, QwenLayerHcW,
+    QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
+    TurnRecurrentCkpt,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
@@ -101,20 +102,69 @@ pub(crate) trait MtpPrefillHiddenSink {
     ) -> AResult<()>;
 }
 
+/// End of one batched-prefill chunk: the earliest TURN_CHECKPOINT boundary inside the ubatch, or
+/// the natural ubatch end.
+///
+/// `min_rows` is the layer-ring threshold (see [`prefill_uses_layer_ring`]): while a round PAID the
+/// ring reserve, a boundary that would starve the chunk below the threshold is skipped (the
+/// 2026-10-19 memory-bomb fix). Skipping is functionally free — recurrent checkpoints publish only
+/// when a chunk ends exactly on the boundary (`Some(cend) == boundary` at the snapshot sites), so a
+/// starved boundary simply degrades to "no reuse checkpoint this turn" instead of misaligning.
+/// Without it, a 160-token prompt was cut into 45+115-row chunks below every ring decision, the
+/// reserve was paid without the ring ever being used, and the gray chunks storm-missed hundreds of
+/// experts per layer through the emptied corridor into unbounded staging (~23 GiB/s of commit).
 fn prefill_chunk_end(
     start: usize,
     end: usize,
     rows: usize,
     checkpoint_boundaries: &[Option<usize>; super::TURN_CHECKPOINT_COUNT],
+    paged_frontier: Option<usize>,
+    min_rows: usize,
 ) -> usize {
     let natural_end = start.saturating_add(rows).min(end);
     checkpoint_boundaries
         .iter()
         .flatten()
         .copied()
-        .filter(|&boundary| start < boundary && boundary < natural_end)
+        .chain(paged_frontier)
+        .filter(|&boundary| {
+            start < boundary && boundary < natural_end && boundary.saturating_sub(start) >= min_rows
+        })
         .min()
         .unwrap_or(natural_end)
+}
+
+/// Floor `value` down to a multiple of `page` (a zero `page` disables segmentation).
+fn page_floor(value: usize, page: usize) -> usize {
+    if page == 0 {
+        value
+    } else {
+        value - value % page
+    }
+}
+
+/// The page-aligned position a chunked prefill of `prompt_len` tokens stops at: every prefill path
+/// leaves the final prompt token to the decode loop, so the deepest state the chunk loop ever
+/// produces is `prompt_len - 1`. Rounded down to the page, that is the only boundary whose
+/// recurrent/PLE snapshot and whose frame chain describe the SAME tokens — which is what a radix
+/// entry needs to resume a later request without replaying the prefill.
+///
+/// Gated on a paged slot and a recurrent model: a pure-attention model needs no aux (its frames are
+/// the whole state) and a non-paged slot publishes nothing. `above` is the already-cached prefix —
+/// a frontier at or below it would capture state the prefill never produced.
+fn paged_frontier_pos(
+    cfg: &Config,
+    paged: bool,
+    page_tokens: usize,
+    prompt_len: usize,
+    above: usize,
+    max_ctx: usize,
+) -> Option<usize> {
+    if !paged || page_tokens == 0 || !(cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
+        return None;
+    }
+    let frontier = page_floor(prompt_len.saturating_sub(1), page_tokens);
+    (frontier > above && frontier <= max_ctx).then_some(frontier)
 }
 
 fn prefill_runtime_candidates(
@@ -145,6 +195,19 @@ fn prefill_runtime_candidates(
             (rows, reserve)
         })
         .collect()
+}
+
+/// Chunk height where one row-slot stops touching more experts than `3 * n_expert` amortizes a
+/// full-layer ring pass — the SAME threshold [`prefill_chunk_end`] must not starve below on a paid
+/// round, and the Vulkan adapter's per-graph `moe_static_phase` boundary. Kept as one expression
+/// so the gate, the chunker and the adapter can never disagree again (2026-10-19 conviction: they
+/// disagreed through the prompt LENGTH vs the actual CHUNK rows and starved the ring).
+pub(crate) fn ring_min_rows(c: &Config) -> Option<usize> {
+    c.moe.map(|moe| {
+        3usize
+            .saturating_mul(moe.n_expert)
+            .div_ceil(moe.n_used.max(1))
+    })
 }
 
 fn prefill_uses_layer_ring(c: &Config, remaining: usize, ubatch: usize) -> bool {
@@ -800,6 +863,11 @@ fn recurrent_extension_start(cached: &[u32], prompt: &[u32]) -> Option<usize> {
 pub(crate) struct PreparedParallelPrompt {
     pub(crate) start: usize,
     pub(crate) checkpoint_boundaries: [Option<usize>; super::TURN_CHECKPOINT_COUNT],
+    /// Paged tier (hybrid recurrent models): the page-aligned prefill position at which this
+    /// request's chunk loop should download the live recurrent/PLE state for the radix entry this
+    /// prefill publishes. `None` on a non-paged slot, a pure-attention model, or when the frontier
+    /// lies at or below the already-cached prefix.
+    pub(crate) paged_frontier: Option<usize>,
 }
 
 /// Prepare one recurrent slot for a layer-synchronous prefill cohort. This mirrors the ordinary
@@ -848,6 +916,8 @@ fn prepare_parallel_prompt_state(
             for checkpoint in kv.turn_recurrent_ckpts.iter_mut().flatten() {
                 checkpoint.invalidate();
             }
+            // A divergent prompt may not publish last turn's host snapshot against this token spine.
+            kv.paged_frontier = None;
             kv.cached.clear();
             0
         }
@@ -871,13 +941,29 @@ fn prepare_parallel_prompt_state(
 
     let mut checkpoint_boundaries = [None; super::TURN_CHECKPOINT_COUNT];
     if let Some(checkpoint) = turn_checkpoint {
+        // Paged mode wants every publishable boundary on a page edge: the radix entry pairs the
+        // recurrent snapshot with `tokens.len() / page` frames, so an off-page boundary describes a
+        // token count the frame chain can never reach and would be rejected at publish. Flooring is
+        // lossless for the device checkpoints too — they publish only when a chunk ENDS on the
+        // boundary, and the chunker is handed the floored value. Non-paged slots keep the caller's
+        // exact semantic boundaries, unchanged.
+        let paged = kv.segmented_kv.paged.is_some();
+        let page = kv.segmented_kv.page_tokens;
         for (index, boundary) in checkpoint.boundaries().into_iter().enumerate() {
-            let boundary = boundary.filter(|&boundary| {
-                recurrent_model
-                    && boundary > start
-                    && boundary < prompt.len()
-                    && boundary <= kv.max_ctx
-            });
+            let boundary = boundary
+                .map(|boundary| {
+                    if paged {
+                        page_floor(boundary, page)
+                    } else {
+                        boundary
+                    }
+                })
+                .filter(|&boundary| {
+                    recurrent_model
+                        && boundary > start
+                        && boundary < prompt.len()
+                        && boundary <= kv.max_ctx
+                });
             checkpoint_boundaries[index] = boundary;
             if let Some(boundary) = boundary {
                 TurnRecurrentCkpt::begin(
@@ -892,10 +978,22 @@ fn prepare_parallel_prompt_state(
             }
         }
     }
+    // The prompt's own page-aligned frontier: the deepest state this request's prefill will produce,
+    // and the one snapshot a later request with the SAME prefix can attach to. Unlike the semantic
+    // turn checkpoints it needs no caller hint, so it exists whenever the slot is paged.
+    let paged_frontier = paged_frontier_pos(
+        c,
+        kv.segmented_kv.paged.is_some(),
+        kv.segmented_kv.page_tokens,
+        prompt.len(),
+        start,
+        kv.max_ctx,
+    );
     kv.cached.truncate(start);
     Ok(PreparedParallelPrompt {
         start,
         checkpoint_boundaries,
+        paged_frontier,
     })
 }
 
@@ -1745,10 +1843,9 @@ fn finish_pending_seam_slot(
         vbufs,
         qsa_kbufs: pending.qsa_kbufs,
         qsa_cbufs: pending.qsa_cbufs,
-        segmented_kv: if segmented_layout.is_some() {
-            SegmentedKvState::enabled()
-        } else {
-            SegmentedKvState::default()
+        segmented_kv: match segmented_layout {
+            Some(layout) => SegmentedKvState::enabled(layout.page_tokens),
+            None => SegmentedKvState::default(),
         },
         k_fmt,
         v_fmt,
@@ -1778,6 +1875,7 @@ fn finish_pending_seam_slot(
         sc_temp_inv_buf: None,
         mtp_delta_ckpt: pending.mtp_delta_ckpt,
         turn_recurrent_ckpts: pending.turn_recurrent_ckpts,
+        paged_frontier: None,
         preallocated_siblings: Vec::new(),
     })
 }
@@ -2856,6 +2954,7 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         .map(|start| PreparedParallelPrompt {
             start,
             checkpoint_boundaries: [None; super::TURN_CHECKPOINT_COUNT],
+            paged_frontier: None,
         })
         .collect::<Vec<_>>();
     let mut request = ParallelMtpVerifyRequest {
@@ -3457,18 +3556,26 @@ fn generate_dense_backend_inner(
         let segmented_available = be.segmented_kv_available() || pager_deferred;
         let segmented_kv =
             crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
-        if ec.kv.dynamic
-            && (c.qwen35 || c.qwen4exp)
-            && !kv_ring
-            && !ec.kv.overflow
-            && segmented_available
-            && !segmented_kv
+        if ec.kv.dynamic && (c.qwen35 || c.qwen4exp) && !kv_ring && !ec.kv.overflow && !segmented_kv
         {
-            tracing::info!(
-                k_dtype = ?k_fmt,
-                v_dtype = ?v_fmt,
-                "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
-            );
+            if !segmented_available {
+                // The one case no `kv.*` setting explains: the layout commits its segments from the
+                // unified arena, and a session whose experts all loaded resident never builds that
+                // arena. Silent here used to mean the operator met the refusal later, in
+                // `init_session_cache`, with nothing in the log pointing at the arena.
+                tracing::warn!(
+                    "dynamic segmented KV is unavailable: this session has no unified VRAM arena \
+                     (every MoE expert loaded resident), so KV stays flat and kv.paged / \
+                     kv.paged_cache_max / kv.ram_cache_max / kv.session_cache_dir cannot start \
+                     (reserve an expert cache with paging.cache to build the arena)"
+                );
+            } else {
+                tracing::info!(
+                    k_dtype = ?k_fmt,
+                    v_dtype = ?v_fmt,
+                    "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
+                );
+            }
         }
         let want_ctx = if segmented_kv || pager_deferred {
             want_ctx
@@ -3476,7 +3583,7 @@ fn generate_dense_backend_inner(
             crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)
         };
         let segmented_layout = segmented_kv.then(|| {
-            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt)
+            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt, ec.kv.paged_page_tokens)
                 .expect("Qwen hybrid models have segmented KV geometry")
         });
 
@@ -3797,10 +3904,9 @@ fn generate_dense_backend_inner(
             vbufs,
             qsa_kbufs,
             qsa_cbufs,
-            segmented_kv: if segmented_kv {
-                SegmentedKvState::enabled()
-            } else {
-                SegmentedKvState::default()
+            segmented_kv: match segmented_layout.as_ref() {
+                Some(layout) => SegmentedKvState::enabled(layout.page_tokens),
+                None => SegmentedKvState::default(),
             },
             k_fmt,
             v_fmt,
@@ -3823,6 +3929,7 @@ fn generate_dense_backend_inner(
             sc_temp_inv_buf: None,
             mtp_delta_ckpt,
             turn_recurrent_ckpts,
+            paged_frontier: None,
             preallocated_siblings,
         });
     }
@@ -3955,6 +4062,7 @@ fn generate_dense_backend_inner(
         sc_temp_inv_buf,
         mtp_delta_ckpt,
         turn_recurrent_ckpts,
+        paged_frontier,
         preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
@@ -3980,10 +4088,12 @@ fn generate_dense_backend_inner(
     // and decode. Adding it to the full prompt would count that tail twice. The parallel branch
     // below validates every lane against its current cached depth instead.
     if dense_request_exceeds_capacity(prompt.len(), max_new, max_ctx, parallel_decode.is_some()) {
-        return Err(anyhow!(
-            "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
-            prompt.len(),
-            max_new
+        return Err(anyhow::Error::new(
+            infr_core::error::ContextLengthExceeded {
+                prompt: prompt.len(),
+                max_new,
+                capacity: max_ctx,
+            },
         ));
     }
     macro_rules! ensure_kv_depth {
@@ -4164,15 +4274,43 @@ fn generate_dense_backend_inner(
     if let Some(prepared) = parallel_prepared.as_ref() {
         turn_checkpoint_boundaries = prepared[0].checkpoint_boundaries;
     } else if let Some(checkpoint) = turn_checkpoint {
+        // Same page-flooring rule as `prepare_parallel_prompt_state`: a paged slot may only publish
+        // a snapshot whose boundary is reachable by whole frames.
+        let paged = segmented_kv.paged.is_some();
+        let page = segmented_kv.page_tokens;
         for (index, boundary) in checkpoint.boundaries().into_iter().enumerate() {
-            turn_checkpoint_boundaries[index] = boundary.filter(|&boundary| {
-                (c.qwen35 || c.qwen4exp || c.bailingmoe3)
-                    && boundary > start
-                    && boundary < prompt.len()
-                    && boundary <= max_ctx
-            });
+            turn_checkpoint_boundaries[index] = boundary
+                .map(|boundary| {
+                    if paged {
+                        page_floor(boundary, page)
+                    } else {
+                        boundary
+                    }
+                })
+                .filter(|&boundary| {
+                    (c.qwen35 || c.qwen4exp || c.bailingmoe3)
+                        && boundary > start
+                        && boundary < prompt.len()
+                        && boundary <= max_ctx
+                });
         }
     }
+    // The page-aligned prompt frontier this request may publish (see `paged_frontier_pos`). The
+    // parallel prepare already computed one for its own lane; a single-sequence request has no
+    // prepare step, so the runner synthesizes it here.
+    let paged_frontier_at = parallel_prepared
+        .as_ref()
+        .map(|prepared| prepared[0].paged_frontier)
+        .unwrap_or_else(|| {
+            paged_frontier_pos(
+                c,
+                segmented_kv.paged.is_some(),
+                segmented_kv.page_tokens,
+                prompt.len(),
+                start,
+                max_ctx,
+            )
+        });
     if parallel_prepared.is_none() {
         for (index, boundary) in turn_checkpoint_boundaries.into_iter().enumerate() {
             if let Some(boundary) = boundary {
@@ -8769,6 +8907,7 @@ fn generate_dense_backend_inner(
                         .iter()
                         .flatten()
                         .copied()
+                        .chain(prepared[lane].paged_frontier)
                         .filter(|&boundary| begin < boundary)
                         .min()
                     {
@@ -9034,6 +9173,32 @@ fn generate_dense_backend_inner(
                                 )?;
                             }
                         }
+                    }
+                }
+                // The page-aligned prompt frontier: the one snapshot this request's radix entry can
+                // carry, so a later request sharing the prefix attaches frames instead of replaying.
+                // Downloaded to the HOST (not a third device checkpoint) because the entry outlives
+                // the slot and the RAM tier already pays for the frames beside it.
+                if Some(range.end) == prepared[lane].paged_frontier {
+                    if lane == 0 {
+                        *paged_frontier = Some(capture_paged_ckpt(
+                            be,
+                            c,
+                            &kbufs[..],
+                            &vbufs[..],
+                            ple_state_buf.as_deref(),
+                            range.end,
+                        )?);
+                    } else {
+                        let slot = &mut parallel.peers[lane - 1];
+                        slot.paged_frontier = Some(capture_paged_ckpt(
+                            be,
+                            c,
+                            &slot.kbufs,
+                            &slot.vbufs,
+                            slot.ple_state_buf.as_deref(),
+                            range.end,
+                        )?);
                     }
                 }
             }
@@ -11951,7 +12116,17 @@ fn generate_dense_backend_inner(
         };
         let pf_end = prompt.len() - 1;
         let mut prefill_runtime_reserve = None;
-        if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
+        // The round pays the ring reserve iff this gate is true; `ring_floor` then forbids any
+        // TURN_CHECKPOINT from cutting a chunk under the threshold the reserve was priced with
+        // (2026-10-19 memory-bomb fix, see `prefill_chunk_end`).
+        let ring_round =
+            be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch);
+        let ring_floor = if ring_round {
+            ring_min_rows(c).unwrap_or(0)
+        } else {
+            0
+        };
+        if ring_round {
             let _gp = req.and_then(|request| request.gate_pass());
             ensure_kv_depth!(pf_end);
             let candidates = prefill_runtime_candidates(
@@ -12002,7 +12177,14 @@ fn generate_dense_backend_inner(
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let ce = prefill_chunk_end(cs, pf_end, ubatch, &turn_checkpoint_boundaries);
+                let ce = prefill_chunk_end(
+                    cs,
+                    pf_end,
+                    ubatch,
+                    &turn_checkpoint_boundaries,
+                    paged_frontier_at,
+                    ring_floor,
+                );
                 v.push((cs, ce));
                 cs = ce;
             }
@@ -12048,6 +12230,9 @@ fn generate_dense_backend_inner(
                     Some(worker.submit_range(prompt, cstart, cend - cstart, c.ple_ngram_size)?);
             }
         }
+        // Assembled at the frontier chunk and published with this request's frames at detach. Held
+        // across the whole sweep because a layer-major prefill fills it one span at a time.
+        let mut frontier_capture: Option<PagedFrontierCapture> = None;
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -12448,6 +12633,38 @@ fn generate_dense_backend_inner(
                                         ple_state_buf.as_deref(),
                                     )?;
                                 }
+                            }
+                        }
+                        // Paged tier: the host snapshot this request's radix entry publishes, taken at
+                        // exactly the position the frame chain reaches. Layer-major fills it span by
+                        // span (see `PagedFrontierCapture`); chunk-major reads the whole model once.
+                        if Some(cend) == paged_frontier_at {
+                            let capture = match frontier_capture.as_mut() {
+                                Some(capture) => capture,
+                                None => frontier_capture.insert(PagedFrontierCapture::new(
+                                    c,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    ple_state_buf.as_deref(),
+                                    cend,
+                                )?),
+                            };
+                            if layer_major {
+                                capture.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                                if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer)) {
+                                    capture.snapshot_ple(be, ple_state_buf.as_deref())?;
+                                }
+                            } else {
+                                capture.snapshot_all(
+                                    be,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    ple_state_buf.as_deref(),
+                                )?;
+                            }
+                            if si + 1 == spans.len() {
+                                *paged_frontier =
+                                    Some(frontier_capture.take().expect("just created").finish()?);
                             }
                         }
                         // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
@@ -14699,10 +14916,10 @@ mod tests {
 
     use super::{
         allocate_parallel_prefill_rows, command_ahead_cohort_ready, dense_request_exceeds_capacity,
-        full_mrope_positions, mrope_rows_are_plain_rope, mrope_token_position,
-        parallel_decode_should_stop, parallel_prefill_group, parallel_prefill_progress,
-        prefill_chunk_end, qsa_prepare_pair_supported, recurrent_extension_start,
-        resident_after_gen, sampling_suffix_start, validate_token_ids,
+        full_mrope_positions, mrope_rows_are_plain_rope, mrope_token_position, page_floor,
+        paged_frontier_pos, parallel_decode_should_stop, parallel_prefill_group,
+        parallel_prefill_progress, prefill_chunk_end, qsa_prepare_pair_supported,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
     use infr_core::DType;
 
@@ -15174,16 +15391,122 @@ mod tests {
     #[test]
     fn ordinary_prefill_chunks_stop_at_turn_checkpoints() {
         let checkpoints = [Some(789), Some(2405)];
-        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 789);
-        assert_eq!(prefill_chunk_end(789, 4063, 2048, &checkpoints), 2405);
-        assert_eq!(prefill_chunk_end(2405, 4063, 2048, &checkpoints), 4063);
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints, None, 0), 789);
+        assert_eq!(
+            prefill_chunk_end(789, 4063, 2048, &checkpoints, None, 0),
+            2405
+        );
+        assert_eq!(
+            prefill_chunk_end(2405, 4063, 2048, &checkpoints, None, 0),
+            4063
+        );
+    }
+
+    #[test]
+    fn page_flooring_is_exact_and_a_zero_page_is_identity() {
+        assert_eq!(page_floor(29_999, 64), 29_952);
+        assert_eq!(page_floor(29_952, 64), 29_952);
+        assert_eq!(page_floor(63, 64), 0);
+        // A zero page means the slot is not segmented at all: never divide by it.
+        assert_eq!(page_floor(29_999, 0), 29_999);
+    }
+
+    #[test]
+    fn a_paged_frontier_splits_a_chunk_like_a_checkpoint() {
+        // 30_000-token prompt on 64-token pages: the prefill stops at 29_952 so the published
+        // frames and the recurrent snapshot describe the same token count.
+        let none = [None, None];
+        assert_eq!(
+            prefill_chunk_end(0, 29_999, 32_768, &none, Some(29_952), 0),
+            29_952
+        );
+        assert_eq!(
+            prefill_chunk_end(29_952, 29_999, 32_768, &none, Some(29_952), 0),
+            29_999
+        );
+        // A frontier the ring reserve would starve is skipped exactly like a checkpoint: the
+        // request loses its snapshot and the next one replays, which is a perf loss, not a hazard.
+        assert_eq!(
+            prefill_chunk_end(29_900, 29_999, 32_768, &none, Some(29_952), 154),
+            29_999
+        );
+    }
+
+    #[test]
+    fn paged_frontier_page_aligns_and_gates() {
+        let cfg = crate::Config {
+            qwen4exp: true,
+            ..crate::Config::default()
+        };
+        // A paged recurrent session floors to the page and stays under the prefill's own end.
+        assert_eq!(
+            paged_frontier_pos(&cfg, true, 64, 30_000, 0, 131_072),
+            Some(29_952)
+        );
+        // Non-paged or non-recurrent sessions publish nothing to pair with a snapshot.
+        assert_eq!(
+            paged_frontier_pos(&cfg, false, 64, 30_000, 0, 131_072),
+            None
+        );
+        let dense = crate::Config::default();
+        assert_eq!(
+            paged_frontier_pos(&dense, true, 64, 30_000, 0, 131_072),
+            None
+        );
+        // A prompt shorter than one page, or already past the frontier, captures nothing: the
+        // snapshot would describe state the chunk loop never produced.
+        assert_eq!(paged_frontier_pos(&cfg, true, 64, 40, 0, 131_072), None);
+        assert_eq!(
+            paged_frontier_pos(&cfg, true, 64, 30_000, 29_952, 131_072),
+            None
+        );
+        // The frontier never exceeds the slot's capacity.
+        assert_eq!(paged_frontier_pos(&cfg, true, 64, 30_000, 0, 16_384), None);
+    }
+
+    #[test]
+    fn ring_rounds_never_starve_a_chunk_below_the_ring_threshold() {
+        // The 2026-10-19 bomb shape: a 160-token prompt with a checkpoint at 45. Under min_rows=0
+        // (unpaid round) the boundary still wins; on a paid ring round (min_rows=154) it is skipped
+        // and the whole suffix rides the ring the reserve paid for.
+        let starving = [Some(45), None];
+        assert_eq!(prefill_chunk_end(0, 159, 2048, &starving, None, 0), 45);
+        assert_eq!(prefill_chunk_end(0, 159, 2048, &starving, None, 154), 159);
+        // A qualifying boundary keeps working on paid rounds (skip only starves).
+        let healthy = [Some(160), None];
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &healthy, None, 154), 160);
+        // `ring_min_rows` agrees with the gate exactly at 153/154 (n_used=10, n_expert=512).
+        let cfg = crate::Config {
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::ring_min_rows(&cfg), Some(154));
+        assert!(!super::prefill_uses_layer_ring(&cfg, 153, 4096));
+        assert!(super::prefill_uses_layer_ring(&cfg, 154, 4096));
+        assert_eq!(super::ring_min_rows(&crate::Config::default()), None);
     }
 
     #[test]
     fn frontier_checkpoint_does_not_create_a_tiny_prefill_tail() {
         let checkpoints = [None, Some(4063)];
-        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 2048);
-        assert_eq!(prefill_chunk_end(2048, 4063, 2048, &checkpoints), 4063);
+        assert_eq!(
+            prefill_chunk_end(0, 4063, 2048, &checkpoints, None, 0),
+            2048
+        );
+        assert_eq!(
+            prefill_chunk_end(2048, 4063, 2048, &checkpoints, None, 0),
+            4063
+        );
     }
 
     #[test]

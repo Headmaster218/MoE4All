@@ -250,6 +250,29 @@ pub fn tool_constraint_for(
     Ok(Some(Constraint::new(env, grammar)?))
 }
 
+/// Build the constraint that forces the reply to be ONE JSON value conforming to `schema` — the
+/// structured-output path shared by `/v1/chat/completions`'s `response_format` and
+/// `/v1/responses`'s `text.format`.
+///
+/// `schema` is already gated by the server's JSON Schema subset validator
+/// (`infr-server::response_format`), so a schema that cannot be compiled here is a would-be 400
+/// that the caller turns into an explicit error — NEVER a silent fall-back to free text.
+///
+/// The constraint applies from the FIRST generated token: the prompt must therefore not prefill a
+/// thinking block (the server pins `enable_thinking=false`; `run_chat` refuses a template that
+/// prefills one anyway).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub fn output_constraint_for(
+    tokenizer: &Tokenizer,
+    vocab: usize,
+    eos_ids: &[u32],
+    schema: &Value,
+) -> Result<Constraint> {
+    let grammar = TopLevelGrammar::from_json_schema(schema.clone());
+    let env = build_tok_env(tokenizer, vocab, eos_ids)?;
+    Constraint::new(env, grammar)
+}
+
 /// Build a JSON-schema grammar constraining the tool-call BODY — a single JSON object
 /// `{"name": <one-of-the-tool-names>, "arguments": <that tool's parameter schema>}` (the union over
 /// the request's tools). The caller prefills the `<tool_call>` opener and constrains only this body,

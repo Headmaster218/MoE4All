@@ -21,12 +21,17 @@ const MIB_F64: f64 = (1u64 << 20) as f64;
 const GIB_F64: f64 = (1u64 << 30) as f64;
 
 pub mod model;
+// Pure two-tier frame bookkeeping for the paged KV cache; the Vulkan wiring
+// lands in Phase B/C, so nothing consumes it yet.
+#[allow(dead_code)]
+pub(crate) mod kv_frame_pool;
 mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
 #[path = "../parallel_token_delivery.rs"]
 pub(crate) mod token_delivery;
+pub(crate) use segmented_kv::SegmentedKvLayout;
 pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
 mod weight_upload;
@@ -1589,7 +1594,8 @@ const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 4096 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// 5120 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default and the
+/// measurements behind that number). ONE
 /// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
 /// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
@@ -1709,18 +1715,32 @@ fn first_successful_moe_ubatch<T, E>(
     Ok(None)
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 4096 rows on a
-/// discrete GPU in both profiles, EXCEPT on an integrated GPU, where a chunk that big is a single
-/// multi-second command buffer and trips
-/// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
-/// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 5120 rows on a
+/// discrete GPU, EXCEPT on an integrated GPU, where a chunk that big is a single multi-second
+/// command buffer and trips the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` ->
+/// `VK_ERROR_DEVICE_LOST`). See [`infr_core::integrated_ubatch_rows`] for the measurements behind
+/// the smaller default.
+///
+/// 5120 is measured, not guessed, and UBATCH IS THE FIRST ALLOCATION: its runtime reserve comes off
+/// the top of the unified arena (`ModelMemoryPlan::runtime_elastic`, ~1.5 GiB per 1024 rows on
+/// Qwen3.8-Flash-Next) and the expert cache is whatever remains, so this constant is the knob that
+/// decides how much VRAM the experts get. Two independent measurements put the knee here:
+/// RDNA3 measurements put the knee here. `kernel-bench --sweep-m` (Vulkan coopmat, the model's two
+/// MoE shapes) peaks at m=4096 (640x2560, 52.9 TF) and 2560x1280 keeps climbing only to 8192
+/// (48.9 -> 54.1 TF). Qwen3.8-Flash-Next (48 layers, 512 experts top-10, 4.27 bpw) pp30000 on the
+/// 7900 XTX with `kv.paged=true`, ctx 30016: ub 2048 = 1110.9 t/s, 4096 = 1591.3, 5120 = 1712.2,
+/// 6144 = 1728.4 (+0.9%). 5120 is the tallest rung that still holds all FOUR prefill lanes; 6144
+/// drops to 3 lanes and pays 1.5 GiB of expert cache for that last 0.9%.
+/// A GPU too small for 5120's reserve loses nothing: the plan's placement sweep starts at this
+/// height and walks [`ubatch_fallbacks_below`] down until the expert cache clears the prefill floor,
+/// so aiming high costs one CPU-side plan recomputation.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) uses the profile default.
+/// `device_class()` is `None`) uses this default.
 fn default_ubatch_rows(_profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 4096,
+        _ => 5120,
     }
 }
 
@@ -2514,6 +2534,57 @@ pub(crate) fn segmented_kv_wanted(
         && v_fmt == DType::Q8_0
 }
 
+/// Every condition a persistent session-state tier still needs, as one readable list. The tree, the
+/// RAM pool and the disk cache all release a conversation's rows and re-attach them elsewhere, which
+/// IS [`segmented_kv_wanted`] — plus one runtime fact that no `kv.*` key controls: the segments are
+/// claimed from the unified VRAM arena, which only exists once the MoE experts are paged. Invariant
+/// (guarded by `segmented_kv_requires_q8_on_both_sides`): the list is empty exactly when the layout
+/// is available, so a refusal can always name the gate the session missed.
+pub(crate) fn segmented_kv_blockers(
+    cfg: &Config,
+    ec: &EngineConfig,
+    ring: bool,
+    k_fmt: DType,
+    v_fmt: DType,
+    arena_available: bool,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !(cfg.qwen35 || cfg.qwen4exp) {
+        blockers
+            .push("this architecture has no segmented KV layout (only Qwen3.5/3.6/3.8 do)".into());
+    }
+    if !ec.kv.dynamic {
+        blockers.push("kv.dynamic is off (INFR_NO_DYNAMIC_KV, or --set kv.dynamic=false)".into());
+    }
+    if ec.kv.overflow {
+        blockers.push(
+            "kv.overflow is on: the overflow layout owns the KV rows, so none can be released"
+                .into(),
+        );
+    }
+    if ring {
+        blockers.push(
+            "the sliding-window layers were allocated as window-sized rings (kv.ring), which drop \
+             the early prefix rows a restore needs"
+                .into(),
+        );
+    }
+    if k_fmt != DType::Q8_0 || v_fmt != DType::Q8_0 {
+        blockers.push(format!(
+            "KV is {k_fmt:?}/{v_fmt:?}; the layout commits Q8_0/Q8_0 segments only"
+        ));
+    }
+    if !arena_available {
+        blockers.push(
+            "there is no unified VRAM arena: every MoE expert loaded resident, so no elastic device \
+             pool exists to back or re-attach segments (an arena appears only when experts are \
+             paged - reserve one with paging.cache / INFR_CACHE, or lower the device budget)"
+                .into(),
+        );
+    }
+    blockers
+}
+
 /// Per-slot persistent state as the allocator must reserve it. Dynamic Qwen caches occupy whole
 /// 32K physical segments, while recurrent/checkpoint state keeps its exact byte size.
 fn kv_state_reserve_bytes(
@@ -2533,8 +2604,14 @@ fn kv_state_reserve_bytes(
     if !segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt) {
         return logical;
     }
-    let layout = segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx.max(1), k_fmt, v_fmt)
-        .expect("segmented Qwen state has a layout");
+    let layout = segmented_kv::SegmentedKvLayout::for_qwen(
+        cfg,
+        want_ctx.max(1),
+        k_fmt,
+        v_fmt,
+        ec.kv.paged_page_tokens,
+    )
+    .expect("segmented Qwen state has a layout");
     logical
         .saturating_sub(layout.logical_bytes())
         .saturating_add(layout.committed_bytes(want_ctx))
@@ -3883,8 +3960,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
         let dynamic_layout = segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt).then(|| {
-            segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
-                .expect("Qwen hybrid models have segmented KV geometry")
+            segmented_kv::SegmentedKvLayout::for_qwen(
+                cfg,
+                want_ctx,
+                k_fmt,
+                v_fmt,
+                ec.kv.paged_page_tokens,
+            )
+            .expect("Qwen hybrid models have segmented KV geometry")
         });
         let dynamic_kv_reserve_per_slot = dynamic_layout
             .as_ref()
@@ -7396,16 +7479,16 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            4096,
-            "no pin, no iGPU: both profiles start at 4096 and let placement fall back"
+            5120,
+            "no pin, no iGPU: both profiles start at the measured 5120 and let placement fall back"
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_rows(&aggressive),
-            4096,
-            "the aggressive discrete default uses a larger prefill chunk"
+            5120,
+            "the aggressive discrete default uses the same measured prefill chunk"
         );
 
         let pinned = EngineConfig {
@@ -7434,7 +7517,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            4096,
+            5120,
             "…and the height falls back"
         );
     }
@@ -7443,10 +7526,10 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 5120);
 
         ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 5120);
 
         ec.device.ubatch = Some(3072);
         ec.device.ubatch_specified = true;
@@ -7463,17 +7546,17 @@ mod seam_helper_tests {
         let mut automatic = EngineConfig::default();
         automatic.spec.mtp = true;
 
-        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(super::ubatch_rows(&automatic), 5120);
         assert_eq!(
             super::ubatch_candidates(&automatic),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         automatic.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(super::ubatch_rows(&automatic), 5120);
         assert_eq!(
             super::ubatch_candidates(&automatic),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         automatic.device.ubatch = Some(3072);
@@ -7667,6 +7750,38 @@ mod seam_helper_tests {
             DType::Q8_0,
             DType::Q8_0
         ));
+
+        // A refused session-state tier prints `segmented_kv_blockers` as the reason, so the list has
+        // to be empty exactly when the layout is available — including `arena_available`, the runner's
+        // one extra term that no `kv.*` key controls (a device with room for every expert resident
+        // never builds the arena and used to fail with a message about Qwen models and Q8 KV).
+        for (ring, k, v, arena) in [
+            (false, DType::Q8_0, DType::Q8_0, true),
+            (true, DType::Q8_0, DType::Q8_0, true),
+            (false, DType::F16, DType::Q8_0, true),
+            (false, DType::Q8_0, DType::Q8_0, false),
+        ] {
+            let blockers = super::segmented_kv_blockers(&cfg, &ec, ring, k, v, arena);
+            assert_eq!(
+                blockers.is_empty(),
+                super::segmented_kv_wanted(&cfg, &ec, ring, k, v) && arena,
+                "blockers {blockers:?} disagree at ring={ring} k={k:?} v={v:?} arena={arena}"
+            );
+        }
+        let no_arena =
+            super::segmented_kv_blockers(&cfg, &ec, false, DType::Q8_0, DType::Q8_0, false);
+        assert!(no_arena
+            .iter()
+            .any(|b| b.contains("unified VRAM arena") && b.contains("paging.cache")));
+        let plain = Config {
+            qwen35: false,
+            ..cfg.clone()
+        };
+        assert!(
+            super::segmented_kv_blockers(&plain, &ec, false, DType::Q8_0, DType::Q8_0, true)
+                .iter()
+                .any(|b| b.contains("Qwen3.5/3.6/3.8"))
+        );
     }
 
     #[test]
@@ -9000,17 +9115,17 @@ mod seam_helper_tests {
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 4096);
+        assert_eq!(super::ubatch_rows(&unset), 5120);
         assert_eq!(
             super::ubatch_candidates(&unset),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_candidates(&aggressive),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
         assert_eq!(
             super::ubatch_fallbacks_below(3072),

@@ -618,6 +618,20 @@ impl<'a> Bindings<'a> {
     }
 }
 
+/// One contiguous run of fixed-size KV frames inside a backend's device memory (the paged
+/// hierarchical cache, Phase B of `.trae/documents/paged-hierarchical-kv-cache.md`). A pool may
+/// hand back several: the unified VRAM arena is built from ~2 GiB ReBAR shard pieces, so a KV
+/// space larger than one shard's largest free gap (ctx 262144 wants 4.31 GiB) can only be
+/// satisfied by tiling. Frame indices stay global across segments — the caller accumulates the
+/// per-segment `first_frame` itself, so the radix tree and eviction logic never see the split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvFrameCorridor {
+    /// Device address of this segment's frame 0.
+    pub base: u64,
+    /// Number of whole frames in this segment.
+    pub frames: usize,
+}
+
 /// Optional idle residency that can be dropped before retrying a failed logical allocation.
 /// Called under the shared device execution gate: implementations must not submit GPU work,
 /// wait for another execution gate, or block on request-owned locks. Return false if busy.
@@ -746,6 +760,55 @@ pub trait Backend: Send + Sync {
     fn release_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
         Err(crate::error::Error::backend(
             "segmented KV release is not supported by this backend",
+        ))
+    }
+    /// Reserve `count` fixed-size KV frames (the paged hierarchical cache, Phase B of
+    /// `.trae/documents/paged-hierarchical-kv-cache.md`) and return the device corridors backing
+    /// them. Global frame `slot` starts at `corridors[i].base + (slot - first_i) * frame_bytes`;
+    /// a session plane's page entry is that address `+ plane_offset`, written through
+    /// [`Backend::set_kv_table_entry`]. Fixed-size frames cannot form external fragments, and the
+    /// corridors outlive every individual conversation: pages move between sessions and the radix
+    /// tree by refcount, never by `vkFreeMemory`. One corridor is the common small-ctx case; a
+    /// backend whose pool is sharded (the unified VRAM arena is ~2 GiB ReBAR pieces) returns
+    /// several when the request exceeds a single shard's largest free gap. `Ok(None)` = unsupported
+    /// backend.
+    fn alloc_kv_frames(
+        &self,
+        _frame_bytes: u64,
+        _count: usize,
+    ) -> Result<Option<Vec<KvFrameCorridor>>> {
+        Ok(None)
+    }
+    /// Write one page entry of a segmented KV buffer's device address table. `addr = 0` unmaps the
+    /// page (RAM-tier frames are never device-addressable — BDA stale-read + bandwidth-wall
+    /// convictions). The caller must hold the GPU baton whenever live sessions could read the
+    /// table; entries are host-visible writes the next dispatch observes.
+    fn set_kv_table_entry(&self, _buffer: &dyn Buffer, _page: usize, _addr: u64) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV table writes are not supported by this backend",
+        ))
+    }
+    /// Release corridors previously returned by [`Self::alloc_kv_frames`]. Engine shutdown only;
+    /// every frame must already be free (refcount 0) or the drop order is a use-after-free.
+    fn free_kv_frames(&self, _corridors: &[KvFrameCorridor]) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV frame corridors are not supported by this backend",
+        ))
+    }
+    /// Copy one paged-KV frame out of its device corridor into host memory (Phase C RAM-tier
+    /// demotion). `frame_addr` is the frame's first-byte corridor address
+    /// (`FramePool::frame_addr`); `dst.len()` must equal `frame_bytes`. The caller holds the GPU
+    /// baton: no dispatch may be writing the frame while it leaves VRAM. Default unsupported.
+    fn kv_frame_download(&self, _frame_addr: u64, _dst: &mut [u8]) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "KV frame corridor DMA is not supported by this backend",
+        ))
+    }
+    /// Copy one paged-KV frame's bytes from host memory into its device-corridor slot (Phase C
+    /// promotion). Same baton discipline as [`Self::kv_frame_download`]. Default unsupported.
+    fn kv_frame_upload(&self, _frame_addr: u64, _src: &[u8]) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "KV frame corridor DMA is not supported by this backend",
         ))
     }
     /// Return only unused tail segments, keeping the prefix and frozen physical layout stable.

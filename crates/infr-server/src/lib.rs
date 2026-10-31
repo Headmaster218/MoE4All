@@ -7,7 +7,13 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
-//!   POST /v1/responses          -> stateless Responses JSON | typed SSE stream         (auth)
+//!   POST /v1/responses          -> Responses JSON | typed SSE stream; stateless unless the
+//!                                   response store is enabled                     (auth)
+//!   GET  /v1/responses          -> stored-response page      | 400 with the store off   (auth)
+//!   GET  /v1/responses/{id}     -> stored response           | 404 unknown              (auth)
+//!   DELETE /v1/responses/{id}   -> {"deleted":true}                                    (auth)
+//!   GET  /v1/responses/{id}/input_items -> the items that turn was given               (auth)
+//!   POST /v1/responses/{id}/cancel      -> 400: nothing is queued to cancel            (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
@@ -18,6 +24,9 @@
 //!   `Delta::Reasoning`  -> `delta.reasoning_content`
 //!   `Delta::Content`    -> `delta.content`
 //!   `Delta::ToolCall`   -> `delta.tool_calls[]`  (finish_reason "tool_calls")
+//!   `Delta::ToolCallBegin`/`Args` -> the same `delta.tool_calls[]` slot, opened early and filled one
+//!     argument at a time; the finished `ToolCall` above then carries only the remainder — see
+//!     [`remainder`].
 
 use std::{
     convert::Infallible,
@@ -53,7 +62,10 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
+mod response_format;
 mod responses;
+
+pub use response_format::ResponseFormat;
 
 #[cfg(test)]
 mod image_input_tests;
@@ -284,6 +296,42 @@ pub struct ChatOutcome {
 // Request DTOs
 // ---------------------------------------------------------------------------
 
+/// OpenAI's `reasoning_effort` wire value: one of the template levels, or `"none"` for "no
+/// reasoning". Local GGUF templates expose levels only, so `none` maps onto the thinking switch
+/// ([`ChatTemplateOptions::enable_thinking`]) instead of being rejected — a client that asks for no
+/// reasoning gets exactly that. `minimal` is an OpenAI level without a local rung and means the
+/// smallest one, `low`. Anything else is a 400 naming `param`.
+///
+/// Returns `(level, reasoning_off)`.
+pub(crate) fn parse_reasoning_effort(
+    raw: &serde_json::Value,
+    param: &'static str,
+) -> Result<(Option<infr_core::config::ReasoningEffort>, bool), ParamError> {
+    if raw.is_null() {
+        return Ok((None, false));
+    }
+    let Some(text) = raw.as_str() else {
+        return Err(ParamError {
+            param,
+            message: "reasoning effort must be a string".into(),
+        });
+    };
+    if text == "none" {
+        return Ok((None, true));
+    }
+    let level = match text {
+        "minimal" => infr_core::config::ReasoningEffort::Low,
+        other => other.parse().map_err(|_| ParamError {
+            param,
+            message: format!(
+                "unsupported reasoning effort {other:?}; expected none, minimal, low, medium, \
+                 high, xhigh or max"
+            ),
+        })?,
+    };
+    Ok((Some(level), false))
+}
+
 /// Top-level chat completion request (OpenAI wire format).
 ///
 /// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `n`, `user`,
@@ -294,9 +342,10 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessageDto>,
     #[serde(default)]
     pub stream: bool,
-    /// Native template effort; no global default is imposed on models.
+    /// Native template effort (`none` = no reasoning); no global default is imposed on models.
+    /// Kept as raw JSON so `"none"` survives — see [`parse_reasoning_effort`].
     #[serde(default)]
-    pub reasoning_effort: Option<infr_core::config::ReasoningEffort>,
+    pub reasoning_effort: Option<serde_json::Value>,
     /// Supported template controls. Kept separate from sampling and never merged into messages.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateOptions>,
@@ -330,6 +379,11 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    /// OpenAI structured output: `{"type":"text"}` | `{"type":"json_object"}` |
+    /// `{"type":"json_schema","json_schema":{"name":..,"schema":{..},"strict":true}}`.
+    /// Parsed (and its JSON Schema subset gated) by [`response_format::parse_response_format`].
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
@@ -348,6 +402,10 @@ pub struct GenParams {
     pub repeat_penalty: Option<f32>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
+    /// Structured output the decode must enforce. [`ResponseFormat::Text`] — the default — is the
+    /// unchanged free-text path; anything else is a grammar constraint applied from the FIRST
+    /// token, plus a post-generation JSON check (see [`response_format`]).
+    pub response_format: ResponseFormat,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
@@ -363,8 +421,12 @@ impl GenParams {
     /// presence/frequency -2..2, at most 4 stop sequences).
     pub fn from_request(req: &ChatRequest) -> Result<Self, ParamError> {
         let mut chat_template_options = req.chat_template_kwargs.clone().unwrap_or_default();
+        let (requested_level, reasoning_off) = match req.reasoning_effort.as_ref() {
+            Some(raw) => parse_reasoning_effort(raw, "reasoning_effort")?,
+            None => (None, false),
+        };
         if let (Some(top), Some(nested)) =
-            (req.reasoning_effort, chat_template_options.reasoning_effort)
+            (requested_level, chat_template_options.reasoning_effort)
         {
             if top != nested {
                 return Err(ParamError {
@@ -375,9 +437,35 @@ impl GenParams {
                 });
             }
         }
-        chat_template_options.reasoning_effort = req
-            .reasoning_effort
+        chat_template_options.reasoning_effort = requested_level
             .or(chat_template_options.reasoning_effort);
+        if reasoning_off && chat_template_options.enable_thinking.is_none() {
+            // `effort: "none"` = no reasoning. An explicit template `enable_thinking` is the finer
+            // control and keeps its say; otherwise the effort decides.
+            chat_template_options.enable_thinking = Some(false);
+        }
+        // Structured output is enforced from the FIRST token, so a thinking block would make the
+        // grammar's first token illegal. Disable thinking unless the client explicitly asked for
+        // it — in which case the request is contradictory and must fail loudly, never silently
+        // drop one of the two instructions.
+        let response_format = response_format::parse_response_format(
+            req.response_format.as_ref(),
+            "response_format",
+        )?;
+        if response_format.is_structured() {
+            match chat_template_options.enable_thinking {
+                Some(true) => {
+                    return Err(ParamError {
+                        param: "response_format",
+                        message: "structured output is constrained from the first token, so it \
+                                  cannot be combined with thinking (enable_thinking=true); \
+                                  set enable_thinking=false or use response_format type text"
+                            .into(),
+                    })
+                }
+                _ => chat_template_options.enable_thinking = Some(false),
+            }
+        }
         let rng = |param: &'static str,
                    v: Option<f32>,
                    lo: f32,
@@ -459,6 +547,7 @@ impl GenParams {
             frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
             repeat_penalty: req.repeat_penalty,
             stop,
+            response_format,
         })
     }
 }
@@ -663,7 +752,7 @@ fn validate_tool_choice(
 }
 
 /// A single chat message.  `content` may be a JSON string or a content-part array.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatMessageDto {
     pub role: String,
     #[serde(default)]
@@ -2093,9 +2182,27 @@ pub struct AppState {
     /// Presentation-only slot registry. It mirrors admission permits but never participates in
     /// scheduling; request progress is read from each request's existing local state.
     dashboard: Arc<ActivityDashboard>,
+    /// Server-side `/v1/responses` state (`previous_response_id` chains, `conversation` cursors,
+    /// stored envelopes for `retrieve`/`list`/`input_items`), LRU-bounded by
+    /// `serve.response_store_entries` (0 = feature OFF, state is rejected with a 400 as before).
+    /// Holds message DTOs and JSON only — chained requests rebuild the same token prefix and the
+    /// paged KV radix tree hits it on its own; no KV is pinned here.
+    response_store: Arc<Mutex<responses::ResponseStore>>,
 }
 
 impl AppState {
+    /// The `/v1/responses` store every constructor shares: memory-only unless
+    /// `serve.response_store_path` names a file. A path that cannot be loaded is a STARTUP error —
+    /// starting empty would make every stored id look lost while the data still sits on disk.
+    fn response_store(cfg: &Config) -> Arc<Mutex<responses::ResponseStore>> {
+        let store = responses::ResponseStore::open(
+            cfg.serve.response_store_entries,
+            cfg.serve.response_store_path.as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("serve.response_store_path: {error}"));
+        Arc::new(Mutex::new(store))
+    }
+
     /// Wrap a single loaded generator for production use with `n_parallel` concurrent slots — the
     /// single-model server (the overwhelming common case). Equivalent to a one-entry
     /// [`multi`](Self::multi).
@@ -2115,6 +2222,8 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
         }
@@ -2143,6 +2252,8 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
         }
@@ -2158,6 +2269,8 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
         }
@@ -2218,6 +2331,8 @@ impl AppState {
             dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
             models,
             embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
         }
@@ -2245,7 +2360,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/v1/responses", post(responses::handler))
+        .route(
+            "/v1/responses",
+            post(responses::handler).get(responses::list),
+        )
+        .route(
+            "/v1/responses/:response_id",
+            get(responses::retrieve).delete(responses::remove),
+        )
+        .route(
+            "/v1/responses/:response_id/input_items",
+            get(responses::input_items),
+        )
+        .route("/v1/responses/:response_id/cancel", post(responses::cancel))
         .route("/v1/embeddings", post(embeddings_handler))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .with_state(state)
@@ -2548,6 +2675,50 @@ async fn dispatch_chat(state: AppState, req: ChatRequest, route: &'static str) -
     if let Err(e) = validate_tool_choice(tool_choice.as_deref(), tools.as_ref()) {
         return param_error(Some(e.param), e.message);
     }
+    // Structured output is ONE llguidance constraint over the whole reply, so request shapes that
+    // would need a second, incompatible mechanism are refused here instead of being silently
+    // narrowed. The parameter name follows the API surface the client actually used.
+    if params.response_format.is_structured() {
+        let param: &'static str = if route == "/v1/responses" {
+            "text.format"
+        } else {
+            "response_format"
+        };
+        if tools
+            .as_ref()
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return param_error(
+                Some(param),
+                "structured output constrains the first token to JSON, so tool calls cannot be \
+                 emitted; remove `tools` or use plain text"
+                    .into(),
+            );
+        }
+        if !params.stop.is_empty() {
+            return param_error(
+                Some(param),
+                "stop sequences are not supported with structured output: a stop inside the JSON \
+                 would truncate it"
+                    .into(),
+            );
+        }
+        if params.chat_template_options.reasoning_effort.is_some() {
+            return param_error(
+                Some(param),
+                "structured output is constrained from the first token, so reasoning effort / \
+                 thinking is not supported in this mode"
+                    .into(),
+            );
+        }
+        if messages.iter().any(|message| !message.images.is_empty()) {
+            return param_error(
+                Some(param),
+                "structured output is not supported together with image inputs yet".into(),
+            );
+        }
+    }
 
     if state.models.is_empty() {
         return json_error(StatusCode::NOT_FOUND, "no chat model is loaded".into());
@@ -2650,6 +2821,9 @@ async fn non_streaming(
     drop(queued);
     let active = ActiveGuard::new(stats.clone());
     let engine_arc = entry.engine.clone();
+    // Kept OUTSIDE the blocking task so the finished reply can be checked without moving the
+    // request params back out of the closure.
+    let output_format = params.response_format.clone();
     let cid_blk = cid.clone();
     let stats_blk = stats.clone();
     let progress = Arc::new(RequestProgress::new(
@@ -2712,6 +2886,9 @@ async fn non_streaming(
                         function: OAIFunction { name, arguments },
                     });
                 }
+                // The whole response is serialized once at the end, so the call's finished form above
+                // is all a client can see; the read-ahead deltas would only duplicate its arguments.
+                Delta::ToolCallBegin { .. } | Delta::ToolCallArgs { .. } => {}
             },
         )?;
 
@@ -2770,6 +2947,14 @@ async fn non_streaming(
             }
         }
         Ok((reasoning, content, tool_calls, outcome, tally, finished_progress)) => {
+            // The grammar makes a conforming reply the expected outcome, but a backend that
+            // ignored the constraint (or a deadline-truncated decode) must not be reported as a
+            // structured success. This is the fail-closed check for that case.
+            if let Err(message) = output_format.verify(&content) {
+                stats.fold_failure();
+                tracing::warn!(req = req_id, error = %message, "structured output failed verification");
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, message);
+            }
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
             // (a 500 would throw away work it can use) and `finish_reason` says "length", which is
             // OpenAI's reason for a completion that ran out of budget.
@@ -2863,6 +3048,9 @@ async fn streaming(
     let cancel = Arc::new(AtomicBool::new(false));
     let task_cancel = cancel.clone();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+    // Mirrors the non-streaming path: the finished text is verified against the requested
+    // structured format before this stream is allowed to report success.
+    let output_format = params.response_format.clone();
 
     // Same per-model admission gate as the non-streaming path, but wait in a detached async task.
     // The SSE response and its keep-alive are already live. A disconnect races the FIFO semaphore
@@ -2966,9 +3154,16 @@ async fn streaming(
 
             let mut tc_index = 0usize;
             let mut saw_tool_call = false;
+            // Calls the engine read ahead of their finished form - index, name sent, arguments sent - in
+            // dispatch order. Each finished call consumes the front entry, which is how its frame keeps
+            // the `index` the client was given and carries only the text the client does not hold.
+            let mut ahead: Vec<(usize, String, String)> = Vec::new();
             // Per-request tally: plain locals inside the generation, folded in once below.
             let mut tally = ReqTally::new();
             let model_progress = progress_cb.callback();
+            // The exact content text the client has been streamed, for the structured-output
+            // check below. Concatenated deltas are byte-identical to the full decoded text.
+            let mut content_acc = String::new();
 
             let res = engine.chat(
                 &messages,
@@ -2988,20 +3183,86 @@ async fn streaming(
                         }
                         Delta::Content(t) => {
                             tally.on_text_delta_progress(&stats_cb, &progress_cb);
+                            content_acc.push_str(&t);
                             DeltaPayload {
                                 content: Some(t),
                                 ..Default::default()
                             }
                         }
                         Delta::ToolCall { name, arguments } => {
+                            // The finished call is authoritative. When this stream already read that
+                            // call ahead, only what the client does not hold may go out: a client
+                            // assembling `delta.tool_calls[]` by concatenation would otherwise receive
+                            // its arguments twice, and an `id` or `name` repeated is noise at best.
+                            let (index, read_name, streamed, fresh) = match ahead.is_empty() {
+                                true => {
+                                    let index = tc_index;
+                                    tc_index += 1;
+                                    (index, String::new(), String::new(), true)
+                                }
+                                false => {
+                                    let (index, read_name, streamed) = ahead.remove(0);
+                                    (index, read_name, streamed, false)
+                                }
+                            };
+                            saw_tool_call = true;
+                            let tc = OAIToolCall {
+                                index,
+                                id: if fresh {
+                                    format!("call_{cid_cb}_{index}")
+                                } else {
+                                    String::new()
+                                },
+                                kind: "function",
+                                function: OAIFunction {
+                                    name: if name == read_name {
+                                        String::new()
+                                    } else {
+                                        name
+                                    },
+                                    arguments: remainder(&streamed, &arguments),
+                                },
+                            };
+                            DeltaPayload {
+                                tool_calls: Some(vec![tc]),
+                                ..Default::default()
+                            }
+                        }
+                        Delta::ToolCallBegin { name } => {
+                            // The same shape a fragmented upstream opens a call with — `id` and `name`
+                            // first, arguments empty — so nothing new has to be learned to read it.
+                            let read_name = name.clone();
+                            ahead.push((tc_index, read_name, String::new()));
                             let tc = OAIToolCall {
                                 index: tc_index,
                                 id: format!("call_{cid_cb}_{tc_index}"),
                                 kind: "function",
-                                function: OAIFunction { name, arguments },
+                                function: OAIFunction {
+                                    name,
+                                    arguments: String::new(),
+                                },
                             };
                             tc_index += 1;
-                            saw_tool_call = true;
+                            DeltaPayload {
+                                tool_calls: Some(vec![tc]),
+                                ..Default::default()
+                            }
+                        }
+                        Delta::ToolCallArgs { fragment } => {
+                            let Some((index, _, streamed)) = ahead.last_mut() else {
+                                return; // no call open to attach it to; the finished one delivers it
+                            };
+                            let index = *index;
+                            streamed.push_str(&fragment);
+                            let tc = OAIToolCall {
+                                index,
+                                id: String::new(),
+                                kind: "function",
+                                function: OAIFunction {
+                                    name: String::new(),
+                                    arguments: fragment,
+                                },
+                            };
                             DeltaPayload {
                                 tool_calls: Some(vec![tc]),
                                 ..Default::default()
@@ -3021,6 +3282,13 @@ async fn streaming(
 
             match res {
                 Ok(outcome) => {
+                    // Fail closed BEFORE the terminal frame: the client already holds the deltas,
+                    // so an invalid structured reply is reported as an error frame instead of a
+                    // finish chunk that would make the truncated JSON look like a success.
+                    if let Err(message) = output_format.verify(&content_acc) {
+                        done.fail(&message);
+                        return;
+                    }
                     // Same honesty rule as the non-streaming path: the generator saw only an abort and
                     // reports `Stop`, so the deadline has to relabel it "length" — the budget ran out,
                     // the model did not finish. A tool call still wins.
@@ -3215,6 +3483,9 @@ fn invalid_request_input(error: &anyhow::Error) -> bool {
         .downcast_ref::<infr_core::error::InvalidInput>()
         .is_some()
         || error
+            .downcast_ref::<infr_core::error::ContextLengthExceeded>()
+            .is_some()
+        || error
             .downcast_ref::<infr_engine::TemplateError>()
             .is_some_and(infr_engine::TemplateError::is_invalid_input)
 }
@@ -3224,6 +3495,23 @@ fn invalid_request_input(error: &anyhow::Error) -> bool {
 /// clean completion (audit finding 1).
 fn sse_error_event(msg: &str, ty: &str) -> Event {
     Event::default().data(error_body(msg, ty).to_string())
+}
+
+/// What a client that already holds `streamed` still needs in order to reach `full`: the text past
+/// the two strings' common prefix, backed off to a UTF-8 boundary. When the streamed text is the
+/// prefix the engine's contract says it is, this is `full[streamed.len()..]` — usually empty. When it
+/// is not (a call that repeated an argument key, where the finished map rebinds a member already
+/// sent), it is the least-damaging answer, because a concatenating client cannot be told to un-write.
+fn remainder(streamed: &str, full: &str) -> String {
+    let mut k = streamed
+        .bytes()
+        .zip(full.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !full.is_char_boundary(k) {
+        k -= 1; // byte 0 is always a boundary, so this terminates
+    }
+    full[k..].to_owned()
 }
 
 /// Serialize a delta payload into an SSE event carrying a `chat.completion.chunk`.
@@ -3592,6 +3880,24 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// A prompt that outgrew the KV window is the CLIENT's request shape to fix (shorten the
+    /// conversation or raise `--ctx`), so it must not surface as a 500 "server_error": this is the
+    /// marker the handlers branch on for 400 / `invalid_request_error`.
+    #[test]
+    fn context_overflow_is_flagged_as_client_input() {
+        let overflow = anyhow::Error::new(infr_core::error::ContextLengthExceeded {
+            prompt: 33_676,
+            max_new: 0,
+            capacity: 32_768,
+        });
+        assert!(invalid_request_input(&overflow));
+        assert_eq!(
+            overflow.to_string(),
+            "prompt 33676 + gen 0 exceeds the session KV capacity 32768"
+        );
+        assert!(!invalid_request_input(&anyhow::anyhow!("backend: device lost")));
+    }
 
     /// Router backed by a headless state — no Engine, so /health and /v1/models work
     /// but /v1/chat/completions would return 500.  That's fine: we never call it here.
@@ -4855,6 +5161,34 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_effort_none_is_no_reasoning_and_unknown_levels_are_rejected() {
+        // OpenAI's `none` = no reasoning. The chat path has no template level for it, so it must
+        // arrive as the thinking switch; anything truly unknown names the parameter instead.
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"reasoning_effort":"none"}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.chat_template_options.reasoning_effort, None);
+        assert_eq!(p.chat_template_options.enable_thinking, Some(false));
+
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"reasoning_effort":"minimal"}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            p.chat_template_options.reasoning_effort,
+            Some(infr_core::config::ReasoningEffort::Low)
+        );
+        assert_eq!(p.chat_template_options.enable_thinking, None);
+
+        let error = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"reasoning_effort":"turbo"}"#,
+        ))
+        .unwrap_err();
+        assert_eq!(error.param, "reasoning_effort");
+    }
+
+    #[test]
     fn unknown_fields_are_ignored_not_rejected() {
         let p = GenParams::from_request(&req(
             r#"{"model":"m","messages":[],"n":1,"user":"bob","logit_bias":{},"logprobs":true}"#,
@@ -5689,6 +6023,94 @@ mod tests {
 
     /// The streaming deadline: the deltas already sent are kept, the finish chunk says `length`,
     /// and `[DONE]` still closes the stream.
+    /// A generator that reads a tool call ahead of its finished form: the name, then one fragment per
+    /// completed argument, then the finished call — whose `arguments` necessarily repeat all of it. A
+    /// client assembling `delta.tool_calls[].arguments` by concatenation must end up holding the
+    /// canonical JSON exactly once, on one index, with the id and name from the first frame.
+    #[tokio::test]
+    async fn read_ahead_arguments_reach_the_client_once() {
+        struct AheadGen;
+        impl ChatGenerator for AheadGen {
+            fn chat(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: Option<&serde_json::Value>,
+                _tool_choice: Option<&str>,
+                _params: &GenParams,
+                _cancel: &Arc<AtomicBool>,
+                _progress: Option<infr_core::GenerationProgressCallback>,
+                on_delta: &mut dyn FnMut(Delta),
+            ) -> anyhow::Result<ChatOutcome> {
+                on_delta(Delta::ToolCallBegin {
+                    name: "run_bash".into(),
+                });
+                on_delta(Delta::ToolCallArgs {
+                    fragment: r#"{"command":"ls"#.into(),
+                });
+                on_delta(Delta::ToolCallArgs {
+                    fragment: r#" -la"}"#.into(),
+                });
+                on_delta(Delta::ToolCall {
+                    name: "run_bash".into(),
+                    arguments: r#"{"command":"ls -la"}"#.into(),
+                });
+                Ok(ChatOutcome {
+                    finish: Finish::Stop,
+                    prompt_tokens: 1,
+                    cached_prompt_tokens: 0,
+                    completion_tokens: 4,
+                })
+            }
+        }
+        let resp = streaming(
+            deadline_entry(Arc::new(AheadGen)),
+            user_msg(),
+            None,
+            None,
+            GenParams::default(),
+            test_ctx(None, true),
+        )
+        .await;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let (mut assembled, mut indexes, mut ids, mut names) =
+            (String::new(), Vec::new(), Vec::new(), Vec::new());
+        for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            for tc in chunk["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                indexes.push(tc["index"].as_u64().unwrap());
+                if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
+                    ids.push(id.to_owned());
+                }
+                if let Some(name) = tc["function"]["name"].as_str().filter(|s| !s.is_empty()) {
+                    names.push(name.to_owned());
+                }
+                assembled.push_str(tc["function"]["arguments"].as_str().unwrap());
+            }
+        }
+        assert_eq!(
+            assembled, r#"{"command":"ls -la"}"#,
+            "arguments duplicated or lost on the wire: {text}"
+        );
+        assert_eq!(indexes, [0, 0, 0, 0], "one call must stay on one index");
+        assert_eq!(
+            ids,
+            ["call_cid_0"],
+            "the id must arrive once, on the frame that opens the call"
+        );
+        assert_eq!(names, ["run_bash"]);
+        assert!(
+            text.contains("\"finish_reason\":\"tool_calls\""),
+            "a dispatched call must finish as `tool_calls`: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn streaming_deadline_finishes_with_length() {
         let resp = streaming(
@@ -6484,5 +6906,243 @@ mod tests {
             w.has_activity(),
             "an interval of failures is not an idle one"
         );
+    }
+
+    // --- structured output (response_format) --------------------------------
+
+    /// Emits its pieces verbatim, so the structured-output tests control the exact bytes the
+    /// handler's fail-closed verification sees — including bytes a real grammar would refuse.
+    struct PiecesGen(&'static [&'static str]);
+
+    impl ChatGenerator for PiecesGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _progress: Option<infr_core::GenerationProgressCallback>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            for piece in self.0 {
+                on_delta(Delta::Content((*piece).into()));
+            }
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 4,
+                cached_prompt_tokens: 0,
+                completion_tokens: self.0.len() as u32,
+            })
+        }
+    }
+
+    /// The object/string schema every structured test below asks for.
+    fn structured_params() -> GenParams {
+        GenParams {
+            response_format: response_format::parse_response_format(
+                Some(&serde_json::json!({"type":"json_schema","json_schema":{
+                    "name":"answer",
+                    "schema":{"type":"object","properties":{"answer":{"type":"string"}},
+                              "required":["answer"],"additionalProperties":false}}})),
+                "response_format",
+            )
+            .unwrap(),
+            ..GenParams::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_non_streaming_returns_the_constrained_json() {
+        let resp = non_streaming(
+            deadline_entry(Arc::new(PiecesGen(&[r#"{"answer":"# , r#""ok"}"#]))),
+            user_msg(),
+            None,
+            None,
+            structured_params(),
+            test_ctx(None, false),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["choices"][0]["message"]["content"], r#"{"answer":"ok"}"#);
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// A backend that ignored the grammar (or a deadline-truncated decode) must be reported as a
+    /// failure, never as structured success. The message names the offending path.
+    #[tokio::test]
+    async fn structured_non_streaming_rejects_content_that_breaks_the_schema() {
+        let resp = non_streaming(
+            deadline_entry(Arc::new(PiecesGen(&[r#"{"answer":7}"#]))),
+            user_msg(),
+            None,
+            None,
+            structured_params(),
+            test_ctx(None, false),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("$.answer"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_streaming_deltas_concatenate_to_valid_json() {
+        let resp = streaming(
+            deadline_entry(Arc::new(PiecesGen(&[r#"{"ans"#, r#"wer":"#, r#""ok"}"#]))),
+            user_msg(),
+            None,
+            None,
+            structured_params(),
+            test_ctx(None, true),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let wire = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut content = String::new();
+        let mut finish = None;
+        for data in wire.lines().filter_map(|line| line.strip_prefix("data:")) {
+            let data = data.trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(data).unwrap();
+            if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
+                content.push_str(text);
+            }
+            if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
+                finish = Some(reason.to_string());
+            }
+        }
+        assert_eq!(content, r#"{"answer":"ok"}"#, "{wire}");
+        serde_json::from_str::<serde_json::Value>(&content).expect("stream must concatenate to JSON");
+        assert_eq!(finish.as_deref(), Some("stop"), "{wire}");
+    }
+
+    /// The stream already delivered the deltas; the failure is an ERROR frame, so the client cannot
+    /// mistake truncated JSON for a completed structured reply.
+    #[tokio::test]
+    async fn structured_streaming_failure_emits_an_error_frame_not_a_stop() {
+        let resp = streaming(
+            deadline_entry(Arc::new(PiecesGen(&[r#"{"answer":"#]))),
+            user_msg(),
+            None,
+            None,
+            structured_params(),
+            test_ctx(None, true),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let wire = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(wire.contains("\"error\""), "{wire}");
+        assert!(wire.contains("structured output"), "{wire}");
+        assert!(wire.trim_end().ends_with("data: [DONE]"), "{wire}");
+        assert!(!wire.contains("\"finish_reason\":\"stop\""), "{wire}");
+    }
+
+    /// Wire-level 400s: the schema subset gate runs before any generation, and the error names the
+    /// field the client sent (`response_format` for chat).
+    #[tokio::test]
+    async fn invalid_response_format_is_a_400_naming_the_parameter() {
+        for format in [
+            serde_json::json!({"type":"json_schema","json_schema":{"name":"x","schema":{"$ref":"#/x"}}}),
+            serde_json::json!({"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object","oneOf":[{"type":"object"}]}}}),
+            serde_json::json!({"type":"json_schema","json_schema":{"name":"x"}}),
+            serde_json::json!({"type":"yaml"}),
+        ] {
+            let body = serde_json::json!({"model":"alpha","messages":[{"role":"user","content":"hi"}],
+                "response_format":format});
+            let resp = multi_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{format}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["type"], "invalid_request_error", "{format}");
+            assert_eq!(v["error"]["param"], "response_format", "{format}");
+        }
+    }
+
+    /// Structured output demands the first token, so every feature that would consume or truncate
+    /// the prefix is rejected instead of silently producing (or cutting off) JSON.
+    #[tokio::test]
+    async fn structured_output_conflicts_are_400s_naming_response_format() {
+        let cases = [
+            serde_json::json!({"model":"alpha","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},
+                "tools":[{"type":"function","function":{"name":"bash"}}]}),
+            serde_json::json!({"model":"alpha","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},"stop":["END"]}),
+            serde_json::json!({"model":"alpha","messages":[{"role":"user","content":"hi"}],
+                "response_format":{"type":"json_object"},"reasoning_effort":"high"}),
+            serde_json::json!({"model":"alpha","messages":[{"role":"user","content":[
+                    {"type":"text","text":"hi"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],
+                "response_format":{"type":"json_object"}}),
+        ];
+        for body in cases {
+            let resp = multi_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let v = body_json(resp).await;
+            assert_eq!(v["error"]["param"], "response_format", "{body}");
+        }
+    }
+
+    /// The trade-off made explicit: a structured request turns thinking OFF (or refuses), because
+    /// the grammar is enforced from the first token. Plain text is untouched.
+    #[test]
+    fn structured_requests_pin_thinking_off_and_reject_an_explicit_contradiction() {
+        let structured =
+            req(r#"{"model":"m","messages":[],"response_format":{"type":"json_object"}}"#);
+        let params = GenParams::from_request(&structured).unwrap();
+        assert_eq!(
+            params.chat_template_options.enable_thinking,
+            Some(false),
+            "structured output must disable thinking instead of failing at token 0"
+        );
+
+        let explicit = req(
+            r#"{"model":"m","messages":[],"response_format":{"type":"json_object"},
+                "chat_template_kwargs":{"enable_thinking":true}}"#,
+        );
+        let error = GenParams::from_request(&explicit).unwrap_err();
+        assert_eq!(error.param, "response_format");
+        assert!(error.message.contains("thinking"), "{}", error.message);
+
+        for raw in [
+            r#"{"model":"m","messages":[]}"#,
+            r#"{"model":"m","messages":[],"response_format":{"type":"text"}}"#,
+        ] {
+            let params = GenParams::from_request(&req(raw)).unwrap();
+            assert_eq!(params.response_format, ResponseFormat::Text, "{raw}");
+            assert_eq!(
+                params.chat_template_options.enable_thinking, None,
+                "plain text must keep the client's choice: {raw}"
+            );
+        }
     }
 }

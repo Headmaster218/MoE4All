@@ -466,7 +466,13 @@ fn native_id_sg_choice(
     if dtype == Iq2Xs {
         return (in_f == 2560 && out_f == 640).then_some(8);
     }
-    if !matches!(dtype, Q6K | Q5K | Iq3S) {
+    // Q5_1 (UD-Q4_K_XL's 43/48 expert downs, 640x2560) fits this band and the same heavy-unpack
+    // rationale, but enrollment is A/B-gated: until the model-level decode A/B lands, the default
+    // keeps every Q5_1 bank on the tree id kernel.
+    if dtype == Q5_1 && !k.id_sg_q51 {
+        return None;
+    }
+    if !matches!(dtype, Q6K | Q5K | Iq3S | Q5_1) {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
@@ -563,7 +569,43 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
-pub(crate) fn q8_prefill_bm128_applies(
+/// Upper bound on a weight the narrow-f32 route will expand: 128 Ki elements = 512 KiB of f32
+/// scratch. Both Flash-Next narrow tensors fit (10240x4 and 2560x48); anything bigger loses more to
+/// the per-chunk expansion than the batched GEMV wins back.
+pub(crate) const NARROW_F32_MAX_ELEMS: usize = 1 << 17;
+
+/// Shape/dtype half of the narrow-output f32 route — pure so the adapter's dispatch site and
+/// `adapter_stages`' scratch reservation cannot drift. `out_f` has no 64-multiple, so NO tiled GEMM
+/// tile can serve the shape; the weight is small enough that expanding it to f32 once per chunk
+/// costs a few microseconds; and the dtype has a `weight_f32` expansion build.
+pub(crate) fn narrow_f32_gemm_eligible(
+    dtype: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    m > 16
+        && !out_f.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && in_f * out_f <= NARROW_F32_MAX_ELEMS
+        && crate::gemm::weight_f32_build_spv(dtype).is_some()
+}
+
+/// The BM128 (128x128 single-buffer A_GLOBAL) row tile: when to take it instead of the BM64
+/// `*_n128_ag` tile. `kernel-bench`'s `t128sb` sweep measured the tile at 52.9 → 72.3 TF
+/// (2048x4096x14336) and 53.4 → 63.0 (2048x4096x4096), but a LOSS at m=128 (4.9 vs 3.8 TF). The
+/// tile itself is format-agnostic, so this gate is dtype-generic: ANY native-dense format with a
+/// `_n128_ag_bm128` build qualifies (see `native_gemm_warp_n128_ag_bm128_kernel_name`).
+///
+/// `m % 128 == 0` is a CORRECTNESS bound, not a tuning one: the kernel stores whole BM-row C tiles
+/// into the caller's buffer, and `lin_a16` is only padded to 64 rows. A ragged chunk (the usual
+/// tail of a prompt) therefore keeps the BM64 tile.
+///
+/// The shape guards come from this tree's own BAAB record, which the `t128sb` microbenchmark did
+/// not cover: short-K and narrow-N shapes LOST with this tile at m>=1024 (k=512 n=2048, k=1024
+/// n=3072, k=640 n=2560, k=2560 n=640), and of the three Flash m=512 shapes only k=3072 kept its
+/// win. Those stay on BM64; nothing else is excluded.
+pub(crate) fn dense_bm128_applies(
     enabled: bool,
     measured: bool,
     default_ag: bool,
@@ -575,15 +617,12 @@ pub(crate) fn q8_prefill_bm128_applies(
     enabled
         && measured
         && default_ag
-        && dtype == infr_core::DType::Q8_0
-        && matches!(
-            (k, n, m),
-            (3072, 8192, 512)
-                | (8192, 3072, 1024)
-                | (3072, 12288, 512 | 1024)
-                | (2560, 10240, 1024)
-                | (2560, 12288, 1024)
-        )
+        && n.is_multiple_of(128)
+        && k.is_multiple_of(32)
+        && m.is_multiple_of(128)
+        && crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).is_some()
+        && ((m >= 1024 && k >= 2048 && n >= 1024)
+            || matches!((k, n, m), (3072, 8192, 512) | (3072, 12288, 512)))
 }
 
 fn kquant_packed_applies(
@@ -3094,9 +3133,70 @@ impl<'a> Recorder<'a> {
     /// variant routing (same env escapes) so parity comparisons land on the same kernel.
     /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
     /// tests call it directly with an explicit arena address.
+    /// Expand a narrow native weight into f32 scratch (`weight_f32.comp`): reads the weight from the
+    /// pager arena by 64-bit address and writes `elems` f32 values to `dst`. `filler` takes binding
+    /// 0 purely so the descriptor set is fully written (the weight itself is never bound — same
+    /// convention as [`Self::dequant_kv_f16`]); `dst` is tracked as an output, so the following
+    /// f32 GEMV's [`Self::linear_f32_tracked`] filler gets the RAW barrier.
+    pub fn dequant_weight_f32(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_off: usize,
+        filler: &dyn Buffer,
+        dst: &dyn Buffer,
+        elems: usize,
+    ) {
+        let (name, spv) = crate::gemm::weight_f32_build_spv(dtype)
+            .expect("weight_f32: dtype without an expansion build");
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(elems as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(w_off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(filler), Self::vkb(dst)],
+            1,
+            &push,
+            (elems as u32).div_ceil(64),
+        );
+    }
+
+    /// [`Self::linear_f32_at`] with the f32 weight's SOURCE scratch bound at descriptor slot 0 in
+    /// place of the `x` filler. The weight itself is read by 64-bit address, which the descriptor
+    /// hazard tracker cannot see; binding the buffer it lives in is what keeps the producing
+    /// `dequant_weight_f32` write ordered before this dispatch's pointer read.
+    pub fn linear_f32_tracked(
+        &self,
+        w_addr: u64,
+        w_track: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.linear_f32_inner(w_addr, Some(w_track), x, y, rows, in_f, out_f);
+    }
+
     pub fn linear_f32_at(
         &self,
         arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.linear_f32_inner(arena_addr, None, x, y, rows, in_f, out_f);
+    }
+
+    fn linear_f32_inner(
+        &self,
+        arena_addr: u64,
+        w_track: Option<&dyn Buffer>,
         x: &dyn Buffer,
         y: &dyn Buffer,
         rows: usize,
@@ -3146,7 +3246,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            &[Self::vkb(w_track.unwrap_or(x)), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
             groups,
@@ -3710,8 +3810,10 @@ impl<'a> Recorder<'a> {
                 64,
             )
         };
-        // All six tuples have M%128==0 and production splits==1. No padding or split policy change.
-        let (name, bn, bm) = if q8_prefill_bm128_applies(
+        // BM128 needs m%128==0 (whole-tile C stores into an m-row buffer, and `lin_a16` is only
+        // padded to 64 rows); `dense_bm128_applies` enforces it, so the padded-dst dance and the
+        // split policy are unchanged.
+        let (name, bn, bm) = if dense_bm128_applies(
             self.vk().q8_prefill_bm128,
             self.be.prefers_q8_prefill_bm128(),
             self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
@@ -3720,7 +3822,11 @@ impl<'a> Recorder<'a> {
             k,
             n,
         ) {
-            ("native_gemm_warp_q8_0_n128_ag_bm128", 128, 128)
+            (
+                crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).expect("bm128 name"),
+                128,
+                128,
+            )
         } else {
             (name, bn, bm)
         };
@@ -7312,13 +7418,20 @@ impl<'a> Recorder<'a> {
         let n_splits =
             flash_split_count(self.vk().flash_splits, base_wg, kv_len, prefer_deep_splits);
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        let kp = self.be.kernel_sg(
-            "attn_flash_warp_hd256_bm16",
-            crate::gemm::attn_flash_warp_hd256_bm16_spv(),
-            6,
-            32,
-            32,
-        );
+        // LLPC (amdvlk) faults on this kernel's FULLY-UNROLLED IR; the `-DNO_UNROLL` twin compiles
+        // and runs there, while conforming drivers keep the unrolled build. Same math either way.
+        let (hd256_name, hd256_spv) = if self.be.is_amd_proprietary_driver() {
+            (
+                "attn_flash_warp_hd256_bm16_nounroll",
+                crate::gemm::attn_flash_warp_hd256_bm16_nounroll_spv(),
+            )
+        } else {
+            (
+                "attn_flash_warp_hd256_bm16",
+                crate::gemm::attn_flash_warp_hd256_bm16_spv(),
+            )
+        };
+        let kp = self.be.kernel_sg(hd256_name, hd256_spv, 6, 32, 32);
         let mut pp = [0u8; 32];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -15628,14 +15741,16 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
-        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
-            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        if matches!(
+            dtype,
+            infr_core::DType::Iq2S | infr_core::DType::Iq3S | infr_core::DType::Iq3Xxs
+        ) && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
             let nr = self.be.paged_grid_buffer_nr();
-            let grid = if dtype == infr_core::DType::Iq2S {
-                &self.be.iq2s_grid
-            } else {
-                &self.be.iq3s_grid
+            let grid = match dtype {
+                infr_core::DType::Iq2S => &self.be.iq2s_grid,
+                infr_core::DType::Iq3Xxs => &self.be.iq3xxs_grid,
+                _ => &self.be.iq3s_grid,
             };
             if let Some(grid) = grid.as_ref() {
                 let build = crate::gemm::native_idm_grid_buffer_paged_spv(dtype, nr);
@@ -19995,6 +20110,13 @@ mod tests {
         }
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 1024, k), None);
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 8193, k), None);
+        // Q5_1 rides the same band but stays gated OFF by default (A/B switch `id_sg_q51`).
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, k), None);
+        let mut cfg_on = infr_core::config::Config::default();
+        cfg_on.kernels.vulkan.gemv.id_sg_q51 = true;
+        let kon = &cfg_on.kernels.vulkan.gemv;
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, kon), Some(2));
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 1024, kon), None);
     }
 
     /// #4 drift guard: the ONE unified [`moe_mmq_desc`] table must produce, for every dtype in

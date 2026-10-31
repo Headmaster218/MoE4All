@@ -12,6 +12,10 @@ use infr_core::tensor::DType;
 use super::{kv_row_elems, kv_side_bytes};
 
 /// Public runtime policy: persistent per-token state grows in 32K-token increments.
+/// This is the DEFAULT page size; `kv.paged_page_tokens` may narrow it to small
+/// power-of-two pages so frames become shareable/DMA-able units (the page size only
+/// feeds `SegmentedKvSpec::segment_elements`, which the kernels turn into a runtime
+/// shift, so geometry changes never touch shader code).
 pub(crate) const KV_GROW_ROWS: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,11 +36,14 @@ pub(crate) struct PlaneLayout {
     /// Number of model tokens represented by one row. Ordinary K/V and QSA-raw rows use one;
     /// QSA block keys use the layer's compression ratio.
     pub(crate) tokens_per_row: usize,
+    /// Model tokens covered by one physical segment (page). Power of two, and a multiple of
+    /// `tokens_per_row` so `rows_per_segment` stays integral.
+    pub(crate) page_tokens: usize,
 }
 
 impl PlaneLayout {
     pub(crate) fn rows_per_segment(self) -> usize {
-        KV_GROW_ROWS / self.tokens_per_row
+        self.page_tokens / self.tokens_per_row
     }
 
     pub(crate) fn segment_bytes(self) -> usize {
@@ -59,7 +66,7 @@ impl PlaneLayout {
             logical_bytes: kv_side_bytes(self.dtype, self.logical_elements(max_ctx)),
             segment_bytes: self.segment_bytes(),
             segment_elements,
-            max_segments: max_ctx.div_ceil(KV_GROW_ROWS),
+            max_segments: max_ctx.div_ceil(self.page_tokens),
         }
     }
 }
@@ -69,21 +76,30 @@ impl PlaneLayout {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SegmentedKvLayout {
     pub(crate) max_ctx: usize,
+    /// Tokens per physical segment shared by every plane (see `PlaneLayout::page_tokens`).
+    pub(crate) page_tokens: usize,
     pub(crate) planes: Vec<PlaneLayout>,
 }
 
 impl SegmentedKvLayout {
     /// Build the layout used by the first implementation target: Qwen3.5/3.6 hybrid attention and
     /// Qwen3.8 full-attention/QSA layers. Other architectures keep their existing static cache.
+    /// `page_tokens` is the physical segment size: `KV_GROW_ROWS` keeps the legacy 32K growth
+    /// step; small power-of-two values (e.g. 64) enable per-page frame sharing.
     pub(crate) fn for_qwen(
         cfg: &Config,
         max_ctx: usize,
         k_fmt: DType,
         v_fmt: DType,
+        page_tokens: usize,
     ) -> Option<Self> {
         if !(cfg.qwen35 || cfg.qwen4exp) {
             return None;
         }
+        assert!(
+            page_tokens.is_power_of_two(),
+            "KV page size must be a power of two (segment addressing uses a shift): got {page_tokens}"
+        );
         let mut planes = Vec::new();
         for layer in 0..cfg.n_layer {
             if cfg.is_recurrent_layer(layer) {
@@ -97,6 +113,7 @@ impl SegmentedKvLayout {
                     dtype: k_fmt,
                     row_elems: k_row,
                     tokens_per_row: 1,
+                    page_tokens,
                 });
             }
             if v_row != 0 {
@@ -106,6 +123,7 @@ impl SegmentedKvLayout {
                     dtype: v_fmt,
                     row_elems: v_row,
                     tokens_per_row: 1,
+                    page_tokens,
                 });
             }
             if cfg.qwen4exp && cfg.is_qwen_hybrid_attn_layer(layer) {
@@ -115,28 +133,38 @@ impl SegmentedKvLayout {
                     dtype: DType::F16,
                     row_elems: cfg.indexer_head_size,
                     tokens_per_row: 1,
+                    page_tokens,
                 });
                 let ratio = cfg.layer_compress_ratio(layer).max(1);
-                debug_assert!(KV_GROW_ROWS.is_multiple_of(ratio));
+                assert!(
+                    page_tokens >= ratio && page_tokens.is_multiple_of(ratio),
+                    "KV page size {page_tokens} must cover and divide evenly by the QSA \
+                     compression ratio {ratio} at layer {layer}"
+                );
                 planes.push(PlaneLayout {
                     layer,
                     kind: PlaneKind::QsaBlock,
                     dtype: DType::F32,
                     row_elems: cfg.indexer_head_size,
                     tokens_per_row: ratio,
+                    page_tokens,
                 });
             }
         }
-        Some(Self { max_ctx, planes })
+        Some(Self {
+            max_ctx,
+            page_tokens,
+            planes,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn max_segments(&self) -> usize {
-        self.max_ctx.div_ceil(KV_GROW_ROWS)
+        self.max_ctx.div_ceil(self.page_tokens)
     }
 
     pub(crate) fn segments_for_tokens(&self, tokens: usize) -> usize {
-        tokens.min(self.max_ctx).div_ceil(KV_GROW_ROWS)
+        tokens.min(self.max_ctx).div_ceil(self.page_tokens)
     }
 
     pub(crate) fn committed_bytes(&self, tokens: usize) -> u64 {
@@ -187,7 +215,8 @@ mod tests {
     #[test]
     fn depth_crosses_exactly_one_32k_boundary() {
         let layout =
-            SegmentedKvLayout::for_qwen(&qwen38(), 262_144, DType::Q8_0, DType::Q8_0).unwrap();
+            SegmentedKvLayout::for_qwen(&qwen38(), 262_144, DType::Q8_0, DType::Q8_0, KV_GROW_ROWS)
+                .unwrap();
         assert_eq!(layout.max_segments(), 8);
         assert_eq!(layout.segments_for_tokens(0), 0);
         assert_eq!(layout.segments_for_tokens(KV_GROW_ROWS - 1), 1);
@@ -200,9 +229,54 @@ mod tests {
     }
 
     #[test]
+    fn paged_64_token_geometry_keeps_shift_addressing_and_linear_growth() {
+        let layout =
+            SegmentedKvLayout::for_qwen(&qwen38(), 262_144, DType::Q8_0, DType::Q8_0, 64).unwrap();
+        assert_eq!(layout.max_segments(), 4096);
+        assert_eq!(layout.segments_for_tokens(63), 1);
+        assert_eq!(layout.segments_for_tokens(64), 1);
+        assert_eq!(layout.segments_for_tokens(65), 2);
+        // Every plane segment stays a power of two so the kernels' runtime shift still works.
+        assert!(layout
+            .planes
+            .iter()
+            .all(|plane| plane.segment_elements().is_power_of_two()));
+        // QSA block rows = page / compression ratio (64 / 4 = 16 rows).
+        assert!(layout
+            .planes
+            .iter()
+            .filter(|plane| plane.kind == PlaneKind::QsaBlock)
+            .all(|plane| plane.rows_per_segment() == 16));
+        // committed bytes scale linearly with the page count.
+        assert_eq!(layout.committed_bytes(128), 2 * layout.committed_bytes(64));
+        // A full-depth paged commit equals a full-depth 32K commit: same total bytes,
+        // just spread over 512x more (smaller) segments.
+        let legacy =
+            SegmentedKvLayout::for_qwen(&qwen38(), 262_144, DType::Q8_0, DType::Q8_0, KV_GROW_ROWS)
+                .unwrap();
+        assert_eq!(
+            layout.committed_bytes(262_144),
+            legacy.committed_bytes(262_144)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn non_power_of_two_page_is_rejected() {
+        SegmentedKvLayout::for_qwen(&qwen38(), 4096, DType::Q8_0, DType::Q8_0, 100).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "compression ratio")]
+    fn page_smaller_than_qsa_ratio_is_rejected() {
+        SegmentedKvLayout::for_qwen(&qwen38(), 4096, DType::Q8_0, DType::Q8_0, 2).unwrap();
+    }
+
+    #[test]
     fn qwen38_layout_contains_only_twelve_attention_layers() {
         let layout =
-            SegmentedKvLayout::for_qwen(&qwen38(), 262_144, DType::Q8_0, DType::Q8_0).unwrap();
+            SegmentedKvLayout::for_qwen(&qwen38(), 262_144, DType::Q8_0, DType::Q8_0, KV_GROW_ROWS)
+                .unwrap();
         assert_eq!(layout.planes.len(), 12 * 4);
         assert_eq!(
             layout
@@ -222,7 +296,9 @@ mod tests {
     #[test]
     fn q8_segment_bytes_use_a_local_quant_scale_plane() {
         let cfg = qwen38();
-        let layout = SegmentedKvLayout::for_qwen(&cfg, 262_144, DType::Q8_0, DType::Q8_0).unwrap();
+        let layout =
+            SegmentedKvLayout::for_qwen(&cfg, 262_144, DType::Q8_0, DType::Q8_0, KV_GROW_ROWS)
+                .unwrap();
         let k = layout
             .planes
             .iter()
@@ -240,7 +316,8 @@ mod tests {
     fn fully_committed_qwen38_planes_equal_the_existing_static_geometry() {
         let cfg = qwen38();
         let ctx = 262_144;
-        let layout = SegmentedKvLayout::for_qwen(&cfg, ctx, DType::Q8_0, DType::Q8_0).unwrap();
+        let layout =
+            SegmentedKvLayout::for_qwen(&cfg, ctx, DType::Q8_0, DType::Q8_0, KV_GROW_ROWS).unwrap();
         let static_bytes: u64 = (0..cfg.n_layer)
             .filter(|&layer| !cfg.is_recurrent_layer(layer))
             .map(|layer| {

@@ -104,6 +104,26 @@ cfg_struct! {
         /// weight cache. Unset keeps automatic sizing with system headroom; zero disables the
         /// host cache. Percentages resolve against total physical host RAM.
         ram_budget: Option<SizeSpec> = None,
+        /// `INFR_MEM_GUARD_HEADROOM`: commit-charge circuit-breaker water line. When the system's
+        /// remaining commit headroom (Windows `ullAvailPageFile`, which WDDM device memory also
+        /// charges) drops below this, the process exits with code 87 instead of sliding into a
+        /// paging storm or a driver AV — the 2026-10-19 gray-zone-prefill miss storm grew host
+        /// staging to ~145 GiB through thousands of small allocations no downstream budget caught.
+        /// The default guards hard commit exhaustion only; miss-storm TESTING wants a much taller
+        /// line (e.g. `50%` of RAM) so the trip lands before RAM itself runs out. Zero disables.
+        mem_guard_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(
+            crate::memguard::DEFAULT_HEADROOM_BYTES,
+        )),
+        /// `INFR_MEM_GUARD_RAM_HEADROOM`: the breaker's PHYSICAL-RAM water line — the sensitive
+        /// axis on big-budget boxes, where a healthy boot legitimately keeps only ~46 GiB of
+        /// commit headroom while the active working set (not commit) is what overruns RAM into a
+        /// paging storm. Trips when available physical RAM drops below this. The default guards
+        /// imminent death only; miss-storm TESTING wants a taller line (e.g. 8-16 GiB) that lands
+        /// before the storm starts. Zero disables this axis.
+        mem_guard_ram_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(4u64 << 30)),
+        /// `INFR_MEM_GUARD_POLL_MS`: breaker poll interval; inline checks at the staging floodgates
+        /// cover the ramps between polls.
+        mem_guard_poll_ms: u64 = 500,
         /// `INFR_VRAM_RESERVE`: additional device memory kept outside the backend's allocation
         /// budget, on top of the Vulkan allocator's built-in safety guard. Percentages resolve
         /// against total device-local memory.
@@ -207,11 +227,47 @@ cfg_struct! {
         session_cache_max: SizeSpec = SizeSpec::Bytes(5u64 << 30),
         /// Remove cold sessions older than this many hours while opening/maintaining the cache.
         session_cache_ttl_hours: u64 = 24,
+        /// `INFR_KV_RAM_CACHE_MAX`: byte ceiling of the host-RAM radix-tree prefix cache that
+        /// holds idle conversation KV (SGLang-style two-tier: VRAM slots over a RAM snapshot
+        /// pool, never written to disk). Percentages resolve against total physical RAM, like
+        /// `device.ram_budget`. `None`/zero keeps the established behavior; when set it takes
+        /// precedence over `session_cache_dir` (the disk tier stays closed).
+        ram_cache_max: Option<SizeSpec> = None,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
         /// Lazily commit supported Qwen KV caches in 32K-token increments. Backends/models without
         /// segmented addressing retain their existing flat allocation.
         dynamic: bool = true,
+        /// `INFR_KV_PAGED`: run the paged radix prefix tree on the VRAM frame corridor ALONE. The
+        /// tree has always implied a host-RAM frame pool because `kv.paged_cache_max` was both
+        /// switches at once; this splits them, so a corridor-only tree keeps zero host RAM frames
+        /// and cold chains evict instead of sinking. `kv.paged_cache_max` stays the pool budget and
+        /// still turns the tree on by itself, so every existing configuration resolves unchanged.
+        paged: bool = false,
+        /// `INFR_KV_PAGED_PAGE_TOKENS`: tokens per physical KV segment (page). The segmented
+        /// machinery addresses planes through a runtime device table, so the page size is pure
+        /// geometry — 32768 (default) reproduces the legacy 32K growth step byte-for-byte, while
+        /// small power-of-two pages (e.g. 64) are the prerequisite for SGLang-style frame sharing
+        /// and DMA tiering. Must be a power of two and a multiple of every layer's QSA
+        /// compression ratio.
+        paged_page_tokens: usize = 32 * 1024,
+        /// `INFR_KV_PAGED_CACHE_MAX`: byte ceiling of the host-RAM frame pool backing the paged
+        /// KV cache (VRAM frames + RAM frames form one logical address space; evicted prefixes
+        /// stay resident in RAM instead of being dropped). Percentages resolve against total
+        /// physical RAM, like `device.ram_budget`. `None`/zero disables the RAM tier; only
+        /// meaningful together with small [`KvCfg::paged_page_tokens`].
+        paged_cache_max: Option<SizeSpec> = None,
+        /// `INFR_KV_DISK_CACHE_MAX`: byte ceiling of the disk frame tier behind the paged KV
+        /// cache's RAM tier (Phase D). When the RAM pool runs dry, the coldest all-RAM chains
+        /// sink to one sparse backing file (`slot * frame_bytes` addressing, grown lazily to the
+        /// high-water mark) instead of being evicted; a hit reads them back through RAM.
+        /// Percentages resolve against total physical RAM like the other budgets. `None`/zero
+        /// keeps the two-tier (VRAM+RAM) behavior. Only meaningful with [`KvCfg::paged_cache_max`].
+        disk_cache_max: Option<SizeSpec> = None,
+        /// `INFR_KV_DISK_CACHE_PATH`: backing file for the paged KV disk tier. `None` = a
+        /// per-process file under the system temp dir. The file is process-scoped bookkeeping:
+        /// it is NOT restored across restarts (content-addressed reuse stays out of scope).
+        disk_cache_path: Option<PathBuf> = None,
         /// `INFR_KV_INLINE`.
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.
@@ -317,11 +373,16 @@ cfg_struct! {
         sg_nr: u32 = 2,
         /// `INFR_GEMV_ID_GRID_NR`: output rows handled per 64-thread paged IQ id-GEMV workgroup.
         id_grid_nr: u32 = 8,
-        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S workgroup. None selects the
+        /// Output rows per immutable-codebook paged IQ2_S/IQ3_S/IQ3_XXS workgroup. None selects the
         /// measured device policy; Some(1/2/4/8) is an explicit A/B override.
         id_grid_buffer_nr: Option<u32> = None,
-        /// Immutable IQ codebooks. None selects measured Windows/RDNA3 Decode shapes only.
+        /// Immutable IQ codebooks (IQ2_S/IQ3_S/IQ3_XXS). None selects measured Windows/RDNA3 Decode
+        /// shapes only (the Qwen3.8-Flash-Next GSQ mixed-quant banks hit 2560x640 gate/up).
         id_grid_buffer: Option<bool> = None,
+        /// A/B gate for enrolling Q5_1 expert-down banks (the UD-Q4_K_XL Qwen3.8-Flash-Next stores
+        /// 43 of 48 downs as Q5_1 at the 640x2560 SG band shape) into the subgroup id-GEMV. False
+        /// keeps the tree id kernel until the model A/B lands. `--set kernels.vulkan.gemv.id_sg_q51`.
+        id_sg_q51: bool = false,
         /// Bit-identical Wave32 large-K Q8_0 Decode GEMV. None selects measured Windows/RDNA3
         /// Decode shapes only; Some(false/true) is an explicit A/B override.
         q8_wave32: Option<bool> = None,
@@ -542,6 +603,16 @@ cfg_struct! {
         flash_dequant: bool = false,
         /// `INFR_NO_FLASH_WARP` (inverted).
         flash_warp: bool = true,
+        /// `INFR_AMDVLK_HD256_FLASH` — feature switch, default OFF: on AMD's proprietary driver
+        /// (amdvlk/LLPC), hd256 prefill takes the coopmat `nonfa` tier (`attn_qk`/`softmax`/
+        /// `attn_pv`) for every geometry that is not a 128-row-aligned, tail-safe register-O
+        /// chunk. The fused `attn_flash_warp_hd256_bm16` build used to crash LLPC inside
+        /// `vkCreateComputePipelines` (`amdvlk64.dll+0x2b65705`) whenever its fully-unrolled IR was
+        /// compiled; `attn_flash_warp_hd256.comp` no longer forces `[[unroll]]`, so the same kernel
+        /// compiles and runs (verified on 26.10.1, +10-24% pp on Qwen3.6-35B). ON by default now;
+        /// `INFR_AMDVLK_HD256_FLASH=0` (or `--set …=false`) restores the old coopmat non-FA tier for
+        /// a driver that still faults.
+        amdvlk_hd256_flash: bool = true,
         /// `INFR_NO_NC_FA` (inverted).
         nc_fa: bool = true,
         /// `INFR_NO_QK_WARP` (inverted).
@@ -602,9 +673,16 @@ cfg_struct! {
         iq4_pair_lut: bool = true,
         /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
         kquant_packed_decode: bool = true,
-        /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
-        /// The original BM64 path remains the per-feature fallback.
+        /// BM128 (128x128 single-buffer) Prefill warptile on measured Windows RX 7900 XTX.
+        /// Every native-dense format with a `_n128_ag_bm128` build takes it at m>=1024 with
+        /// whole 128-row tiles and wide k/n; short-k/narrow-n shapes and the m=512 Flash tuples
+        /// that regressed keep the BM64 tile. See `dense_bm128_applies`.
         q8_prefill_bm128: bool = true,
+        /// Expand a narrow-output (n not a multiple of 64, so no tiled GEMM tile exists) native
+        /// Prefill weight to f32 and contract it with the batched f32r GEMV instead of the native
+        /// per-row GEMV. The expansion is exact (Q8_0/BF16 decode fits f32); the weights it covers
+        /// are <= 512 KiB. See `narrow_f32_gemv_applies`.
+        narrow_f32_gemv: bool = true,
         /// Exact chronological QSA Top-K collection on measured devices.
         qsa_topk_ordered: bool = true,
         /// Reuse probability fragments in measured hd256 Prefill register-O kernels.
@@ -875,6 +953,12 @@ cfg_struct! {
         /// boundary the target verification cost exceeds the saved decode work on the reference
         /// RDNA3 configuration. Zero disables this automatic cutoff.
         mtp_max_context: usize = 49152,
+        /// Rolling draft acceptance (`accepted / drafted`) below which the Qwen3.8 MTP path steps
+        /// aside for the NEXT request and uses ordinary decode. A VERIFY cycle costs several plain
+        /// steps, so drafting only pays above roughly one accepted token per cycle; a head that
+        /// accepts 0.4 of its drafts makes the server measurably slower (measured 29 vs 46 tok/s
+        /// on a 7900 XTX with the shared Q4_K_M head). `0` disables the breaker.
+        mtp_min_alpha: f32 = 0.9,
         /// Let two active Qwen3.8 lanes probe batched MTP VERIFY. Disabled by default because the
         /// ordinary batched path is faster and does not need to maintain detached side state.
         mtp_concurrent: bool = false,
@@ -1151,6 +1235,26 @@ cfg_struct! {
         /// `INFR_EMBEDDING_RUNNER`: optional llama-server executable used by the managed embedding
         /// worker. Unset lets the embedding adapter discover a compatible runner.
         embedding_runner: Option<PathBuf> = None,
+        /// `INFR_RESPONSE_STORE_ENTRIES`: LRU bound on server-side `/v1/responses` state
+        /// (`previous_response_id` chains and `conversation` cursors). `0` (the default) keeps
+        /// the stateless contract — those fields are rejected with a 400 exactly as before.
+        ///
+        /// When ON, a chained request replays the stored message history and appends the new
+        /// turn, so the rebuilt prompt shares the previous turn's exact token prefix; the paged
+        /// KV radix tree (`best_match`) then hits that prefix on its own. The store holds DTOs
+        /// only — no KV is pinned here, eviction of cached KV pages is unaffected.
+        response_store_entries: u32 = 0,
+        /// `INFR_RESPONSE_STORE_PATH`: file that mirrors the `/v1/responses` store, so
+        /// `previous_response_id`/`conversation` chains survive a restart. Unset (the default)
+        /// keeps the store in memory only — the privacy-preserving default, since the file holds
+        /// every stored prompt and response in the clear.
+        ///
+        /// Ignored when `response_store_entries` is 0 (the stateless contract has nothing to
+        /// mirror). Loaded once at startup — a missing file starts fresh, an unreadable or
+        /// unparsable one refuses to start rather than silently dropping the history — and
+        /// rewritten (write-to-temp, then rename) after every turn that changes the store, so the
+        /// I/O cost follows the total size of the retained turns.
+        response_store_path: Option<PathBuf> = None,
     }
 }
 
