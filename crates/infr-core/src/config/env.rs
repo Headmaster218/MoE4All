@@ -401,6 +401,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.spec.mtp_ple_overlap = presence_inv(get, "INFR_NO_MTP_PLE_OVERLAP");
     p.spec.draft = opt_path(get, "INFR_SPEC_DRAFT");
     p.spec.k = num(get, "INFR_SPEC_K");
+    p.spec.mtp_min_alpha = num(get, "INFR_SPEC_MTP_MIN_ALPHA");
     p.spec.debug = presence(get, "INFR_SPEC_DEBUG");
     p.spec.decode_chain = num(get, "INFR_DECODE_CHAIN");
     p.spec.gpu_draft_prob = presence_inv(get, "INFR_NO_GPU_DRAFT_PROB");

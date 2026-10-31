@@ -1838,6 +1838,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SPEC_DEBUG",
         "INFR_SPEC_DRAFT",
         "INFR_SPEC_K",
+        "INFR_SPEC_MTP_MIN_ALPHA",
         "INFR_TENSOR_PARALLEL",
         "INFR_TP_HOST",
         "INFR_UBATCH",

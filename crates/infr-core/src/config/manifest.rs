@@ -318,6 +318,7 @@ knobs! {
     "INFR_NO_MTP_PLE_OVERLAP" => "spec.mtp_ple_overlap", PresenceInv, Ignored, "1",         migrated;
     "INFR_SPEC_DRAFT"         => "spec.draft",           Path,        Ignored, "/tmp/d.gguf", migrated;
     "INFR_SPEC_K"             => "spec.k",               Int,         Ignored, "4",         migrated;
+    "INFR_SPEC_MTP_MIN_ALPHA" => "spec.mtp_min_alpha",   Float,       Ignored, "0.9",       migrated;
     "INFR_SPEC_DEBUG"         => "spec.debug",           Presence,    Ignored, "1",         migrated;
     "INFR_DECODE_CHAIN"       => "spec.decode_chain",    Int,         Ignored, "4",         migrated;
     "INFR_NO_GPU_DRAFT_PROB"  => "spec.gpu_draft_prob",  PresenceInv, Ignored, "1",         migrated;

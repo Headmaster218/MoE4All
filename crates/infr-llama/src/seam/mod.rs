@@ -1725,13 +1725,12 @@ fn first_successful_moe_ubatch<T, E>(
 /// the top of the unified arena (`ModelMemoryPlan::runtime_elastic`, ~1.5 GiB per 1024 rows on
 /// Qwen3.8-Flash-Next) and the expert cache is whatever remains, so this constant is the knob that
 /// decides how much VRAM the experts get. Two independent measurements put the knee here:
-///   - `kernel-bench --sweep-m` (Vulkan coopmat, the model's two MoE shapes): 640x2560 peaks at
-///     m=4096 (52.9 TF) and 2560x1280 keeps climbing only to 8192 (48.9 -> 54.1 TF), so there is
-///     nothing to win far past one warp-tile row block.
-///   - Qwen3.8-Flash-Next (48 layers, 512 experts top-10, 4.27 bpw) pp30000 on the 7900 XTX with
-///     `kv.paged=true`, ctx 30016: ub 2048 = 1110.9 t/s, 4096 = 1591.3, 5120 = 1712.2, 6144 =
-///     1728.4 (+0.9%). 5120 is the tallest rung that still holds all FOUR prefill lanes; 6144 drops
-///     to 3 lanes and pays 1.5 GiB of expert cache for that last 0.9%.
+/// RDNA3 measurements put the knee here. `kernel-bench --sweep-m` (Vulkan coopmat, the model's two
+/// MoE shapes) peaks at m=4096 (640x2560, 52.9 TF) and 2560x1280 keeps climbing only to 8192
+/// (48.9 -> 54.1 TF). Qwen3.8-Flash-Next (48 layers, 512 experts top-10, 4.27 bpw) pp30000 on the
+/// 7900 XTX with `kv.paged=true`, ctx 30016: ub 2048 = 1110.9 t/s, 4096 = 1591.3, 5120 = 1712.2,
+/// 6144 = 1728.4 (+0.9%). 5120 is the tallest rung that still holds all FOUR prefill lanes; 6144
+/// drops to 3 lanes and pays 1.5 GiB of expert cache for that last 0.9%.
 /// A GPU too small for 5120's reserve loses nothing: the plan's placement sweep starts at this
 /// height and walks [`ubatch_fallbacks_below`] down until the expert cache clears the prefill floor,
 /// so aiming high costs one CPU-side plan recomputation.
