@@ -18,6 +18,7 @@ infr-engine.workspace = true
 infr-embedding.workspace = true
 infr-vision.workspace = true
 infr-server.workspace = true
+infr-audio = { path = "../infr-audio" }
 infr-llama = { path = "../infr-llama" }
 clap.workspace = true
 clap_complete.workspace = true

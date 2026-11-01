@@ -11,6 +11,7 @@ mod benchmark_hardware;
 mod diagnostics;
 mod submission;
 mod submission_validation;
+mod transcription;
 
 #[derive(Parser)]
 #[command(
@@ -522,7 +523,10 @@ enum Cmd {
     },
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
-        model: String,
+        /// Chat model; omit for an audio-only server with --transcription-model.
+        model: Option<String>,
+        #[command(flatten)]
+        transcription: transcription::ServeOptions,
         /// Optional Qwen3.8 vision projector GGUF. Image parts are accepted through the OpenAI
         /// chat API as data URIs or base64 strings; projector weights are request-scoped.
         #[arg(long, value_name = "PATH")]
@@ -566,6 +570,12 @@ enum Cmd {
         /// Sampling flags are the SERVER DEFAULTS — a per-request OpenAI field still overrides them.
         #[command(flatten)]
         sampling: SamplingOpts,
+    },
+    /// Transcribe a WAV file with a native GGUF audio model on CPU.
+    Transcribe {
+        model: String,
+        #[command(flatten)]
+        options: transcription::FileOptions,
     },
     /// Start a native embedding-only OpenAI-compatible HTTP API (GGUF, CPU or Vulkan).
     ServeEmbedding {
@@ -855,9 +865,10 @@ fn combined_log_writer() -> CombinedLogWriter {
 fn command_model(cmd: &Cmd) -> Option<&str> {
     match cmd {
         Cmd::Run { model, .. }
-        | Cmd::Serve { model, .. }
+        | Cmd::Transcribe { model, .. }
         | Cmd::ServeEmbedding { model, .. }
         | Cmd::Bench { model, .. } => Some(model),
+        Cmd::Serve { model, .. } => model.as_deref(),
         _ => None,
     }
 }
@@ -872,6 +883,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::TestPlanPrompt { .. } => "test-plan-prompt",
         Cmd::Run { .. } => "run",
         Cmd::Serve { .. } => "serve",
+        Cmd::Transcribe { .. } => "transcribe",
         Cmd::ServeEmbedding { .. } => "serve-embedding",
         Cmd::Multi { .. } => "multi",
         Cmd::Bench { .. } => "bench",
@@ -1486,6 +1498,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             layer.sampling.seed = Some(Some(0x1_6e37));
         }
         Cmd::Pull { .. }
+        | Cmd::Transcribe { .. }
         | Cmd::Devices
         | Cmd::Report { .. }
         | Cmd::Submission { .. }
@@ -1523,6 +1536,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         ),
         Cmd::Serve {
             model,
+            transcription,
             mmproj,
             embedding_model,
             embedding_idle_timeout,
@@ -1531,7 +1545,8 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             parallel,
             ..
         } => cmd_serve(
-            &model,
+            model.as_deref(),
+            &transcription,
             mmproj.as_deref(),
             embedding_model.as_deref(),
             embedding_idle_timeout,
@@ -1541,6 +1556,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             cfg,
             specified,
         ),
+        Cmd::Transcribe { model, options } => transcription::transcribe(&model, options, cfg),
         Cmd::ServeEmbedding {
             model,
             embedding_runner,
@@ -6935,7 +6951,8 @@ fn apply_model_sampling_defaults(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_serve(
-    model: &str,
+    model: Option<&str>,
+    transcription: &transcription::ServeOptions,
     mmproj: Option<&Path>,
     embedding_model: Option<&str>,
     embedding_idle_timeout: u64,
@@ -6945,6 +6962,22 @@ fn cmd_serve(
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
+    let audio = transcription.load(cfg)?;
+    let Some(model) = model else {
+        anyhow::ensure!(
+            mmproj.is_none() && embedding_model.is_none() && embedding_runner.is_none(),
+            "audio-only serve cannot use chat vision or embedding flags"
+        );
+        let transcriber =
+            audio.context("serve requires a chat model or --transcription-model <GGUF>")?;
+        let sockaddr = addr.parse().context("invalid --addr")?;
+        let state = transcription.attach(
+            infr_server::AppState::transcription(transcriber, cfg.clone()),
+            None,
+        );
+        diagnostics::mark_runtime();
+        return tokio::runtime::Runtime::new()?.block_on(infr_server::serve_state(state, sockaddr));
+    };
     let (gguf, tok) = resolve(model, cfg)?;
     let model_id = gguf
         .file_stem()
@@ -7065,25 +7098,12 @@ fn cmd_serve(
             if n_slots == 1 { "" } else { "s" },
             if mmproj.is_some() { ", vision" } else { "" },
         );
-        return match embedding {
-            Some((embedding_id, embedding)) => rt.block_on(infr_server::serve_with_embedding(
-                generator,
-                model_id,
-                n_slots,
-                embedding,
-                embedding_id,
-                1,
-                sockaddr,
-                cfg.clone(),
-            )),
-            None => rt.block_on(infr_server::serve(
-                generator,
-                model_id,
-                sockaddr,
-                n_slots,
-                cfg.clone(),
-            )),
-        };
+        let mut state = infr_server::AppState::new(generator, model_id, n_slots, cfg.clone());
+        if let Some((embedding_id, embedding)) = embedding {
+            state = state.with_embedding(embedding, embedding_id, 1);
+        }
+        let state = transcription.attach(state, audio);
+        return rt.block_on(infr_server::serve_state(state, sockaddr));
     }
 
     // ── the SERIALISED path: CPU / Metal / diffusion-gemma ────────────────────────────
@@ -7121,25 +7141,12 @@ fn cmd_serve(
         diagnostics::mark_runtime();
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
-        match embedding {
-            Some((embedding_id, embedding)) => rt.block_on(infr_server::serve_with_embedding(
-                generator,
-                model_id,
-                1,
-                embedding,
-                embedding_id,
-                1,
-                sockaddr,
-                cfg.clone(),
-            )),
-            None => rt.block_on(infr_server::serve(
-                generator,
-                model_id,
-                sockaddr,
-                1,
-                cfg.clone(),
-            )),
+        let mut state = infr_server::AppState::new(generator, model_id, 1, cfg.clone());
+        if let Some((embedding_id, embedding)) = embedding {
+            state = state.with_embedding(embedding, embedding_id, 1);
         }
+        let state = transcription.attach(state, audio);
+        rt.block_on(infr_server::serve_state(state, sockaddr))
     }
 }
 
@@ -8482,7 +8489,7 @@ mod tests {
         else {
             panic!("expected serve command");
         };
-        assert_eq!(model, "chat.gguf");
+        assert_eq!(model.as_deref(), Some("chat.gguf"));
         assert_eq!(mmproj.as_deref(), Some(Path::new("vision.gguf")));
         assert_eq!(embedding_model.as_deref(), Some("embed.gguf"));
         assert_eq!(embedding_idle_timeout, 45);

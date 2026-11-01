@@ -10,6 +10,7 @@ members = [
     "crates/infr-chat",
     "crates/infr-engine",
     "crates/infr-embedding",
+    "crates/infr-audio",
     "crates/infr-server",
     "crates/infr-llama",
     "crates/infr-cli",
@@ -36,6 +37,7 @@ infr-cpu = { path = "crates/infr-cpu" }
 infr-chat = { path = "crates/infr-chat" }
 infr-engine = { path = "crates/infr-engine" }
 infr-embedding = { path = "crates/infr-embedding" }
+infr-audio = { path = "crates/infr-audio" }
 infr-server = { path = "crates/infr-server" }
 infr-prof = { path = "crates/infr-prof" }
 infr-prof-rt = { path = "crates/infr-prof-rt" }

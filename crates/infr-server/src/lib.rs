@@ -1,4 +1,4 @@
-//! OpenAI-compatible HTTP server (axum + SSE). Talks only to `infr-engine` — never the GPU.
+//! OpenAI-compatible HTTP server (axum + SSE), over engine/audio traits — never the GPU.
 //!
 //! Reference for the wire mapping (streaming, `reasoning_content`, tool_calls): the working
 //! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/plan.md "server".
@@ -9,6 +9,7 @@
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
 //!   POST /v1/responses          -> stateless Responses JSON | typed SSE stream         (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
+//!   POST /v1/audio/transcriptions -> native WAV transcription JSON/text or segment SSE (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
@@ -54,6 +55,7 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
 mod responses;
+mod transcription;
 
 #[cfg(test)]
 mod image_input_tests;
@@ -2081,6 +2083,8 @@ pub struct AppState {
     /// Independently routed embedding models. Their semaphores and engines do not share chat KV
     /// slots; future unified memory policy coordinates the resources below this API boundary.
     embeddings: Arc<Vec<EmbeddingEntry>>,
+    transcription: Option<transcription::Entry>,
+    transcription_upload_dir: Option<std::path::PathBuf>,
     /// The resolved process configuration (S7). The handler reads `serve.api_key` and
     /// `serve.max_tokens_cap` off it instead of the environment; it is an EXPLICIT constructor
     /// parameter on every entry point that can host a real model, so an embedder cannot silently
@@ -2117,6 +2121,8 @@ impl AppState {
             embeddings,
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2145,6 +2151,8 @@ impl AppState {
             embeddings,
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2160,6 +2168,8 @@ impl AppState {
             embeddings,
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2220,6 +2230,8 @@ impl AppState {
             embeddings,
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2232,6 +2244,30 @@ impl AppState {
                 .unwrap_or(default)
                 .clone(),
         )
+    }
+
+    /// Attach an independently scheduled transcription capability. Native model load/unload
+    /// remains inside infr-audio; the transport owns only admission and request lifetime.
+    pub fn with_transcription(mut self, transcriber: Arc<dyn infr_audio::Transcriber>) -> Self {
+        self.transcription = Some(transcription::Entry::new(transcriber));
+        self
+    }
+
+    /// Controlled upload directory; defaults to <executable directory>/data/audio-upload.
+    pub fn with_transcription_upload_dir(
+        mut self,
+        directory: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.transcription_upload_dir = Some(directory.into());
+        self
+    }
+
+    /// Audio-only server state, with no placeholder chat model advertised by /v1/models.
+    pub fn transcription(transcriber: Arc<dyn infr_audio::Transcriber>, cfg: Arc<Config>) -> Self {
+        let mut state = Self::headless("", cfg);
+        state.models = Arc::new(Vec::new());
+        state.dashboard = Arc::new(ActivityDashboard::new(&state.models, &state.embeddings));
+        state.with_transcription(transcriber)
     }
 }
 
@@ -2248,6 +2284,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses", post(responses::handler))
         .route("/v1/embeddings", post(embeddings_handler))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
+        // Merge after the chat body limit so audio's 128 MiB cap stays route-local.
+        .merge(transcription::router())
         .with_state(state)
 }
 
@@ -2319,8 +2357,9 @@ pub async fn serve_with_embedding(
 
 /// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
 /// place the listener, the graceful-shutdown latch, and `axum::serve` live.
-async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
-    let n_models = state.models.len() + state.embeddings.len();
+pub async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
+    let n_models =
+        state.models.len() + state.embeddings.len() + usize::from(state.transcription.is_some());
     // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
     // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
     // server ends, no task is left ticking.
@@ -2403,6 +2442,15 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
         {
             data.push(ModelCard {
                 id: model.id.to_string(),
+                object: "model",
+                owned_by: "local",
+            });
+        }
+    }
+    if let Some(audio) = &state.transcription {
+        if !data.iter().any(|card| card.id == audio.transcriber.model_id()) {
+            data.push(ModelCard {
+                id: audio.transcriber.model_id().to_owned(),
                 object: "model",
                 owned_by: "local",
             });
