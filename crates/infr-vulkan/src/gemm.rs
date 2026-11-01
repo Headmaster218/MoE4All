@@ -10,6 +10,29 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, VulkanBackend};
 
+/// Exact widening builds used by the measured narrow projection policy.
+pub(crate) fn weight_f32_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match dtype {
+        infr_core::DType::Q8_0 => variant!("weight_f32_q8_0"),
+        infr_core::DType::Bf16 => variant!("weight_f32_bf16"),
+        _ => None,
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
     bytes

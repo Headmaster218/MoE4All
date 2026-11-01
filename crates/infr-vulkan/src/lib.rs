@@ -22,6 +22,7 @@ mod host_ready_combined_test_support;
 pub(crate) mod indirect_copy;
 pub mod linear;
 mod matmul;
+mod narrow_projection;
 mod ops;
 pub mod p2p;
 pub mod pager;
@@ -736,6 +737,7 @@ struct VulkanShared {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     exact_silu_quant_order: bool,
+    narrow_f32_device: bool,
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
@@ -5334,6 +5336,12 @@ impl VulkanBackend {
                 exact_silu_quant_order: device_probe.driver_id_reported
                     && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY
                     && props.driver_version == 8_389_003,
+                narrow_f32_device: crate::narrow_projection::device_eligible(
+                    &device_probe,
+                    device_arch,
+                    has_bda,
+                    cfg!(target_os = "windows"),
+                ),
                 device,
                 queue,
                 queue_family_index,

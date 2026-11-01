@@ -35,6 +35,9 @@ mod deferred_prepare_tests;
 #[cfg(test)]
 #[path = "adapter_dense_mmq_fallback_tests.rs"]
 mod dense_mmq_fallback_tests;
+#[cfg(test)]
+#[path = "adapter_narrow_projection_tests.rs"]
+mod narrow_projection_tests;
 #[path = "adapter_verify_pair.rs"]
 mod pair_admission;
 #[path = "adapter_pure_mapped_coalesce.rs"]
@@ -2283,6 +2286,29 @@ fn paged_phase_scratch_requests(
     graph: &Graph,
 ) -> Result<Vec<(&'static str, usize)>> {
     let mut maxima = HashMap::<&'static str, usize>::new();
+    // Include Prefill and dense-streamed plans, not only complete Decode workspaces.
+    for op in &graph.ops {
+        if let Op::Linear {
+            weight,
+            m,
+            in_f,
+            out_f,
+            w_off,
+            ..
+        } = op
+        {
+            if let Some(bytes) = narrow_projection_scratch(
+                be_,
+                graph.desc(*weight).dtype,
+                *m as usize,
+                *in_f as usize,
+                *out_f as usize,
+                *w_off as usize,
+            ) {
+                record_scratch_max(&mut maxima, "lin_w32", bytes);
+            }
+        }
+    }
     for (tag, bytes) in paged_qsa_scratch_requests(graph)?
         .into_iter()
         .chain(qsa_workspace::requests(
@@ -4032,6 +4058,14 @@ fn lower_op(
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
                                    without offset-capable kernels"));
                 }
+                if let Some(bytes) = narrow_projection_scratch(be_, dt, m, in_f, out_f, w_off) {
+                    // The streaming seam has already emitted arena RAW/WAR barriers.
+                    let key = pooled(pool, be_, "lin_w32", bytes)?;
+                    let expanded = pool[&key].as_ref();
+                    rec.dequant_weight_f32(dt, arena_addr, w_off, xb, expanded, in_f * out_f);
+                    rec.linear_f32_tracked(expanded, xb, y, m, in_f, out_f);
+                    return Ok(());
+                }
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
                     // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
                     // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
@@ -4807,6 +4841,16 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
+                } else if let Some(bytes) =
+                    narrow_projection_scratch(be_, dt, m, in_f, out_f, w_off)
+                {
+                    let addr = w
+                        .device_addr()
+                        .ok_or_else(|| be("narrow projection requires BDA"))?;
+                    let key = pooled(pool, be_, "lin_w32", bytes)?;
+                    let expanded = pool[&key].as_ref();
+                    rec.dequant_weight_f32(dt, addr, w_off, w, expanded, in_f * out_f);
+                    rec.linear_f32_tracked(expanded, xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
@@ -17802,6 +17846,30 @@ fn sync_stream_inner<'a>(
         infr_core::pager_profile::record_paging_sync_wait(elapsed);
     }
     Ok(())
+}
+
+/// Shared admission for scratch planning and both native Linear fallbacks.
+fn narrow_projection_scratch(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    w_off: usize,
+) -> Option<usize> {
+    let bytes = crate::narrow_projection::scratch_bytes(
+        &be_.cfg().kernels.vulkan,
+        be_.shared.narrow_f32_device,
+        dt,
+        m,
+        in_f,
+        out_f,
+        w_off,
+    )?;
+    // Only the unified activation arena guarantees addressable scratch. Ordinary
+    // standalone activation allocations deliberately lack BDA; keep their native
+    // GEMV route instead of changing the allocator's device/storage contract.
+    be_.unified_vram().map(|_| bytes)
 }
 
 /// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed

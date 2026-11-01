@@ -1348,6 +1348,9 @@ fn main() {
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
+        // Narrow projection: exact native-weight widening into bounded F32 scratch.
+        ("weight_f32", "weight_f32_q8_0", &["-DFMT_Q8_0"]),
+        ("weight_f32", "weight_f32_bf16", &["-DFMT_BF16"]),
         // Quantize a KV row into the Q8_0 cache. f32 source (V) + f16 source (un-fused roped K),
         // each with a record-once (pos from params) variant.
         ("store_q8", "store_q8", &[]),

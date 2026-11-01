@@ -189,6 +189,7 @@ knobs! {
 
     // ── kernels.vulkan — GEMM / GEMV tiers (§6.5) ────────────────────────────
     "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_NARROW_F32_GEMV" => "kernels.vulkan.narrow_f32_gemv", PresenceInv, Ignored, "1", migrated;
     "INFR_GEMM_WIDE_TILE"   => "kernels.vulkan.gemm_wide_tile", Presence,    Ignored, "1",  migrated;
     "INFR_GEMM_DIRECT_A"    => "kernels.vulkan.gemm_direct_a",  Presence,    Ignored, "1",  migrated;
     "INFR_NO_SMALL_BM"      => "kernels.vulkan.small_bm",       PresenceInv, Ignored, "1",  migrated;

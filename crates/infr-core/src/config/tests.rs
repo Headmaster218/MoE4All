@@ -22,6 +22,25 @@ fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
 }
 
 #[test]
+fn narrow_f32_gemv_default_and_presence_inverted_fallback() {
+    assert!(Config::default().kernels.vulkan.narrow_f32_gemv);
+    for value in ["", "0", "1"] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_NO_NARROW_F32_GEMV", value)])]);
+        assert!(!cfg.kernels.vulkan.narrow_f32_gemv);
+    }
+    let mut layer = PartialConfig::default();
+    layer
+        .set_path("kernels.vulkan.narrow_f32_gemv", "false")
+        .unwrap();
+    assert!(
+        !Config::load_from_layers(&[layer])
+            .kernels
+            .vulkan
+            .narrow_f32_gemv
+    );
+}
+
+#[test]
 fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
     assert!(Config::default().device.decode_prepare_ahead);
     let mut layer = PartialConfig::default();
@@ -2038,6 +2057,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// they were born reading `Config` (`docs/config-plan.md` R3), so they are `migrated` from
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
+        "INFR_NO_NARROW_F32_GEMV",
         "INFR_RAM_BUDGET",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",

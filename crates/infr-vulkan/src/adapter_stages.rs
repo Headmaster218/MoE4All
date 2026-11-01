@@ -200,6 +200,7 @@ fn linear_scratch_requests(
             m,
             in_f,
             out_f,
+            w_off,
             ..
         } = op
         else {
@@ -207,6 +208,10 @@ fn linear_scratch_requests(
         };
         let (m, k, n) = (*m as usize, *in_f as usize, *out_f as usize);
         let dt = graph.desc(*weight).dtype;
+        if let Some(bytes) = narrow_projection_scratch(be_, dt, m, k, n, *w_off as usize) {
+            record_scratch_max(requests, "lin_w32", bytes);
+            continue;
+        }
         if m == 0 || k == 0 || n == 0 || k % 32 != 0 {
             continue;
         }

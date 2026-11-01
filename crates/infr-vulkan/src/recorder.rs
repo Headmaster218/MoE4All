@@ -3128,6 +3128,35 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        self.linear_f32_inner(arena_addr, None, x, y, rows, in_f, out_f);
+    }
+
+    /// Track the BDA weight read so expansion writes and scratch reuse are ordered.
+    pub(crate) fn linear_f32_tracked(
+        &self,
+        weight: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let addr = weight
+            .device_addr()
+            .expect("narrow F32 scratch requires BDA");
+        self.linear_f32_inner(addr, Some(weight), x, y, rows, in_f, out_f);
+    }
+
+    fn linear_f32_inner(
+        &self,
+        arena_addr: u64,
+        weight_track: Option<&dyn Buffer>,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
         let use_mrow = rows > 1 && self.vk().f32_mrow;
         let use_v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
@@ -3171,10 +3200,42 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            &[
+                Self::vkb(weight_track.unwrap_or(x)),
+                Self::vkb(x),
+                Self::vkb(y),
+            ],
             1,
             &push,
             groups,
+        );
+    }
+
+    /// Widen a bounded native slice. For resident weights binding 0 tracks the
+    /// source; streamed callers use their existing arena RAW/WAR barriers.
+    pub(crate) fn dequant_weight_f32(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_off: usize,
+        source_track: &dyn Buffer,
+        dst: &dyn Buffer,
+        elems: usize,
+    ) {
+        let (name, spv) = crate::gemm::weight_f32_build_spv(dtype)
+            .expect("narrow F32 policy requires a widening build");
+        let kernel = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(elems as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(w_off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(source_track), Self::vkb(dst)],
+            1,
+            &push,
+            (elems as u32).div_ceil(64),
         );
     }
 

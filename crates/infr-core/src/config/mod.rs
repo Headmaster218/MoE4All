@@ -365,6 +365,9 @@ cfg_struct! {
 
         /// `INFR_NO_GEMM_WARP` (inverted).
         gemm_warp: bool = true,
+        /// `INFR_NO_NARROW_F32_GEMV` (inverted). Expand measured Q8_0/BF16 narrow
+        /// projections once per chunk, then use batched F32 GEMV on qualified Navi31.
+        narrow_f32_gemv: bool = true,
         /// `INFR_GEMM_WIDE_TILE`.
         gemm_wide_tile: bool = false,
         /// `INFR_GEMM_DIRECT_A` — fuse the store_f16 pass into the A_GLOBAL warp GEMM by

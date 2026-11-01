@@ -245,6 +245,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.i8_dot = presence_inv(get, "INFR_NO_I8DOT");
 
     v.gemm_warp = presence_inv(get, "INFR_NO_GEMM_WARP");
+    v.narrow_f32_gemv = presence_inv(get, "INFR_NO_NARROW_F32_GEMV");
     v.gemm_wide_tile = presence(get, "INFR_GEMM_WIDE_TILE");
     v.gemm_direct_a = presence(get, "INFR_GEMM_DIRECT_A");
     v.small_bm = presence_inv(get, "INFR_NO_SMALL_BM");
