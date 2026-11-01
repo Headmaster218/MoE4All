@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Extends the original Q8 Graph/Recorder contract to large Q8 and Q6_K projections.
 //! Mounted under the existing contract module to share its guard/offset fixtures.
 use super::*;

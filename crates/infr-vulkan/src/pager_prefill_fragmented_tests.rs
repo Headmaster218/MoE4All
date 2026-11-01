@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Whole-expert span payloads and standalone cross-shard PAGED Q8_0 correctness.
 //!
 //! The cross-shard fixtures do not install their pool into the backend or construct a model
