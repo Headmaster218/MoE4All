@@ -53,6 +53,8 @@ waveform or whole-recording attention matrix is allocated. Streaming uses a
 bounded response channel and does not accumulate the full transcript. JSON/text
 responses necessarily retain their returned text. Acoustic boundaries can split
 speech; this implementation has no separate VAD or cross-chunk decoder history.
+Exact digital-silence chunks bypass acoustic inference and emit empty text with
+their original timing; quiet nonzero audio is processed normally.
 
 `stream=true` returns SSE `transcription.text.delta` events containing each
 completed chunk and its audio start/end, then `transcription.done`. Those are

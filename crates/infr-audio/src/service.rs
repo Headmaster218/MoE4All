@@ -277,13 +277,21 @@ impl Transcriber for NativeTranscriber {
                     if cancel.load(Ordering::Acquire) {
                         bail!("transcription cancelled");
                     }
-                    let features = model.prepare_audio(&segment.samples, segment.sample_rate)?;
-                    let piece = model.infer_cancellable(
-                        &features,
-                        &options.language,
-                        options.use_itn,
-                        cancel,
-                    )?;
+                    // Exact digital silence contains no acoustic information. Avoid CTC
+                    // hallucinations on silent chunks without an energy threshold that
+                    // could suppress quiet speech. Keep its timing/event below.
+                    let piece = if segment.samples.iter().all(|&sample| sample == 0.0) {
+                        String::new()
+                    } else {
+                        let features =
+                            model.prepare_audio(&segment.samples, segment.sample_rate)?;
+                        model.infer_cancellable(
+                            &features,
+                            &options.language,
+                            options.use_itn,
+                            cancel,
+                        )?
+                    };
                     ensure!(!cancel.load(Ordering::Acquire), "transcription cancelled");
                     duration = segment.start_seconds
                         + segment.samples.len() as f64 / segment.sample_rate as f64;

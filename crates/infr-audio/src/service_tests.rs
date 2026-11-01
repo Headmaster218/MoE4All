@@ -132,6 +132,41 @@ fn run(service: &NativeTranscriber, path: &Path, collect: bool) -> Result<Transc
 }
 
 #[test]
+fn exact_silence_preserves_segments_and_timing_without_suppressing_quiet_audio() {
+    let fixture = Fixture::new();
+    let (backend, factory, _, _) = factories(false);
+    let service = NativeTranscriber::with_factories(fixture.config(), backend, factory).unwrap();
+    let mut bytes = std::fs::read(&fixture.wav).unwrap();
+    bytes[44..].fill(0);
+    std::fs::write(&fixture.wav, &bytes).unwrap();
+    let mut events = Vec::new();
+    let result = service
+        .transcribe_file(
+            &fixture.wav,
+            &Default::default(),
+            &AtomicBool::new(false),
+            &mut |segment| {
+                events.push(segment);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(result.text.is_empty());
+    assert_eq!(result.duration, 0.1);
+    assert_eq!(events.len(), 3);
+    assert!(events.iter().all(|event| event.text.is_empty()));
+    assert_eq!(events[0].start, 0.0);
+    assert_eq!(events[0].end, events[1].start);
+    assert_eq!(events[1].end, events[2].start);
+    assert_eq!(events[2].end, result.duration);
+    // One PCM16 LSB must still reach the model. No approximate silence policy.
+    bytes[44] = 1;
+    std::fs::write(&fixture.wav, bytes).unwrap();
+    assert_eq!(run(&service, &fixture.wav, true).unwrap().text, "test");
+    assert_eq!(service.resource_snapshot().active_requests, 0);
+}
+
+#[test]
 fn lazy_reuse_release_reload_and_streaming_collection() {
     let fixture = Fixture::new();
     let (backend, factory, loaded, live) = factories(false);
