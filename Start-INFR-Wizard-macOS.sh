@@ -580,6 +580,7 @@ defaults() {
         [server_addr]=127.0.0.1:8080 [server_parallel]=1 [server_auth]=false [server_session_cache]=false
         [session_cache_dir]="$ROOT/kv-sessions" [session_idle_secs]=120 [session_cache_max]=5GiB [session_cache_ttl_hours]=24
         [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
+        [server_transcription]=false [transcription_model]='' [transcription_threads]=4 [transcription_idle_timeout]=300 [transcription_upload_dir]="$CONFIG_DIR/audio-uploads"
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
         [bench_kind]=manual [bench_parallel]=1 [manual_bench_kind]=decode [prompt_tokens]=6144 [gen_tokens]=512 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
         [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [benchmark_upload_gh_auth]=true [error_upload]=false [submission_browser_action]=later [submission_failure_action]=later [submission_pending_retry]=true
@@ -802,7 +803,7 @@ absolute() {
     [[ $value == /* ]] || value="$ROOT/$value"
     REPLY=${value:A}
 }
-CATALOG_IDS=(qwen35-balanced flashnext-427)
+CATALOG_IDS=(qwen35-balanced flashnext-427 sensevoice-small-q8)
 catalog_load() {
     CATALOG_ID=$1 CATALOG_KIND='' CATALOG_NAME='' CATALOG_INFO='' CATALOG_PRIMARY='' CATALOG_COUNT=0
     case $1 in
@@ -822,6 +823,10 @@ catalog_load() {
             CATALOG_KIND=embedding; CATALOG_NAME='Qwen3-Embedding 0.6B Q8_0'
             CATALOG_INFO='https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/blob/main/Qwen3-Embedding-0.6B-Q8_0.gguf'
             CATALOG_PRIMARY='Qwen3-Embedding-0.6B-Q8_0/Qwen3-Embedding-0.6B-Q8_0.gguf'; CATALOG_COUNT=1 ;;
+        sensevoice-small-q8)
+            CATALOG_KIND=audio; CATALOG_NAME='SenseVoice Small Q8_0（约 278 MiB / about 278 MiB）'
+            CATALOG_INFO='https://huggingface.co/lovemefan/sense-voice-gguf/blob/main/sense-voice-small-q8_0.gguf'
+            CATALOG_PRIMARY='SenseVoice-Small-Q8_0/sense-voice-small-q8_0.gguf'; CATALOG_COUNT=1 ;;
         *) fail "Unknown recommended download: $1"; return 1 ;;
     esac
 }
@@ -843,6 +848,9 @@ catalog_file() {
         qwen3-embedding-06b-q8)
             DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
             DOWNLOAD_URL='https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' ;;
+        sensevoice-small-q8)
+            DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
+            DOWNLOAD_URL='https://huggingface.co/lovemefan/sense-voice-gguf/resolve/main/sense-voice-small-q8_0.gguf?download=true' ;;
     esac
 }
 recommendations() {
@@ -913,7 +921,7 @@ download_menu() {
         done
         printf ' [A] 全部 / All\n [B] 返回 / Back\n选择一个或多个编号，用逗号分隔 / Select one or more numbers, comma-separated: '
         IFS= read -r raw || { fail '下载选择已取消：输入已结束。Download selection cancelled: input ended.'; return 1; }; trim "$raw"; raw=$REPLY
-        case ${raw:l} in b|back) return 0 ;; a|all) selected=(0 1 2 3) ;; *)
+        case ${raw:l} in b|back) return 0 ;; a|all) selected=(); for ((i=0;i<${#CATALOG_IDS[@]};i++)); do selected+=("$i"); done ;; *)
             raw=${raw//,/ }; raw=${raw//;/ }; selected=(); seen=(); valid=true
             for token in $raw; do
                 if ! valid_uint "$token" 1 "${#CATALOG_IDS[@]}"; then valid=false; break; fi
@@ -971,12 +979,14 @@ model_path() {
         for ((i=0;i<${#nearby[@]};i++)); do printf ' [%d] %s\n' "$((i+1))" "${nearby[i]}"; done
         printf ' [D] 下载模型或组件 / Download models or components\n [R] 显示官方下载链接 / Show official download links\n [N] 输入新路径 / Enter a new path\n'
         value=$saved; [[ -n $value || ${#nearby[@]} == 0 ]] || value=1
-        [[ -n $value || ${#nearby[@]} != 0 ]] || value=D
+        # Audio downloads require an explicit D; Enter must not download a model.
+        [[ -n $value || ${#nearby[@]} != 0 || $kind == audio ]] || value=D
         prompt '选择模型、命令或 GGUF 路径 / Select a model, command, or GGUF path' "$value" true; value=$REPLY
         if [[ ${value:l} == d || ${value:l} == download ]]; then
             case $kind in
                 vision) download_bundle flashnext-vision || continue ;;
                 embedding) download_bundle qwen3-embedding-06b-q8 || continue ;;
+                audio) download_bundle sensevoice-small-q8 || continue ;;
                 *) download_menu || continue ;;
             esac
             CANDIDATES=("${nearby[@]}"); catalog_candidates "$kind"; nearby=("${CANDIDATES[@]}")
@@ -996,6 +1006,34 @@ model_path() {
         if [[ $kind == llm ]] && hub_reference "$value"; then S[$key]=$value; return; fi
         printf '未找到 GGUF 文件。GGUF file not found.\n'
     done
+}
+
+configure_transcription() {
+    [[ ${S[launch_mode]} == serve ]] || return 0
+    ask_yes server_transcription '可选：同时提供本地语音转录 API？/ Also serve the optional local transcription API?'
+    [[ ${S[server_transcription]} == true ]] || return 0
+    printf '%s\n' 'CPU 原生 infr，仅需 GGUF；无需 Python、ffmpeg、ORT 或 ggml runtime。/ Native infr on CPU needs only GGUF; no Python, ffmpeg, ORT or ggml runtime.' \
+        '首版支持 WAV/PCM；不支持全格式或真正逐 token 流式。/ First release: WAV/PCM; no all-format support or true token-by-token streaming.'
+    model_path audio transcription_model
+    integer transcription_threads '语音 CPU 线程数 / Transcription CPU threads' 1 256
+    integer transcription_idle_timeout '语音空闲释放秒数，0 为服务期间常驻 / Transcription idle eviction seconds, 0 keeps resident'
+    ask transcription_upload_dir '语音上传目录 / Transcription upload directory' true
+}
+add_transcription_arguments() {
+    [[ ${S[launch_mode]} == serve && ${S[server_transcription]} == true ]] || return 0
+    local upload_dir="${S[transcription_upload_dir]}"
+    if [[ $upload_dir == \"*\" || $upload_dir == \'*\' ]]; then upload_dir=${upload_dir:1:${#upload_dir}-2}; fi
+    absolute "${S[transcription_model]}"; S[transcription_model]=$REPLY
+    [[ -f $REPLY && ${REPLY:l} == *.gguf ]] || { fail '未找到语音 GGUF 文件。Transcription GGUF file not found.'; return 1; }
+    valid_uint "${S[transcription_threads]}" 1 256 && valid_uint "${S[transcription_idle_timeout]}" 0 && [[ -n $upload_dir ]] || { fail '语音参数无效。Invalid transcription settings.'; return 1; }
+    absolute "$upload_dir"; S[transcription_upload_dir]=$REPLY
+    add_arg --transcription-model transcription_model; COMMAND+=(--transcription-dev cpu)
+    add_arg --transcription-threads transcription_threads; add_arg --transcription-idle-timeout transcription_idle_timeout
+    add_arg --transcription-upload-dir transcription_upload_dir
+}
+show_transcription_api() {
+    [[ ${S[launch_mode]} == serve && ${S[server_transcription]} == true ]] || return 0
+    printf '本地语音转录 API / Local transcription API: /v1/audio/transcriptions (WAV/PCM, CPU)\n'
 }
 
 remember_model() {
@@ -1644,7 +1682,8 @@ configure() {
     if [[ ${S[launch_mode]} == serve ]]; then
         S[server_vision]=false; S[vision_projector]=''
         S[server_embedding]=false; S[embedding_model]=''
-        printf '实验性 Metal 包目前只支持文本生成；视觉与 Embedding 仍需 Vulkan。\nThe experimental Metal package currently serves text generation only; Vision and Embedding require Vulkan.\n'
+        printf '实验性 Metal 包的 GPU 目前只支持文本生成；视觉与 Embedding 仍需 Vulkan。\nThe experimental Metal GPU currently serves text generation only; Vision and Embedding require Vulkan.\n'
+        configure_transcription
     fi
     choose_device
     choice setup_mode '配置方式 / Configuration' 'conservative|自动配置：保守（推荐）/ Automatic: conservative (recommended)' 'aggressive|自动配置：激进性能 / Automatic: aggressive performance' 'manual|全手动配置 / Fully manual configuration'
@@ -1802,6 +1841,7 @@ build_command() {
         if [[ ${S[server_session_cache]} == true ]] && ! serial_mtp; then
             for key in session_cache_dir session_idle_secs session_cache_max session_cache_ttl_hours; do setting "kv.$key" "${S[$key]}"; done
         else setting kv.session_cache_dir ''; fi
+        add_transcription_arguments || return 1
     fi
     COMMAND+=("${S[model]}")
 }
@@ -2155,6 +2195,7 @@ main() {
     build_command
     if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then retry_pending_submissions; fi
     printf '\n最终命令 / Final command\n  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
+    show_transcription_api
     if [[ ${S[launch_mode]} == serve && -z $api_key ]] && ! loopback "${S[server_addr]}"; then
         printf '警告：当前网络监听地址未启用 API key 鉴权。Warning: network listen address without API-key authentication.\n' >&2
         if [[ $DRY_RUN == false && $HEADLESS == false ]]; then

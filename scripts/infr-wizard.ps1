@@ -668,11 +668,22 @@ function Get-RecommendedModelCatalog {
                 RelativePath = 'Qwen3-Embedding-0.6B-Q8_0\Qwen3-Embedding-0.6B-Q8_0.gguf'
             })
         }
+        [pscustomobject]@{
+            Id = 'sensevoice-small-q8'
+            Kind = 'audio'
+            Name = 'SenseVoice Small Q8_0（约 278 MiB / about 278 MiB）'
+            InfoUrl = 'https://huggingface.co/lovemefan/sense-voice-gguf/blob/main/sense-voice-small-q8_0.gguf'
+            Primary = 'SenseVoice-Small-Q8_0\sense-voice-small-q8_0.gguf'
+            Files = @([pscustomobject]@{
+                Url = 'https://huggingface.co/lovemefan/sense-voice-gguf/resolve/main/sense-voice-small-q8_0.gguf?download=true'
+                RelativePath = 'SenseVoice-Small-Q8_0\sense-voice-small-q8_0.gguf'
+            })
+        }
     )
 }
 
 function Show-RecommendedModelDownloads {
-    param([ValidateSet('all', 'llm', 'vision', 'embedding')][string]$Kind = 'all')
+    param([ValidateSet('all', 'llm', 'vision', 'embedding', 'audio')][string]$Kind = 'all')
 
     Write-Host "`n官方推荐的模型 / Official recommended models" -ForegroundColor Cyan
     foreach ($download in @(Get-RecommendedModelCatalog)) {
@@ -2208,6 +2219,71 @@ function Select-EmbeddingModelPath {
     }
 }
 
+function Select-TranscriptionModelPath {
+    param([AllowEmptyString()][string]$Default = '')
+
+    if (-not $Default) { Show-RecommendedModelDownloads -Kind 'audio' }
+    while ($true) {
+        $inputPath = Read-TextValue -Label '语音 GGUF 文件或目录，D 自动下载，R 查看推荐 / Audio GGUF file or directory, D to download, R for recommendations' -Default $Default -Required
+        if ($inputPath -match '^(d|download|下载)$') {
+            try { return Invoke-RecommendedModelDownload -Id 'sensevoice-small-q8' } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow; continue }
+        }
+        if ($inputPath -match '^(r|recommended|推荐)$') { Show-RecommendedModelDownloads -Kind 'audio'; continue }
+        try {
+            $path = ConvertTo-FullPath $inputPath
+            if (Test-Path -LiteralPath $path -PathType Container) {
+                $models = @(Get-ChildItem -LiteralPath $path -File | Where-Object { $_.Extension -ieq '.gguf' })
+                if ($models.Count -ne 1) { throw '请输入准确的 GGUF 文件路径。Enter the exact GGUF file path.' }
+                $path = $models[0].FullName
+            }
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or [IO.Path]::GetExtension($path) -ine '.gguf') {
+                throw '未找到 GGUF 文件。GGUF file not found.'
+            }
+            return $path
+        } catch { Write-Host $_.Exception.Message -ForegroundColor Yellow; $Default = '' }
+    }
+}
+
+function Get-TranscriptionSettings {
+    # Do not cast a saved string "false" to [bool]: PowerShell treats it as true.
+    return [pscustomobject]@{
+        Enabled = ([string](Get-SavedValue 'server_transcription' $false) -ieq 'true')
+        Model = [string](Get-SavedValue 'transcription_model' '')
+        Threads = [string](Get-SavedValue 'transcription_threads' '4')
+        IdleTimeout = [string](Get-SavedValue 'transcription_idle_timeout' '300')
+        UploadDir = [string](Get-SavedValue 'transcription_upload_dir' (Join-Path $dataDir 'audio-uploads'))
+    }
+}
+
+function Read-TranscriptionSettings {
+    param($Settings)
+    $Settings.Enabled = Read-YesNo -Label '可选：同时提供本地语音转录 API？/ Also serve the optional local transcription API?' -Default $Settings.Enabled
+    if (-not $Settings.Enabled) { return }
+    Write-Host 'CPU 原生 infr，仅需 GGUF；无需 Python、ffmpeg、ORT 或 ggml runtime。/ Native infr on CPU needs only GGUF; no Python, ffmpeg, ORT or ggml runtime.' -ForegroundColor DarkGray
+    Write-Host '首版支持 WAV/PCM；不支持全格式或真正逐 token 流式。/ First release: WAV/PCM; no all-format support or true token-by-token streaming.' -ForegroundColor DarkGray
+    $Settings.Model = Select-TranscriptionModelPath -Default $Settings.Model
+    $Settings.Threads = Read-IntegerValue -Label '语音 CPU 线程数 / Transcription CPU threads' -Default $Settings.Threads -Minimum 1 -Maximum 256
+    $Settings.IdleTimeout = Read-IntegerValue -Label '语音空闲释放秒数，0 为服务期间常驻 / Transcription idle eviction seconds, 0 keeps resident' -Default $Settings.IdleTimeout -Minimum 0 -Maximum 999999999
+    $Settings.UploadDir = ConvertTo-FullPath (Read-TextValue -Label '语音上传目录 / Transcription upload directory' -Default $Settings.UploadDir -Required)
+}
+
+function Add-TranscriptionArguments {
+    param([System.Collections.Generic.List[string]]$Arguments, $Settings)
+    if (-not $Settings.Enabled) { return }
+    $path = ConvertTo-FullPath $Settings.Model
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or [IO.Path]::GetExtension($path) -ine '.gguf') {
+        throw '未找到语音 GGUF 文件。Transcription GGUF file not found.'
+    }
+    $threadCount = 0; $idleSeconds = 0
+    if (-not [int]::TryParse($Settings.Threads, [ref]$threadCount) -or $threadCount -lt 1 -or $threadCount -gt 256 -or
+        -not [int]::TryParse($Settings.IdleTimeout, [ref]$idleSeconds) -or $idleSeconds -lt 0 -or $idleSeconds -gt 999999999 -or
+        [string]::IsNullOrWhiteSpace($Settings.UploadDir)) { throw '语音参数无效。Invalid transcription settings.' }
+    $Settings.Model = $path
+    $Settings.UploadDir = ConvertTo-FullPath $Settings.UploadDir
+    foreach ($value in @('--transcription-model', $path, '--transcription-dev', 'cpu', '--transcription-threads', [string]$threadCount,
+        '--transcription-idle-timeout', [string]$idleSeconds, '--transcription-upload-dir', $Settings.UploadDir)) { [void]$Arguments.Add($value) }
+}
+
 function Find-VisionProjectorPath {
     param([Parameter(Mandatory = $true)][string]$ModelPath)
 
@@ -2829,6 +2905,7 @@ $visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
 $serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
+$transcription = Get-TranscriptionSettings
 
 $configureThinking = [bool](Get-SavedValue 'configure_thinking' ($thinkMode -ne 'default' -or $reasoningEffort -ne 'default'))
 $cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
@@ -2873,6 +2950,7 @@ if (-not $reuseSavedSettings) {
             $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
             $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
         }
+        Read-TranscriptionSettings -Settings $transcription
     }
 
     $device = Read-ComputeDevice -Default $device
@@ -3264,6 +3342,7 @@ if ($launchMode -eq 'server') {
         [void]$nativeArgs.Add('--embedding-model'); [void]$nativeArgs.Add($embeddingModelPath)
         [void]$nativeArgs.Add('--embedding-idle-timeout'); [void]$nativeArgs.Add($embeddingIdleTimeout)
     }
+    Add-TranscriptionArguments -Arguments $nativeArgs -Settings $transcription
 }
 [void]$nativeArgs.Add($modelPath)
 
@@ -3308,6 +3387,9 @@ $state = [ordered]@{
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
+    server_transcription = $transcription.Enabled; transcription_model = $transcription.Model
+    transcription_threads = $transcription.Threads; transcription_idle_timeout = $transcription.IdleTimeout
+    transcription_upload_dir = $transcription.UploadDir
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }
@@ -3339,6 +3421,9 @@ if ($launchMode -eq 'server') {
     Write-Host 'For OpenAI clients, use the /v1 address above as the Base URL.' -ForegroundColor DarkGray
     if ($serverEmbedding) {
         Write-Host "Embedding API: http://$clientAddress/v1/embeddings" -ForegroundColor Cyan
+    }
+    if ($transcription.Enabled) {
+        Write-Host "本地语音转录 API / Local transcription API: http://$clientAddress/v1/audio/transcriptions (WAV/PCM, CPU)" -ForegroundColor Cyan
     }
     if ($serverVision) {
         Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
