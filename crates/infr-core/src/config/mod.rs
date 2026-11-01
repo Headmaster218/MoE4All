@@ -602,7 +602,7 @@ cfg_struct! {
         iq4_pair_lut: bool = true,
         /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
         kquant_packed_decode: bool = true,
-        /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
+        /// Qualified Q8/Q6_K BN128 Prefill projections on measured Windows RX 7900 XTX.
         /// The original BM64 path remains the per-feature fallback.
         q8_prefill_bm128: bool = true,
         /// Exact chronological QSA Top-K collection on measured devices.

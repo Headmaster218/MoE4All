@@ -586,6 +586,31 @@ pub(crate) fn q8_prefill_bm128_applies(
         )
 }
 
+/// Extend the original six Q8 tuples only to measured large projection shapes.
+/// BM128 writes complete row tiles: ragged Prefill tails must retain BM64.
+/// Windows RX 7900 XTX qualification and the existing A_GLOBAL debug overrides
+/// are supplied by the caller. No expert MMQ, small-M or BF16 routing changes.
+pub(crate) fn dense_prefill_bm128_applies(
+    enabled: bool,
+    measured: bool,
+    default_ag: bool,
+    dtype: infr_core::DType,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    if q8_prefill_bm128_applies(enabled, measured, default_ag, dtype, m, k, n) {
+        return true;
+    }
+    let min_rows = match (dtype, k, n) {
+        (infr_core::DType::Q8_0, 2560, 10240 | 12288)
+        | (infr_core::DType::Q8_0, 2048, 4096 | 8192) => 1024,
+        (infr_core::DType::Q6K, 2048, 4096 | 8192) => 2048,
+        _ => return false,
+    };
+    enabled && measured && default_ag && (min_rows..=12288).contains(&m) && m.is_multiple_of(128)
+}
+
 fn kquant_packed_applies(
     enabled: bool,
     measured: bool,
@@ -3710,8 +3735,9 @@ impl<'a> Recorder<'a> {
                 64,
             )
         };
-        // All six tuples have M%128==0 and production splits==1. No padding or split policy change.
-        let (name, bn, bm) = if q8_prefill_bm128_applies(
+        // Qualified shapes have M%128==0 and reach this unsplit A_GLOBAL path;
+        // the existing split policy and 64-row scratch padding remain unchanged.
+        let (name, bn, bm) = if dense_prefill_bm128_applies(
             self.vk().q8_prefill_bm128,
             self.be.prefers_q8_prefill_bm128(),
             self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
@@ -3720,7 +3746,12 @@ impl<'a> Recorder<'a> {
             k,
             n,
         ) {
-            ("native_gemm_warp_q8_0_n128_ag_bm128", 128, 128)
+            (
+                crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype)
+                    .expect("qualified BM128 dtype"),
+                128,
+                128,
+            )
         } else {
             (name, bn, bm)
         };

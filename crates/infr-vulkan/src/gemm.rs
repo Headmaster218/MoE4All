@@ -1961,6 +1961,17 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
     })
 }
 
+/// BM128 variants built only for qualified dense Prefill projections.
+pub(crate) fn native_gemm_warp_n128_ag_bm128_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    match dtype {
+        infr_core::DType::Q8_0 => Some("native_gemm_warp_q8_0_n128_ag_bm128"),
+        infr_core::DType::Q6K => Some("native_gemm_warp_q6k_n128_ag_bm128"),
+        _ => None,
+    }
+}
+
 /// BN=64/BK=64 A_GLOBAL warptile for Q8_0 output widths divisible by 64 but not 128.
 /// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
