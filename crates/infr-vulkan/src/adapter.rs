@@ -4954,6 +4954,12 @@ fn lower_op(
             rec.scale(r(*dst)?, *s, n);
         }
         Op::Silu { x, dst, n, scale } => rec.silu_scale(r(*x)?, r(*dst)?, *n, *scale),
+        Op::Relu { .. } | Op::DepthwiseConv1d { .. } => {
+            return Err(Error::Unsupported(format!(
+                "Vulkan Op::{} is CPU-only; select CPU in the caller",
+                op.kind()
+            )));
+        }
         Op::Gelu { x, dst, rows, cols } => {
             if graph.desc(*x).dtype != infr_core::DType::F32
                 || graph.desc(*dst).dtype != infr_core::DType::F32

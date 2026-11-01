@@ -53,6 +53,19 @@ use repack::{Q4kPack, Repack6CacheState, RepackCacheState};
 /// Dequantized-weight cache: `(buffer address, byte-len, dtype) -> Arc<f32>`. See `weight_cache`.
 type WeightCache = HashMap<(u64, DType), Arc<Vec<f32>>>;
 
+/// Only graphs using the new primitives need binding preflight. Legacy graphs retain their
+/// GraphPlan fast path, without an additional per-execute graph scan.
+struct DenseCpuPlan {
+    graph: Graph,
+    ops: Vec<usize>,
+}
+
+impl Plan for DenseCpuPlan {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 // ─── Q8_0 integer dot kernels ─────────────────────────────────────────────────
 //
 // Q8_0 weight layout: 34 bytes / 32 elements.  Bytes 0..2 = f16 scale `d`; bytes 2..34 = i8 qs.
@@ -296,6 +309,19 @@ impl CpuBackend {
             pool: std::sync::OnceLock::new(),
             cfg,
         }
+    }
+
+    /// Independent CPU capability with a per-backend active-thread budget.
+    /// Existing constructors retain their process-global pool policy.
+    pub fn new_with_thread_limit(cfg: Arc<Config>, threads: usize) -> Result<Self> {
+        if threads == 0 {
+            return Err(Error::backend("CPU thread limit must be positive"));
+        }
+        let pool = pool::SpinPool::new_bounded(&cfg.kernels.cpu, threads)
+            .map_err(|e| Error::backend(format!("create bounded CPU pool: {e}")))?;
+        let backend = Self::new_with(cfg);
+        let _ = backend.pool.set(pool);
+        Ok(backend)
     }
 
     /// A backend in REFERENCE mode: every quantized `Op::Linear` (dense and MoE-expert) decodes
@@ -887,15 +913,32 @@ impl Backend for CpuBackend {
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
+        let mut ops = Vec::new();
+        for (i, op) in graph.ops.iter().enumerate() {
+            if matches!(op, Op::Relu { .. } | Op::DepthwiseConv1d { .. }) {
+                op.validate(graph)?;
+                ops.push(i);
+            }
+        }
+        if !ops.is_empty() {
+            return Ok(Box::new(DenseCpuPlan {
+                graph: graph.clone(),
+                ops,
+            }));
+        }
         Ok(GraphPlan::boxed(graph))
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
-        let g = &plan
-            .as_any()
-            .downcast_ref::<GraphPlan>()
-            .expect("cpu backend: plan is not a GraphPlan")
-            .graph;
+        let g = if let Some(plan) = plan.as_any().downcast_ref::<GraphPlan>() {
+            &plan.graph
+        } else if let Some(plan) = plan.as_any().downcast_ref::<DenseCpuPlan>() {
+            // Reject bindings before provisioning can allocate/index/decode these operands.
+            validate_dense_cpu_bindings(&plan.graph, &plan.ops, bindings)?;
+            &plan.graph
+        } else {
+            return Err(Error::backend("cpu backend: incompatible plan"));
+        };
 
         // f32 working store for every Input/Internal/Output handle (weights are read on demand:
         // norms via the small dequant cache, `Op::Linear` weights streamed row-by-row).
@@ -4215,6 +4258,44 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::Relu { x, dst, n } => {
+                    let xs = dense_cpu_operand(g, bindings, &vals, x)?;
+                    let mut out = dense_cpu_zeros(n as usize)?;
+                    for (o, &v) in out.iter_mut().zip(xs.iter()) {
+                        *o = if v <= 0.0 { 0.0 } else { v };
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::DepthwiseConv1d {
+                    x,
+                    weight,
+                    dst,
+                    rows,
+                    channels,
+                    kernel,
+                    pad_left,
+                    pad_right: _,
+                } => {
+                    let xs = dense_cpu_operand(g, bindings, &vals, x)?;
+                    let ws = dense_cpu_operand(g, bindings, &vals, weight)?;
+                    let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
+                    let mut out = dense_cpu_zeros(rr * cc)?;
+                    // A separate output makes x==dst, weight==dst and x==weight safe.
+                    // Widen before adding a tap so row+tap cannot overflow a u32/usize.
+                    for t in 0..rr {
+                        for ch in 0..cc {
+                            let mut acc = 0.0f32;
+                            for j in 0..kk {
+                                let row = t as i64 + j as i64 - pad_left as i64;
+                                if row >= 0 && row < rr as i64 {
+                                    acc += xs[row as usize * cc + ch] * ws[ch * kk + j];
+                                }
+                            }
+                            out[t * cc + ch] = acc;
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Conv1dSilu {
                     x,
                     weight: w,
@@ -4859,6 +4940,150 @@ impl Backend for CpuBackend {
     fn sync(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Preflight only Relu/DepthwiseConv1d; legacy composite contracts are unchanged.
+fn validate_dense_cpu_bindings(g: &Graph, ops: &[usize], bindings: &Bindings) -> Result<()> {
+    for &index in ops {
+        let op = &g.ops[index]; // descriptors were validated at compile time
+        let (reads, writes) = op.io_inline();
+        for id in reads.iter().chain(writes.iter()) {
+            let decl = &g.tensors[id.0 as usize]; // validate checked every handle
+                                                  // Encoder K/V are ordinary internal values, even though Attention
+                                                  // names them in this semantic set. Only bound Inputs bypass vals.
+            if decl.kind == TensorKind::Input && g.in_place_inputs().contains(id) {
+                return Err(Error::backend(format!(
+                    "{}: operand is a direct state/cache tensor",
+                    op.kind()
+                )));
+            }
+            if decl.kind == TensorKind::Internal {
+                continue;
+            }
+            let buf = bindings
+                .get(*id)
+                .ok_or_else(|| Error::backend(format!("{}: unbound tensor {}", op.kind(), id.0)))?;
+            let cb = buf.as_any().downcast_ref::<CpuBuffer>().ok_or_else(|| {
+                Error::backend(format!(
+                    "{}: tensor {} is not a CPU buffer",
+                    op.kind(),
+                    id.0
+                ))
+            })?;
+            // Validation bounded numel * 4; all allowed storage types use at most 4 bytes.
+            let bytes = decl
+                .desc
+                .dtype
+                .dense_bytes(decl.desc.numel())
+                .ok_or_else(|| Error::backend(format!("{}: invalid dense dtype", op.kind())))?;
+            if buf.len_bytes() != bytes {
+                return Err(Error::backend(format!(
+                    "{}: tensor {} binding size must be {bytes} bytes",
+                    op.kind(),
+                    id.0
+                )));
+            }
+            // The shared executor writes F32 Inputs back, even when this op only reads them.
+            let writes_back = decl.kind == TensorKind::Output
+                || (decl.kind == TensorKind::Input && decl.desc.dtype == DType::F32);
+            if writes_back && !matches!(&cb.store, CpuStore::Owned(_)) {
+                return Err(Error::backend(format!(
+                    "{}: tensor {} requires writable storage",
+                    op.kind(),
+                    id.0
+                )));
+            }
+            if decl.kind != TensorKind::Weight && matches!(&cb.store, CpuStore::Paged { .. }) {
+                return Err(Error::backend(format!(
+                    "{}: paged operands must be declared Weight",
+                    op.kind()
+                )));
+            }
+        }
+        // Separate handles have separate working values. Their post-walk writeback order is
+        // declaration order, so reject shared external storage rather than silently clobber dst.
+        // In-place execution is expressed by reusing the SAME TensorId, which is supported.
+        for dst in &writes {
+            if g.kind(*dst) == TensorKind::Internal {
+                continue;
+            }
+            let Some(dst_buf) = bindings
+                .get(*dst)
+                .and_then(|b| b.as_any().downcast_ref::<CpuBuffer>())
+            else {
+                continue;
+            };
+            let dst_uid = dst_buf.uid;
+            for src in &reads {
+                if src != dst
+                    && g.kind(*src) != TensorKind::Internal
+                    && bindings
+                        .get(*src)
+                        .and_then(|b| b.as_any().downcast_ref::<CpuBuffer>())
+                        .is_some_and(|b| b.uid == dst_uid)
+                {
+                    return Err(Error::backend(format!(
+                        "{}: aliased bindings must use the same TensorId",
+                        op.kind()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dense_cpu_zeros(n: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n)
+        .map_err(|e| Error::backend(format!("dense CPU allocation: {e}")))?;
+    out.resize(n, 0.0);
+    Ok(out)
+}
+
+/// Dynamic operands use the current working value; static weights are pinned by the op walk.
+/// Decode by bytes so even an unaligned mapped F32 weight cannot panic in a cast.
+fn dense_cpu_operand<'a>(
+    g: &Graph,
+    bindings: &Bindings,
+    vals: &'a [Vec<f32>],
+    id: TensorId,
+) -> Result<std::borrow::Cow<'a, [f32]>> {
+    let decl = &g.tensors[id.0 as usize];
+    let n = decl.desc.numel();
+    if decl.kind != TensorKind::Weight {
+        let data = &vals[id.0 as usize];
+        if data.len() != n {
+            return Err(Error::backend(
+                "dense CPU operand has an invalid working shape",
+            ));
+        }
+        return Ok(std::borrow::Cow::Borrowed(data));
+    }
+    let buf = bindings
+        .get(id)
+        .ok_or_else(|| Error::backend("unbound dense CPU weight"))?;
+    let bytes = cpu_buf(buf).read();
+    let mut out = dense_cpu_zeros(n)?;
+    match decl.desc.dtype {
+        DType::F32 => {
+            for (v, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *v = f32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        DType::F16 | DType::Bf16 => {
+            for (v, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                let bits = u16::from_ne_bytes([b[0], b[1]]);
+                *v = if decl.desc.dtype == DType::F16 {
+                    half::f16::from_bits(bits).to_f32()
+                } else {
+                    half::bf16::from_bits(bits).to_f32()
+                };
+            }
+        }
+        _ => return Err(Error::Unsupported("dense CPU operand dtype".into())),
+    }
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// Depthwise causal conv (fixed per-channel kernel of width `kk`) followed by SiLU, over a rolling
