@@ -472,10 +472,12 @@ S[setup_mode]=aggressive; S[vision_projector]="$ROOT/models/mmproj-flash.gguf"
 S[embedding_model]="$ROOT/models/mtp-flash.gguf"; S[server_parallel]=2
 configure > "$tmp/interactive-combined" <<'INPUT'
 
+y
+y
+n
 
 y
 
-y
 
 
 

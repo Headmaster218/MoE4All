@@ -579,7 +579,7 @@ defaults() {
         [configure_sampling]=false [temperature]='' [top_k]='' [top_p]='' [seed]=''
         [server_addr]=127.0.0.1:8080 [server_parallel]=1 [server_auth]=false [server_session_cache]=false
         [session_cache_dir]="$ROOT/kv-sessions" [session_idle_secs]=120 [session_cache_max]=5GiB [session_cache_ttl_hours]=24
-        [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
+        [server_llm_enabled]=true [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
         [server_transcription]=false [transcription_model]='' [transcription_threads]=4 [transcription_idle_timeout]=300 [transcription_upload_dir]="$CONFIG_DIR/audio-uploads"
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
         [bench_kind]=manual [bench_parallel]=1 [manual_bench_kind]=decode [prompt_tokens]=6144 [gen_tokens]=512 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
@@ -722,19 +722,31 @@ save_benchmark_upload_preferences() {
 }
 save_state() {
     if [[ ${BENCHMARK_GUIDE_ACTIVE-false} == true ]]; then save_benchmark_upload_preferences; return; fi
-    local temporary key sep=''
+    local temporary key raw state_path flat source_state=$STATE sep='' top_level='^\["[^"]*"\]$'
+    local -A values=()
+    if ! llm_enabled; then
+        # Auxiliary-only launches preserve unknown/future LLM settings as JSON too.
+        if [[ ! -f $source_state && -n ${LEGACY_STATE-} && -f $LEGACY_STATE ]]; then source_state=$LEGACY_STATE; fi
+        if [[ -f $source_state ]]; then
+            flat=$(LC_ALL=C awk -v BRIEF=0 "$JSON_PARSER" "$source_state") || return 1
+            while IFS=$'\t' read -r state_path raw; do
+                if [[ $state_path =~ $top_level ]]; then key=${state_path:1:${#state_path}-2}; values[$key]=$raw; fi
+            done <<< "$flat"
+        fi
+    fi
+    for key in "${(@k)S[@]}"; do
+        case ${DEFAULTS[$key]} in true|false) raw=${S[$key]} ;; *) json_quote "${S[$key]}"; raw=$REPLY ;; esac
+        json_quote "$key"; values[$REPLY]=$raw
+    done
     mkdir -p -- "$CONFIG_DIR"; temporary=$(mktemp "$CONFIG_DIR/.wizard-state.XXXXXX")
     {
         printf '{\n'
-        for key in "${(@k)S[@]}"; do
-            printf '%s  "%s": ' "$sep" "$key"
-            case ${DEFAULTS[$key]} in true|false) printf '%s' "${S[$key]}" ;; *) json_quote "${S[$key]}"; printf '%s' "$REPLY" ;; esac
-            sep=$',\n'
-        done
+        for key in "${(@k)values[@]}"; do printf '%s  %s: %s' "$sep" "$key" "${values[$key]}"; sep=$',\n'; done
         printf '\n}\n'
     } > "$temporary"
     chmod 600 "$temporary"; mv -f -- "$temporary" "$STATE"
 }
+
 prompt() {
     local value
     while true; do
@@ -757,7 +769,7 @@ yes() {
 }
 ask_yes() { yes "$2" "${S[$1]}"; S[$1]=$REPLY; }
 valid_uint() { [[ $1 =~ ^[0-9]{1,9}$ ]] && ((10#$1 >= ${2-0} && 10#$1 <= ${3-999999999})); }
-integer() {
+ask_integer() {
     while true; do
         prompt "$2" "${S[$1]}"
         if [[ -z $REPLY && ${5-false} == true ]] || valid_uint "$REPLY" "${3-0}" "${4-999999999}"; then S[$1]=$REPLY; return; fi
@@ -803,7 +815,7 @@ absolute() {
     [[ $value == /* ]] || value="$ROOT/$value"
     REPLY=${value:A}
 }
-CATALOG_IDS=(qwen35-balanced flashnext-427 sensevoice-small-q8)
+CATALOG_IDS=(qwen35-balanced flashnext-427 qwen3-embedding-06b-q8 sensevoice-small-q8)
 catalog_load() {
     CATALOG_ID=$1 CATALOG_KIND='' CATALOG_NAME='' CATALOG_INFO='' CATALOG_PRIMARY='' CATALOG_COUNT=0
     case $1 in
@@ -1008,15 +1020,39 @@ model_path() {
     done
 }
 
+# Chat and benchmarks always use the LLM; API modules can run independently.
+llm_enabled() { [[ ${S[launch_mode]} != serve || ${S[server_llm_enabled]} == true ]]; }
+device_needed() { llm_enabled || [[ ${S[server_embedding]} == true ]]; }
+reset_legacy_mtp() {
+    # Never migrate or clear settings belonging to a disabled LLM.
+    if llm_enabled && [[ ! -v 'OVERRIDES[mtp_model]' ]]; then
+        S[mtp_enabled]=false; S[mtp_model]=''; S[mtp_verify_tokens]=4
+    fi
+}
+configure_api_modules() {
+    while true; do
+        ask_yes server_llm_enabled '启用大语言模型 API？/ Enable the language model API?'
+        ask_yes server_embedding '启用 Embedding API？/ Enable the Embedding API?'
+        ask_yes server_transcription '启用本地语音转录 API？/ Enable the local transcription API?'
+        [[ ${S[server_llm_enabled]} == true || ${S[server_embedding]} == true || ${S[server_transcription]} == true ]] && break
+        printf '%s\n' '请至少启用一个 API 模块。/ Enable at least one API module.'
+    done
+}
+configure_embedding() {
+    [[ ${S[server_embedding]} == true ]] || return 0
+    printf '%s\n' 'Embedding 模型与 Backend 在首次请求时加载，空闲超时后卸载整个实例。/ The Embedding model and backend load on the first request; the entire instance unloads after the idle timeout.'
+    model_path embedding embedding_model
+    ask_integer embedding_idle_timeout 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident'
+}
 configure_transcription() {
     [[ ${S[launch_mode]} == serve ]] || return 0
-    ask_yes server_transcription '可选：同时提供本地语音转录 API？/ Also serve the optional local transcription API?'
     [[ ${S[server_transcription]} == true ]] || return 0
-    printf '%s\n' 'CPU 原生 infr，仅需 GGUF；无需 Python、ffmpeg、ORT 或 ggml runtime。/ Native infr on CPU needs only GGUF; no Python, ffmpeg, ORT or ggml runtime.' \
+    printf '%s\n' '语音转录固定使用 CPU，默认 4 线程；模型载入后约占 300 MiB RAM。/ Transcription uses the CPU with 4 threads by default; the loaded model uses about 300 MiB RAM.' \
+        '语音模型在首次请求时载入；不额外占用 GPU 权重，无需外部 runtime。/ The transcription model loads on the first request; no extra GPU weights or external runtime are needed.' \
         '首版支持 WAV/PCM；不支持全格式或真正逐 token 流式。/ First release: WAV/PCM; no all-format support or true token-by-token streaming.'
     model_path audio transcription_model
-    integer transcription_threads '语音 CPU 线程数 / Transcription CPU threads' 1 256
-    integer transcription_idle_timeout '语音空闲释放秒数，0 为服务期间常驻 / Transcription idle eviction seconds, 0 keeps resident'
+    ask_integer transcription_threads '语音 CPU 线程数 / Transcription CPU threads' 1 256
+    ask_integer transcription_idle_timeout '语音空闲释放秒数，0 为服务期间常驻 / Transcription idle eviction seconds, 0 keeps resident'
     ask transcription_upload_dir '语音上传目录 / Transcription upload directory' true
 }
 add_transcription_arguments() {
@@ -1037,6 +1073,7 @@ show_transcription_api() {
 }
 
 remember_model() {
+    llm_enabled || return 0
     local current=${S[model]} value candidate_path count=0 history='' found existing
     [[ -n $current ]] || return 0
     if hub_reference "$current"; then return 0; fi
@@ -1678,55 +1715,63 @@ configure() {
         choice launch_mode '你想做什么？/ What would you like to do?' 'run|实时终端对话（推荐）/ Terminal chat (recommended)' 'serve|启动 OpenAI 兼容 API / Start OpenAI-compatible API server' 'bench|性能测试 / Benchmark' 'report|报告当前运行问题 / Report a current runtime problem'
     fi
     [[ ${S[launch_mode]} != report ]] || return 0
-    model_path llm model
-    if [[ ${S[launch_mode]} == serve ]]; then
-        S[server_vision]=false; S[vision_projector]=''
-        S[server_embedding]=false; S[embedding_model]=''
-        printf '实验性 Metal 包的 GPU 目前只支持文本生成；视觉与 Embedding 仍需 Vulkan。\nThe experimental Metal GPU currently serves text generation only; Vision and Embedding require Vulkan.\n'
-        configure_transcription
-    fi
-    choose_device
-    choice setup_mode '配置方式 / Configuration' 'conservative|自动配置：保守（推荐）/ Automatic: conservative (recommended)' 'aggressive|自动配置：激进性能 / Automatic: aggressive performance' 'manual|全手动配置 / Fully manual configuration'
-    if [[ ${S[setup_mode]} == manual ]]; then
-        integer ubatch 'Ubatch，留空为自动 / Ubatch, blank for auto' 1 999999999 true; integer threads 'CPU 线程，留空为全部 / CPU threads, blank for all' 1 999999999 true
-        while true; do ask config_path '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup'; [[ -n ${S[config_path]} ]] || break; absolute "${S[config_path]}"; [[ ! -f $REPLY ]] || break; printf '未找到配置 TOML。Config TOML not found.\n'; done
-        choice kv_preset 'KV Cache 类型 / KV cache type' 'auto|引擎自动（推荐）/ Engine default (recommended)' 'q8|Q8_0 K + Q8_0 V' 'f16|F16 K + F16 V' 'custom|分别指定 / Custom K and V'
-        case ${S[kv_preset]} in custom) ask kv_type_k 'K 类型 / K dtype' true; ask kv_type_v 'V 类型 / V dtype' true ;; q8) S[kv_type_k]=q8_0; S[kv_type_v]=q8_0 ;; f16) S[kv_type_k]=f16; S[kv_type_v]=f16 ;; esac
-        ask_yes configure_memory '设置进程总 RAM 预算？/ Configure total process RAM budget?'
-        if [[ ${S[configure_memory]} == true ]]; then ask ram_budget '进程总 RAM 预算，留空为自动 / Total process RAM budget, blank for auto'; fi
-        S[vram_budget]=''; S[vram_reserve]=''; S[expert_cache]=''; S[pager_ring]=''; S[pager_ring_slots]=''
-        S[host_dma]=false; S[kv_overflow]=false; S[submit_mode]=auto; S[configure_diagnostics]=false
-        ask custom_sets '额外 --set，以分号分隔 / Extra --set entries separated by semicolons'
-    else S[kv_preset]=auto; S[kv_type_k]=''; S[kv_type_v]=''; fi
-    S[auto_overrides]=''
-    if [[ ${S[launch_mode]} != bench ]]; then
-        ask_yes configure_thinking '是否配置默认思考？API 可覆盖 / Configure default reasoning? API may override'
-        previous=${S[think_mode]}; effort=${S[reasoning_effort]}; S[think_mode]=default; S[reasoning_effort]=default
-        if [[ ${S[configure_thinking]} == true ]]; then
-            value=true; [[ $previous != no-think ]] || value=false; yes '默认开启思考？/ Enable reasoning by default?' "$value"
-            if [[ $REPLY == true ]]; then
-                S[think_mode]=think; value=$(reasoning_efforts "${S[model]}") || value=''
-                if [[ -n $value ]]; then
-                    local -a effort_options=('default|模板默认 / Template default'); local found=false
-                    for key in $value; do effort_options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
-                    [[ $found == false ]] || S[reasoning_effort]=$effort
-                    choice reasoning_effort '默认思考强度 / Default reasoning effort' "${effort_options[@]}"
-                else printf '未检测到思考强度支持，将保留模板默认值。Reasoning-effort support not detected; keeping template default.\n'; fi
-            else S[think_mode]=no-think; fi
+    if [[ ${S[launch_mode]} == serve ]]; then configure_api_modules; fi
+    reset_legacy_mtp
+    if llm_enabled; then
+        model_path llm model
+        if [[ ${S[launch_mode]} == serve ]]; then
+            S[server_vision]=false; S[vision_projector]=''
+            printf '实验性 Metal 包支持文本生成与 Embedding；视觉仍需 Vulkan。\nThe experimental Metal package supports text generation and Embedding; Vision requires Vulkan.\n'
         fi
-        integer max_new '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' 1
-        ask_yes configure_sampling '设置默认采样参数？/ Configure default sampling?'
-        if [[ ${S[configure_sampling]} == true ]]; then ask temperature '温度，留空为模型默认 / Temperature, blank for model default'; integer top_k 'Top K，留空为模型默认 / Top K, blank for model default' 0 999999999 true; ask top_p 'Top P，留空为模型默认 / Top P, blank for model default'; integer seed '随机种子，留空为模型默认 / Seed, blank for model default' 0 999999999 true; fi
     fi
-    S[cpu_miss_enabled]=false; S[cpu_miss_cores]=''; S[cpu_miss_max]=1
-    if [[ ${S[launch_mode]} == serve ]]; then
-        S[server_parallel]=1; S[server_session_cache]=false
-        printf '并发会话数 / Concurrent slots: 1（Metal 后端当前串行 / currently serialized）\n'
+    if [[ ${S[launch_mode]} == serve ]]; then configure_embedding; configure_transcription; fi
+    if device_needed; then
+        [[ ${S[launch_mode]} != serve ]] || printf '%s\n' 'LLM 和 Embedding 共用所选设备；语音转录固定使用 CPU。/ LLM and Embedding share the selected device; transcription always uses the CPU.'
+        choose_device
     fi
-    if [[ ${S[launch_mode]} != bench ]]; then ask context '上下文窗口，留空为自动 / Context window, blank for auto'; fi
+    if llm_enabled; then
+        choice setup_mode '配置方式 / Configuration' 'conservative|自动配置：保守（推荐）/ Automatic: conservative (recommended)' 'aggressive|自动配置：激进性能 / Automatic: aggressive performance' 'manual|全手动配置 / Fully manual configuration'
+        if [[ ${S[setup_mode]} == manual ]]; then
+            ask_integer ubatch 'Ubatch，留空为自动 / Ubatch, blank for auto' 1 999999999 true; ask_integer threads 'CPU 线程，留空为全部 / CPU threads, blank for all' 1 999999999 true
+            while true; do ask config_path '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup'; [[ -n ${S[config_path]} ]] || break; absolute "${S[config_path]}"; [[ ! -f $REPLY ]] || break; printf '未找到配置 TOML。Config TOML not found.\n'; done
+            choice kv_preset 'KV Cache 类型 / KV cache type' 'auto|引擎自动（推荐）/ Engine default (recommended)' 'q8|Q8_0 K + Q8_0 V' 'f16|F16 K + F16 V' 'custom|分别指定 / Custom K and V'
+            case ${S[kv_preset]} in custom) ask kv_type_k 'K 类型 / K dtype' true; ask kv_type_v 'V 类型 / V dtype' true ;; q8) S[kv_type_k]=q8_0; S[kv_type_v]=q8_0 ;; f16) S[kv_type_k]=f16; S[kv_type_v]=f16 ;; esac
+            ask_yes configure_memory '设置进程总 RAM 预算？/ Configure total process RAM budget?'
+            if [[ ${S[configure_memory]} == true ]]; then ask ram_budget '进程总 RAM 预算，留空为自动 / Total process RAM budget, blank for auto'; fi
+            S[vram_budget]=''; S[vram_reserve]=''; S[expert_cache]=''; S[pager_ring]=''; S[pager_ring_slots]=''
+            S[host_dma]=false; S[kv_overflow]=false; S[submit_mode]=auto; S[configure_diagnostics]=false
+            ask custom_sets '额外 --set，以分号分隔 / Extra --set entries separated by semicolons'
+        else S[kv_preset]=auto; S[kv_type_k]=''; S[kv_type_v]=''; fi
+        S[auto_overrides]=''
+        if [[ ${S[launch_mode]} != bench ]]; then
+            ask_yes configure_thinking '是否配置默认思考？API 可覆盖 / Configure default reasoning? API may override'
+            previous=${S[think_mode]}; effort=${S[reasoning_effort]}; S[think_mode]=default; S[reasoning_effort]=default
+            if [[ ${S[configure_thinking]} == true ]]; then
+                value=true; [[ $previous != no-think ]] || value=false; yes '默认开启思考？/ Enable reasoning by default?' "$value"
+                if [[ $REPLY == true ]]; then
+                    S[think_mode]=think; value=$(reasoning_efforts "${S[model]}") || value=''
+                    if [[ -n $value ]]; then
+                        local -a effort_options=('default|模板默认 / Template default'); local found=false
+                        for key in $value; do effort_options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
+                        [[ $found == false ]] || S[reasoning_effort]=$effort
+                        choice reasoning_effort '默认思考强度 / Default reasoning effort' "${effort_options[@]}"
+                    else printf '未检测到思考强度支持，将保留模板默认值。Reasoning-effort support not detected; keeping template default.\n'; fi
+                else S[think_mode]=no-think; fi
+            fi
+            ask_integer max_new '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' 1
+            ask_yes configure_sampling '设置默认采样参数？/ Configure default sampling?'
+            if [[ ${S[configure_sampling]} == true ]]; then ask temperature '温度，留空为模型默认 / Temperature, blank for model default'; ask_integer top_k 'Top K，留空为模型默认 / Top K, blank for model default' 0 999999999 true; ask top_p 'Top P，留空为模型默认 / Top P, blank for model default'; ask_integer seed '随机种子，留空为模型默认 / Seed, blank for model default' 0 999999999 true; fi
+        fi
+        S[cpu_miss_enabled]=false; S[cpu_miss_cores]=''; S[cpu_miss_max]=1
+        if [[ ${S[launch_mode]} == serve ]]; then
+            S[server_parallel]=1; S[server_session_cache]=false
+            S[server_session_cache]=false
+            printf 'SSD 会话 KV 缓存 / SSD session KV cache：串行 Metal 后端暂不可用 / unavailable on the serialized Metal backend\n'
+            printf '并发会话数 / Concurrent slots: 1（Metal 后端当前串行 / currently serialized）\n'
+        fi
+        if [[ ${S[launch_mode]} != bench ]]; then ask context '上下文窗口，留空为自动 / Context window, blank for auto'; fi
+    fi
     if [[ ${S[launch_mode]} == serve ]]; then
-        S[server_session_cache]=false
-        printf 'SSD 会话 KV 缓存 / SSD session KV cache：串行 Metal 后端暂不可用 / unavailable on the serialized Metal backend\n'
         while true; do ask server_addr '监听地址（IP:端口）/ Listen address (IP:port)' true; valid_address "${S[server_addr]}" && break; printf '请输入 IP:端口，例如 127.0.0.1:8080 或 [::1]:8080。Enter an IP:port, such as 127.0.0.1:8080 or [::1]:8080.\n'; done
         ask_yes server_auth '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?'
     fi
@@ -1749,9 +1794,9 @@ configure() {
         [[ ${S[prompt_tokens]} =~ ^[1-9][0-9]*$ ]] || S[prompt_tokens]=6144
         [[ ${S[gen_tokens]} =~ ^[1-9][0-9]*$ ]] || S[gen_tokens]=512
         case ${S[manual_bench_kind]} in
-            prefill) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
-            decode) S[prompt_tokens]=0; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
-            mixed) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; printf '已添加 / Added: Prefill %s tokens\n' "${S[prompt_tokens]}"; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
+            prefill) ask_integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
+            decode) S[prompt_tokens]=0; ask_integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
+            mixed) ask_integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; printf '已添加 / Added: Prefill %s tokens\n' "${S[prompt_tokens]}"; ask_integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
         esac
         printf '已添加 / Added: Prefill %s, Decode %s tokens\n' "${S[prompt_tokens]}" "${S[gen_tokens]}"
         if [[ ${S[manual_bench_kind]} != prefill ]]; then
@@ -1760,11 +1805,11 @@ configure() {
                 $'real|真实上下文 / Real context|先真实 Prefill 指定长度，再开始计时。\nReally prefill the selected depth before timing.'
             if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else
                 [[ ${S[depth_tokens]} =~ ^[1-9][0-9]*$ ]] || S[depth_tokens]=6144
-                integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1
+                ask_integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1
             fi
             printf '已添加 / Added: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
         fi
-        integer reps '重复次数 / Repetitions' 1; S[json_output]=true
+        ask_integer reps '重复次数 / Repetitions' 1; S[json_output]=true
         printf '最终计划 / Final plan: Prefill %s, Decode %s, context %s/%s, repetitions %s。JSON 自动输出。/ JSON is emitted automatically.\n' \
             "${S[prompt_tokens]}" "${S[gen_tokens]}" "${S[depth_mode]}" "${S[depth_tokens]}" "${S[reps]}"
     fi
@@ -1774,76 +1819,90 @@ add_arg() { [[ -z ${S[$2]} ]] || COMMAND+=("$1" "${S[$2]}"); return 0; }
 setting() { COMMAND+=(--set "$1=$2"); }
 build_command() {
     local key entry value flag; local -a entries
-    [[ ${S[launch_mode]} =~ ^(run|serve|bench)$ && ${S[setup_mode]} =~ ^(conservative|aggressive|manual)$ ]] || { fail 'Invalid mode or profile.'; return 1; }
-    [[ -n ${S[model]} ]] || { fail 'A model is required.'; return 1; }
-    [[ ${S[device]} == metal ]] || { fail 'The macOS arm64 package supports only --dev metal.'; return 1; }
-    if [[ ${S[mtp_enabled]} == true && ${S[launch_mode]} != bench ]]; then
-        [[ -n ${S[mtp_model]} && ${S[mtp_verify_tokens]} =~ ^[234]$ ]] || { fail 'MTP requires a compatible draft head and width 2-4.'; return 1; }
-        if [[ ${S[launch_mode]} == serve ]]; then
-            [[ ${S[server_parallel]} == 1 || ${S[server_parallel]} == 2 ]] || { fail 'MTP supports one or two configured slots.'; return 1; }
-            [[ ${S[server_parallel]} != 2 ]] || S[mtp_verify_tokens]=4
+    [[ ${S[launch_mode]} =~ ^(run|serve|bench)$ ]] || { fail 'Invalid mode.'; return 1; }
+    if [[ ${S[launch_mode]} == serve ]]; then
+        [[ ${S[server_llm_enabled]} == true || ${S[server_embedding]} == true || ${S[server_transcription]} == true ]] || { fail '请至少启用一个 API 模块。/ Enable at least one API module.'; return 1; }
+    fi
+    COMMAND=("$BINARY" "${S[launch_mode]}")
+    if device_needed; then
+        [[ ${S[device]} == '' || ${S[device]} == metal ]] || { fail 'The macOS arm64 package supports only --dev metal.'; return 1; }
+        COMMAND+=(--dev "${S[device]:-metal}")
+    else COMMAND+=(--dev cpu); fi
+    if llm_enabled; then
+        [[ ${S[setup_mode]} =~ ^(conservative|aggressive|manual)$ ]] || { fail 'Invalid profile.'; return 1; }
+        [[ -n ${S[model]} ]] || { fail 'A model is required.'; return 1; }
+        if [[ ${S[mtp_enabled]} == true && ${S[launch_mode]} != bench ]]; then
+            [[ -n ${S[mtp_model]} && ${S[mtp_verify_tokens]} =~ ^[234]$ ]] || { fail 'MTP requires a compatible draft head and width 2-4.'; return 1; }
+            if [[ ${S[launch_mode]} == serve ]]; then
+                [[ ${S[server_parallel]} == 1 || ${S[server_parallel]} == 2 ]] || { fail 'MTP supports one or two configured slots.'; return 1; }
+                [[ ${S[server_parallel]} != 2 ]] || S[mtp_verify_tokens]=4
+            fi
         fi
-    fi
-    COMMAND=("$BINARY" "${S[launch_mode]}"); add_arg --dev device
-    if [[ ${S[setup_mode]} == manual ]]; then add_arg --config config_path; add_arg --ubatch ubatch; add_arg --threads threads
-    else
-        setting device.auto_profile "${S[setup_mode]}"
-        [[ ,${S[auto_overrides]}, != *,ubatch,* ]] || add_arg --ubatch ubatch
-        if [[ ,${S[auto_overrides]}, == *,ram_budget,* && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
-    fi
-    [[ ${S[launch_mode]} == bench ]] || add_arg --ctx context
-    if [[ ${S[setup_mode]} != manual ]]; then
-        # Old automatic profiles saved Q8 as if it were explicit; retain only current CLI choices.
-        S[kv_preset]=auto
-        if [[ -v 'OVERRIDES[kv_type_k]' || -v 'OVERRIDES[kv_type_v]' ]]; then S[kv_preset]=custom; fi
-        [[ -v 'OVERRIDES[kv_type_k]' ]] || S[kv_type_k]=''
-        [[ -v 'OVERRIDES[kv_type_v]' ]] || S[kv_type_v]=''
-    fi
-    if [[ ${S[kv_preset]} != auto ]]; then
-        [[ -z ${S[kv_type_k]} ]] || setting kv.type_k "${S[kv_type_k]}"
-        [[ -z ${S[kv_type_v]} ]] || setting kv.type_v "${S[kv_type_v]}"
-    fi
-    if [[ ${S[setup_mode]} == manual ]]; then
-        if [[ ${S[configure_memory]} == true && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
-    fi
-    if [[ ${S[setup_mode]} == manual ]]; then
-        IFS=';' read -rA entries <<< "${S[custom_sets]}"
-        for entry in "${entries[@]}"; do
-            trim "$entry"; entry=$REPLY; [[ -n $entry ]] || continue
-            [[ $entry == *=* ]] || { fail 'Extra --set requires key=value.'; return 1; }
-            trim "${entry%%=*}"; key=$REPLY; trim "${entry#*=}"; value=$REPLY
-            [[ -n $key && $key != serve.api_key ]] || { fail 'Use the dedicated API-key prompt.'; return 1; }
-            case $key in
-                kernels.vulkan.*|device.vram_budget|device.vram_reserve|device.submit_dispatches|paging.host_dma|paging.cache|paging.ring|paging.ring_slots|kv.overflow|kv.overflow_*)
-                    fail 'Vulkan-only settings are not supported by the macOS Metal package.'; return 1 ;;
-            esac
-            setting "$key" "$value"
-        done
-    fi
-    if [[ ${S[launch_mode]} == bench ]]; then
-        if [[ ${S[manual_bench_kind]} == mixed ]]; then COMMAND+=(--pg "${S[prompt_tokens]},${S[gen_tokens]}"); else COMMAND+=(-p "${S[prompt_tokens]}" -n "${S[gen_tokens]}"); fi
-        case ${S[depth_mode]} in real) COMMAND+=(-d "${S[depth_tokens]}") ;; synthetic) COMMAND+=(--synthetic-depth "${S[depth_tokens]}") ;; esac
-        COMMAND+=(-r "${S[reps]}" --json)
-    else
-        setting spec.mtp "${S[mtp_enabled]}"
-        if [[ ${S[mtp_enabled]} == true ]]; then setting spec.draft "${S[mtp_model]}"; setting spec.k "${S[mtp_verify_tokens]}"; fi
-        case ${S[think_mode]} in think|no-think) COMMAND+=("--${S[think_mode]}") ;; esac
-        if [[ ${S[think_mode]} != no-think && ${S[reasoning_effort]} != default ]]; then add_arg --reasoning-effort reasoning_effort; fi
-        add_arg --max-new max_new
-        if [[ ${S[mtp_enabled]} == true ]]; then COMMAND+=(--temp 0)
-        elif [[ ${S[configure_sampling]} == true ]]; then add_arg --temp temperature; add_arg --top-k top_k; add_arg --top-p top_p; add_arg --seed seed; fi
+        if [[ ${S[setup_mode]} == manual ]]; then add_arg --config config_path; add_arg --ubatch ubatch; add_arg --threads threads
+        else
+            setting device.auto_profile "${S[setup_mode]}"
+            [[ ,${S[auto_overrides]}, != *,ubatch,* ]] || add_arg --ubatch ubatch
+            if [[ ,${S[auto_overrides]}, == *,ram_budget,* && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
+        fi
+        [[ ${S[launch_mode]} == bench ]] || add_arg --ctx context
+        if [[ ${S[setup_mode]} != manual ]]; then
+            # Old automatic profiles saved Q8 as if it were explicit; retain only current CLI choices.
+            S[kv_preset]=auto
+            if [[ -v 'OVERRIDES[kv_type_k]' || -v 'OVERRIDES[kv_type_v]' ]]; then S[kv_preset]=custom; fi
+            [[ -v 'OVERRIDES[kv_type_k]' ]] || S[kv_type_k]=''
+            [[ -v 'OVERRIDES[kv_type_v]' ]] || S[kv_type_v]=''
+        fi
+        if [[ ${S[kv_preset]} != auto ]]; then
+            [[ -z ${S[kv_type_k]} ]] || setting kv.type_k "${S[kv_type_k]}"
+            [[ -z ${S[kv_type_v]} ]] || setting kv.type_v "${S[kv_type_v]}"
+        fi
+        if [[ ${S[setup_mode]} == manual ]]; then
+            if [[ ${S[configure_memory]} == true && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
+        fi
+        if [[ ${S[setup_mode]} == manual ]]; then
+            IFS=';' read -rA entries <<< "${S[custom_sets]}"
+            for entry in "${entries[@]}"; do
+                trim "$entry"; entry=$REPLY; [[ -n $entry ]] || continue
+                [[ $entry == *=* ]] || { fail 'Extra --set requires key=value.'; return 1; }
+                trim "${entry%%=*}"; key=$REPLY; trim "${entry#*=}"; value=$REPLY
+                [[ -n $key && $key != serve.api_key ]] || { fail 'Use the dedicated API-key prompt.'; return 1; }
+                case $key in
+                    kernels.vulkan.*|device.vram_budget|device.vram_reserve|device.submit_dispatches|paging.host_dma|paging.cache|paging.ring|paging.ring_slots|kv.overflow|kv.overflow_*)
+                        fail 'Vulkan-only settings are not supported by the macOS Metal package.'; return 1 ;;
+                esac
+                setting "$key" "$value"
+            done
+        fi
+        if [[ ${S[launch_mode]} == bench ]]; then
+            if [[ ${S[manual_bench_kind]} == mixed ]]; then COMMAND+=(--pg "${S[prompt_tokens]},${S[gen_tokens]}"); else COMMAND+=(-p "${S[prompt_tokens]}" -n "${S[gen_tokens]}"); fi
+            case ${S[depth_mode]} in real) COMMAND+=(-d "${S[depth_tokens]}") ;; synthetic) COMMAND+=(--synthetic-depth "${S[depth_tokens]}") ;; esac
+            COMMAND+=(-r "${S[reps]}" --json)
+        else
+            setting spec.mtp "${S[mtp_enabled]}"
+            if [[ ${S[mtp_enabled]} == true ]]; then setting spec.draft "${S[mtp_model]}"; setting spec.k "${S[mtp_verify_tokens]}"; fi
+            case ${S[think_mode]} in think|no-think) COMMAND+=("--${S[think_mode]}") ;; esac
+            if [[ ${S[think_mode]} != no-think && ${S[reasoning_effort]} != default ]]; then add_arg --reasoning-effort reasoning_effort; fi
+            add_arg --max-new max_new
+            if [[ ${S[mtp_enabled]} == true ]]; then COMMAND+=(--temp 0)
+            elif [[ ${S[configure_sampling]} == true ]]; then add_arg --temp temperature; add_arg --top-k top_k; add_arg --top-p top_p; add_arg --seed seed; fi
+        fi
     fi
     if [[ ${S[launch_mode]} == serve ]]; then
         valid_address "${S[server_addr]}" || { fail 'Invalid listen address.'; return 1; }
-        valid_uint "${S[server_parallel]}" 1 || { fail 'Invalid concurrent slot count.'; return 1; }
         [[ ${S[server_auth]} == true ]] || setting serve.api_key ''
-        add_arg --addr server_addr; add_arg --parallel server_parallel
-        if [[ ${S[server_session_cache]} == true ]] && ! serial_mtp; then
-            for key in session_cache_dir session_idle_secs session_cache_max session_cache_ttl_hours; do setting "kv.$key" "${S[$key]}"; done
-        else setting kv.session_cache_dir ''; fi
+        add_arg --addr server_addr
+        if llm_enabled; then
+            valid_uint "${S[server_parallel]}" 1 || { fail 'Invalid concurrent slot count.'; return 1; }
+            add_arg --parallel server_parallel
+            if [[ ${S[server_session_cache]} == true ]] && ! serial_mtp; then
+                for key in session_cache_dir session_idle_secs session_cache_max session_cache_ttl_hours; do setting "kv.$key" "${S[$key]}"; done
+            else setting kv.session_cache_dir ''; fi
+        fi
+        if [[ ${S[server_embedding]} == true ]]; then [[ -n ${S[embedding_model]} ]] || return 1; add_arg --embedding-model embedding_model; add_arg --embedding-idle-timeout embedding_idle_timeout; fi
         add_transcription_arguments || return 1
     fi
-    COMMAND+=("${S[model]}")
+    if llm_enabled; then COMMAND+=("${S[model]}"); fi
+    return 0
 }
 
 version_valid() { [[ $1 =~ $RE_VERSION ]]; }
@@ -2123,10 +2182,8 @@ main() {
                 (($#)) || { fail "$flag requires a value"; return 1; }; S[$key]=$1; OVERRIDES[$key]=1; shift ;;
         esac
     done
-    [[ ${S[device]} == '' || ${S[device]} == metal ]] || { fail 'The macOS arm64 package supports only --dev metal.'; return 1; }
-    S[device]=metal
-    if [[ -v 'OVERRIDES[vision_projector]' || -v 'OVERRIDES[embedding_model]' ]]; then
-        fail 'Vision and Embedding are not yet available in the experimental Metal package.'; return 1
+    if [[ -v 'OVERRIDES[vision_projector]' ]]; then
+        fail 'Vision is not yet available in the experimental Metal package.'; return 1
     fi
     if [[ -v 'OVERRIDES[cpu_miss_cores]' || -v 'OVERRIDES[cpu_miss_max]' ]]; then
         fail 'Vulkan CPU-miss computation is not available on Metal.'; return 1
@@ -2137,11 +2194,7 @@ main() {
     if [[ -v 'OVERRIDES[server_parallel]' && ${S[server_parallel]} != 1 ]]; then
         fail 'The Metal backend is currently serialized; --parallel must be 1.'; return 1
     fi
-    S[server_parallel]=1; S[server_session_cache]=false
     for key in ubatch ram_budget; do [[ ! -v "OVERRIDES[$key]" ]] || S[auto_overrides]+=",$key,"; done
-    # The release wizard no longer exposes MTP. Ignore stale saved MTP state,
-    # while preserving the explicit --mtp CLI for advanced/manual use.
-    if [[ ! -v 'OVERRIDES[mtp_model]' ]]; then S[mtp_enabled]=false; S[mtp_model]=''; S[mtp_verify_tokens]=4; fi
     for key in mtp_model vision_projector embedding_model; do
         case $key in mtp_model) value=mtp_enabled ;; vision_projector) value=server_vision ;; embedding_model) value=server_embedding ;; esac
         if [[ -v "OVERRIDES[$key]" ]]; then S[$value]=false; [[ -z ${S[$key]} ]] || S[$value]=true; fi
@@ -2187,7 +2240,14 @@ main() {
         fi
         [[ -n $api_key ]] || { fail 'API-key authentication requires INFR_API_KEY or hidden input.'; return 1; }
     fi
+    reset_legacy_mtp
+    if device_needed; then [[ -n ${S[device]} ]] || S[device]=metal; fi
+    if llm_enabled; then S[server_parallel]=1; S[server_session_cache]=false; fi
     for key in model mtp_model vision_projector embedding_model config_path session_cache_dir; do
+        case $key in
+            embedding_model) [[ ${S[launch_mode]} == serve && ${S[server_embedding]} == true ]] || continue ;;
+            *) llm_enabled || continue ;;
+        esac
         [[ -n ${S[$key]} ]] || continue
         if [[ $key == model ]] && hub_reference "${S[$key]}"; then continue; fi
         absolute "${S[$key]}"; S[$key]=$REPLY

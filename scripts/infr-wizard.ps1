@@ -2219,6 +2219,54 @@ function Select-EmbeddingModelPath {
     }
 }
 
+function Read-ServerModules {
+    param([bool]$LlmEnabled, [bool]$EmbeddingEnabled, [bool]$TranscriptionEnabled)
+    while ($true) {
+        $LlmEnabled = Read-YesNo -Label '启用大语言模型 API？/ Enable the language model API?' -Default $LlmEnabled
+        $EmbeddingEnabled = Read-YesNo -Label '启用 Embedding API？/ Enable the Embedding API?' -Default $EmbeddingEnabled
+        $TranscriptionEnabled = Read-YesNo -Label '启用本地语音转录 API？/ Enable the local transcription API?' -Default $TranscriptionEnabled
+        if ($LlmEnabled -or $EmbeddingEnabled -or $TranscriptionEnabled) {
+            return [pscustomobject]@{ Llm = $LlmEnabled; Embedding = $EmbeddingEnabled; Transcription = $TranscriptionEnabled }
+        }
+        Write-Host '请至少启用一个 API 模块。/ Enable at least one API module.' -ForegroundColor Yellow
+    }
+}
+
+function Test-SavedWizardModels {
+    $isServer = (Get-SavedValue 'launch_mode' 'chat') -eq 'server'
+    $paths = @()
+    if (-not $isServer -or ([string](Get-SavedValue 'server_llm_enabled' $true) -ieq 'true')) {
+        $paths += [string](Get-SavedValue 'model' '')
+    }
+    if ($isServer) {
+        if ([string](Get-SavedValue 'server_embedding' $false) -ieq 'true') { $paths += [string](Get-SavedValue 'embedding_model' '') }
+        if ([string](Get-SavedValue 'server_transcription' $false) -ieq 'true') { $paths += [string](Get-SavedValue 'transcription_model' '') }
+    }
+    if ($paths.Count -eq 0) { return $false }
+    foreach ($path in $paths) {
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    }
+    return $true
+}
+
+function Restore-DisabledLlmState {
+    param([System.Collections.IDictionary]$State)
+    # Preserve exact saved values, including legacy settings normalized during initialization.
+    $updatedKeys = @(
+        'launch_mode', 'device', 'server_llm_enabled', 'server_addr', 'server_auth',
+        'server_embedding', 'embedding_model', 'embedding_idle_timeout', 'server_transcription',
+        'transcription_model', 'transcription_threads', 'transcription_idle_timeout', 'transcription_upload_dir',
+        'benchmark_upload', 'benchmark_upload_has_github', 'benchmark_upload_gh_auth', 'benchmark_upload_fallback',
+        'submission_browser_action', 'submission_failure_action', 'submission_pending_retry', 'error_upload', 'last_command',
+        'api_key', 'server_api_key'
+    )
+    if ($null -eq $script:Saved) { return }
+    foreach ($property in $script:Saved.PSObject.Properties) {
+        # Retain legacy/unknown LLM fields too, for a later LLM-enabled launch.
+        if ($property.Name -notin $updatedKeys) { $State[$property.Name] = $property.Value }
+    }
+}
+
 function Select-TranscriptionModelPath {
     param([AllowEmptyString()][string]$Default = '')
 
@@ -2257,9 +2305,9 @@ function Get-TranscriptionSettings {
 
 function Read-TranscriptionSettings {
     param($Settings)
-    $Settings.Enabled = Read-YesNo -Label '可选：同时提供本地语音转录 API？/ Also serve the optional local transcription API?' -Default $Settings.Enabled
     if (-not $Settings.Enabled) { return }
-    Write-Host 'CPU 原生 infr，仅需 GGUF；无需 Python、ffmpeg、ORT 或 ggml runtime。/ Native infr on CPU needs only GGUF; no Python, ffmpeg, ORT or ggml runtime.' -ForegroundColor DarkGray
+    Write-Host '语音转录固定使用 CPU，默认 4 线程；模型载入后约占 300 MiB RAM。/ Transcription uses the CPU with 4 threads by default; the loaded model uses about 300 MiB RAM.' -ForegroundColor DarkGray
+    Write-Host '语音模型在首次请求时载入；不额外占用 GPU 权重，无需外部 runtime。/ The transcription model loads on the first request; no extra GPU weights or external runtime are needed.' -ForegroundColor DarkGray
     Write-Host '首版支持 WAV/PCM；不支持全格式或真正逐 token 流式。/ First release: WAV/PCM; no all-format support or true token-by-token streaming.' -ForegroundColor DarkGray
     $Settings.Model = Select-TranscriptionModelPath -Default $Settings.Model
     $Settings.Threads = Read-IntegerValue -Label '语音 CPU 线程数 / Transcription CPU threads' -Default $Settings.Threads -Minimum 1 -Maximum 256
@@ -2789,11 +2837,11 @@ Show-UpdateStatus -CurrentVersion $productVersion
 $reuseSavedSettings = $false
 $script:BenchmarkGuideActive = Invoke-BenchmarkStartupGuide -Interactive (Test-BenchmarkGuideInteractive) -JsonAutomation ([bool](Get-SavedValue 'json_output' $false))
 $savedModel = [string](Get-SavedValue 'model' '')
-if (-not $script:BenchmarkGuideActive -and $null -ne $script:Saved -and -not $InitialModelPath -and $savedModel) {
-    if (Test-Path -LiteralPath $savedModel -PathType Leaf) {
+if (-not $script:BenchmarkGuideActive -and $null -ne $script:Saved -and -not $InitialModelPath) {
+    if (Test-SavedWizardModels) {
         $reuseSavedSettings = Read-YesNo -Label '是否按上次设置直接启动？/ Start with the previous settings?' -Default $true
     } else {
-        Write-Warning '上次模型路径已不存在，请重新选择。The previous model is missing; choose a model again.'
+        Write-Warning '上次启用模块的模型不可用，请重新选择。A previously enabled module has no available model; choose again.'
     }
 }
 
@@ -2902,7 +2950,8 @@ $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
 $visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
-$serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
+$serverLlmEnabled = ([string](Get-SavedValue 'server_llm_enabled' $true) -ieq 'true')
+$serverEmbedding = ([string](Get-SavedValue 'server_embedding' $false) -ieq 'true')
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
 $transcription = Get-TranscriptionSettings
@@ -2912,6 +2961,7 @@ $cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
 $cpuMissMax = [string](Get-SavedValue 'cpu_miss_max' '1')
 $cpuMissCores = [string](Get-SavedValue 'cpu_miss_cores' '')
 $customSets = [string](Get-SavedValue 'custom_sets' '')
+$llmEnabled = ($launchMode -ne 'server' -or $serverLlmEnabled)
 
 if (-not $reuseSavedSettings) {
     if ($script:BenchmarkGuideActive) {
@@ -2928,12 +2978,19 @@ if (-not $reuseSavedSettings) {
         try { [void](Complete-ErrorReport) } catch { Write-Warning "错误报告生成失败：$($_.Exception.Message) / Could not create the error report." }
         exit 0
     }
-    Start-VulkanDeviceProbe
-    $modelPath = Select-ModelPath -InitialPath $InitialModelPath
-    if ($launchMode -ne 'benchmark') {
-        Start-ModelReasoningProbe -ModelPath $modelPath
-    }
     if ($launchMode -eq 'server') {
+        $modules = Read-ServerModules -LlmEnabled $serverLlmEnabled -EmbeddingEnabled $serverEmbedding -TranscriptionEnabled $transcription.Enabled
+        $serverLlmEnabled = $modules.Llm
+        $serverEmbedding = $modules.Embedding
+        $transcription.Enabled = $modules.Transcription
+    }
+    $llmEnabled = ($launchMode -ne 'server' -or $serverLlmEnabled)
+    if ($llmEnabled -or $serverEmbedding) { Start-VulkanDeviceProbe }
+    if ($llmEnabled) {
+        $modelPath = Select-ModelPath -InitialPath $InitialModelPath
+        if ($launchMode -ne 'benchmark') { Start-ModelReasoningProbe -ModelPath $modelPath }
+    }
+    if ($launchMode -eq 'server' -and $llmEnabled) {
         if (-not $visionProjectorPath -or -not (Test-Path -LiteralPath $visionProjectorPath -PathType Leaf)) {
             $visionProjectorPath = Find-VisionProjectorPath -ModelPath $modelPath
         }
@@ -2943,179 +3000,188 @@ if (-not $reuseSavedSettings) {
             Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
             $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
         }
-        $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
+    }
+    if ($launchMode -eq 'server') {
         if ($serverEmbedding) {
-            Write-Host 'Embedding 首次请求时从 GGUF/SSD 载入统一显存；空闲超时后释放，不建立额外 RAM 权重缓存。' -ForegroundColor DarkGray
-            Write-Host 'Weights load from GGUF/SSD into unified VRAM on demand and are released after the idle timeout; no extra RAM weight cache is kept.' -ForegroundColor DarkGray
+            Write-Host 'Embedding 模型与 Backend 在首次请求时加载，空闲超时后卸载整个实例。/ The Embedding model and backend load on the first request; the entire instance unloads after the idle timeout.' -ForegroundColor DarkGray
             $embeddingModelPath = Select-EmbeddingModelPath -Default $embeddingModelPath
             $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
         }
         Read-TranscriptionSettings -Settings $transcription
     }
 
-    $device = Read-ComputeDevice -Default $device
-    $setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $setupModeDefault -Options @(
-        [pscustomobject]@{ Key = '1'; Value = 'conservative'; Label = '自动配置：保守（推荐）/ Automatic: conservative (recommended)' }
-        [pscustomobject]@{ Key = '2'; Value = 'aggressive'; Label = '自动配置：激进性能 / Automatic: aggressive performance' }
-        [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
-    )
-    if ($setupMode -eq 'manual') {
-        Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
-        Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
-        $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
-        $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
-        $configPath = Read-TextValue -Label '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup' -Default $configPath
-        if (-not [string]::IsNullOrWhiteSpace($configPath)) {
-            $configPath = ConvertTo-FullPath $configPath
-            if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-                throw "找不到配置文件 / Config file not found: $configPath"
-            }
+    if ($llmEnabled -or $serverEmbedding) {
+        if ($launchMode -eq 'server') {
+            Write-Host 'LLM 和 Embedding 共用所选设备；语音转录固定使用 CPU。/ LLM and Embedding share the selected device; transcription always uses the CPU.' -ForegroundColor DarkGray
         }
-
-        $kvPreset = Read-Choice -Label 'KV Cache 类型 / KV cache type' -DefaultValue $kvPreset -Options @(
-            [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '引擎自动（推荐）/ Engine default (recommended)' }
-            [pscustomobject]@{ Key = '2'; Value = 'q8'; Label = 'Q8_0 K + Q8_0 V' }
-            [pscustomobject]@{ Key = '3'; Value = 'f16'; Label = 'F16 K + F16 V' }
-            [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '分别指定 / Custom K and V' }
+        $device = Read-ComputeDevice -Default $device
+    }
+    if ($llmEnabled) {
+        $setupMode = Read-Choice -Label '配置方式 / Configuration' -DefaultValue $setupModeDefault -Options @(
+            [pscustomobject]@{ Key = '1'; Value = 'conservative'; Label = '自动配置：保守（推荐）/ Automatic: conservative (recommended)' }
+            [pscustomobject]@{ Key = '2'; Value = 'aggressive'; Label = '自动配置：激进性能 / Automatic: aggressive performance' }
+            [pscustomobject]@{ Key = '3'; Value = 'manual'; Label = '全手动配置 / Fully manual configuration' }
         )
-        switch ($kvPreset) {
-            'q8' { $kvTypeK = 'q8_0'; $kvTypeV = 'q8_0' }
-            'f16' { $kvTypeK = 'f16'; $kvTypeV = 'f16' }
-            'custom' {
-                $kvTypeK = Read-TextValue -Label 'K cache 类型 / K cache dtype' -Default $kvTypeK -Required
-                $kvTypeV = Read-TextValue -Label 'V cache 类型 / V cache dtype' -Default $kvTypeV -Required
-            }
-        }
-
-        $configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default $configureMemory
-    } elseif ($setupMode -eq 'aggressive') {
-        Write-Host "`n将自动探测硬件，并减少 RAM/VRAM 保留、提高 Ubatch、探索更大的 Submit cap。" -ForegroundColor Yellow
-        Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
-        Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
-        Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
-        $kvPreset = 'auto'
-        $kvTypeK = ''
-        $kvTypeV = ''
-    } else {
-        Write-Host "`n将自动预算所选设备的显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
-        Write-Host 'VRAM and RAM budgets use the selected device; leave context blank for engine sizing.' -ForegroundColor DarkGray
-        $kvPreset = 'auto'
-        $kvTypeK = ''
-        $kvTypeV = ''
-    }
-    if ($setupMode -eq 'manual' -and $configureMemory) {
-        Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
-        $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
-        $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
-        $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
-        $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
-        $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
-        $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
-        $pagerRingSlots = Read-IntegerValue -Label 'Pager ring slots，留空为默认 / Pager ring slots, blank for default' -Default $pagerRingSlots -Minimum 2 -AllowBlank
-        $kvOverflow = Read-YesNo -Label '允许 KV 溢出到 RAM？/ Allow KV overflow to RAM?' -Default $kvOverflow
-        if ($kvOverflow) {
-            $kvOverflowVram = Read-IntegerValue -Label 'KV 显存上限 MiB，留空为自动 / KV VRAM ceiling MiB, blank for auto' -Default $kvOverflowVram -Minimum 1 -AllowBlank
-            $kvOverflowReserve = Read-IntegerValue -Label 'KV 之外保留 MiB，留空为自动 / Non-KV reserve MiB, blank for auto' -Default $kvOverflowReserve -Minimum 1 -AllowBlank
-        }
-    }
-    if ($setupMode -eq 'manual') {
-        $submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue $submitMode -Options @(
-            [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
-            [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
-            [pscustomobject]@{ Key = '3'; Value = 'fixed'; Label = '固定 cap / Fixed cap' }
-        )
-        if ($submitMode -eq 'fixed') {
-            $submitCap = Read-IntegerValue -Label '固定 dispatch cap / Fixed dispatch cap' -Default $submitCap -Minimum 1
-        }
-    }
-    if ($setupMode -eq 'manual') {
-        $configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default $configureDiagnostics
-    }
-    if ($setupMode -eq 'manual' -and $configureDiagnostics) {
-        $pagerStats = Read-YesNo -Label '输出 pager 命中统计？/ Print pager hit statistics?' -Default $pagerStats
-        $pagerProfile = Read-YesNo -Label '启用聚合 pager profiler？/ Enable aggregate pager profiler?' -Default $pagerProfile
-        $stageProfile = Read-YesNo -Label '启用阶段计时？/ Enable stage timings?' -Default $stageProfile
-        $vramProfile = Read-YesNo -Label '输出实时显存信息？/ Print live VRAM information?' -Default $vramProfile
-    }
-    if ($setupMode -eq 'manual') {
-        $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
-    }
-
-    if ($launchMode -ne 'benchmark') {
-        $configureThinking = Read-YesNo -Label '是否配置默认思考？/ Configure default reasoning?' -Default $configureThinking
-        if ($configureThinking) {
-            $thinkingEnabled = Read-YesNo -Label '默认开启思考？/ Enable reasoning by default?' -Default ($thinkMode -ne 'no-think')
-            $thinkMode = if ($thinkingEnabled) { 'think' } else { 'no-think' }
-            $reasoningEffort = 'default'
-            if ($thinkingEnabled) {
-                $efforts = @(Get-ModelReasoningEfforts -ModelPath $modelPath)
-                if ($efforts.Count) {
-                    $effortDefault = [string](Get-SavedValue 'reasoning_effort' 'default')
-                    if ($effortDefault -ne 'default' -and $effortDefault -notin $efforts) { $effortDefault = 'default' }
-                    $effortOptions = @([pscustomobject]@{ Key = '1'; Value = 'default'; Label = '模板默认 / Template default' })
-                    foreach ($effort in $efforts) {
-                        $effortOptions += [pscustomobject]@{ Key = ($effortOptions.Count + 1).ToString(); Value = $effort; Label = $effort }
-                    }
-                    $reasoningEffort = Read-Choice -Label '默认思考强度 / Default reasoning effort' -DefaultValue $effortDefault -Options $effortOptions
+        if ($setupMode -eq 'manual') {
+            Write-Host "`n高级通用设置 / Advanced common settings" -ForegroundColor Cyan
+            Write-Host '各项留空即可继续使用引擎的硬件探测与自动预算。Leave values blank to keep engine auto-detection.' -ForegroundColor DarkGray
+            $ubatch = Read-IntegerValue -Label 'Ubatch，留空为自动 / Ubatch, blank for auto' -Default $ubatch -Minimum 1 -AllowBlank
+            $threads = Read-IntegerValue -Label 'CPU 线程，留空为全部 / CPU threads, blank for all' -Default $threads -Minimum 1 -AllowBlank
+            $configPath = Read-TextValue -Label '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup' -Default $configPath
+            if (-not [string]::IsNullOrWhiteSpace($configPath)) {
+                $configPath = ConvertTo-FullPath $configPath
+                if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+                    throw "找不到配置文件 / Config file not found: $configPath"
                 }
             }
+
+            $kvPreset = Read-Choice -Label 'KV Cache 类型 / KV cache type' -DefaultValue $kvPreset -Options @(
+                [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '引擎自动（推荐）/ Engine default (recommended)' }
+                [pscustomobject]@{ Key = '2'; Value = 'q8'; Label = 'Q8_0 K + Q8_0 V' }
+                [pscustomobject]@{ Key = '3'; Value = 'f16'; Label = 'F16 K + F16 V' }
+                [pscustomobject]@{ Key = '4'; Value = 'custom'; Label = '分别指定 / Custom K and V' }
+            )
+            switch ($kvPreset) {
+                'q8' { $kvTypeK = 'q8_0'; $kvTypeV = 'q8_0' }
+                'f16' { $kvTypeK = 'f16'; $kvTypeV = 'f16' }
+                'custom' {
+                    $kvTypeK = Read-TextValue -Label 'K cache 类型 / K cache dtype' -Default $kvTypeK -Required
+                    $kvTypeV = Read-TextValue -Label 'V cache 类型 / V cache dtype' -Default $kvTypeV -Required
+                }
+            }
+
+            $configureMemory = Read-YesNo -Label '设置显存、内存和分页参数？/ Configure memory and paging?' -Default $configureMemory
+        } elseif ($setupMode -eq 'aggressive') {
+            Write-Host "`n将自动探测硬件，并减少 RAM/VRAM 保留、提高 Ubatch、探索更大的 Submit cap。" -ForegroundColor Yellow
+            Write-Host 'Hardware stays auto-detected, with tighter RAM/VRAM headroom, a larger Ubatch and a wider Submit cap search.' -ForegroundColor DarkGray
+            Write-Host '适合追求吞吐且能接受更高资源压力；启动失败或系统换页时请改用保守档。' -ForegroundColor Yellow
+            Write-Host 'Use conservative mode if allocation fails or Windows starts paging.' -ForegroundColor DarkGray
+            $kvPreset = 'auto'
+            $kvTypeK = ''
+            $kvTypeV = ''
         } else {
-            $thinkMode = 'default'
-            $reasoningEffort = 'default'
+            Write-Host "`n将自动预算所选设备的显存和 RAM；上下文留空时由引擎自动确定。" -ForegroundColor DarkGray
+            Write-Host 'VRAM and RAM budgets use the selected device; leave context blank for engine sizing.' -ForegroundColor DarkGray
+            $kvPreset = 'auto'
+            $kvTypeK = ''
+            $kvTypeV = ''
         }
-        if (-not $maxNew) { $maxNew = '65536' }
-        $maxNew = Read-IntegerValue -Label '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' -Default $maxNew -Minimum 1
-        $configureSampling = Read-YesNo -Label '设置默认采样参数？/ Configure default sampling?' -Default $configureSampling
-        if ($configureSampling) {
-            $temperature = Read-TextValue -Label 'Temperature，留空为模型默认 / blank for model default' -Default $temperature
-            $topK = Read-IntegerValue -Label 'Top-K，留空为模型默认 / blank for model default' -Default $topK -Minimum 0 -AllowBlank
-            $topP = Read-TextValue -Label 'Top-P，留空为模型默认 / blank for model default' -Default $topP
-            $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
+        if ($setupMode -eq 'manual' -and $configureMemory) {
+            Write-Host '大小可写 21GiB、512MiB、80%；留空表示自动。Sizes accept 21GiB, 512MiB or 80%; blank means auto.' -ForegroundColor DarkGray
+            $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
+            $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
+            $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
+            $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
+            $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
+            $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
+            $pagerRingSlots = Read-IntegerValue -Label 'Pager ring slots，留空为默认 / Pager ring slots, blank for default' -Default $pagerRingSlots -Minimum 2 -AllowBlank
+            $kvOverflow = Read-YesNo -Label '允许 KV 溢出到 RAM？/ Allow KV overflow to RAM?' -Default $kvOverflow
+            if ($kvOverflow) {
+                $kvOverflowVram = Read-IntegerValue -Label 'KV 显存上限 MiB，留空为自动 / KV VRAM ceiling MiB, blank for auto' -Default $kvOverflowVram -Minimum 1 -AllowBlank
+                $kvOverflowReserve = Read-IntegerValue -Label 'KV 之外保留 MiB，留空为自动 / Non-KV reserve MiB, blank for auto' -Default $kvOverflowReserve -Minimum 1 -AllowBlank
+            }
         }
-    }
+        if ($setupMode -eq 'manual') {
+            $submitMode = Read-Choice -Label 'Submit splitter' -DefaultValue $submitMode -Options @(
+                [pscustomobject]@{ Key = '1'; Value = 'auto'; Label = '自动反馈 / Automatic feedback' }
+                [pscustomobject]@{ Key = '2'; Value = 'disabled'; Label = '禁用，no-split / Disabled, no-split' }
+                [pscustomobject]@{ Key = '3'; Value = 'fixed'; Label = '固定 cap / Fixed cap' }
+            )
+            if ($submitMode -eq 'fixed') {
+                $submitCap = Read-IntegerValue -Label '固定 dispatch cap / Fixed dispatch cap' -Default $submitCap -Minimum 1
+            }
+        }
+        if ($setupMode -eq 'manual') {
+            $configureDiagnostics = Read-YesNo -Label '设置统计或 profiler？/ Configure statistics or profilers?' -Default $configureDiagnostics
+        }
+        if ($setupMode -eq 'manual' -and $configureDiagnostics) {
+            $pagerStats = Read-YesNo -Label '输出 pager 命中统计？/ Print pager hit statistics?' -Default $pagerStats
+            $pagerProfile = Read-YesNo -Label '启用聚合 pager profiler？/ Enable aggregate pager profiler?' -Default $pagerProfile
+            $stageProfile = Read-YesNo -Label '启用阶段计时？/ Enable stage timings?' -Default $stageProfile
+            $vramProfile = Read-YesNo -Label '输出实时显存信息？/ Print live VRAM information?' -Default $vramProfile
+        }
+        if ($setupMode -eq 'manual') {
+            $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
+        }
 
-    $cpuMissEnabled = Read-YesNo -Label '启用实验性 CPU 专家 miss 计算？/ Enable experimental CPU expert-miss computation?' -Default ([bool](Get-SavedValue 'cpu_miss_enabled' $false))
-    if ($cpuMissEnabled) {
-        $cpuTopology = Get-CpuMissTopology
-        $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Physical - 2)
-        Write-Host ('物理核心 {0}，性能核心 {1}；默认计算核数为 max(1, 总物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
-        Write-Host ('Physical cores: {0}; performance cores: {1}; default compute cores: max(1, physical - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
-        if ($cpuTopology.Preferred -lt $cpuTopology.Physical) {
-            Write-Host '大小核 CPU 优先预留两个大核：其余大核 → 小核 → 预留大核；选满不预留。' -ForegroundColor DarkGray
-            Write-Host 'Hybrid CPU: other performance cores, then efficiency cores, then the two reserved performance cores; selecting all cores leaves no reserve.' -ForegroundColor DarkGray
+        if ($launchMode -ne 'benchmark') {
+            $configureThinking = Read-YesNo -Label '是否配置默认思考？/ Configure default reasoning?' -Default $configureThinking
+            if ($configureThinking) {
+                $thinkingEnabled = Read-YesNo -Label '默认开启思考？/ Enable reasoning by default?' -Default ($thinkMode -ne 'no-think')
+                $thinkMode = if ($thinkingEnabled) { 'think' } else { 'no-think' }
+                $reasoningEffort = 'default'
+                if ($thinkingEnabled) {
+                    $efforts = @(Get-ModelReasoningEfforts -ModelPath $modelPath)
+                    if ($efforts.Count) {
+                        $effortDefault = [string](Get-SavedValue 'reasoning_effort' 'default')
+                        if ($effortDefault -ne 'default' -and $effortDefault -notin $efforts) { $effortDefault = 'default' }
+                        $effortOptions = @([pscustomobject]@{ Key = '1'; Value = 'default'; Label = '模板默认 / Template default' })
+                        foreach ($effort in $efforts) {
+                            $effortOptions += [pscustomobject]@{ Key = ($effortOptions.Count + 1).ToString(); Value = $effort; Label = $effort }
+                        }
+                        $reasoningEffort = Read-Choice -Label '默认思考强度 / Default reasoning effort' -DefaultValue $effortDefault -Options $effortOptions
+                    }
+                }
+            } else {
+                $thinkMode = 'default'
+                $reasoningEffort = 'default'
+            }
+            if (-not $maxNew) { $maxNew = '65536' }
+            $maxNew = Read-IntegerValue -Label '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' -Default $maxNew -Minimum 1
+            $configureSampling = Read-YesNo -Label '设置默认采样参数？/ Configure default sampling?' -Default $configureSampling
+            if ($configureSampling) {
+                $temperature = Read-TextValue -Label 'Temperature，留空为模型默认 / blank for model default' -Default $temperature
+                $topK = Read-IntegerValue -Label 'Top-K，留空为模型默认 / blank for model default' -Default $topK -Minimum 0 -AllowBlank
+                $topP = Read-TextValue -Label 'Top-P，留空为模型默认 / blank for model default' -Default $topP
+                $seed = Read-IntegerValue -Label '随机种子，留空为随机 / Seed, blank for random' -Default $seed -Minimum 0 -AllowBlank
+            }
         }
-        if (-not $cpuTopology.Detected) {
-            Write-Warning '未能识别大小核，默认按总物理核心计算；请确认核心数。Hybrid-core detection unavailable; confirm the compute-core count.'
+
+        $cpuMissEnabled = Read-YesNo -Label '启用实验性 CPU 专家 miss 计算？/ Enable experimental CPU expert-miss computation?' -Default ([bool](Get-SavedValue 'cpu_miss_enabled' $false))
+        if ($cpuMissEnabled) {
+            $cpuTopology = Get-CpuMissTopology
+            $defaultCpuMissCores = [Math]::Max(1, $cpuTopology.Physical - 2)
+            Write-Host ('物理核心 {0}，性能核心 {1}；默认计算核数为 max(1, 总物理核数 - 2) = {2}。' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+            Write-Host ('Physical cores: {0}; performance cores: {1}; default compute cores: max(1, physical - 2) = {2}.' -f $cpuTopology.Physical, $cpuTopology.Preferred, $defaultCpuMissCores) -ForegroundColor DarkGray
+            if ($cpuTopology.Preferred -lt $cpuTopology.Physical) {
+                Write-Host '大小核 CPU 优先预留两个大核：其余大核 → 小核 → 预留大核；选满不预留。' -ForegroundColor DarkGray
+                Write-Host 'Hybrid CPU: other performance cores, then efficiency cores, then the two reserved performance cores; selecting all cores leaves no reserve.' -ForegroundColor DarkGray
+            }
+            if (-not $cpuTopology.Detected) {
+                Write-Warning '未能识别大小核，默认按总物理核心计算；请确认核心数。Hybrid-core detection unavailable; confirm the compute-core count.'
+            }
+            $parsedCores = 0
+            if (-not [int]::TryParse($cpuMissCores, [ref]$parsedCores) -or $parsedCores -lt 1 -or $parsedCores -gt $cpuTopology.Physical) {
+                $cpuMissCores = $defaultCpuMissCores.ToString()
+            }
+            $parsedMissMax = 0
+            if (-not [int]::TryParse($cpuMissMax, [ref]$parsedMissMax) -or $parsedMissMax -lt 1 -or $parsedMissMax -gt 3) { $cpuMissMax = '1' }
+            $cpuMissMax = Read-IntegerValue -Label '最多交给 CPU 的 miss 数（1-3）/ Maximum CPU miss count (1-3)' -Default $cpuMissMax -Minimum 1 -Maximum 3
+            $cpuMissCores = Read-IntegerValue -Label 'CPU 计算核心数 / CPU compute cores' -Default $cpuMissCores -Minimum 1 -Maximum $cpuTopology.Physical
+            Write-Host '要求 AVX2 + FMA3、支持的量化和完整 RAM 专家缓存；超出 miss 上限或其他不支持工况自动使用 GPU。' -ForegroundColor DarkGray
+            Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
+            Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
         }
-        $parsedCores = 0
-        if (-not [int]::TryParse($cpuMissCores, [ref]$parsedCores) -or $parsedCores -lt 1 -or $parsedCores -gt $cpuTopology.Physical) {
-            $cpuMissCores = $defaultCpuMissCores.ToString()
+        if ($launchMode -eq 'server') {
+            $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
         }
-        $parsedMissMax = 0
-        if (-not [int]::TryParse($cpuMissMax, [ref]$parsedMissMax) -or $parsedMissMax -lt 1 -or $parsedMissMax -gt 3) { $cpuMissMax = '1' }
-        $cpuMissMax = Read-IntegerValue -Label '最多交给 CPU 的 miss 数（1-3）/ Maximum CPU miss count (1-3)' -Default $cpuMissMax -Minimum 1 -Maximum 3
-        $cpuMissCores = Read-IntegerValue -Label 'CPU 计算核心数 / CPU compute cores' -Default $cpuMissCores -Minimum 1 -Maximum $cpuTopology.Physical
-        Write-Host '要求 AVX2 + FMA3、支持的量化和完整 RAM 专家缓存；超出 miss 上限或其他不支持工况自动使用 GPU。' -ForegroundColor DarkGray
-        Write-Host 'Requires AVX2 + FMA3, supported quantization and full-RAM experts; unsupported cases or larger miss sets use GPU.' -ForegroundColor DarkGray
-        Write-Host '性能收益尚未保证；2/3 miss 未做整机性能验收。Performance gains are not guaranteed; 2/3-miss model throughput is unvalidated.' -ForegroundColor Yellow
+
+        if ($launchMode -ne 'benchmark') {
+            $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
+        }
+        if ($launchMode -eq 'server') {
+            $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
+            if ($serverSessionCache -and (Read-YesNo -Label '修改 SSD KV 缓存参数？/ Customize SSD KV cache settings?' -Default $false)) {
+                $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
+                $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
+                $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
+                $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
+                $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
+            }
+
+        }
     }
     if ($launchMode -eq 'server') {
-        $serverParallel = Read-IntegerValue -Label '并发会话数（每个会话有独立 KV）/ Concurrent slots (one KV cache each)' -Default $serverParallel -Minimum 1
-    }
-
-    if ($launchMode -ne 'benchmark') {
-        $context = Read-TextValue -Label '上下文窗口，留空为自动 / Context window, blank for auto' -Default $context
-    }
-    if ($launchMode -eq 'server') {
-        $serverSessionCache = Read-YesNo -Label '将闲置会话 KV 缓存到 SSD？/ Cache idle-session KV on SSD?' -Default $serverSessionCache
-        if ($serverSessionCache -and (Read-YesNo -Label '修改 SSD KV 缓存参数？/ Customize SSD KV cache settings?' -Default $false)) {
-            $sessionCacheDir = Read-TextValue -Label 'KV 缓存目录 / KV cache directory' -Default $sessionCacheDir -Required
-            $sessionCacheDir = ConvertTo-FullPath $sessionCacheDir
-            $sessionIdleSecs = Read-IntegerValue -Label '会话闲置多少秒后写入 SSD / Spill after idle seconds' -Default $sessionIdleSecs -Minimum 0
-            $sessionCacheMax = Read-TextValue -Label 'SSD KV 缓存总上限（绝对大小）/ Total SSD KV cache limit (absolute size)' -Default $sessionCacheMax -Required
-            $sessionCacheTtlHours = Read-IntegerValue -Label '缓存保留小时数，0 为不按时间清理 / Cache TTL hours, 0 disables age expiry' -Default $sessionCacheTtlHours -Minimum 0
-        }
-
         Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
@@ -3198,90 +3264,96 @@ if ($launchMode -eq 'server') {
     }
 }
 
+if ($launchMode -eq 'server' -and -not ($serverLlmEnabled -or $serverEmbedding -or $transcription.Enabled)) {
+    throw '请至少启用一个 API 模块。/ Enable at least one API module.'
+}
 $nativeArgs = [System.Collections.Generic.List[string]]::new()
 [void]$nativeArgs.Add($(switch ($launchMode) {
     'benchmark' { 'bench' }
     'server' { 'serve' }
     default { 'run' }
 }))
-if (-not [string]::IsNullOrWhiteSpace($device)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($device) }
-if ($setupMode -eq 'manual') {
-    if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
-    if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
-    if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
-}
-if ($launchMode -ne 'benchmark' -and -not [string]::IsNullOrWhiteSpace($context)) {
-    [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context)
-}
-
-if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
-    Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
-    # Also migrate direct reuse of older automatic settings; the engine owns format support.
-    $kvPreset = 'auto'
-    $kvTypeK = ''
-    $kvTypeV = ''
-}
-
-if ($kvPreset -ne 'auto') {
-    Add-SetArgument $nativeArgs 'kv.type_k' $kvTypeK
-    Add-SetArgument $nativeArgs 'kv.type_v' $kvTypeV
-}
-if ($setupMode -eq 'manual' -and $configureMemory) {
-    if ($vramBudget) { Add-SetArgument $nativeArgs 'device.vram_budget' $vramBudget }
-    if ($vramReserve) { Add-SetArgument $nativeArgs 'device.vram_reserve' $vramReserve }
-    if ($expertCache) { Add-SetArgument $nativeArgs 'paging.cache' $expertCache }
-    if ($ramBudget) { Add-SetArgument $nativeArgs 'device.ram_budget' $ramBudget }
-    Add-SetArgument $nativeArgs 'paging.host_dma' $hostDma.ToString().ToLowerInvariant()
-    if ($pagerRing) { Add-SetArgument $nativeArgs 'paging.ring' $pagerRing }
-    if ($pagerRingSlots) { Add-SetArgument $nativeArgs 'paging.ring_slots' $pagerRingSlots }
-    Add-SetArgument $nativeArgs 'kv.overflow' $kvOverflow.ToString().ToLowerInvariant()
-    if ($kvOverflow -and $kvOverflowVram) { Add-SetArgument $nativeArgs 'kv.overflow_vram_mb' $kvOverflowVram }
-    if ($kvOverflow -and $kvOverflowReserve) { Add-SetArgument $nativeArgs 'kv.overflow_reserve_mb' $kvOverflowReserve }
-}
-if ($setupMode -eq 'manual') {
-    switch ($submitMode) {
-        'disabled' { Add-SetArgument $nativeArgs 'device.submit_dispatches' '0' }
-        'fixed' { Add-SetArgument $nativeArgs 'device.submit_dispatches' $submitCap }
+$commandDevice = if ($llmEnabled -or $serverEmbedding) { $device } else { 'cpu' }
+if (-not [string]::IsNullOrWhiteSpace($commandDevice)) { [void]$nativeArgs.Add('--dev'); [void]$nativeArgs.Add($commandDevice) }
+if ($llmEnabled) {
+    if ($setupMode -eq 'manual') {
+        if (-not [string]::IsNullOrWhiteSpace($configPath)) { [void]$nativeArgs.Add('--config'); [void]$nativeArgs.Add($configPath) }
+        if (-not [string]::IsNullOrWhiteSpace($ubatch)) { [void]$nativeArgs.Add('--ubatch'); [void]$nativeArgs.Add($ubatch) }
+        if (-not [string]::IsNullOrWhiteSpace($threads)) { [void]$nativeArgs.Add('--threads'); [void]$nativeArgs.Add($threads) }
     }
-}
-if ($setupMode -eq 'manual' -and $configureDiagnostics) {
-    Add-SetArgument $nativeArgs 'paging.stats' $pagerStats.ToString().ToLowerInvariant()
-    Add-SetArgument $nativeArgs 'prof.pager_profile' $pagerProfile.ToString().ToLowerInvariant()
-    Add-SetArgument $nativeArgs 'prof.stages' $stageProfile.ToString().ToLowerInvariant()
-    Add-SetArgument $nativeArgs 'prof.vram' $vramProfile.ToString().ToLowerInvariant()
-}
-Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_threads' $(if ($cpuMissEnabled) { $cpuMissCores } else { '0' })
-if ($cpuMissEnabled) {
-    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_max' $cpuMissMax
-    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_push' 'true'
-    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_host_result' 'true'
-    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_token_park' 'true'
-    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_spin' '262144'
-}
-if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
-    foreach ($entry in $customSets.Split(';')) {
-        $entry = $entry.Trim()
-        if (-not $entry) { continue }
-        $equals = $entry.IndexOf('=')
-        if ($equals -le 0) {
-            throw "额外配置缺少 path=value / Invalid extra setting: $entry"
-        }
-        $settingPath = $entry.Substring(0, $equals).Trim()
-        if ($launchMode -eq 'server' -and $settingPath -eq 'serve.api_key') {
-            throw '服务器 API key 请使用专用提示输入，以免密钥出现在命令和历史记录中。Use the server API-key prompt so the secret is not exposed in commands or history.'
-        }
-        if ($settingPath.StartsWith('kernels.vulkan.cpu_miss_', [System.StringComparison]::Ordinal) -and
-            @($nativeArgs | Where-Object { $_.StartsWith("$settingPath=", [System.StringComparison]::Ordinal) }).Count -gt 0) {
-            Write-Warning "CPU-miss 参数 $settingPath 已由向导设置，忽略同名额外配置。The wizard controls this CPU-miss setting; the duplicate extra setting is ignored."
-            continue
-        }
-        Add-SetArgument $nativeArgs $settingPath $entry.Substring($equals + 1).Trim()
+    if ($launchMode -ne 'benchmark' -and -not [string]::IsNullOrWhiteSpace($context)) {
+        [void]$nativeArgs.Add('--ctx'); [void]$nativeArgs.Add($context)
     }
-}
-if ($launchMode -ne 'benchmark') {
-    # The engine still supports MTP through manual CLI/config use, but the release wizard keeps a
-    # deterministic non-MTP path and overrides stale saved or environment configuration.
-    Add-SetArgument $nativeArgs 'spec.mtp' 'false'
+
+    if ($setupMode -eq 'conservative' -or $setupMode -eq 'aggressive') {
+        Add-SetArgument $nativeArgs 'device.auto_profile' $setupMode
+        # Also migrate direct reuse of older automatic settings; the engine owns format support.
+        $kvPreset = 'auto'
+        $kvTypeK = ''
+        $kvTypeV = ''
+    }
+
+    if ($kvPreset -ne 'auto') {
+        Add-SetArgument $nativeArgs 'kv.type_k' $kvTypeK
+        Add-SetArgument $nativeArgs 'kv.type_v' $kvTypeV
+    }
+    if ($setupMode -eq 'manual' -and $configureMemory) {
+        if ($vramBudget) { Add-SetArgument $nativeArgs 'device.vram_budget' $vramBudget }
+        if ($vramReserve) { Add-SetArgument $nativeArgs 'device.vram_reserve' $vramReserve }
+        if ($expertCache) { Add-SetArgument $nativeArgs 'paging.cache' $expertCache }
+        if ($ramBudget) { Add-SetArgument $nativeArgs 'device.ram_budget' $ramBudget }
+        Add-SetArgument $nativeArgs 'paging.host_dma' $hostDma.ToString().ToLowerInvariant()
+        if ($pagerRing) { Add-SetArgument $nativeArgs 'paging.ring' $pagerRing }
+        if ($pagerRingSlots) { Add-SetArgument $nativeArgs 'paging.ring_slots' $pagerRingSlots }
+        Add-SetArgument $nativeArgs 'kv.overflow' $kvOverflow.ToString().ToLowerInvariant()
+        if ($kvOverflow -and $kvOverflowVram) { Add-SetArgument $nativeArgs 'kv.overflow_vram_mb' $kvOverflowVram }
+        if ($kvOverflow -and $kvOverflowReserve) { Add-SetArgument $nativeArgs 'kv.overflow_reserve_mb' $kvOverflowReserve }
+    }
+    if ($setupMode -eq 'manual') {
+        switch ($submitMode) {
+            'disabled' { Add-SetArgument $nativeArgs 'device.submit_dispatches' '0' }
+            'fixed' { Add-SetArgument $nativeArgs 'device.submit_dispatches' $submitCap }
+        }
+    }
+    if ($setupMode -eq 'manual' -and $configureDiagnostics) {
+        Add-SetArgument $nativeArgs 'paging.stats' $pagerStats.ToString().ToLowerInvariant()
+        Add-SetArgument $nativeArgs 'prof.pager_profile' $pagerProfile.ToString().ToLowerInvariant()
+        Add-SetArgument $nativeArgs 'prof.stages' $stageProfile.ToString().ToLowerInvariant()
+        Add-SetArgument $nativeArgs 'prof.vram' $vramProfile.ToString().ToLowerInvariant()
+    }
+    Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_threads' $(if ($cpuMissEnabled) { $cpuMissCores } else { '0' })
+    if ($cpuMissEnabled) {
+        Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_max' $cpuMissMax
+        Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_push' 'true'
+        Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_host_result' 'true'
+        Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_token_park' 'true'
+        Add-SetArgument $nativeArgs 'kernels.vulkan.cpu_miss_spin' '262144'
+    }
+    if ($setupMode -eq 'manual' -and -not [string]::IsNullOrWhiteSpace($customSets)) {
+        foreach ($entry in $customSets.Split(';')) {
+            $entry = $entry.Trim()
+            if (-not $entry) { continue }
+            $equals = $entry.IndexOf('=')
+            if ($equals -le 0) {
+                throw "额外配置缺少 path=value / Invalid extra setting: $entry"
+            }
+            $settingPath = $entry.Substring(0, $equals).Trim()
+            if ($launchMode -eq 'server' -and $settingPath -eq 'serve.api_key') {
+                throw '服务器 API key 请使用专用提示输入，以免密钥出现在命令和历史记录中。Use the server API-key prompt so the secret is not exposed in commands or history.'
+            }
+            if ($settingPath.StartsWith('kernels.vulkan.cpu_miss_', [System.StringComparison]::Ordinal) -and
+                @($nativeArgs | Where-Object { $_.StartsWith("$settingPath=", [System.StringComparison]::Ordinal) }).Count -gt 0) {
+                Write-Warning "CPU-miss 参数 $settingPath 已由向导设置，忽略同名额外配置。The wizard controls this CPU-miss setting; the duplicate extra setting is ignored."
+                continue
+            }
+            Add-SetArgument $nativeArgs $settingPath $entry.Substring($equals + 1).Trim()
+        }
+    }
+    if ($launchMode -ne 'benchmark') {
+        # The engine still supports MTP through manual CLI/config use, but the release wizard keeps a
+        # deterministic non-MTP path and overrides stale saved or environment configuration.
+        Add-SetArgument $nativeArgs 'spec.mtp' 'false'
+    }
 }
 
 if ($launchMode -eq 'benchmark') {
@@ -3303,7 +3375,7 @@ if ($launchMode -eq 'benchmark') {
         [void]$nativeArgs.Add('-r'); [void]$nativeArgs.Add($reps)
         [void]$nativeArgs.Add('--json')
     }
-} else {
+} elseif ($llmEnabled) {
     switch ($thinkMode) {
         'think' { [void]$nativeArgs.Add('--think') }
         'no-think' { [void]$nativeArgs.Add('--no-think') }
@@ -3325,18 +3397,20 @@ if ($launchMode -eq 'server') {
         Add-SetArgument $nativeArgs 'serve.api_key' ''
     }
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
-    [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
-    if ($serverSessionCache) {
-        Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
-        Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
-        Add-SetArgument $nativeArgs 'kv.session_cache_max' $sessionCacheMax
-        Add-SetArgument $nativeArgs 'kv.session_cache_ttl_hours' $sessionCacheTtlHours
-    } else {
-        # An explicit empty CLI layer disables a cache inherited from infr.toml or the environment.
-        Add-SetArgument $nativeArgs 'kv.session_cache_dir' ''
-    }
-    if ($serverVision) {
-        [void]$nativeArgs.Add('--mmproj'); [void]$nativeArgs.Add($visionProjectorPath)
+    if ($llmEnabled) {
+        [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+        if ($serverSessionCache) {
+            Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
+            Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
+            Add-SetArgument $nativeArgs 'kv.session_cache_max' $sessionCacheMax
+            Add-SetArgument $nativeArgs 'kv.session_cache_ttl_hours' $sessionCacheTtlHours
+        } else {
+            # An explicit empty CLI layer disables a cache inherited from infr.toml or the environment.
+            Add-SetArgument $nativeArgs 'kv.session_cache_dir' ''
+        }
+        if ($serverVision) {
+            [void]$nativeArgs.Add('--mmproj'); [void]$nativeArgs.Add($visionProjectorPath)
+        }
     }
     if ($serverEmbedding) {
         [void]$nativeArgs.Add('--embedding-model'); [void]$nativeArgs.Add($embeddingModelPath)
@@ -3344,14 +3418,16 @@ if ($launchMode -eq 'server') {
     }
     Add-TranscriptionArguments -Arguments $nativeArgs -Settings $transcription
 }
-[void]$nativeArgs.Add($modelPath)
+if ($llmEnabled) { [void]$nativeArgs.Add($modelPath) }
 
 $commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
-if ($null -ne $script:ModelReasoningProbe -and $script:ModelReasoningProbe.Async.IsCompleted) {
+if ($llmEnabled -and $null -ne $script:ModelReasoningProbe -and $script:ModelReasoningProbe.Async.IsCompleted) {
     [void](Get-ModelReasoningEfforts -ModelPath $modelPath)
 }
 $state = [ordered]@{
-    launch_mode = $launchMode; setup_mode = $setupMode; model = $modelPath; model_history = @(Get-UpdatedModelHistory -SelectedModel $modelPath); device = $device; context = $context
+    launch_mode = $launchMode; setup_mode = $setupMode; model = $modelPath
+    model_history = @(if ($llmEnabled) { Get-UpdatedModelHistory -SelectedModel $modelPath } else { Get-SavedValue 'model_history' @() })
+    device = $device; context = $context
     ubatch = $ubatch; threads = $threads; config_path = $configPath
     kv_preset = $kvPreset; kv_type_k = $kvTypeK; kv_type_v = $kvTypeV
     configure_memory = $configureMemory; vram_budget = $vramBudget; vram_reserve = $vramReserve
@@ -3385,6 +3461,7 @@ $state = [ordered]@{
     session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
     session_cache_ttl_hours = $sessionCacheTtlHours
     server_vision = $serverVision; vision_projector = $visionProjectorPath
+    server_llm_enabled = $serverLlmEnabled
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
     server_transcription = $transcription.Enabled; transcription_model = $transcription.Model
@@ -3393,6 +3470,7 @@ $state = [ordered]@{
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }
+if (-not $llmEnabled) { Restore-DisabledLlmState -State $state }
 if (-not $DryRun -and -not $script:PendingSubmissionPrompted) { Offer-PendingSubmissions }
 Write-Host "`n最终命令 / Final command" -ForegroundColor Green
 Write-Host $commandText -ForegroundColor White
@@ -3425,7 +3503,7 @@ if ($launchMode -eq 'server') {
     if ($transcription.Enabled) {
         Write-Host "本地语音转录 API / Local transcription API: http://$clientAddress/v1/audio/transcriptions (WAV/PCM, CPU)" -ForegroundColor Cyan
     }
-    if ($serverVision) {
+    if ($llmEnabled -and $serverVision) {
         Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
         Write-Host 'Vision chat enabled: send an image_url data URI in /v1/chat/completions content parts.' -ForegroundColor Cyan
     }

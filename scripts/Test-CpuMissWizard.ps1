@@ -34,11 +34,12 @@ if ($null -eq $start) { throw 'Missing CPU wizard prompts' }
 $promptStatements = @($start.Parent.Statements)
 $promptIndex = [array]::IndexOf($promptStatements, $start)
 $prompts = [scriptblock]::Create($start.Extent.Text + "`n" + $promptStatements[$promptIndex + 1].Extent.Text)
-$argumentStart = $statements | Where-Object { $_.Extent.Text.StartsWith('Add-SetArgument $nativeArgs ''kernels.vulkan.cpu_miss_threads''') } | Select-Object -First 1
-$argumentIndex = [array]::IndexOf($statements, $argumentStart)
+$argumentStart = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text.StartsWith('Add-SetArgument $nativeArgs ''kernels.vulkan.cpu_miss_threads''') }, $true)
+$llmStatements = @($argumentStart.Parent.Parent.Statements)
+$argumentIndex = [array]::IndexOf($llmStatements, $argumentStart.Parent)
 if ($argumentIndex -lt 0) { throw 'Missing CPU command arguments' }
-$arguments = [scriptblock]::Create($argumentStart.Extent.Text + "`n" + $statements[$argumentIndex + 1].Extent.Text)
-$customStatement = $statements | Where-Object { $_.Extent.Text.StartsWith('if ($setupMode -eq ''manual'' -and -not') -and $_.Extent.Text.Contains('$customSets') } | Select-Object -First 1
+$arguments = [scriptblock]::Create($argumentStart.Extent.Text + "`n" + $llmStatements[$argumentIndex + 1].Extent.Text)
+$customStatement = $llmStatements | Where-Object { $_.Extent.Text.StartsWith('if ($setupMode -eq ''manual'' -and -not') -and $_.Extent.Text.Contains('$customSets') } | Select-Object -First 1
 if ($null -eq $customStatement) { throw 'Missing extra settings block' }
 $customArguments = [scriptblock]::Create($customStatement.Extent.Text)
 $stateStatement = $statements | Where-Object { $_.Extent.Text.StartsWith('$state = [ordered]') } | Select-Object -First 1

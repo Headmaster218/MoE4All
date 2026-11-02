@@ -98,6 +98,9 @@ function Test-Flow {
     $script:Events = [System.Collections.Generic.List[string]]::new()
     $script:Output = [System.Collections.Generic.List[string]]::new()
     $repoRoot = $testRoot
+    $dataDir = Join-Path $testRoot 'gui-data'
+    $statePath = Join-Path $dataDir 'wizard-state.json'
+    $DryRun = $true
     $guiStatePath = Join-Path $testRoot 'no-gui-state.json'
     $infrPath = Join-Path $testRoot 'never-run.exe'
     $InitialModelPath = $InitialPath
@@ -193,13 +196,13 @@ try {
         Assert ('kernels.vulkan.cpu_miss_max=2' -in $nativeArgs) 'Saved CPU miss limit lost'
     }
     $script:CpuTopology = [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true }
-    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', $model, '', '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', '', '', '', $model, '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'serve' -and 'device.auto_profile=aggressive' -in $nativeArgs) 'Expected aggressive API'
         Assert ($state.server_parallel -eq '3' -and $state.context -eq '100k') 'Parallel/context prompts shifted'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Cache must default to the install directory'
         Assert ('serve.api_key=' -in $nativeArgs) 'Explicit no-auth override lost'
     }
-    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', $model, '', '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
         Assert ($state.server_session_cache) 'Fresh API installs should enable SSD KV caching'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Default SSD KV cache path was not emitted'
     }
@@ -209,12 +212,12 @@ try {
         }
         Assert ($state.context -eq '20k') 'Manual context should be asked once at the common step'
     }
-    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', $model, 'y', $aux, 'y', $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '') -Check {
+    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', '', 'y', '', $model, 'y', $aux, $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '') -Check {
         foreach ($value in @('spec.mtp=false', '--mmproj', '--embedding-model')) {
             Assert ($value -in $nativeArgs) "Missing auxiliary setting $value"
         }
         Assert ($state.embedding_idle_timeout -eq '17') 'Auxiliary settings changed'
-        $order = @('Enable image understanding', 'Also serve the Embedding', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
+        $order = @('Enable the language model API', 'Enable the Embedding API', 'Enable the local transcription API', 'Enable image understanding', 'GGUF file or directory', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
         $previous = -1
         foreach ($pattern in $order) {
             $position = -1
@@ -577,7 +580,7 @@ try {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model) 'Missing model should not launch directly'
         Assert (@($script:Events | Where-Object { $_ -match 'Start with the previous settings' }).Count -eq 0) 'Missing model should not offer direct launch'
     }
-    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', $model, 'y', $aux, 'n', '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', '', 'n', '', $model, 'y', $aux, '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
         Assert ($state.server_parallel -eq '1' -and $state.server_session_cache) 'Vision serving should keep SSD KV caching available'
     }
     $script:Saved = $null
@@ -640,7 +643,7 @@ try {
     $catalog = @(Get-RecommendedModelCatalog)
     $flashBundle = @($catalog | Where-Object { $_.Id -eq 'flashnext-427' })[0]
     $embeddingBundle = @($catalog | Where-Object { $_.Id -eq 'qwen3-embedding-06b-q8' })[0]
-    Assert ($catalog.Count -eq 4 -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain only main, vision and embedding downloads'
+    Assert ($catalog.Count -eq 5 -and ($catalog.Kind -contains 'audio') -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain main, vision, embedding and audio downloads'
     Assert (@($flashBundle.Files).Count -eq 33 -and $flashBundle.Primary -match '00001-of-00033') 'FlashNext shard catalog is incomplete'
     Assert ($embeddingBundle.Files[0].Url -match 'Qwen3-Embedding-0\.6B-Q8_0\.gguf') 'Embedding direct download URL is missing'
     $script:Passed++

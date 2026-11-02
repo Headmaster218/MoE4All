@@ -1,4 +1,4 @@
-param([Parameter(Mandatory = $true)][string]$WorkDir)
+﻿param([Parameter(Mandatory = $true)][string]$WorkDir)
 $ErrorActionPreference = 'Stop'
 $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 if (-not $WorkDir.StartsWith('D:\AIinfr\infr\local-work\tmp\moe4all\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Use local-work/tmp/moe4all/<task>/windows.' }
@@ -36,9 +36,10 @@ function Read-Host { param($Prompt) if (-not $script:answers.Count) { throw 'Une
 $script:downloads = 0
 function Invoke-RecommendedModelDownload { param($Id) Check ($Id -eq 'sensevoice-small-q8') 'Wrong download'; $script:downloads++; return $modelFile }
 $script:Saved = $null; $transcription = Get-TranscriptionSettings
-$script:answers.Enqueue(''); Read-TranscriptionSettings $transcription
+Read-TranscriptionSettings $transcription
 Check (-not $transcription.Enabled -and $script:answers.Count -eq 0 -and $script:downloads -eq 0) 'Disabled flow'
-foreach ($answer in @('y', 'R', ('"' + $modelDir + '"'), '0', '4', '-1', '0', (Join-Path $WorkDir "upload space's"))) { $script:answers.Enqueue($answer) }
+$transcription.Enabled = $true
+foreach ($answer in @('R', ('"' + $modelDir + '"'), '0', '4', '-1', '0', (Join-Path $WorkDir "upload space's"))) { $script:answers.Enqueue($answer) }
 Read-TranscriptionSettings $transcription
 Check ($transcription.Enabled -and $transcription.Model -eq $modelFile -and $transcription.Threads -eq '4' -and $transcription.IdleTimeout -eq '0' -and $script:answers.Count -eq 0) 'Interactive input and integer retry'
 Check ($script:downloads -eq 0) 'R/local path must not download'
@@ -46,7 +47,7 @@ $script:answers.Enqueue('D'); Check ((Select-TranscriptionModelPath) -eq $modelF
 # Evaluate only the existing command-assembly server branch, with all execution mocked out.
 $serverBlock = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Extent.Text.Contains('Add-TranscriptionArguments -Arguments') })
 Check ($serverBlock.Count -eq 1) 'Server command integration'
-$serverAuth = $true; $serverSessionCache = $false; $serverVision = $false; $serverEmbedding = $false; $serverAddr = '127.0.0.1:8080'; $serverParallel = '1'
+$llmEnabled = $false; $serverAuth = $true; $serverSessionCache = $false; $serverVision = $false; $serverEmbedding = $false; $serverAddr = '127.0.0.1:8080'; $serverParallel = '1'
 foreach ($launchMode in @('chat', 'benchmark', 'server')) {
     $nativeArgs = [Collections.Generic.List[string]]::new()
     . ([scriptblock]::Create($serverBlock[0].Extent.Text))
@@ -79,23 +80,103 @@ for ($parent = $promptNode.Parent; $null -ne $parent; $parent = $parent.Parent) 
     if ($parent -is [Management.Automation.Language.IfStatementAst] -and $parent.Clauses[0].Item1.Extent.Text -eq "`$launchMode -eq 'server'") { $guarded = $true; break }
 }
 Check $guarded 'New prompt is guarded by server mode'
-# Static macOS review: shared behavior and bilingual strings must stay aligned.
-# Execute test-wizard-transcription.sh with zsh on a host with zsh for interpreter coverage.
+# Static cross-platform contracts only. Interpreter/backend coverage belongs to the shell tests.
+# Normalize only the two intentional Bash/zsh syntax differences in these shared functions.
+function Get-ShellFunction([string]$Source, [string]$Name) {
+    $match = [regex]::Match($Source, ('(?ms)^' + [regex]::Escape($Name) + '\(\) \{\n.*?^\}'))
+    Check $match.Success ("Missing shell function: $Name")
+    return $match.Value
+}
 $linux = [IO.File]::ReadAllText((Join-Path $repoRoot 'Start-INFR-Wizard-Linux.sh')).Replace("`r`n", "`n")
 $mac = [IO.File]::ReadAllText((Join-Path $repoRoot 'Start-INFR-Wizard-macOS.sh')).Replace("`r`n", "`n")
-foreach ($name in @('configure_transcription', 'add_transcription_arguments', 'show_transcription_api')) {
-    $pattern = '(?ms)^' + $name + '\(\) \{\n.*?^\}'
-    $linuxFunction = [regex]::Match($linux, $pattern).Value
-    $macFunction = [regex]::Match($mac, $pattern).Value.Replace('${REPLY:l}', '${REPLY,,}')
-    Check ($linuxFunction -and $linuxFunction -eq $macFunction) ('Shell behavior parity: ' + $name)
+foreach ($name in @('configure_api_modules', 'configure_embedding', 'configure_transcription', 'add_transcription_arguments', 'show_transcription_api')) {
+    $linuxFunction = Get-ShellFunction $linux $name
+    $macFunction = (Get-ShellFunction $mac $name).Replace('${REPLY:l}', '${REPLY,,}')
+    $macFunction = [regex]::Replace($macFunction, '(?m)^(\s*)ask_integer(?=\s)', '${1}integer')
+    Check ($linuxFunction -ceq $macFunction) ("Shell shared behavior parity: $name")
 }
-$settingsFunction = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-TranscriptionSettings' }, $true)
-foreach ($literal in $settingsFunction.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.Contains(' / ') }, $true)) {
-    Check ($linux.Contains($literal.Value) -and $mac.Contains($literal.Value)) 'Three-platform bilingual text parity'
+
+# Match the complete Chinese/English literal, not just its English half. Pin counts to
+# avoid silently losing coverage when strings move out of the expected functions.
+foreach ($contract in @(
+    @{ Function = 'Read-ServerModules'; Count = 4 }
+    @{ Function = 'Read-TranscriptionSettings'; Count = 6 }
+)) {
+    $functionName = $contract.Function
+    $definition = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $functionName }, $true)
+    Check ($null -ne $definition) ("Missing Windows function: $functionName")
+    $literals = @($definition.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.Contains('/ ') }, $true))
+    Check ($literals.Count -eq $contract.Count) ("Public bilingual contract count: $functionName")
+    foreach ($literal in $literals) {
+        Check ($linux.Contains($literal.Value)) ("Linux bilingual parity: $($literal.Value)")
+        Check ($mac.Contains($literal.Value)) ("macOS bilingual parity: $($literal.Value)")
+    }
 }
-foreach ($shell in @($linux, $mac)) {
-    Check ($shell.Contains('[server_transcription]=false [transcription_model]='''' [transcription_threads]=4 [transcription_idle_timeout]=300')) 'Shell defaults'
-    Check ($shell.Contains($audio[0].Files[0].Url) -and $shell.Contains($audio[0].Primary.Replace('\', '/'))) 'Shell official catalog'
-    Check ($shell.Contains('add_transcription_arguments || return 1') -and $shell.Contains('        configure_transcription')) 'Shell integration'
+foreach ($phrase in @('The Embedding model and backend load on the first request;', 'LLM and Embedding share the selected device;')) {
+    $literals = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value.Contains($phrase) }, $true))
+    Check ($literals.Count -eq 1) ("Public module explanation exists once: $phrase")
+    Check ($linux.Contains($literals[0].Value) -and $mac.Contains($literals[0].Value)) ("Three-platform module explanation parity: $phrase")
+}
+
+# Verify the defaults in their actual declarations, including old-state LLM compatibility.
+$expectedDefaults = [ordered]@{
+    server_llm_enabled = $true; server_embedding = $false; server_transcription = $false
+    embedding_model = ''; embedding_idle_timeout = '300'; transcription_model = ''
+    transcription_threads = '4'; transcription_idle_timeout = '300'
+}
+$shells = [ordered]@{ Linux = $linux; macOS = $mac }
+foreach ($key in $expectedDefaults.Keys) {
+    $expected = $expectedDefaults[$key]
+    $defaults = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-SavedValue' -and $n.CommandElements.Count -eq 3 -and $n.CommandElements[1].Value -eq $key }, $true))
+    Check ($defaults.Count -gt 0) ("Windows saved default exists: $key")
+    foreach ($default in $defaults) {
+        $value = & ([scriptblock]::Create($default.CommandElements[2].Extent.Text))
+        Check ($value -is $expected.GetType() -and $value -ceq $expected) ("Windows saved default: $key")
+    }
+    foreach ($platform in $shells.Keys) {
+        $declaration = Get-ShellFunction $shells[$platform] 'defaults'
+        $assignments = [regex]::Matches($declaration, ('\[' + [regex]::Escape($key) + '\]=(''''|[^\s)]+)'))
+        Check ($assignments.Count -eq 1) ("$platform default declared once: $key")
+        $value = $assignments[0].Groups[1].Value.Trim("'")
+        Check ($value -ceq ([string]$expected).ToLowerInvariant()) ("$platform default: $key")
+    }
+}
+
+# Check each common auxiliary bundle in its own catalog cases, so a matching URL
+# elsewhere in a script cannot mask an incorrect ID, kind, path or file count.
+$catalog = @(Get-RecommendedModelCatalog)
+foreach ($spec in @(
+    @{ Id = 'sensevoice-small-q8'; Kind = 'audio'; Primary = 'SenseVoice-Small-Q8_0/sense-voice-small-q8_0.gguf'
+        Info = 'https://huggingface.co/lovemefan/sense-voice-gguf/blob/main/sense-voice-small-q8_0.gguf'
+        Url = 'https://huggingface.co/lovemefan/sense-voice-gguf/resolve/main/sense-voice-small-q8_0.gguf?download=true' }
+    @{ Id = 'qwen3-embedding-06b-q8'; Kind = 'embedding'; Primary = 'Qwen3-Embedding-0.6B-Q8_0/Qwen3-Embedding-0.6B-Q8_0.gguf'
+        Info = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/blob/main/Qwen3-Embedding-0.6B-Q8_0.gguf'
+        Url = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' }
+)) {
+    $bundles = @($catalog | Where-Object Id -eq $spec.Id)
+    Check ($bundles.Count -eq 1) ("Windows auxiliary catalog ID: $($spec.Id)")
+    $bundle = $bundles[0]
+    Check ($bundle.Kind -ceq $spec.Kind -and $bundle.Primary.Replace('\', '/') -ceq $spec.Primary -and $bundle.InfoUrl -ceq $spec.Info) ("Windows auxiliary catalog metadata: $($spec.Id)")
+    Check ($bundle.Files.Count -eq 1 -and $bundle.Files[0].Url -ceq $spec.Url -and $bundle.Files[0].RelativePath.Replace('\', '/') -ceq $spec.Primary) ("Windows official single-GGUF download: $($spec.Id)")
+    foreach ($platform in $shells.Keys) {
+        $shell = $shells[$platform]
+        Check ([regex]::IsMatch($shell, ('(?m)^CATALOG_IDS=\([^\n)]*\b' + [regex]::Escape($spec.Id) + '\b'))) ("$platform selectable catalog ID: $($spec.Id)")
+        $casePattern = '(?ms)^\s*' + [regex]::Escape($spec.Id) + '\)\n(?<body>.*?)\s*;;'
+        $metadata = [regex]::Match((Get-ShellFunction $shell 'catalog_load'), $casePattern)
+        $file = [regex]::Match((Get-ShellFunction $shell 'catalog_file'), $casePattern)
+        Check ($metadata.Success -and $file.Success) ("$platform catalog cases: $($spec.Id)")
+        $metadataBody = $metadata.Groups['body'].Value
+        Check ($metadataBody.Contains('CATALOG_KIND=' + $spec.Kind + ';') -and $metadataBody.Contains("CATALOG_PRIMARY='$($spec.Primary)'") -and $metadataBody.Contains("CATALOG_INFO='$($spec.Info)'") -and $metadataBody.Contains('CATALOG_COUNT=1')) ("$platform auxiliary catalog metadata: $($spec.Id)")
+        Check ($file.Groups['body'].Value.Contains("DOWNLOAD_URL='$($spec.Url)'") -and $file.Groups['body'].Value.Contains('DOWNLOAD_RELATIVE=$CATALOG_PRIMARY')) ("$platform official download case: $($spec.Id)")
+    }
+}
+foreach ($platform in $shells.Keys) {
+    $shell = $shells[$platform]
+    $build = Get-ShellFunction $shell 'build_command'
+    $configure = Get-ShellFunction $shell 'configure'
+    Check ($build.Contains('add_transcription_arguments || return 1')) ("$platform transcription argv integration")
+    foreach ($name in @('configure_api_modules', 'configure_embedding', 'configure_transcription')) {
+        Check ([regex]::IsMatch($configure, ('(?m)(?:^|;|\bthen)\s+' + $name + '(?=\s*(?:;|$))'))) ("$platform interactive integration: $name")
+    }
 }
 Write-Output "PASS: $checks Windows transcription and cross-platform static checks (functions/AST only)"

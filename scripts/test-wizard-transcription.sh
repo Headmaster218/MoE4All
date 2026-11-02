@@ -46,7 +46,8 @@ download_bundle() {
     printf fixture > "$ROOT/models/SenseVoice-Small-Q8_0/sense-voice-small-q8_0.gguf"
 }
 # Blank/R must never download; explicit local paths and invalid integers are simulated.
-printf 'y\n\nR\n"%s"\n0\n4\n-1\n0\n%s\n' "$ROOT/audio space's" "$work/upload space's" > "$work/answers"
+S[server_transcription]=true
+printf '\nR\n"%s"\n0\n4\n-1\n0\n%s\n' "$ROOT/audio space's" "$work/upload space's" > "$work/answers"
 configure_transcription < "$work/answers" > "$work/enabled.log"
 [[ ${S[server_transcription]} == true && ${S[transcription_model]} == "$model_file" && ${S[transcription_threads]} == 4 && ${S[transcription_idle_timeout]} == 0 && $downloads == 0 ]]; ((checks+=1))
 S[transcription_upload_dir]="\"$work/upload space's\""; build_command
