@@ -886,6 +886,121 @@ fn command_message(cmd: &Cmd) -> Option<&str> {
     }
 }
 
+/// Whether THIS subcommand puts a model on a GPU in this process. The set is the same as
+/// [`should_record_diagnostics`]'s, but the two are deliberately separate predicates: a diagnostics
+/// bundle and a device reservation can stop agreeing at any time, and this one getting wider by
+/// accident would block starts.
+///
+/// `compare` is NOT in it — it owns no device, it shells out to `infr bench` one cell at a time, and
+/// each of those children takes the lock for its own lifetime. That is what keeps the sweep honest
+/// against a server started elsewhere without deadlocking against itself.
+fn gpu_workload(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Run { .. }
+            | Cmd::Serve { .. }
+            | Cmd::ServeEmbedding { .. }
+            | Cmd::Multi { .. }
+            | Cmd::Bench {
+                estimate_only: false,
+                ..
+            }
+    )
+}
+
+/// What the lock's banner should say about us, so the process that gets refused can name the
+/// process that refused it. Command + model, never the message text.
+fn lock_label(cmd: &Cmd) -> String {
+    match command_model(cmd) {
+        Some(model) => format!("{} {model}", command_name(cmd)),
+        None => command_name(cmd).to_string(),
+    }
+}
+
+/// Take the machine's GPU startup lock before this process touches a device.
+///
+/// Two engines on one card each size their unified VRAM arena against the other's footprint, so
+/// both the serving and the measurement degrade — and the ONLY symptom is the number. The lock is
+/// `infr_core::gpu_lock`: a loopback `bind()` (kernel-owned, so a `kill -9`'d holder releases it
+/// instantly) plus a one-line identity banner, which is what makes the refusal evidence-based.
+/// Everything it cannot prove is a warning, never a block: see the codes below.
+///
+/// The returned guard is process-scoped by design — the caller holds it until the subcommand
+/// returns. `Ok(None)` means "not our business" (a non-GPU command, `--dev cpu`, a bypassed check,
+/// or an unprovable holder).
+fn acquire_gpu_startup_lock(
+    cmd: &Cmd,
+    cfg: &Config,
+) -> anyhow::Result<Option<infr_core::gpu_lock::Lock>> {
+    use infr_core::gpu_lock as lock;
+    if !gpu_workload(cmd) {
+        return Ok(None);
+    }
+    let backend = selected_backend(cfg)?;
+    if matches!(backend, Backend::Cpu) {
+        return Ok(None);
+    }
+    let device = dev_spec_of(&backend);
+    if !cfg.device.gpu_lock {
+        let (code, config, bypass) = (lock::CODE_BYPASSED, lock::CONFIG_PATH, lock::ENV_BYPASS);
+        tracing::warn!(
+            "{code}: GPU startup lock check is OFF (`{config}` / `{bypass}`) — a second infr on \
+             device `{device}` will not be detected, and the two will share one VRAM arena."
+        );
+        return Ok(None);
+    }
+    match lock::acquire(&device, &lock_label(cmd)) {
+        lock::Outcome::Held(guard) => {
+            tracing::debug!("GPU startup lock held for device `{device}`");
+            Ok(Some(guard))
+        }
+        lock::Outcome::Conflict(holder) => {
+            let (code, bypass, config, bypass_code) = (
+                lock::CODE_CONFLICT,
+                lock::ENV_BYPASS,
+                lock::CONFIG_PATH,
+                lock::CODE_BYPASSED,
+            );
+            Err(anyhow!(format!(
+                "{code}: another infr is already running on device `{device}` — {holder}. Two \
+                 engines on one card split its VRAM arena and its memory bandwidth, so this start \
+                 would both serve worse and measure worse than either alone.\nStop that process, or \
+                 aim this one at another device with `--dev`, or set `{bypass}=1` / `--set \
+                 {config}=false` to start anyway — that logs {bypass_code} and skips the check."
+            )))
+        }
+        lock::Outcome::Skipped(skip) => {
+            match skip {
+                lock::Skipped::OtherDevice(holder) => {
+                    let code = lock::CODE_OTHER_DEVICE;
+                    tracing::warn!(
+                        "{code}: another infr holds the startup lock for device `{}` \
+                         ({holder}) — assuming separate GPUs, this start is not blocked.",
+                        holder.device,
+                    );
+                }
+                lock::Skipped::NotIdentifiable(why) => {
+                    let code = lock::CODE_NOT_IDENTIFIABLE;
+                    tracing::warn!(
+                        "{code}: {why} — the holder could not be identified as infr, so this \
+                         start is not blocked, but a process MAY already share the device."
+                    );
+                }
+                lock::Skipped::BindFailed(error) => {
+                    let code = lock::CODE_BIND_FAILED;
+                    let port = lock::PORT;
+                    tracing::warn!(
+                        "{code}: could not bind the GPU startup lock on 127.0.0.1:{port} ({error}) \
+                         — nothing was checked, so a concurrent infr on this device would go \
+                         unnoticed."
+                    );
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn sanitize_launch_arguments(
     arguments: impl IntoIterator<Item = String>,
     model: Option<&str>,
@@ -1189,6 +1304,9 @@ fn run_engine_command(
         );
     }
     let cfg = Arc::new(cfg);
+    // BEFORE anything touches the device: refuse a start that would share a GPU with a live `infr`.
+    // The guard is held for the whole subcommand — see [`acquire_gpu_startup_lock`].
+    let _gpu_lock = acquire_gpu_startup_lock(&cmd, &cfg)?;
     install_shutdown_file_watcher(cfg.serve.shutdown_file.as_deref())?;
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
