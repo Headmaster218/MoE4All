@@ -868,34 +868,64 @@ fn convert_tools(value: Option<&Value>) -> Result<Option<Value>, ParamError> {
         if tool["type"] != "function" {
             return Err(invalid("tools", "only custom function tools are supported"));
         }
-        if tool
-            .get("strict")
-            .is_some_and(|v| !v.is_null() && v != false)
-        {
+        // Two wire shapes carry the same function: the Responses flat form
+        // (`{"type":"function","name":…,"parameters":…}`) and the Chat Completions nested form
+        // (`{"type":"function","function":{…}}`), which SDK adapters and converted tool catalogs
+        // keep producing. Both are accepted, and each is checked against the keys THAT form is
+        // allowed to carry — an unrecognized setting is named and refused instead of being dropped,
+        // so a schema option this server cannot honour can never look accepted.
+        let nested = tool.get("function").is_some();
+        let spec = if nested {
+            let inner = tool.get("function").unwrap();
+            if inner.is_object() {
+                inner
+            } else {
+                return Err(invalid("tools", "a nested function tool must be an object"));
+            }
+        } else {
+            tool
+        };
+        let outer_allowed: &[&str] = if nested {
+            &["type", "function"]
+        } else {
+            &["type", "name", "description", "parameters", "strict"]
+        };
+        let inner_allowed: &[&str] = if nested {
+            &["name", "description", "parameters", "strict"]
+        } else {
+            &[]
+        };
+        let unexpected = tool
+            .as_object()
+            .and_then(|object| object.keys().find(|key| !outer_allowed.contains(&key.as_str())))
+            .or_else(|| {
+                nested.then_some(spec.as_object()?).and_then(|inner| {
+                    inner
+                        .keys()
+                        .find(|key| !inner_allowed.contains(&key.as_str()))
+                })
+            });
+        if let Some(key) = unexpected {
+            return Err(invalid(
+                "tools",
+                format!("unsupported function tool setting: {key}"),
+            ));
+        }
+        if spec.get("strict").is_some_and(|v| !v.is_null() && v != false) {
             return Err(invalid(
                 "tools",
                 "strict function schemas are not supported",
             ));
         }
-        if tool.as_object().is_some_and(|o| {
-            o.keys().any(|k| {
-                !matches!(
-                    k.as_str(),
-                    "type" | "name" | "description" | "parameters" | "strict"
-                )
-            })
-        }) {
-            return Err(invalid("tools", "unsupported function tool setting"));
-        }
-        let name = tool
+        let name = spec
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("tools", "function requires name"))?;
-        let parameters = tool
+        let parameters = spec
             .get("parameters")
             .cloned()
             .unwrap_or_else(|| json!({"type":"object"}));
-        out.push(json!({"type":"function","function":{"name":name,"description":tool.get("description"),"parameters":parameters}}));
+        out.push(json!({"type":"function","function":{"name":name,"description":spec.get("description"),"parameters":parameters}}));
     }
     Ok(Some(Value::Array(out)))
 }
@@ -1895,6 +1925,11 @@ struct OpenCall {
     /// Whether `response.output_item.added` has been emitted for this slot: the first fragment
     /// announces it (and closes the prose items ahead of it), later fragments only add arguments.
     added: bool,
+    /// Whether this item's `function_call_arguments.done` + `output_item.done` pair has been
+    /// emitted. A call is closed BEFORE the next one opens, because the documented lifecycle is
+    /// one item open→deltas→done at a time, and a client tracking "the open item" per type never
+    /// gets a second `in_progress` announcement over the first one's head.
+    closed: bool,
 }
 
 impl StreamState {
@@ -1983,6 +2018,10 @@ impl StreamState {
         let index = if let Some(index) = self.content_index {
             index
         } else {
+            // The reasoning item ahead of this one closes first: like two tool calls, a `message`
+            // announced while a `reasoning` item is still `in_progress` leaves a client that tracks
+            // one open item per turn waiting for an announcement that already passed.
+            self.finish_items(false);
             let index = self.next_index;
             self.next_index += 1;
             self.content_index = Some(index);
@@ -2044,8 +2083,14 @@ impl StreamState {
         let output_index = self.open_calls[slot].output_index;
         if !self.open_calls[slot].added {
             // The prose items this call follows close first, so the events arrive in `output_index`
-            // order — the ordering guarantee a client uses to interleave thinking and calls.
+            // order — the ordering guarantee a client uses to interleave thinking and calls. Then
+            // every call before this one closes too: announcing a second `in_progress` item while
+            // the first is still open is what a harness that tracks one open call reads as "the
+            // first call never finished", and it never dispatches either.
             self.finish_items(false);
+            for earlier in 0..slot {
+                self.close_call(earlier);
+            }
             self.open_calls[slot].added = true;
             self.emit("response.output_item.added", json!({"output_index":output_index,"item":{"id":item_id,"type":"function_call","status":"in_progress","call_id":self.calls[slot]["id"].clone(),"name":self.calls[slot]["function"]["name"].clone(),"arguments":""}}));
         }
@@ -2107,34 +2152,44 @@ impl StreamState {
             upstream_index: upstream,
             output_index: self.next_index,
             added: false,
+            closed: false,
         });
         self.next_index += 1;
         self.calls.push(opened);
         Some(self.calls.len() - 1)
     }
 
-    /// Close every tool call that was opened: the terminal events that move an item from "in
-    /// progress" to something the client can dispatch.
+    /// Close ONE opened tool call: the event pair that moves an item from "in progress" to a
+    /// complete call the client can dispatch. Idempotent, and silent for a slot that never
+    /// surfaced — a call that was opened upstream but suppressed by `parallel_tool_calls=false` has
+    /// nothing to close.
+    fn close_call(&mut self, slot: usize) {
+        if !self.open_calls[slot].added || self.open_calls[slot].closed {
+            return;
+        }
+        let Some(id) = self.id.clone() else { return };
+        let output_index = self.open_calls[slot].output_index;
+        let arguments = self.calls[slot]["function"]["arguments"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let call_id = self.calls[slot]["id"].clone();
+        let name = self.calls[slot]["function"]["name"].clone();
+        self.open_calls[slot].closed = true;
+        let item_id = format!("fc_{id}_{slot}");
+        self.emit(
+            "response.function_call_arguments.done",
+            json!({"item_id":item_id,"output_index":output_index,"arguments":arguments.clone()}),
+        );
+        self.emit("response.output_item.done", json!({"output_index":output_index,"item":{"id":item_id,"type":"function_call","status":"completed","call_id":call_id,"name":name,"arguments":arguments}}));
+    }
+
+    /// Close every tool call that is still open, in output order. Normally this is only the last
+    /// one — each earlier call was already closed when the next was announced — but it also covers
+    /// a stream that ends without opening a successor.
     fn finish_calls(&mut self) {
-        let id = match self.id.clone() {
-            Some(id) => id,
-            None => return,
-        };
         for slot in 0..self.calls.len() {
-            if !self.open_calls[slot].added {
-                continue; // never surfaced, so there is nothing to close
-            }
-            let output_index = self.open_calls[slot].output_index;
-            let item_id = format!("fc_{id}_{slot}");
-            let arguments = self.calls[slot]["function"]["arguments"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            self.emit(
-                "response.function_call_arguments.done",
-                json!({"item_id":item_id,"output_index":output_index,"arguments":arguments}),
-            );
-            self.emit("response.output_item.done", json!({"output_index":output_index,"item":{"id":item_id,"type":"function_call","status":"completed","call_id":self.calls[slot]["id"].clone(),"name":self.calls[slot]["function"]["name"].clone(),"arguments":arguments}}));
+            self.close_call(slot);
         }
     }
 
@@ -2884,6 +2939,60 @@ mod tests {
         assert_eq!(tool.content, Some(json!("only text")));
     }
 
+    /// Both wire shapes carry the same function: the Responses flat form, and the Chat Completions
+    /// nested form that SDK adapters and converted tool catalogs keep producing. Only the first was
+    /// accepted, so a nested catalog 400'd on `tools` with "unsupported function tool setting"
+    /// before the model ever saw the request. What is still refused — and now named — is a key
+    /// neither form is allowed to carry, so an option this server cannot honour cannot look accepted.
+    #[test]
+    fn tools_accept_both_the_flat_and_the_nested_function_shape() {
+        let flat = convert_tools(Some(&json!([
+            {"type":"function","name":"a","description":"d","parameters":{"type":"object"}}
+        ])))
+        .unwrap()
+        .unwrap();
+        let nested = convert_tools(Some(&json!([
+            {"type":"function","function":
+                {"name":"a","description":"d","parameters":{"type":"object"}}}
+        ])))
+        .unwrap()
+        .unwrap();
+        assert_eq!(flat, nested, "one normalized shape either way");
+        assert_eq!(flat[0]["function"]["name"], "a");
+        assert_eq!(flat[0]["function"]["description"], "d");
+        assert_eq!(
+            convert_tools(Some(&json!([{"type":"function","function":{"name":"a"}}])))
+                .unwrap()
+                .unwrap()[0]["function"]["parameters"],
+            json!({"type":"object"}),
+            "a nested tool with no schema still gets the open one"
+        );
+
+        let error = convert_tools(Some(&json!([
+            {"type":"function","function":{"name":"a","strict":true}}
+        ])))
+        .expect_err("strict schemas stay refused in both shapes");
+        assert_eq!(error.param, "tools");
+        let error = convert_tools(Some(&json!([
+            {"type":"function","function":
+                {"name":"a","cache_control":{"type":"ephemeral"}}}
+        ])))
+        .expect_err("an unknown setting is never silently dropped");
+        assert!(
+            error.message.contains("cache_control"),
+            "the message names the key the caller has to remove: {}",
+            error.message
+        );
+        assert!(convert_tools(Some(&json!([
+            {"type":"function","function":"not-an-object"}
+        ])))
+        .is_err());
+        assert!(convert_tools(Some(&json!([
+            {"type":"function","name":"a","extra":"anything"}
+        ])))
+        .is_err());
+    }
+
     #[test]
     fn minimal_effort_and_requested_token_limit_are_reported_honestly() {
         let request: ResponsesRequest = serde_json::from_value(json!({
@@ -3251,19 +3360,42 @@ mod tests {
             .collect();
         assert_eq!(events[0]["type"], "response.created");
         assert_eq!(events.last().unwrap()["type"], "response.failed");
-        assert!(!events.iter().any(|event| {
-            event["type"] == "response.output_item.done"
-                || event["type"] == "response.content_part.done"
-                || event["type"] == "response.output_text.done"
-        }));
+        // A failure mid-content must not complete the turn, and must not complete the item that was
+        // still streaming. The reasoning item ahead of it MAY be closed: the engine had already moved
+        // past it when the first content fragment arrived, and a stream closes the item it is leaving
+        // before opening the next — so that close was already honestly on the wire.
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "response.content_part.done"
+                    || event["type"] == "response.output_text.done"
+                    || (event["type"] == "response.output_item.done"
+                        && event["item"]["type"] == "message")),
+            "a truncated message is never reported complete: {events:?}"
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event["type"] == "response.completed"));
         assert_eq!(events.last().unwrap()["response"]["status"], "failed");
+        let output = events.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let status_of = |kind: &str| {
+            output
+                .iter()
+                .find(|item| item["type"] == kind)
+                .map(|item| item["status"].as_str().unwrap_or_default().to_string())
+        };
         assert_eq!(
-            events.last().unwrap()["response"]["output"][0]["status"],
-            "in_progress"
+            status_of("reasoning").as_deref(),
+            Some("completed"),
+            "its completion was already streamed, so the terminal response says the same"
         );
         assert_eq!(
-            events.last().unwrap()["response"]["output"][1]["status"],
-            "in_progress"
+            status_of("message").as_deref(),
+            Some("in_progress"),
+            "the item the failure cut off stays unfinished"
         );
         assert_eq!(
             events.last().unwrap()["response"]["error"]["message"],
@@ -3395,6 +3527,145 @@ mod tests {
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["arguments"], r#"{"cmd":"dir"}"#);
         assert_eq!(output[0]["id"], added[0]["item"]["id"]);
+    }
+
+    /// Two calls in one turn must not BOTH be announced while the first is still open: a harness
+    /// that tracks one open item per type reads the second `output_item.added` as proof the first
+    /// never finished and dispatches neither. So each item's lifecycle is strictly
+    /// open → deltas → arguments.done → item.done, and only then does the next open.
+    #[tokio::test]
+    async fn parallel_tool_calls_close_one_item_before_announcing_the_next() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hi",
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},
+                     {"type":"function","name":"read","parameters":{"type":"object"}}]
+        }))
+        .unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
+        let response = stream_response(
+            upstream_stream(&[
+                r#"{"id":"chatcmpl-2","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"shell","arguments":""}}]}}]}"#,
+                r#"{"id":"chatcmpl-2","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"dir\"}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-2","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"read","arguments":""}}]}}]}"#,
+                r#"{"id":"chatcmpl-2","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\"x\"}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-2","created":1,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#,
+            ]),
+            meta,
+            None,
+        );
+        let events = sse_events(response).await;
+        let lifecycle = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("response.output_item.added")
+                        | Some("response.function_call_arguments.done")
+                        | Some("response.output_item.done")
+                )
+            })
+            .map(|event| {
+                (
+                    event["type"].as_str().unwrap().to_string(),
+                    event["output_index"].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let added = "response.output_item.added".to_string();
+        let arguments_done = "response.function_call_arguments.done".to_string();
+        let item_done = "response.output_item.done".to_string();
+        assert_eq!(
+            lifecycle,
+            vec![
+                (added.clone(), json!(0)),
+                (arguments_done.clone(), json!(0)),
+                (item_done.clone(), json!(0)),
+                (added.clone(), json!(1)),
+                (arguments_done.clone(), json!(1)),
+                (item_done.clone(), json!(1)),
+            ],
+            "one call fully closed before the next is announced"
+        );
+        let completed = events.last().unwrap();
+        assert_eq!(completed["type"], "response.completed");
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "both calls survive in the terminal response");
+        assert_eq!(output[0]["arguments"], r#"{"cmd":"dir"}"#);
+        assert_eq!(output[1]["arguments"], r#"{"path":"x"}"#);
+        assert_eq!(output[1]["call_id"], "call_b");
+        // Every event carries the running sequence, and it never repeats or rewinds.
+        let sequence = events
+            .iter()
+            .map(|event| event["sequence_number"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert!(sequence
+            .iter()
+            .zip(sequence.iter().skip(1))
+            .all(|(before, after)| after > before));
+    }
+
+    /// The same invariant stated for a whole turn, prose included: across every
+    /// `output_item.added` / `output_item.done` pair, at most ONE item is open at a time and each
+    /// `done` closes the item that is open. A stream that announces item N+1 before closing item N
+    /// is spec-parseable but reads as a hung item to a client tracking one open item per turn —
+    /// reasoning, message and tool calls all alike.
+    #[tokio::test]
+    async fn a_stream_never_announces_the_next_item_before_closing_the_current_one() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture","input":"hi",
+            "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},
+                     {"type":"function","name":"read","parameters":{"type":"object"}}]
+        }))
+        .unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
+        let response = stream_response(
+            upstream_stream(&[
+                r#"{"id":"chatcmpl-3","created":1,"model":"fixture","choices":[{"index":0,"delta":{"reasoning_content":"想一下"}}]}"#,
+                r#"{"id":"chatcmpl-3","created":1,"model":"fixture","choices":[{"index":0,"delta":{"content":"先看看"}}]}"#,
+                r#"{"id":"chatcmpl-3","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"shell","arguments":"{\"cmd\":\"dir\"}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-3","created":1,"model":"fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"read","arguments":"{\"path\":\"x\"}"}}]}}]}"#,
+                r#"{"id":"chatcmpl-3","created":1,"model":"fixture","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}"#,
+            ]),
+            meta,
+            None,
+        );
+        let events = sse_events(response).await;
+        let mut open: Option<u64> = None;
+        let mut order = Vec::new();
+        for event in &events {
+            let (kind, index) = (
+                event["type"].as_str().unwrap_or_default(),
+                event["output_index"].as_u64(),
+            );
+            match kind {
+                "response.output_item.added" => {
+                    assert_eq!(open, None, "item {index:?} opened while {open:?} was still open");
+                    open = index;
+                    order.push(("added", index));
+                }
+                "response.output_item.done" => {
+                    assert_eq!(open, index, "item {index:?} closed while {open:?} was the open one");
+                    open = None;
+                    order.push(("done", index));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(open, None, "the stream ended with an item left open");
+        assert_eq!(
+            order,
+            vec![
+                ("added", Some(0)),
+                ("done", Some(0)),
+                ("added", Some(1)),
+                ("done", Some(1)),
+                ("added", Some(2)),
+                ("done", Some(2)),
+                ("added", Some(3)),
+                ("done", Some(3)),
+            ],
+            "reasoning, message and both calls each open and close in turn"
+        );
     }
 
     #[tokio::test]
