@@ -136,6 +136,9 @@ knobs! {
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
+    // The GPU startup lock's bypass (`INFR_NO_GPU_LOCK=1` ⇒ `device.gpu_lock = false`). `SetNotZeroInv`
+    // like `INFR_CPU_NO_SPINPOOL`, so `=0` keeps the check ON.
+    "INFR_NO_GPU_LOCK"          => "device.gpu_lock",          SetNotZeroInv, Ignored, "1", migrated;
 
     // ── sampling (§6.2) ──────────────────────────────────────────────────────
     "INFR_TEMP"                 => "sampling.temp",       Float,      Ignored, "0.6",  migrated;

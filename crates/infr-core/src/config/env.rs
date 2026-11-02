@@ -185,6 +185,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         };
         p.device.subgroup_pref = Some(Some(sg));
     }
+    // The GPU startup lock's bypass, spelled like `INFR_CPU_NO_SPINPOOL`: set AND `!= "0"` turns the
+    // (positive) `device.gpu_lock` field OFF, so `INFR_NO_GPU_LOCK=0` keeps the check ON.
+    p.device.gpu_lock = set_not_zero_inv(get, "INFR_NO_GPU_LOCK");
 
     // ── sampling ─────────────────────────────────────────────────────────────
     p.sampling.temp = num(get, "INFR_TEMP");

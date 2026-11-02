@@ -167,6 +167,14 @@ cfg_struct! {
         /// Extend acknowledged command lookahead through the first resident expert submission.
         /// Requires command-ahead and early-submit; unsupported shapes keep the shorter prefix.
         decode_command_resident: bool = true,
+        /// `INFR_NO_GPU_LOCK` (set AND `!= "0"` ⇒ off): refuse to start when another live `infr`
+        /// already holds the machine's GPU startup lock for this device
+        /// ([`crate::gpu_lock`]). Two engines on one card each size their VRAM arena against the
+        /// other's footprint, so both the measurement and the serving degrade; the check turns that
+        /// into a startup error naming the holder. It is a DIAGNOSTIC guard, not a reservation: a
+        /// holder on a DIFFERENT device, a non-`infr` holder, or an unbindable port all warn and
+        /// start. `--dev cpu` starts are never gated.
+        gpu_lock: bool = true,
     }
 }
 
