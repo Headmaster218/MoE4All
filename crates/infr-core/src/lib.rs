@@ -16,9 +16,6 @@ pub mod fusion;
 /// llama.cpp's `gguf-split` filename convention — shared by the hub (is the set complete?) and the
 /// GGUF loader (which files make up this model?).
 pub mod gguf_split;
-/// The cross-process GPU startup lock: refuse to start a second engine on the same card, and the
-/// stable `INFR-E1001` / `INFR-W100x` diagnostic codes that go with it.
-pub mod gpu_lock;
 pub mod graph;
 pub mod hostmem;
 pub mod hostpager;

@@ -49,13 +49,6 @@ ubatch_parallel = 256
 # Default: unset = vendor-derived.
 # subgroup_pref = 32
 
-# Refuse to start when another live infr already holds this device (see
-# documentation/reference/configuration.md, "GPU startup lock"). The lock is a
-# loopback bind, so a killed or crashed holder releases it; only an infr that
-# says it holds THIS device blocks a start — any other case warns and runs.
-# Default: true. Same as INFR_NO_GPU_LOCK=1 (which prints INFR-W1001).
-# gpu_lock = false
-
 # ── sampling ─────────────────────────────────────────────────────────────────
 #
 # CAUTION: temp / top_k / top_p / max_new are PROVENANCE-sensitive. `infr run`
