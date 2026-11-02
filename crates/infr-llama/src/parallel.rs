@@ -266,6 +266,18 @@ fn should_handoff_multimodal_to_scheduler(
 ///
 /// Split out as a pure fn so this decision is unit-testable without a live Vulkan backend / KV
 /// slots (the lock-drop and device-side `seed_from` around it stay integration-only).
+/// The multimodal continuation compares in the tree's KEY space, so it has to see the same
+/// projection tag the slot publishes under — otherwise a stable setting would miss its own warm
+/// prefix at position 0.
+fn tagged_key(
+    kv: &SeamKv,
+    key_view: &[u32],
+    req: &RequestCtx,
+) -> Vec<u32> {
+    kv.paged_request_key(key_view, req.sampling().uncensor)
+        .unwrap_or_else(|| key_view.to_vec())
+}
+
 fn pick_continuation(
     candidates: impl IntoIterator<Item = (usize, usize, usize)>,
     prompt_len: usize,
@@ -3074,7 +3086,18 @@ impl ParallelSeam {
 
                 // 2. Deepest page-aligned chain the tree can serve (counts a hit/miss itself).
                 //    A resident continuation only loses to a STRICTLY deeper tree chain.
-                if let Some((node, matched)) = tree.best_match(prompt) {
+                // The tree is addressed under the projection setting THIS request resolves to, so an
+                // ON chain is never handed to an OFF request — and a flip stops paying a wasted
+                // attach followed by a full re-prefill. No direction file loaded ⇒ plain tokens, and
+                // every chain that exists today keeps addressing exactly as it did.
+                let request_key = target_kv
+                    .as_ref()
+                    .and_then(|kv| kv.paged_request_key(prompt, req.sampling().uncensor));
+                let match_tokens: &[u32] = request_key.as_deref().unwrap_or(prompt);
+                let attach_setting = target_kv
+                    .as_ref()
+                    .and_then(|kv| kv.uncensor_setting(req.sampling().uncensor));
+                if let Some((node, matched)) = tree.best_match(match_tokens) {
                     // A dense model resumes wherever it matched; a hybrid recurrent model only at a
                     // boundary its entry carries a snapshot for (see `PagedKv::hit_prefix`).
                     let pages = tree.page_tokens();
@@ -3133,6 +3156,11 @@ impl ParallelSeam {
                                 ) {
                                     Ok(()) => {
                                         tree_attached = reusable;
+                                        if let Some(on) = attach_setting {
+                                            if let Some(kv) = target_kv.as_mut() {
+                                                kv.note_uncensor_attached(on);
+                                            }
+                                        }
                                         tracing::info!(
                                             slot = target,
                                             cached_prefix_tokens = reusable,
@@ -3554,7 +3582,7 @@ impl ParallelSeam {
                         .then_some(pool.slots[index].kv.as_ref())
                         .flatten()
                         .and_then(|kv| {
-                            kv.continuation_prefix_len_keyed(key_view)
+                            kv.continuation_prefix_len_keyed(&tagged_key(kv, key_view, req))
                                 .map(|prefix| (index, prefix, prefix))
                         })
                 }),
@@ -3565,7 +3593,7 @@ impl ParallelSeam {
                     pool.slots[index]
                         .kv
                         .as_ref()
-                        .and_then(|kv| kv.continuation_prefix_len_keyed(key_view))
+                        .and_then(|kv| kv.continuation_prefix_len_keyed(&tagged_key(kv, key_view, req)))
                 })
                 .unwrap_or(0);
             let target = continuation.unwrap_or_else(|| {
@@ -3650,7 +3678,15 @@ impl ParallelSeam {
                 }
 
                 // 2. Deepest page-aligned chain the tree can serve for THIS key.
-                if let Some((node, matched)) = tree.best_match(key_view) {
+                // Same setting-aware addressing on top of the image content key.
+                let request_key = target_kv
+                    .as_ref()
+                    .and_then(|kv| kv.paged_request_key(key_view, req.sampling().uncensor));
+                let match_key: &[u32] = request_key.as_deref().unwrap_or(key_view);
+                let attach_setting = target_kv
+                    .as_ref()
+                    .and_then(|kv| kv.uncensor_setting(req.sampling().uncensor));
+                if let Some((node, matched)) = tree.best_match(match_key) {
                     let pages = tree.page_tokens();
                     let (mut reusable, mut ckpt) = tree.hit_prefix(node, recurrent, matched);
                     if reusable > continuation_prefix {
@@ -3696,6 +3732,11 @@ impl ParallelSeam {
                                 ) {
                                     Ok(()) => {
                                         tree_attached = reusable;
+                                        if let Some(on) = attach_setting {
+                                            if let Some(kv) = target_kv.as_mut() {
+                                                kv.note_uncensor_attached(on);
+                                            }
+                                        }
                                         tracing::info!(
                                             slot = target,
                                             cached_prefix_tokens = reusable,

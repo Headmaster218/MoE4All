@@ -65,6 +65,22 @@ pub const DEFAULT_FIRST_LAYER: usize = 4;
 /// shows up as a model that rambles.
 pub const DEFAULT_LAST_LAYER: usize = 44;
 
+/// The paged-KV tree's key bit for the projection setting.
+///
+/// A tree chain is addressed by a token vector, but the rows it holds were computed EITHER with or
+/// WITHOUT the projection — one token prefix has two different bodies of activations. Tagging the
+/// key's first position with this reserved id keeps an ON chain and an OFF chain of the same prompt
+/// in separate entries instead of the tree handing one to a request that wants the other. Bit 30 is
+/// deliberate: it can never equal a vocabulary id, nor an image-cache id (which carries bit 31, see
+/// [`seam::IMAGE_CACHE_TOKEN_BIT`] in `infr-llama`). Sessions with no direction file never set it,
+/// so their keys — and every chain that exists today — are unchanged.
+pub const KEY_TOKEN_BIT: u32 = 1 << 30;
+
+/// The key token standing in for "this chain was materialized with the projection `on`".
+pub const fn key_token(on: bool) -> u32 {
+    KEY_TOKEN_BIT | if on { 1 } else { 0 }
+}
+
 /// The request-level field, and the Strata spelling of the same field accepted as an alias.
 pub const API_FIELD: &str = "uncensor";
 /// See [`API_FIELD`]. Both spellings mean the same thing; giving both is only an error when they
@@ -374,6 +390,22 @@ mod tests {
         assert!(!effective(Some(false), Some(true)));
         assert!(effective(Some(true), Some(false)));
         assert!(!effective(Some(false), None));
+    }
+
+    /// The tree key must separate an ON chain from an OFF chain of the SAME tokens, and must not
+    /// collide with anything the tree can already hold: a vocabulary id, or an image-cache id (which
+    /// carries the higher bit). A session with no projection never produces either value.
+    #[test]
+    fn key_tokens_separate_the_settings_without_reaching_any_real_id() {
+        let (on, off) = (key_token(true), key_token(false));
+        assert_eq!(on & KEY_TOKEN_BIT, KEY_TOKEN_BIT);
+        assert_eq!(off & KEY_TOKEN_BIT, KEY_TOKEN_BIT);
+        assert_ne!(on, off, "the two settings are two different chains");
+        assert_eq!(on ^ off, 1, "and they differ only in the setting bit");
+        // Vocabulary ids stay below the tag, and image ids carry the HIGHER bit, so all three
+        // address spaces are disjoint.
+        assert!(on < (1 << 31) && off < (1 << 31));
+        assert!(on & (1 << 31) == 0 && off & (1 << 31) == 0);
     }
 
     #[test]

@@ -862,6 +862,16 @@ pub struct ImageCacheSpan {
     pub ids: std::sync::Arc<Vec<u32>>,
 }
 
+/// Stamp a tree key with the projection setting its rows were computed under, by overwriting the
+/// first position with one of the two reserved ids (`infr_uncensor::key_token`). Only the first
+/// position moves, so the rest of the key — text prefixes included — still matches across settings
+/// for the sessions that never load a direction file. A no-op on an empty key.
+pub(crate) fn tag_uncensor_key(view: &mut [u32], token: u32) {
+    if let Some(first) = view.first_mut() {
+        *first = token;
+    }
+}
+
 /// `tokens` seen through the tree's key space: each recorded image span's pad run is replaced by
 /// that image's content block and everything else stays as it is. Positions at or past
 /// `tokens.len()` are ignored, so a partial conversation — truncated, or attached mid-prompt —

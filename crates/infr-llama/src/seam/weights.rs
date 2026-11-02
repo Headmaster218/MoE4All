@@ -1699,7 +1699,54 @@ impl SeamKv {
     /// run replaced by that image's content block. Byte-identical to `cached` for a text
     /// conversation, so a slot that never saw an image keys and publishes exactly as before.
     pub(crate) fn paged_cache_view(&self) -> Vec<u32> {
-        crate::seam::image_cache_view(&self.cached, &self.image_cache_spans)
+        let mut view = crate::seam::image_cache_view(&self.cached, &self.image_cache_spans);
+        // The setting these rows were actually computed under. Without it, an ON chain and an OFF
+        // chain of the same prompt would be one entry, and a flip would be served activations the
+        // request did not ask for (see `infr_uncensor::KEY_TOKEN_BIT`).
+        if let Some(tag) = self.uncensor_key(self.uncensor.as_ref().and_then(|u| u.ran())) {
+            crate::seam::tag_uncensor_key(&mut view, tag);
+        }
+        view
+    }
+
+    /// The tree key for a request about to run ON THIS SLOT: `tokens` tagged with the setting the
+    /// request resolves to, or `None` when the session has no projection at all — in which case the
+    /// caller uses the plain tokens and keys behave exactly as they did before this feature.
+    /// The setting a request resolves to on this slot, or `None` when the session has no projection.
+    /// The checkout needs it twice: to address the tree, and to tell the slot that the chain it just
+    /// attached WAS materialized under it.
+    pub(crate) fn uncensor_setting(&self, requested: Option<bool>) -> Option<bool> {
+        self.uncensor
+            .as_ref()
+            .map(|_| infr_uncensor::effective(requested, self.uncensor.as_ref().and_then(|u| u.ran())))
+    }
+
+    /// A tree attach gave this slot rows produced under `on`, so its history no longer comes from the
+    /// other setting: `uncensor_apply` must upload the scale, not drop the prefix it just attached.
+    /// The upload itself stays `select`'s job — only the bookkeeping of "what produced these rows"
+    /// moves here.
+    pub(crate) fn note_uncensor_attached(&mut self, on: bool) {
+        if let Some(u) = self.uncensor.as_mut() {
+            u.ran = Some(on);
+        }
+    }
+
+    pub(crate) fn paged_request_key(&self, tokens: &[u32], requested: Option<bool>) -> Option<Vec<u32>> {
+        let ran = self.uncensor.as_ref().and_then(|u| u.ran());
+        let tag = self.uncensor_key(Some(infr_uncensor::effective(requested, ran)))?;
+        let mut view = tokens.to_vec();
+        crate::seam::tag_uncensor_key(&mut view, tag);
+        Some(view)
+    }
+
+    /// The tree key this slot would use to run the projection setting `on` — `None` when the session
+    /// has no projection, which is the state where keys stay exactly as they were before.
+    ///
+    /// Callers pass the setting the REQUEST resolves to (`infr_uncensor::effective` of the request's
+    /// field and this slot's last real run), so a lookup addresses the chain the request will
+    /// actually compute under.
+    pub(crate) fn uncensor_key(&self, on: Option<bool>) -> Option<u32> {
+        self.uncensor.as_ref().map(|_| infr_uncensor::key_token(on.unwrap_or(true)))
     }
 
     /// Record the image spans of the prompt this slot is about to materialize, so its chain is
