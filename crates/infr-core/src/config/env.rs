@@ -182,6 +182,12 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         };
         p.device.subgroup_pref = Some(Some(sg));
     }
+    // The commit circuit breaker's three knobs: two sizes (MiB grammar as everywhere) and a poll
+    // interval. Unset in this layer means "keep the resolved default", which is what the old
+    // `env::var(...).ok().and_then(parse)` sites did.
+    p.device.mem_guard_headroom = opt_size(get, "INFR_MEM_GUARD_HEADROOM");
+    p.device.mem_guard_ram_headroom = opt_size(get, "INFR_MEM_GUARD_RAM_HEADROOM");
+    p.device.mem_guard_poll_ms = num(get, "INFR_MEM_GUARD_POLL_MS");
 
     // ── sampling ─────────────────────────────────────────────────────────────
     p.sampling.temp = num(get, "INFR_TEMP");

@@ -392,6 +392,17 @@ fn default_config_matches_documented_defaults() {
     assert!(!d.device.ubatch_parallel_specified);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);
+    // The commit breaker ships armed on both axes: 8 GiB of commit margin over the authorized
+    // plan, 4 GiB of physical RAM, polled twice a second.
+    assert_eq!(
+        d.device.mem_guard_headroom,
+        Some(crate::SizeSpec::Bytes(8u64 << 30))
+    );
+    assert_eq!(
+        d.device.mem_guard_ram_headroom,
+        Some(crate::SizeSpec::Bytes(4u64 << 30))
+    );
+    assert_eq!(d.device.mem_guard_poll_ms, 500);
     // §6.3 / §6.4.
     assert_eq!(d.kv.slots, 4);
     assert_eq!(d.kv.session_cache_dir, None);
@@ -2060,6 +2071,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SESSION_IDLE_SECS",
         "INFR_KV_SESSION_CACHE_MAX",
         "INFR_KV_SESSION_CACHE_TTL_HOURS",
+        "INFR_MEM_GUARD_HEADROOM",
+        "INFR_MEM_GUARD_RAM_HEADROOM",
+        "INFR_MEM_GUARD_POLL_MS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
