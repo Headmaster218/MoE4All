@@ -476,8 +476,8 @@ pub struct NativeEmbeddingEngine {
     weights: Arc<WeightCache>,
     weight_bytes: u64,
     /// A backend fork sharing the LLM elastic arena loads weights only for an active request and
-    /// retains them only until the configured idle deadline. Standalone CPU/Vulkan embedding keeps
-    /// the established eager-resident behavior because it has no Expert cache to return capacity.
+    /// retains them only until the configured idle deadline. Low-level standalone constructors are
+    /// eager; standalone services wrap them in LazyNativeEmbeddingEngine to release whole backends.
     dynamic_weights: bool,
     idle_timeout: Duration,
     layout: WeightLayout,
@@ -488,6 +488,34 @@ pub struct NativeEmbeddingEngine {
 }
 
 impl NativeEmbeddingEngine {
+    /// Standalone service: defer backend creation until a request, then drop the whole backend
+    /// after the idle deadline. Weight arenas and CPU repack caches must be released together.
+    pub fn load_cpu_with_idle(
+        path: &Path,
+        engine_cfg: Arc<infr_core::config::Config>,
+        idle_timeout: Duration,
+    ) -> Result<crate::LazyNativeEmbeddingEngine> {
+        let source = path.to_owned();
+        crate::LazyNativeEmbeddingEngine::new(path, idle_timeout, move || {
+            Ok(Box::new(Self::load_cpu(&source, Arc::clone(&engine_cfg))?))
+        })
+    }
+
+    pub fn load_vulkan_with_idle(
+        path: &Path,
+        engine_cfg: Arc<infr_core::config::Config>,
+        idle_timeout: Duration,
+    ) -> Result<crate::LazyNativeEmbeddingEngine> {
+        let source = path.to_owned();
+        let engine_cfg = standalone_backend_config(&engine_cfg);
+        crate::LazyNativeEmbeddingEngine::new(path, idle_timeout, move || {
+            Ok(Box::new(Self::load_vulkan(
+                &source,
+                Arc::clone(&engine_cfg),
+            )?))
+        })
+    }
+
     pub fn load_cpu(path: &Path, engine_cfg: Arc<infr_core::config::Config>) -> Result<Self> {
         Self::load(
             path,
@@ -1248,6 +1276,29 @@ impl NativeEmbeddingEngine {
     }
 }
 
+/// Validate the native architecture and weight catalog without initializing a compute device or
+/// touching weight payloads. The temporary GGUF mapping is not retained by a dormant service.
+pub(crate) fn standalone_metadata(path: &Path) -> Result<(EmbeddingConfig, u64)> {
+    let gguf = Gguf::open(path).map_err(|error| anyhow!(error.to_string()))?;
+    let cfg = NativeConfig::from_gguf(&gguf)?;
+    let (_, _, weight_bytes) = build_weight_catalog(&gguf, &cfg)?;
+    Ok((cfg.public().clone(), weight_bytes))
+}
+
+fn standalone_backend_config(
+    cfg: &Arc<infr_core::config::Config>,
+) -> Arc<infr_core::config::Config> {
+    // A standalone embedding backend creates no LLM pager/host cache. UMA admission must not
+    // subtract a legacy cache target inherited from that absent module. Keep explicit process
+    // and device ceilings, the selected device and the saved/source configuration unchanged.
+    if cfg.paging.dram.is_none() {
+        return Arc::clone(cfg);
+    }
+    let mut standalone = (**cfg).clone();
+    standalone.paging.dram = None;
+    Arc::new(standalone)
+}
+
 impl Drop for NativeEmbeddingEngine {
     fn drop(&mut self) {
         if let Some(reaper) = self._idle_reaper.as_mut() {
@@ -1469,6 +1520,61 @@ fn load_weight_buffers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_uma_does_not_reserve_absent_llm_cache_or_change_explicit_caps() {
+        use infr_core::{
+            config::{AutoProfile, Config},
+            hostmem, SizeSpec,
+        };
+        for profile in [AutoProfile::Conservative, AutoProfile::Aggressive] {
+            let mut original = Config::default();
+            original.device.auto_profile = profile;
+            original.device.dev = Some("Vulkan2".into());
+            original.device.vram_budget = Some(SizeSpec::Bytes(2 << 30));
+            original.paging.dram = Some(SizeSpec::Bytes(128 << 30));
+            original.paging.dram_bypass = false;
+            let original = Arc::new(original);
+            let standalone = standalone_backend_config(&original);
+            let old = hostmem::unified_device_budget_for_snapshot(
+                &original,
+                Some(32 << 30),
+                Some(64 << 30),
+                Some(1 << 30),
+            );
+            let new = hostmem::unified_device_budget_for_snapshot(
+                &standalone,
+                Some(32 << 30),
+                Some(64 << 30),
+                Some(1 << 30),
+            );
+            assert_eq!(old, Some(0));
+            assert!(new.unwrap() > 0);
+            assert!(original.paging.dram.is_some());
+            assert!(standalone.paging.dram.is_none());
+            assert_eq!(standalone.device, original.device);
+
+            let mut explicit = (*original).clone();
+            explicit.device.ram_budget = Some(SizeSpec::Bytes(8 << 30));
+            let explicit = Arc::new(explicit);
+            let standalone = standalone_backend_config(&explicit);
+            assert_eq!(standalone.device, explicit.device);
+            assert_eq!(
+                hostmem::unified_device_budget_for_snapshot(
+                    &explicit,
+                    Some(32 << 30),
+                    Some(64 << 30),
+                    Some(1 << 30)
+                ),
+                hostmem::unified_device_budget_for_snapshot(
+                    &standalone,
+                    Some(32 << 30),
+                    Some(64 << 30),
+                    Some(1 << 30)
+                )
+            );
+        }
+    }
     use serde::Deserialize;
 
     #[test]

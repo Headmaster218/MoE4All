@@ -5,9 +5,11 @@
 //! implementations share one engine boundary and resource-accounting contract so embedding
 //! weights can join the future unified VRAM/RAM/SSD policy without changing the HTTP API.
 
+mod lazy;
 mod native;
 mod tokenizer;
 
+pub use lazy::LazyNativeEmbeddingEngine;
 pub use native::NativeEmbeddingEngine;
 
 use anyhow::{anyhow, bail, Context, Result};
