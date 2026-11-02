@@ -13,6 +13,9 @@ mod submission;
 mod submission_validation;
 mod transcription;
 
+#[cfg(test)]
+mod module_composition_tests;
+
 #[derive(Parser)]
 #[command(
     name = "infr",
@@ -521,26 +524,30 @@ enum Cmd {
         #[command(flatten)]
         sampling: SamplingOpts,
     },
-    /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
+    /// Serve any non-empty combination of chat, embedding and transcription models.
+    #[command(group(clap::ArgGroup::new("modules")
+        .args(["model", "embedding_model", "transcription_model"])
+        .required(true)
+        .multiple(true)))]
     Serve {
-        /// Chat model; omit for an audio-only server with --transcription-model.
+        /// Optional chat model; omit to serve embedding and/or transcription independently.
         model: Option<String>,
         #[command(flatten)]
         transcription: transcription::ServeOptions,
         /// Optional Qwen3.8 vision projector GGUF. Image parts are accepted through the OpenAI
         /// chat API as data URIs or base64 strings; projector weights are request-scoped.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", requires = "model")]
         mmproj: Option<PathBuf>,
         /// Optional GGUF embedding model hosted natively at /v1/embeddings.
         #[arg(long, value_name = "MODEL")]
         embedding_model: Option<String>,
-        /// Seconds an idle native embedding model remains in unified VRAM. Its first request loads
+        /// Seconds an idle native embedding model remains in RAM/VRAM. Its first request loads
         /// weights from GGUF/SSD; later requests reuse them until this deadline. 0 keeps them
-        /// resident until server shutdown. Applies only to the shared Vulkan embedding backend.
+        /// resident until server shutdown. Applies to native CPU and Vulkan embedding backends.
         #[arg(long, value_name = "SECONDS", default_value_t = 300)]
         embedding_idle_timeout: u64,
         /// Use a llama-server compatibility worker instead of native embedding execution.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", requires = "embedding_model")]
         embedding_runner: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
@@ -580,6 +587,9 @@ enum Cmd {
     /// Start a native embedding-only OpenAI-compatible HTTP API (GGUF, CPU or Vulkan).
     ServeEmbedding {
         model: String,
+        /// Seconds before idle native embedding weights unload; 0 keeps them resident.
+        #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+        embedding_idle_timeout: u64,
         /// Use a llama-server compatibility worker instead of native embedding execution.
         #[arg(long, value_name = "PATH")]
         embedding_runner: Option<PathBuf>,
@@ -1191,7 +1201,7 @@ fn run_engine_command(
         flags: cli_flag_layer(&cmd)?,
     };
     let mut cfg = Config::load(&overrides)?;
-    if let Some(frozen) = infr_core::hostmem::freeze_automatic_ram_budget(&mut cfg) {
+    if let Some(frozen) = freeze_llm_ram_budget(&cmd, &mut cfg) {
         tracing::info!(
             auto_profile = %frozen.profile,
             startup_available_host_bytes = ?frozen.startup_available_bytes,
@@ -1221,6 +1231,31 @@ fn run_engine_command(
     infr_core::timeline::flush().context("writing Decode timeline")?;
     exit_if_signalled();
     res
+}
+
+/// Only LLM execution paths may turn an automatic profile into a process-sized RAM target.
+/// Auxiliary services allocate on demand and retain the user's policy and explicit device caps.
+fn uses_llm(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Run { .. }
+            | Cmd::Serve { model: Some(_), .. }
+            | Cmd::Bench { .. }
+            | Cmd::Multi { .. }
+            | Cmd::Compare { .. }
+            | Cmd::TestPlanPrompt { .. }
+    )
+}
+
+fn freeze_llm_ram_budget(
+    cmd: &Cmd,
+    cfg: &mut Config,
+) -> Option<infr_core::hostmem::FrozenAutomaticRamBudget> {
+    if uses_llm(cmd) {
+        infr_core::hostmem::freeze_automatic_ram_budget(cfg)
+    } else {
+        None
+    }
 }
 fn validate_benchmark_payload(value: &serde_json::Value) -> anyhow::Result<()> {
     submission_validation::validate("benchmark", value)
@@ -1559,11 +1594,19 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         Cmd::Transcribe { model, options } => transcription::transcribe(&model, options, cfg),
         Cmd::ServeEmbedding {
             model,
+            embedding_idle_timeout,
             embedding_runner,
             addr,
             parallel,
             ..
-        } => cmd_serve_embedding(&model, embedding_runner.as_deref(), &addr, parallel, cfg),
+        } => cmd_serve_embedding(
+            &model,
+            embedding_runner.as_deref(),
+            embedding_idle_timeout,
+            &addr,
+            parallel,
+            cfg,
+        ),
         Cmd::Multi {
             models,
             addr,
@@ -6962,19 +7005,30 @@ fn cmd_serve(
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
+    validate_serve_modules(
+        model,
+        embedding_model,
+        transcription,
+        mmproj,
+        embedding_runner,
+    )?;
+    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let audio = transcription.load(cfg)?;
     let Some(model) = model else {
-        anyhow::ensure!(
-            mmproj.is_none() && embedding_model.is_none() && embedding_runner.is_none(),
-            "audio-only serve cannot use chat vision or embedding flags"
-        );
-        let transcriber =
-            audio.context("serve requires a chat model or --transcription-model <GGUF>")?;
-        let sockaddr = addr.parse().context("invalid --addr")?;
-        let state = transcription.attach(
-            infr_server::AppState::transcription(transcriber, cfg.clone()),
-            None,
-        );
+        // Return before any LLM resolution, warmup, KV sizing or pager/arena construction.
+        let mut state = infr_server::AppState::empty(cfg.clone());
+        if let Some(model) = embedding_model {
+            let parallel = parallel.unwrap_or(1).max(1);
+            let (id, embedding) = load_embedding_generator(
+                model,
+                embedding_runner,
+                parallel,
+                embedding_idle_timeout,
+                cfg,
+            )?;
+            state = state.with_embedding(embedding, id, parallel);
+        }
+        let state = transcription.attach(state, audio);
         diagnostics::mark_runtime();
         return tokio::runtime::Runtime::new()?.block_on(infr_server::serve_state(state, sockaddr));
     };
@@ -6984,7 +7038,6 @@ fn cmd_serve(
         .and_then(|s| s.to_str())
         .unwrap_or("model")
         .to_string();
-    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     // `--parallel` was EXPLICITLY set iff `Some`; the concurrent-path slot count defaults to 1, so
     // an unflagged `infr serve` hands one request the whole context window rather than a quarter of
     // it. Raising it is the user's call, and `--ctx` still pins the per-slot window either way.
@@ -7024,7 +7077,9 @@ fn cmd_serve(
         None
     } else {
         embedding_model
-            .map(|model| load_embedding_generator(model, embedding_runner, 1, cfg))
+            .map(|model| {
+                load_embedding_generator(model, embedding_runner, 1, embedding_idle_timeout, cfg)
+            })
             .transpose()?
     };
 
@@ -7060,7 +7115,13 @@ fn cmd_serve(
                 let compatibility_runner =
                     embedding_runner.or(cfg.serve.embedding_runner.as_deref());
                 if compatibility_runner.is_some() {
-                    load_embedding_generator(model, embedding_runner, 1, cfg)
+                    load_embedding_generator(
+                        model,
+                        embedding_runner,
+                        1,
+                        embedding_idle_timeout,
+                        cfg,
+                    )
                 } else {
                     let backend = engine.fork_embedding_backend()?;
                     load_native_embedding_generator_on(model, cfg, backend, embedding_idle_timeout)
@@ -7150,10 +7211,33 @@ fn cmd_serve(
     }
 }
 
+fn validate_serve_modules(
+    model: Option<&str>,
+    embedding_model: Option<&str>,
+    transcription: &transcription::ServeOptions,
+    mmproj: Option<&Path>,
+    embedding_runner: Option<&Path>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        model.is_some() || embedding_model.is_some() || transcription.transcription_model.is_some(),
+        "serve requires a chat model, --embedding-model or --transcription-model"
+    );
+    anyhow::ensure!(
+        mmproj.is_none() || model.is_some(),
+        "--mmproj requires a chat model"
+    );
+    anyhow::ensure!(
+        embedding_runner.is_none() || embedding_model.is_some(),
+        "--embedding-runner requires --embedding-model"
+    );
+    Ok(())
+}
+
 fn load_embedding_generator(
     model: &str,
     runner: Option<&Path>,
     parallel: usize,
+    idle_timeout_secs: u64,
     cfg: &Arc<Config>,
 ) -> anyhow::Result<(String, Arc<dyn infr_server::EmbeddingGenerator>)> {
     let (gguf, _) = resolve(model, cfg)?;
@@ -7185,12 +7269,19 @@ fn load_embedding_generator(
             (Some(_), Backend::Metal) => anyhow::bail!(
                 "llama.cpp embedding compatibility mode supports --dev cpu and Vulkan only"
             ),
-            (None, Backend::Cpu) => Box::new(infr_embedding::NativeEmbeddingEngine::load_cpu(
-                &gguf,
-                cfg.clone(),
-            )?),
+            (None, Backend::Cpu) => {
+                Box::new(infr_embedding::NativeEmbeddingEngine::load_cpu_with_idle(
+                    &gguf,
+                    cfg.clone(),
+                    std::time::Duration::from_secs(idle_timeout_secs),
+                )?)
+            }
             (None, Backend::Vulkan(_)) => Box::new(
-                infr_embedding::NativeEmbeddingEngine::load_vulkan(&gguf, cfg.clone())?,
+                infr_embedding::NativeEmbeddingEngine::load_vulkan_with_idle(
+                    &gguf,
+                    cfg.clone(),
+                    std::time::Duration::from_secs(idle_timeout_secs),
+                )?,
             ),
             (None, Backend::Metal) => anyhow::bail!(
             "native embedding currently supports --dev cpu and Vulkan; Metal is not implemented"
@@ -7239,12 +7330,14 @@ fn load_native_embedding_generator_on(
 fn cmd_serve_embedding(
     model: &str,
     runner: Option<&Path>,
+    idle_timeout_secs: u64,
     addr: &str,
     parallel: usize,
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
-    let (model_id, generator) = load_embedding_generator(model, runner, parallel, cfg)?;
+    let (model_id, generator) =
+        load_embedding_generator(model, runner, parallel, idle_timeout_secs, cfg)?;
     let parallel = parallel.max(1);
     // print-ok: serve-embedding endpoint banner is stable CLI output.
     println!("infr serve-embedding: {model_id} on http://{sockaddr}  (OpenAI /v1/embeddings)");

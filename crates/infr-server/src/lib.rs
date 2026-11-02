@@ -2071,7 +2071,9 @@ impl ModelEntry {
     }
 }
 
-/// Shared server state — a non-empty, ordered set of hosted [`ModelEntry`]s. A request is routed to
+/// Shared server state — independently composed chat, embedding and transcription capabilities.
+/// An empty state can be assembled with [`AppState::empty`] before attaching capabilities.
+/// A chat request is routed to
 /// the entry whose `id` matches its `model` field; an unknown/empty `model` falls to the DEFAULT
 /// (the first entry). The single-model server is just the one-entry case, so its behaviour — and the
 /// hot path — is byte-identical to before this became multi-model.
@@ -2100,6 +2102,22 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Start composing a server without a placeholder chat model or chat admission slots.
+    /// Attach at least one capability before calling [`serve_state`].
+    pub fn empty(cfg: Arc<Config>) -> Self {
+        let models = Arc::new(Vec::new());
+        let embeddings = Arc::new(Vec::new());
+        Self {
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
+            cfg,
+            stats: Arc::default(),
+            transcription: None,
+            transcription_upload_dir: None,
+        }
+    }
+
     /// Wrap a single loaded generator for production use with `n_parallel` concurrent slots — the
     /// single-model server (the overwhelming common case). Equivalent to a one-entry
     /// [`multi`](Self::multi).
@@ -2131,8 +2149,7 @@ impl AppState {
     /// (used for a request with an unknown or empty `model`). This is the multi-device host: pass a
     /// generator pinned to each physical GPU and the server routes by model name — see `infr multi`.
     ///
-    /// Panics if `entries` is empty (the state invariant is a non-empty model set); the CLI never
-    /// calls it with none.
+    /// Panics if `entries` is empty; use [`Self::empty`] to compose auxiliary capabilities.
     pub fn multi(entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>, cfg: Arc<Config>) -> Self {
         assert!(
             !entries.is_empty(),
@@ -2197,7 +2214,7 @@ impl AppState {
             .clone()
     }
 
-    /// Attach one independently loaded embedding model to an existing chat state.
+    /// Attach one independently loaded embedding model to a composed server state.
     pub fn with_embedding(
         mut self,
         generator: Arc<dyn EmbeddingGenerator>,
@@ -2218,21 +2235,7 @@ impl AppState {
         n_parallel: usize,
         cfg: Arc<Config>,
     ) -> Self {
-        let models = Arc::new(Vec::new());
-        let embeddings = Arc::new(vec![EmbeddingEntry::new(
-            &model_id.into(),
-            generator,
-            n_parallel,
-        )]);
-        Self {
-            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
-            models,
-            embeddings,
-            cfg,
-            stats: Arc::default(),
-            transcription: None,
-            transcription_upload_dir: None,
-        }
+        Self::empty(cfg).with_embedding(generator, model_id, n_parallel)
     }
 
     fn route_embedding(&self, requested: &str) -> Option<EmbeddingEntry> {
@@ -2264,10 +2267,7 @@ impl AppState {
 
     /// Audio-only server state, with no placeholder chat model advertised by /v1/models.
     pub fn transcription(transcriber: Arc<dyn infr_audio::Transcriber>, cfg: Arc<Config>) -> Self {
-        let mut state = Self::headless("", cfg);
-        state.models = Arc::new(Vec::new());
-        state.dashboard = Arc::new(ActivityDashboard::new(&state.models, &state.embeddings));
-        state.with_transcription(transcriber)
+        Self::empty(cfg).with_transcription(transcriber)
     }
 }
 
@@ -2360,6 +2360,10 @@ pub async fn serve_with_embedding(
 pub async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
     let n_models =
         state.models.len() + state.embeddings.len() + usize::from(state.transcription.is_some());
+    anyhow::ensure!(
+        n_models > 0,
+        "server requires at least one hosted capability"
+    );
     // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
     // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
     // server ends, no task is left ticking.
@@ -2448,7 +2452,10 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
     }
     if let Some(audio) = &state.transcription {
-        if !data.iter().any(|card| card.id == audio.transcriber.model_id()) {
+        if !data
+            .iter()
+            .any(|card| card.id == audio.transcriber.model_id())
+        {
             data.push(ModelCard {
                 id: audio.transcriber.model_id().to_owned(),
                 object: "model",
@@ -3633,6 +3640,9 @@ fn parse_oai_tool_calls(v: &serde_json::Value) -> Option<Vec<ToolCall>> {
 
 #[cfg(test)]
 mod thinking_tests;
+
+#[cfg(test)]
+mod module_composition_tests;
 
 #[cfg(test)]
 mod tests {

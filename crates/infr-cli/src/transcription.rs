@@ -14,7 +14,8 @@ use std::{
 
 #[derive(Args, Debug)]
 pub(crate) struct ServeOptions {
-    /// Native transcription GGUF served at /v1/audio/transcriptions (loaded on first request).
+    /// Native transcription GGUF at /v1/audio/transcriptions (loaded on first request).
+    /// File-audio API supports an OpenAI-compatible subset, using an independent CPU backend.
     #[arg(long, value_name = "GGUF")]
     pub transcription_model: Option<PathBuf>,
     /// Transcription backend. This first native implementation supports only cpu.
@@ -279,5 +280,36 @@ mod tests {
         assert!(validate("cpu", 257).is_err());
         assert!(validate("cpu", 256).is_ok());
         assert!(validate("CPU", 4).is_ok());
+    }
+
+    #[test]
+    fn combined_services_reject_gpu_transcription_before_loading_any_model() {
+        for device in ["vulkan", "Vulkan1", "cuda", "metal"] {
+            let cli = Cli::try_parse_from([
+                "infr",
+                "serve",
+                "--embedding-model",
+                "missing-embedding.gguf",
+                "--dev",
+                "Vulkan1",
+                "--transcription-model",
+                "missing-audio.gguf",
+                "--transcription-dev",
+                device,
+            ])
+            .unwrap();
+            let cmd = cli.cmd.unwrap();
+            let cfg = Arc::new(Config::load_from_layers(&[
+                crate::cli_flag_layer(&cmd).unwrap()
+            ]));
+            let original = format!("{cfg:?}");
+            let error = crate::dispatch(cmd, &cfg, &infr_core::config::PartialConfig::default())
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unsupported transcription device"));
+            assert_eq!(cfg.device.dev.as_deref(), Some("Vulkan1"));
+            assert_eq!(format!("{cfg:?}"), original);
+        }
     }
 }
