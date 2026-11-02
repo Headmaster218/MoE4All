@@ -1370,7 +1370,117 @@ fn has_readable_reasoning(item: &Value) -> bool {
     })
 }
 
+/// A request's wire shape, never its text: exactly the fields that decide which validation path
+/// runs. The prompt belongs to the client; the flags are what the log needs to explain a 400.
+struct RequestShape {
+    model: String,
+    stream: bool,
+    tools: usize,
+    tool_choice: bool,
+    /// What the client sent for `store` — `None` is the server default, which is a different
+    /// answer from the client explicitly saying `false`.
+    store: Option<bool>,
+    chain: bool,
+    max_output_tokens: Option<u32>,
+}
+
+impl RequestShape {
+    fn of(request: &ResponsesRequest) -> Self {
+        Self {
+            model: request.model.clone(),
+            stream: request.stream,
+            tools: request
+                .tools
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            tool_choice: request.tool_choice.is_some(),
+            store: request.store,
+            chain: request.previous_response_id.is_some() || request.conversation.is_some(),
+            max_output_tokens: request.max_output_tokens,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            " model={} stream={} tools={} tool_choice={} store={:?} chain={} max_output={:?}",
+            self.model,
+            self.stream,
+            self.tools,
+            self.tool_choice,
+            self.store,
+            self.chain,
+            self.max_output_tokens,
+        )
+    }
+}
+
+/// Cap on the error envelope copied out of a failed response for the log line. Our own errors are
+/// small JSON objects (the largest field is a validation sentence), so a megabyte is orders of
+/// magnitude above anything this path can produce — and the body being read here is the one the
+/// client is about to receive, so it is put back verbatim rather than truncated.
+const MAX_ERROR_ECHO_BYTES: usize = 1024 * 1024;
+
+/// The `error.message` the client was handed, or a trimmed prefix of whatever body came back.
+fn error_reason(bytes: &[u8]) -> String {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|body| {
+            body["error"]["message"]
+                .as_str()
+                .map(|message| message.to_string())
+        })
+        .or_else(|| {
+            let text = String::from_utf8_lossy(bytes);
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.chars().take(300).collect())
+        })
+        .unwrap_or_else(|| "no response body".to_string())
+}
+
+/// One terminal line per `/v1/responses` request: how the exchange ended, how long it took, the
+/// wire shape that decided the path, and — when it failed — the error envelope the client received.
+/// Chat completions already reported their requests through `serve`'s own logging; the Responses
+/// surface answered clients and stayed silent, so a rejected wire shape looked like a request that
+/// "just failed" from the other side of the socket.
+///
+/// A streaming success is logged when the SSE headers go out (that IS the HTTP outcome); the
+/// per-token progress lines the chat pipeline already emits stay the completion record.
 pub(super) async fn handler(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<ResponsesRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let started = std::time::Instant::now();
+    let shape = body.as_ref().ok().map(|Json(request)| RequestShape::of(request));
+    let response = handle_request(state, headers, body).await;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis();
+    let shape = match &shape {
+        Some(shape) => shape.to_string(),
+        // A body that never deserialized has no shape to report — that is itself the finding.
+        None => " model=<unparseable body>".to_string(),
+    };
+    if status == StatusCode::OK {
+        tracing::info!("responses: {status} in {elapsed_ms} ms{shape}");
+        return response;
+    }
+    let (parts, original) = response.into_parts();
+    let bytes = to_bytes(original, MAX_ERROR_ECHO_BYTES)
+        .await
+        .unwrap_or_default();
+    tracing::warn!(
+        "responses: {status} in {elapsed_ms} ms{shape}: {}",
+        error_reason(&bytes)
+    );
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+async fn handle_request(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<ResponsesRequest>, axum::extract::rejection::JsonRejection>,

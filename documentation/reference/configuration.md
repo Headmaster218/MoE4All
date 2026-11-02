@@ -225,6 +225,8 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 汇总 `serve stats` 行仅在**有活动时**输出：无事件的区间不输出任何内容，因此空闲服务器会留下干净日志，且不会出现可能被误认为负载的心跳。它的 `prefill_tps`/`decode_tps` 是整个服务器的模型 token 数除以该区间的实际时钟时间，而非累计值。每个活跃请求还会在完成预填充块时及解码期间输出受限频率的 `request progress` 行。它报告精确的模型 token `context_tokens/context_limit`、未缓存预填充进度、缓存前缀、已生成 token（包含推理）和请求本地速率。即使禁用周期性行，阶段变化和 `request done` 仍会记录。请求日志**仅包含计数，绝不包含提示词文本**。
 
+每个 `POST /v1/responses` 额外输出一条 `responses:` 状态行：HTTP 结果、整次交换的耗时，以及决定走哪条校验路径的**请求形状**（`model`、`stream`、tools 数量、是否带 `tool_choice`、客户端送的 `store`、是否带链式 id、`max_output_tokens`）；非 2xx 时再附上客户端收到的 `error.message`，这样“请求直接失败”在服务器终端就能读出是哪一条契约拒绝的。请求体无法解析时形状显示为 `model=<unparseable body>`——缺 `Content-Type: application/json` 与非法 UTF-8 都属于这一类。该行同样只含元信息，不含提示词文本。
+
 成功的非流式响应和流式响应的终止完成帧，均包含权威的 `usage` 及 llama.cpp 兼容的 `timings` 对象。`timings.context_n` 是完整提示词加补全深度，`context_limit` 是 KV 槽位容量，`cached_n` 将复用的提示词 token 与实际评估的 `prompt_n` token 区分开来。流式指标无条件输出，因此未发送 `stream_options.include_usage` 的客户端不会静默记录零 token。
 
 `POST /v1/responses` 复用相同的模型调度与请求上限；支持文本消息、重放的 function call/output、自定义 function tools，以及 `stream=true` 的 typed SSE。启用视觉模型及 projector 时，`input_image` 用 base64 `data:` URI。与存储无关、始终返回 400 的语义有：文件输入（`input_file`）、`file_id` 与远程图片 URL、hosted tools、结构化输出模式、`truncation="auto"`、`background`、除 `reasoning.encrypted_content` 之外的 `include`，以及任何未被识别的请求字段。`parallel_tool_calls=false` 已被接受：解码器没有并行开关，模型仍可能给出多个调用，因此多余的调用会被丢掉，并在响应的 `warnings` 里说明丢掉了几个——静默少给调用会让 agent 循环永远等一个没人问过的结果。错误体的 `error.param` 指向客户端实际发送的那个字段；无法归到单一字段时记为 `request`（未识别字段），`GET`/`DELETE /v1/responses/{id}` 这类路径参数则记为 `response_id`。
