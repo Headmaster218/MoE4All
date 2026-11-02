@@ -841,14 +841,70 @@ pub struct ImageSpanEmbeds {
     pub embeds: std::sync::Arc<Vec<f32>>,
 }
 
+/// Marks a token id as an image-cache key rather than a vocabulary token. Every key id has it
+/// set and every real token id clears it, so a text chain and an image chain can never match
+/// each other INSIDE an image span.
+pub const IMAGE_CACHE_TOKEN_BIT: u32 = 1 << 31;
+
+/// One image span in the shared paged-KV tree's KEY space.
+///
+/// The tree addresses a KV chain by its token vector, and an image span is `grid_nx * grid_ny`
+/// copies of the SAME image-pad token: two different pictures would publish an identical chain,
+/// and the second reader would be handed the first one's attention rows. `ids` replaces that run
+/// with content-derived pseudo-tokens carrying [`IMAGE_CACHE_TOKEN_BIT`], which no real
+/// vocabulary id reaches. The substitution is length-preserving, so page alignment, snapshot
+/// boundaries and chain promotion keep working on the key exactly as they do on tokens.
+#[derive(Clone)]
+pub struct ImageCacheSpan {
+    /// First expanded prompt token of this image.
+    pub start: usize,
+    /// One reserved-range id per image-token position.
+    pub ids: std::sync::Arc<Vec<u32>>,
+}
+
+/// `tokens` seen through the tree's key space: each recorded image span's pad run is replaced by
+/// that image's content block and everything else stays as it is. Positions at or past
+/// `tokens.len()` are ignored, so a partial conversation — truncated, or attached mid-prompt —
+/// keys itself without any clipping by the caller. Spans are ordered and disjoint, the way
+/// `expand_multimodal_prompt` builds them.
+pub(crate) fn image_cache_view(tokens: &[u32], spans: &[ImageCacheSpan]) -> Vec<u32> {
+    if spans.is_empty() {
+        return tokens.to_vec();
+    }
+    let mut view = Vec::with_capacity(tokens.len());
+    let mut next = 0usize;
+    for span in spans {
+        if span.start >= tokens.len() {
+            break;
+        }
+        view.extend_from_slice(&tokens[next..span.start]);
+        let keep = (span.start + span.ids.len()).min(tokens.len()) - span.start;
+        view.extend_from_slice(&span.ids[..keep]);
+        next = span.start + keep;
+    }
+    view.extend_from_slice(&tokens[next..]);
+    view
+}
+
 /// Qwen multimodal RoPE data for one request. Text-only callers pass `None` and retain the
 /// original graph and cache behavior.
 pub struct MropePlan {
     /// Row-major `(T, H, W, E)` positions for every expanded prompt token.
     pub prompt_pos4: Vec<i32>,
     pub spans: Vec<ImageSpanEmbeds>,
+    /// This request's image spans in the paged-KV tree's key space — parallel to [`Self::spans`],
+    /// and the only form of them a shared cache may be addressed by.
+    pub cache_spans: Vec<ImageCacheSpan>,
     /// Position used by the first generated token; later generated tokens advance linearly.
     pub decode_base: i32,
+}
+
+impl MropePlan {
+    /// The tree key of this request's expanded prompt: what its chain is published under, and
+    /// what the slot keeps materializing under afterwards.
+    pub fn cache_view(&self, tokens: &[u32]) -> Vec<u32> {
+        image_cache_view(tokens, &self.cache_spans)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

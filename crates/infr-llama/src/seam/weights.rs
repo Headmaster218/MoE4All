@@ -436,6 +436,11 @@ pub(crate) struct SeamKv {
     pub(super) kv_ring: bool,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
+    /// This conversation's image spans in the shared paged-KV tree's key space; empty for a text
+    /// conversation. `cached` stays the REAL ids the model runs on — the tree is addressed through
+    /// these blocks instead, which is what lets an image-bearing chain be reused without ever being
+    /// mistaken for a different picture. See [`Self::paged_cache_view`].
+    pub(super) image_cache_spans: Vec<crate::seam::ImageCacheSpan>,
     /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
     /// non-diffusion-gemma caller (never populated). Reset to `None` whenever the (cc, p) key
     /// changes (see `DenoiseCache`).
@@ -1546,6 +1551,19 @@ impl SeamKv {
         live.into_iter().chain(checkpoint).max()
     }
 
+    /// [`Self::continuation_prefix_len`] applied in the paged tree's KEY space: `key_view` is the
+    /// requesting prompt's [`crate::seam::MropePlan::cache_view`], and this slot's side is its own
+    /// [`Self::paged_cache_view`]. Comparing in that space is what allows a slot that materialized
+    /// picture A to continue a request carrying picture A — and never one carrying picture B, whose
+    /// key differs from the first pad token onward. The rolling recurrent checkpoints are real-token
+    /// prefixes, so they stay out of this comparison; a multimodal session continues from its live
+    /// frontier or from the tree, which is the same rule the resident path already applies.
+    pub(crate) fn continuation_prefix_len_keyed(&self, key_view: &[u32]) -> Option<usize> {
+        let view = self.paged_cache_view();
+        let score = common_prefix_len(&view, key_view);
+        (score > 0 && (score == view.len() || score == key_view.len())).then_some(score)
+    }
+
     /// Longest prefix this slot can copy into another slot without replaying model work. Hybrid
     /// recurrent models can only export their live frontier or a captured turn checkpoint; an
     /// arbitrary token LCP has no matching recurrent/PLE summary.
@@ -1579,6 +1597,7 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        self.image_cache_spans.clear();
         self.invalidate_turn_checkpoint();
         self.invalidate_delta_checkpoint();
     }
@@ -1592,6 +1611,21 @@ impl SeamKv {
         &self.cached
     }
 
+    /// The token vector this slot's KV may be SHARED under: `cached`, with every image span's pad
+    /// run replaced by that image's content block. Byte-identical to `cached` for a text
+    /// conversation, so a slot that never saw an image keys and publishes exactly as before.
+    pub(crate) fn paged_cache_view(&self) -> Vec<u32> {
+        crate::seam::image_cache_view(&self.cached, &self.image_cache_spans)
+    }
+
+    /// Record the image spans of the prompt this slot is about to materialize, so its chain is
+    /// published and matched under a key that names the PICTURES rather than the pad token they
+    /// replaced. Callers own the ordering: set it for the whole conversation before the first
+    /// prefill, and let [`Self::reset`] / the paged publish clear it when the conversation ends.
+    pub(crate) fn set_image_cache_spans(&mut self, spans: Vec<crate::seam::ImageCacheSpan>) {
+        self.image_cache_spans = spans;
+    }
+
     /// Paged tier: does this slot still own corridor frames (a published chain, or warm-reuse
     /// frames past a `reset()`)? A paged attach needs an empty chain; see `checkout_with_paged_cache`.
     pub(crate) fn paged_holds_frames(&self) -> bool {
@@ -1602,6 +1636,7 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        self.image_cache_spans.clear();
         self.invalidate_turn_checkpoint();
         self.invalidate_delta_checkpoint();
     }
@@ -2277,6 +2312,9 @@ impl SeamKv {
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
+            // A forked slot materializes nothing yet, so it has no image identity to key by — and
+            // `seed_from` below carries the source's spans whenever it copies real rows.
+            image_cache_spans: Vec::new(),
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
             // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
@@ -2859,6 +2897,7 @@ mod tests {
             max_ctx: 16,
             kv_ring: false,
             cached: vec![10, 20, 30, 40],
+            image_cache_spans: Vec::new(),
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,

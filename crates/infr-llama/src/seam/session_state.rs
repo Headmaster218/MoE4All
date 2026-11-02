@@ -481,14 +481,18 @@ impl SeamKv {
             return Err(anyhow!("paged detach requires a paged segmented KV slot"));
         }
         let page = self.segmented_kv.page_tokens;
-        let full = self.cached.len() / page;
+        // The tree is addressed through the CACHE KEY, which equals `cached` for a text
+        // conversation and replaces each image span's pad run with that picture's own block — so a
+        // chain holding image KV can only ever be handed back to the same pictures.
+        let view = self.paged_cache_view();
+        let full = view.len() / page;
         if full > 0 {
             // Publish FIRST: until `publish` returns the frames are only session-owned, so a
             // failed publish leaves a consistent resident slot. After it, the tree holds its own
             // owners and the detach below can never strand the conversation.
             let ckpts = self.take_paged_ckpts(be, full * page, page);
             kv.publish_with_ckpts(
-                self.cached[..full * page].to_vec(),
+                view[..full * page].to_vec(),
                 self.segmented_kv.chain[..full].to_vec(),
                 ckpts,
             )?;
@@ -497,6 +501,7 @@ impl SeamKv {
             .map_err(|error| anyhow!("sync before paged KV detach: {error}"))?;
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
+        self.image_cache_spans.clear();
         self.paged_frontier = None;
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();

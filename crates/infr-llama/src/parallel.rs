@@ -95,6 +95,42 @@ fn multimodal_key(images: &[MultimodalEmbedding]) -> MultimodalKey {
     hash.finalize().into()
 }
 
+/// One image's block in the shared paged-KV tree key: `n_tokens` reserved-range ids standing in
+/// for its pad run, as [`crate::seam::ImageCacheSpan`].
+///
+/// A per-position digest of `(content fingerprint, grid, position)` means two different pictures —
+/// or the same picture at a different resolution, which changes the grid AND the run length — can
+/// never produce the same block, while one picture always produces the same block wherever it is
+/// replayed. These ids exist only as cache addresses: nothing feeds them to the model, the
+/// tokenizer or the sampler, and [`crate::seam::IMAGE_CACHE_TOKEN_BIT`] keeps them out of the range
+/// any real vocabulary token occupies, so a text chain and an image chain cannot match inside a span.
+fn image_cache_block(
+    fingerprint: &[u8; 32],
+    grid_nx: usize,
+    grid_ny: usize,
+    n_tokens: usize,
+) -> Vec<u32> {
+    let mut seed = Sha256::new();
+    seed.update(fingerprint);
+    seed.update((grid_nx as u64).to_le_bytes());
+    seed.update((grid_ny as u64).to_le_bytes());
+    let seed = seed.finalize();
+    (0..n_tokens)
+        .map(|index| {
+            let mut stream = Sha256::new();
+            stream.update(seed.as_slice());
+            stream.update((index as u64).to_le_bytes());
+            let digest = stream.finalize();
+            let word = u32::from_le_bytes(
+                digest[..4]
+                    .try_into()
+                    .expect("a SHA-256 digest always starts with four bytes"),
+            );
+            word | crate::seam::IMAGE_CACHE_TOKEN_BIT
+        })
+        .collect()
+}
+
 fn expand_multimodal_prompt(
     tokens: &[u32],
     image_pad_id: u32,
@@ -104,6 +140,7 @@ fn expand_multimodal_prompt(
     let mut expanded = Vec::new();
     let mut positions4 = Vec::new();
     let mut spans = Vec::with_capacity(images.len());
+    let mut cache_spans = Vec::with_capacity(images.len());
     let mut images = images.into_iter();
     let mut used = 0usize;
     let mut cursor = 0i32;
@@ -122,6 +159,10 @@ fn expand_multimodal_prompt(
             anyhow!("rendered prompt contains more <|image_pad|> markers than image payloads")
         })?;
         used += 1;
+        // Bound before `image.values` moves out below: the paged-KV tree key needs this image's
+        // content identity and grid, not just its projector output.
+        let image_fingerprint = image.fingerprint;
+        let image_grid = (image.grid_nx, image.grid_ny);
         let n_tokens = image
             .grid_nx
             .checked_mul(image.grid_ny)
@@ -166,6 +207,15 @@ fn expand_multimodal_prompt(
             n_tokens,
             embeds: image.values,
         });
+        cache_spans.push(crate::seam::ImageCacheSpan {
+            start,
+            ids: std::sync::Arc::new(image_cache_block(
+                &image_fingerprint,
+                image_grid.0,
+                image_grid.1,
+                n_tokens,
+            )),
+        });
     }
     if images.next().is_some() {
         return Err(anyhow!(
@@ -177,6 +227,7 @@ fn expand_multimodal_prompt(
         crate::seam::MropePlan {
             prompt_pos4: positions4,
             spans,
+            cache_spans,
             decode_base: cursor,
         },
     ))
@@ -1847,7 +1898,7 @@ impl ParallelSeam {
                 disk_frames,
                 disk_bytes = frame_bytes * disk_frames as u64,
                 tree = %tree.stats_line(),
-                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, multimodal sessions never enter the tree; cold chains sink to the RAM tier and cascade to the disk tier before eviction when a RAM tier is configured, and evict outright when there is none)"
+                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, image spans keyed by picture content so visual KV survives any other request; cold chains sink to the RAM tier and cascade to the disk tier before eviction when a RAM tier is configured, and evict outright when there is none)"
             );
             let tree = Arc::new(Mutex::new(tree));
             self.paged_cache = Some(Arc::clone(&tree));
@@ -2940,7 +2991,9 @@ impl ParallelSeam {
             pool.slots[target].busy = true;
             pool.slots[target].tick = tick;
             pool.slots[target].idle_since = None;
-            let incompatible = pool.slots[target].multimodal_key.take().is_some();
+            // Clear the image marker: whatever this slot held is being replaced, and the guard only
+            // re-marks a slot that this turn is itself multimodal.
+            pool.slots[target].multimodal_key = None;
             let mut target_kv = pool.slots[target].kv.take();
             drop(pool);
 
@@ -2973,17 +3026,10 @@ impl ParallelSeam {
                     // arrives without the handle, so every checkout re-injects it.
                     kv.set_paged(Arc::clone(tree_mutex));
                 }
-                if incompatible {
-                    // Multimodal KV is keyed by opaque content, not tokens — never publish it to
-                    // the token tree. `reset` keeps the frames as this slot's warm reuse capacity;
-                    // a later tree attach frees them through the empty-publish detach.
-                    if let Some(kv) = target_kv.as_mut() {
-                        kv.reset();
-                    }
-                    if let Some(heads) = heads.as_mut() {
-                        heads[target].invalidate_all();
-                    }
-                }
+                // Multimodal KV is keyed by opaque content, not tokens — and the tree is fed the
+                // CACHE KEY for exactly that reason (see `seam::ImageCacheSpan`), so a text request
+                // taking over this slot publishes the old conversation under its own images instead
+                // of discarding it. Step 1 below does that publish; nothing may reset the slot first.
 
                 // 1. The old conversation leaves FIRST (different-prefix swap), so the tree sees
                 //    it before the new prompt matches, and the frames are never in limbo. A
@@ -3447,13 +3493,266 @@ impl ParallelSeam {
     fn checkout_multimodal(
         &self,
         prompt: &[u32],
+        key_view: &[u32],
+        cache_spans: Vec<crate::seam::ImageCacheSpan>,
         key: MultimodalKey,
         req: &RequestCtx,
     ) -> SlotGuard<'_> {
-        if self.session_cache.is_some() {
+        if self.paged_cache.is_some() {
+            self.checkout_multimodal_with_paged_cache(prompt, key_view, cache_spans, key, req)
+        } else if self.session_cache.is_some() {
             self.checkout_multimodal_with_cold_cache(prompt, key, req)
         } else {
             self.checkout_multimodal_resident(prompt, key)
+        }
+    }
+
+    /// Paged-tier multimodal checkout: the same publish-before-attach swap the text path runs, with
+    /// the tree addressed through the request's CACHE KEY.
+    ///
+    /// This is what lets an image's KV outlive the turn that produced it. Without it a multimodal
+    /// conversation continues only while its own slot stays untouched, so any other request in
+    /// between repays the whole picture — measured on Qwen3.8-Flash-Next with `kv.paged=true`: a
+    /// 6.4K-token turn carrying one image cost 2.1s back-to-back and 10.0s after a single text
+    /// request, because `reset()` discarded 4K tokens of materialized KV that the tree could have
+    /// handed straight back.
+    ///
+    /// Publish strictly precedes attach (see [`Self::checkout_with_paged_cache`]) and the old
+    /// conversation is published under ITS OWN spans, so a chain never changes picture identity
+    /// mid-swap; the requesting spans are installed only once this slot is about to materialize
+    /// this prompt.
+    #[allow(clippy::too_many_arguments)]
+    fn checkout_multimodal_with_paged_cache(
+        &self,
+        prompt: &[u32],
+        key_view: &[u32],
+        cache_spans: Vec<crate::seam::ImageCacheSpan>,
+        key: MultimodalKey,
+        req: &RequestCtx,
+    ) -> SlotGuard<'_> {
+        let tree_mutex = self
+            .paged_cache
+            .as_ref()
+            .expect("paged multimodal checkout requires a paged cache");
+        let cfg: &Config = self.model.config();
+        let recurrent = cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3;
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if free.is_empty() {
+                pool = self.freed.wait(pool).expect("pool poisoned");
+                continue;
+            }
+            // A resident continuation is only this same conversation: the slot has to carry the
+            // very images this request does, compared in key space. Anything else the tree can
+            // serve comes from the publish/attach arms below.
+            let continuation = pick_continuation(
+                free.iter().filter_map(|&index| {
+                    (pool.slots[index].multimodal_key == Some(key))
+                        .then_some(pool.slots[index].kv.as_ref())
+                        .flatten()
+                        .and_then(|kv| {
+                            kv.continuation_prefix_len_keyed(key_view)
+                                .map(|prefix| (index, prefix, prefix))
+                        })
+                }),
+                key_view.len(),
+            );
+            let continuation_prefix = continuation
+                .and_then(|index| {
+                    pool.slots[index]
+                        .kv
+                        .as_ref()
+                        .and_then(|kv| kv.continuation_prefix_len_keyed(key_view))
+                })
+                .unwrap_or(0);
+            let target = continuation.unwrap_or_else(|| {
+                *free
+                    .iter()
+                    .min_by_key(|&&index| {
+                        let slot = &pool.slots[index];
+                        let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                        (!empty, slot.tick)
+                    })
+                    .expect("free is non-empty")
+            });
+            pool.tick += 1;
+            let tick = pool.tick;
+            pool.slots[target].busy = true;
+            pool.slots[target].tick = tick;
+            pool.slots[target].idle_since = None;
+            pool.slots[target].multimodal_key = None;
+            let mut target_kv = pool.slots[target].kv.take();
+            drop(pool);
+
+            // Same replay rule as the text path: a hybrid recurrent slot resumes only INSIDE its own
+            // conversation, so an equal-length prompt goes to the tree instead of the live frontier.
+            let continuation_prefix = if recurrent && continuation_prefix >= key_view.len() {
+                0
+            } else {
+                continuation_prefix
+            };
+
+            let mut tree_attached = 0usize;
+            {
+                let _gate = req.gate_pass();
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .map(|heads| heads.lock().expect("MTP heads poisoned"));
+                let mut tree = tree_mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(kv) = target_kv.as_mut() {
+                    kv.set_paged(Arc::clone(tree_mutex));
+                }
+
+                // 1. The old conversation leaves FIRST, under its own key, so the tree sees it
+                //    before this request matches and its frames are never in limbo.
+                if continuation_prefix == 0 {
+                    if let Some(kv) = target_kv.as_mut() {
+                        if kv.cached_len() != 0 || kv.paged_holds_frames() {
+                            match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
+                                Ok(published) => {
+                                    tracing::info!(
+                                        slot = target,
+                                        published,
+                                        tree = %tree.stats_line(),
+                                        "published replaced multimodal conversation KV to the paged radix cache"
+                                    );
+                                    if let Some(heads) = heads.as_mut() {
+                                        if let Err(error) =
+                                            heads[target].head.release_kv(self.vk.as_ref())
+                                        {
+                                            tracing::warn!(
+                                                slot = target,
+                                                "paged KV replacement could not release stale MTP head KV: {error}"
+                                            );
+                                        }
+                                        heads[target].invalidate_all();
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        slot = target,
+                                        "paged KV replacement publish failed; forgetting the old conversation: {error}"
+                                    );
+                                    kv.reset();
+                                    if let Some(heads) = heads.as_mut() {
+                                        heads[target].invalidate_all();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Deepest page-aligned chain the tree can serve for THIS key.
+                if let Some((node, matched)) = tree.best_match(key_view) {
+                    let pages = tree.page_tokens();
+                    let (mut reusable, mut ckpt) = tree.hit_prefix(node, recurrent, matched);
+                    if reusable > continuation_prefix {
+                        let occupied = target_kv
+                            .as_ref()
+                            .is_some_and(|kv| kv.cached_len() != 0 || kv.paged_holds_frames());
+                        let mut ready = !occupied;
+                        if occupied {
+                            if let Some(kv) = target_kv.as_mut() {
+                                match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
+                                    Ok(_) => ready = true,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            slot = target,
+                                            "paged KV could not empty the slot for a tree attach; re-prefilling: {error}"
+                                        );
+                                        kv.reset();
+                                        if let Some(heads) = heads.as_mut() {
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ready {
+                            let mut chain =
+                                tree.entry_chain_promoted(self.vk.as_ref(), node, reusable);
+                            let promoted = chain.len() * pages;
+                            if promoted < reusable {
+                                (reusable, ckpt) = tree.hit_prefix(node, recurrent, promoted);
+                                chain.truncate(reusable / pages);
+                            }
+                            if let Some(kv) = target_kv.as_mut().filter(|_| !chain.is_empty()) {
+                                let aux = ckpt.is_some();
+                                // The slot adopts REAL tokens; only the tree ever sees the key.
+                                match kv.paged_attach(
+                                    self.vk.as_ref(),
+                                    cfg,
+                                    &mut tree,
+                                    &chain,
+                                    &prompt[..reusable],
+                                    ckpt,
+                                ) {
+                                    Ok(()) => {
+                                        tree_attached = reusable;
+                                        tracing::info!(
+                                            slot = target,
+                                            cached_prefix_tokens = reusable,
+                                            aux,
+                                            tree = %tree.stats_line(),
+                                            "paged KV prefix hit for a multimodal prompt (zero-copy frame attach)"
+                                        );
+                                        if let Some(heads) = heads.as_mut() {
+                                            if let Err(error) =
+                                                heads[target].head.release_kv(self.vk.as_ref())
+                                            {
+                                                tracing::warn!(
+                                                    slot = target,
+                                                    "paged KV attach could not release stale MTP head KV: {error}"
+                                                );
+                                            }
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            slot = target,
+                                            "paged KV attach failed; re-prefilling the request: {error}"
+                                        );
+                                        if let Some(heads) = heads.as_mut() {
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. From here the slot materializes THIS conversation, so its chain — however much
+                //    of it was reused — is keyed by these images.
+                if let Some(kv) = target_kv.as_mut() {
+                    kv.set_image_cache_spans(cache_spans);
+                }
+                let reused = tree_attached.max(continuation_prefix);
+                tracing::info!(
+                    slot = target,
+                    prompt_tokens = prompt.len(),
+                    reused_tokens = reused,
+                    prefill_tokens = prompt.len().saturating_sub(reused),
+                    cache = %tree.stats_line(),
+                    "paged KV prefix cache status"
+                );
+            }
+
+            return SlotGuard {
+                engine: self,
+                idx: target,
+                kv: target_kv,
+                detached: false,
+                multimodal_key: Some(key),
+            };
         }
     }
 
@@ -6289,7 +6588,11 @@ impl ParallelSeam {
                 .map(|tokens| tokens.len());
             crate::seam::TurnCheckpoint::new(None, boundary)
         });
-        let mut guard = self.checkout_multimodal(&prompt_tokens, key, req);
+        // The tree key of this prompt: every image-pad run replaced by that picture's own block.
+        // Taken before `plan` moves into the turn below.
+        let cache_spans = plan.cache_spans.clone();
+        let key_view = plan.cache_view(&prompt_tokens);
+        let mut guard = self.checkout_multimodal(&prompt_tokens, &key_view, cache_spans, key, req);
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let mut acc = Vec::new();
         let mut printed = 0usize;
@@ -7508,6 +7811,64 @@ mod tests {
         assert_eq!(multimodal_token_position(Some(&plan), 9).unwrap(), 7);
         assert_eq!(multimodal_token_position(Some(&plan), 10).unwrap(), 8);
         assert_eq!(multimodal_token_position(Some(&plan), 13).unwrap(), 11);
+    }
+
+    /// The paged tree addresses a chain by its token vector, and an image span is one repeated pad
+    /// token: without a content key, a second picture would be handed the first one's attention
+    /// rows. `cache_view` is the fence — same length as the prompt, text positions untouched, and
+    /// every image position reserved so no vocabulary token can ever reach it.
+    #[test]
+    fn image_cache_key_names_the_picture_not_the_pad_token() {
+        let embed = |fingerprint: [u8; 32], nx, ny, fill: f32| MultimodalEmbedding {
+            values: Arc::new(vec![fill; nx * ny * 3]),
+            grid_nx: nx,
+            grid_ny: ny,
+            fingerprint,
+        };
+        let prompt = |images| {
+            expand_multimodal_prompt(&[10, 99, 11], 99, images, 3).expect("valid prompt")
+        };
+        let (tokens, blue) = prompt(vec![embed([1; 32], 2, 2, 1.0)]);
+        let (_, red) = prompt(vec![embed([2; 32], 2, 2, 2.0)]);
+        let view = blue.cache_view(&tokens);
+        let span = &blue.spans[0];
+        let after = span.start + span.n_tokens;
+        assert_eq!(view.len(), tokens.len(), "a key stays addressable per token");
+        assert_eq!(&view[..span.start], &tokens[..span.start]);
+        assert_eq!(&view[after..], &tokens[after..]);
+        assert!(
+            view[span.start..after]
+                .iter()
+                .all(|id| id & crate::seam::IMAGE_CACHE_TOKEN_BIT != 0),
+            "every image position is reserved, so a text chain can never match one"
+        );
+        assert_ne!(
+            view,
+            red.cache_view(&tokens),
+            "a different picture is a different chain"
+        );
+        assert_eq!(view, blue.cache_view(&tokens), "and one picture replays its key exactly");
+
+        // The same content at another resolution is another computation: grid AND run length move.
+        let (big_tokens, big) = prompt(vec![embed([1; 32], 3, 3, 1.0)]);
+        assert_ne!(
+            big.cache_view(&big_tokens)[..after],
+            view[..after],
+            "a resized picture does not inherit the original's prefix"
+        );
+
+        // A partial conversation — attached mid-prompt, or truncated — still keys itself: spans past
+        // the materialized length are ignored instead of rewriting positions that no longer exist.
+        assert_eq!(
+            crate::seam::image_cache_view(&tokens[..span.start + 1], &blue.cache_spans),
+            vec![tokens[0], view[span.start]],
+            "a slot one image-token deep keeps only the position it actually holds"
+        );
+        assert_eq!(
+            crate::seam::image_cache_view(&tokens[..span.start], &blue.cache_spans),
+            vec![tokens[0]],
+            "nothing inside the span means nothing rewritten"
+        );
     }
 
     #[test]

@@ -1867,6 +1867,7 @@ fn finish_pending_seam_slot(
         max_ctx: want_ctx,
         kv_ring,
         cached: Vec::new(),
+        image_cache_spans: Vec::new(),
         denoise_cache: None,
         self_cond_w: None,
         sc_embt: None,
@@ -3921,6 +3922,7 @@ fn generate_dense_backend_inner(
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
+            image_cache_spans: Vec::new(),
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -4054,6 +4056,9 @@ fn generate_dense_backend_inner(
         mtp_verify_bufs,
         max_ctx,
         cached,
+        // Read only through `set_image_cache_spans` / `paged_cache_view`, both of which own the
+        // conversation-level lifecycle; the generation loop materializes REAL token ids.
+        image_cache_spans: _,
         denoise_cache,
         self_cond_w,
         sc_embt,
@@ -15327,6 +15332,7 @@ mod tests {
         let plan = crate::seam::MropePlan {
             prompt_pos4: vec![0, 0, 0, 0, 5, 2, 3, 0],
             spans: Vec::new(),
+            cache_spans: Vec::new(),
             decode_base: 6,
         };
         assert_eq!(
