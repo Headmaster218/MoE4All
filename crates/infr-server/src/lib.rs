@@ -712,6 +712,16 @@ const TOOL_CHOICE_POLICIES: [&str; 3] = ["auto", "none", "required"];
 ///
 /// Same policy as the existing malformed-object 400s: a forced tool call the server cannot deliver
 /// is an error, never a quiet fallback to "auto" (audit finding 6).
+/// Is this (already validated) `tool_choice` a FORCED call — `required` or a named function, as
+/// opposed to `auto`/`none`/absent? The engine's constraint builder treats exactly these two as
+/// "force a call", so the server's pre-flight checks have to agree with it.
+fn tool_choice_is_forced(tool_choice: Option<&str>) -> bool {
+    !matches!(
+        tool_choice,
+        None | Some("auto") | Some("none") // free choice: nothing is forced
+    )
+}
+
 fn validate_tool_choice(
     tool_choice: Option<&str>,
     tools: Option<&serde_json::Value>,
@@ -2674,6 +2684,20 @@ async fn dispatch_chat(state: AppState, req: ChatRequest, route: &'static str) -
     // would quietly generate ordinary text instead (B22).
     if let Err(e) = validate_tool_choice(tool_choice.as_deref(), tools.as_ref()) {
         return param_error(Some(e.param), e.message);
+    }
+    // …and a forced call combined with an image is a 400 here, not a 500 from the engine. The
+    // vision path cannot mix an image block with a first-token grammar constraint yet (the engine
+    // bails for it too), and a 5xx is "retry me" to every SDK: a client that sent both got an
+    // endless retry loop on an identical request instead of an answer naming the conflict.
+    if tool_choice_is_forced(tool_choice.as_deref())
+        && messages.iter().any(|message| !message.images.is_empty())
+    {
+        return param_error(
+            Some("tool_choice"),
+            "forced tool calls are not supported together with image inputs yet; send the image on \
+             a turn without a forced `tool_choice`, or set `tool_choice` to `auto`"
+                .into(),
+        );
     }
     // Structured output is ONE llguidance constraint over the whole reply, so request shapes that
     // would need a second, incompatible mechanism are refused here instead of being silently
@@ -5596,6 +5620,59 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["error"]["param"], "tool_choice");
         assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// The forced-call + image combination used to reach the engine and `bail!` there, which the
+    /// wire reported as a 500 — and every SDK retries a 5xx, so the client hammered the same
+    /// request until it gave up. It is now a 400 that names the parameter to change.
+    #[tokio::test]
+    async fn forced_tool_choice_with_an_image_is_a_400_not_a_500() {
+        let body = serde_json::json!({
+            "model": "a",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+            ]}],
+            "tools": [{"type": "function", "function": {"name": "bash",
+                        "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": "required"
+        });
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "5xx invites retries"
+        );
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["param"], "tool_choice");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("image")),
+            "the message must say what conflicts: {v}"
+        );
+    }
+
+    /// `auto` is not a forced call, so the same request with `auto` must pass the pre-flight and
+    /// reach the engine: the guard may not block the vision + tools combination that does work.
+    #[test]
+    fn auto_tool_choice_is_not_forced() {
+        assert!(!tool_choice_is_forced(None));
+        assert!(!tool_choice_is_forced(Some("auto")));
+        assert!(!tool_choice_is_forced(Some("none")));
+        assert!(tool_choice_is_forced(Some("required")));
+        assert!(tool_choice_is_forced(Some("bash")));
     }
 
     #[test]
