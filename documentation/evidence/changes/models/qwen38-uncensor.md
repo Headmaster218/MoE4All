@@ -44,21 +44,25 @@ h ← h − (h·v)v          v 为每层一个的单位方向，h 为残差
 
 | 模块 | 文件 | 改动 |
 | --- | --- | --- |
-| 新模块 | `crates/infr-uncensor/{Cargo.toml,src/lib.rs,src/config.rs,src/vectors.rs}`（新） | `lib.rs`：`Projection`、纯函数 `span/resolve`、请求语义 `api_merge/effective/scale/flipped`；`config.rs`：三个 `INFR_UNCENSOR_*` 的解析（未设与设空串都算关闭，非数字层号是硬错误）；`vectors.rs`：`controlvector` GGUF 解析、逐层 dtype/shape 校验、**加载期一次性单位归一化**、非有限/零向量报错 |
+| 新模块 | `crates/infr-uncensor/{Cargo.toml,src/lib.rs,src/config.rs,src/vectors.rs}`（新） | `lib.rs`：`Projection`、纯函数 `span/resolve`、请求语义 `api_merge/effective/scale/flipped`；`config.rs`：只做 `[uncensor]` 配置表到引擎视图的映射（空 `vector` = 关闭），读取与层序由 `infr_core::config` 负责；`vectors.rs`：`controlvector` GGUF 解析、逐层 dtype/shape 校验、**加载期一次性单位归一化**、非有限/零向量报错 |
 | 图 | `infr-core/src/graph.rs` | 新增 `Op::UncensorProject`（`x`/`dir`/`dst` + `rows`/`hc`/`n_embd`/`dir_off`/`scale`/`scale_buf`）及 `kind()`、`io()` 两处穷尽匹配。刻意不叫 `QwenHc*`：投影不专属某个架构。元素偏移字段叫 `dir_off` 而非 `voff`，因为本 fork 的向量里没有 `voff` 这个概念 |
 | 接线 | `infr-llama/src/seam/runner.rs` | 冷启动 `resolve` + `UncensorState::new`；`uncensor_apply()` 每请求决定并逐 slot 失效；建图时按绝对层号在覆盖段内发射；`bind_layer_io`/`bind_parallel_layer_io` 各加两个参数（并行路径共享主槽的 `scale`，因为宽残差对所有 lane 一次投影） |
 | 状态 | `infr-llama/src/seam/weights.rs` | `UncensorState`（`dirs_buf`/`scale_buf`/`uploaded`/`ran`）挂进 `SeamKv`，`fork` 时继承父槽的 `ran`：分叉出的 KV 行出自同一个模型，不该在第一次请求时被判定为"切换" |
 | CPU | `infr-cpu/src/lib.rs` | 参考实现；先 clone 输入行再整体写回，因此天然支持 `x == dst`，并同样 honour `scale_buf` |
 | Vulkan | `shaders/uncensor_project.comp`（新）、`build.rs`、`gemm.rs`、`recorder.rs`、`adapter.rs` | 256 线程、`subgroupAdd` + `shared` 两级归约的整行内核；**一个 workgroup 独占一条流**，这是原地写合法性的来源；`USE_SCALE_BUF` 双变体，动态变体的 push 只剩 8 字节（`n_embd`、`dir_off`），被写的残差仍是最后一个 binding（`dispatch` 以"最后 n_out 个绑定是输出"做 hazard 跟踪） |
 | Metal | `infr-metal/src/exec.rs` | 显式 `Unsupported` |
-| 配置层 | `infr-core/src/config/manifest.rs` | 三个键进 `NOT_MIGRATED` 并写明"启动参数而非调节项"的理由——这是本版对配置子系统唯一的改动 |
+| 配置层 | `infr-core/src/config/{mod,env,manifest,tests}.rs` | 三个值并入 `cfg_struct!` 的 `UncensorCfg`（`[uncensor] vector / first_layer / last_layer`，默认 `None` / 4 / 44），环境变量只由 `env.rs` 读，`manifest::KEYS` 登记三条 `migrated`，漂移测试与 `default_config_matches_documented_defaults` 一起扩；新增 `uncensor_ships_off_and_every_layer_can_name_a_direction_file` |
 | API | `infr-server/src/{lib.rs,responses.rs}`、`infr-llama/src/sampling.rs`、`infr-cli/src/main.rs` | `ChatRequest` 两个字段 + `GenParams::from_request` 里一次 `api_merge`（冲突 → 400）+ `RequestSampling.uncensor` + CLI 一行透传 |
-| 启动器 | `Start-INFR-Wizard.cmd` | 询问（默认取上次、30 秒超时）、**只有交互选择才写** `gui-data/uncensor.txt`、`-uncensor on\|off\|<PATH>` / `-no-uncensor` 单次覆盖不改默认、导出三个环境变量 |
+| 向导 | `scripts/infr-wizard.ps1` | 只对探测到 `qwen4exp` 的模型询问，**默认否**；询问前先打双语风险提示（仅 Qwen3.8-Flash-Next 支持、安全合规法律风险自行承担、开启即视为同意）；同意后取方向文件：`huggingface.co` 失败回退 `hf-mirror.com`，按钉住的 sha256 校验，不匹配即删除；存 `uncensor_vector` 于 `wizard-state.json`，两条路径都发 `--set uncensor.vector=<path>`。`Start-INFR-Wizard.cmd` 不再管这事 |
 | 文档 | `documentation/reference/configuration.md`、`documentation/evidence/changes/README.md`（索引）、`CHANGELOG.md`、本页 | 配置层的"例外"说明、索引可达、`## [Unreleased]` 条目 |
+
+## 方向文件的来源与校验
+
+引擎只带机制，不带方向。方向文件是外部输入，向导只认这一个：`cjxzdzh/Qwen3.8-Flash-Next-refusal-direction-qwen4exp-cvec` 的 `cvec-qwen4exp.gguf`，483,520 字节，sha256 `ef0724c5b79297e481017be85769832bc26eb220c984ecba2b0e1b0c8426312b`（`direction.1..47`，每条 `[2560]` f32，`general.architecture=controlvector`）。注意 hub 上另有三个仓库提供 `Huihui-Qwen3.8-Flash-Next-refusal-direction-r.gguf`：**同文件名、同尺寸、数值不同**（sha256 `59f9ae8b…`），是另一版方向，因此下载按 sha256 钉死，校验不过就删掉而不留下次复用。下载先试 `https://huggingface.co`，失败回退 `https://hf-mirror.com`（两台机器可能只通其一）。文件落在 `models/control-vectors/`（`models/` 已被 .gitignore 排除，方向文件不进仓库）。派生自模型激活，故模型许可证（Qwen Community License 1.0）继续适用。
 
 ## 双层控制的确切语义
 
-**启动决定投影是否存在**（`INFR_UNCENSOR_VECTOR` / `INFR_UNCENSOR_FIRST_LAYER` / `INFR_UNCENSOR_LAST_LAYER`，默认层范围 4–44，只夹紧上限）。关闭的正确含义是"变量不存在"；本版也把"设成空串"视为关闭，但脚本仍按前者的保守写法。
+**启动决定投影是否存在**（配置表 `[uncensor] vector / first_layer / last_layer`，环境变量别名 `INFR_UNCENSOR_VECTOR` / `INFR_UNCENSOR_FIRST_LAYER` / `INFR_UNCENSOR_LAST_LAYER`，默认层范围 4–44，只夹紧上限）。关闭的正确含义是"变量不存在"；本版也把"设成空串"视为关闭，但脚本仍按前者的保守写法。
 
 **每个请求决定是否生效**，三态明确：
 

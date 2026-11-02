@@ -2295,6 +2295,67 @@ function Add-SetArgument {
     [void]$Arguments.Add("$Path=$Value")
 }
 
+# The refusal-direction control vector `[uncensor] vector` projects. Pinned by repository, file name
+# AND sha256 on purpose: the hub also carries a same-named look-alike with DIFFERENT numbers, and a
+# wrong direction is exactly the kind of mistake nobody notices until the model behaves oddly. A
+# function rather than script variables because the wizard's own tests load function definitions
+# one at a time, where a script-scope assignment would never have run.
+function Get-UncensorVectorSpec {
+    return @{
+        Repo = 'cjxzdzh/Qwen3.8-Flash-Next-refusal-direction-qwen4exp-cvec'
+        File = 'cvec-qwen4exp.gguf'
+        Sha256 = 'EF0724C5B79297E481017BE85769832BC26EB220C984ECBA2B0E1B0C8426312B'
+    }
+}
+
+function Get-UncensorVectorPath {
+    $spec = Get-UncensorVectorSpec
+    return Join-Path (Join-Path $repoRoot 'models\control-vectors') $spec.File
+}
+
+function Test-UncensorVectorCurrent {
+    $spec = Get-UncensorVectorSpec
+    $path = Get-UncensorVectorPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $spec.Sha256
+}
+
+# huggingface.co first, then the mirror: some machines cannot reach the origin at all and others can
+# only reach the origin. A partial download, or one whose hash does not match, is DELETED — never
+# kept as if it were the direction.
+function Get-UncensorDirectionVector {
+    $spec = Get-UncensorVectorSpec
+    $path = Get-UncensorVectorPath
+    if (Test-UncensorVectorCurrent) { return $path }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    foreach ($origin in @('https://huggingface.co', 'https://hf-mirror.com')) {
+        $url = "$origin/$($spec.Repo)/resolve/main/$($spec.File)"
+        Write-Host "获取方向文件 / Fetching the direction vector: $url" -ForegroundColor DarkGray
+        try {
+            Invoke-ModelFileDownload -Url $url -Destination $path -Label $spec.File
+        } catch {
+            Write-Host "该来源失败，尝试下一个 / this endpoint failed, trying the next one: $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+        if (Test-UncensorVectorCurrent) { return $path }
+        Write-Host "校验和不匹配，已删除 / sha256 mismatch, discarded" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+    return ''
+}
+
+function Show-UncensorNotice {
+    Write-Host ''
+    Write-Host '去审查投影 / Uncensor (refusal-direction projection)' -ForegroundColor Yellow
+    Write-Host '  只支持 Qwen3.8-Flash-Next（qwen4exp）；给别的模型指定方向文件会直接启动失败，不会被静默忽略。' 
+    Write-Host '  Supported on Qwen3.8-Flash-Next (qwen4exp) ONLY; naming a file for another model fails startup.'
+    Write-Host '  它移除的是模型训练出来的拒绝行为：本服务器之后回答什么由你负责，安全、合规与法律风险自行承担，'
+    Write-Host '  模型许可证的使用条款仍然适用。开启即视为同意。默认：关闭。'
+    Write-Host '  It REMOVES A TRAINED REFUSAL: safety, compliance and legal risk are yours to carry, the model'
+    Write-Host '  licence still applies, and enabling it counts as consent. Default: OFF.'
+    Write-Host ''
+}
+
 function Get-BenchmarkEstimateArguments {
     if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf) -or [string]::IsNullOrWhiteSpace($modelPath)) {
         return @()
@@ -3381,12 +3442,39 @@ if ($launchMode -eq 'server') {
         [void]$nativeArgs.Add('--embedding-idle-timeout'); [void]$nativeArgs.Add($embeddingIdleTimeout)
     }
 }
-[void]$nativeArgs.Add($modelPath)
-
-$commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
+# Uncensor: the architecture gate is the reasoning probe (only qwen4exp exposes low/medium/xhigh), so
+# a model the projection cannot apply to is never even asked about. A saved ON is reused WITHOUT
+# re-asking — the yes that saved it already carried the consent — but the notice is printed again,
+# because "what this server answers is on you" has to be visible on the run that does it. This sits
+# before the model path: a named file is the request for the projection, so handing it over IS the
+# opt-in, and it happens outside the manual-memory block so automatic profiles carry it too.
 if ($null -ne $script:ModelReasoningProbe -and $script:ModelReasoningProbe.Async.IsCompleted) {
     [void](Get-ModelReasoningEfforts -ModelPath $modelPath)
 }
+$uncensorVector = [string](Get-SavedValue 'uncensor_vector' '')
+if ($launchMode -ne 'benchmark' -and (@($script:ReasoningProbeEfforts) -contains 'xhigh')) {
+    if ($uncensorVector) {
+        Show-UncensorNotice
+        Write-Host "沿用上次开启 / staying on from the last run: $uncensorVector" -ForegroundColor DarkGray
+    } elseif (-not $reuseSavedSettings) {
+        Show-UncensorNotice
+        if (Read-YesNo -Label '开启去审查投影？/ Enable the refusal-direction projection?' -Default $false) {
+            $fetched = Get-UncensorDirectionVector
+            if ($fetched) {
+                $uncensorVector = $fetched
+            } else {
+                Write-Host '未能取得方向文件，本次不开启 / no direction vector could be fetched; staying off' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+if ($uncensorVector) {
+    Add-SetArgument $nativeArgs 'uncensor.vector' $uncensorVector
+    Write-Host '去审查投影：开 / uncensor: ON' -ForegroundColor Yellow
+}
+[void]$nativeArgs.Add($modelPath)
+
+$commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
 $state = [ordered]@{
     launch_mode = $launchMode; setup_mode = $setupMode; model = $modelPath; model_history = @(Get-UpdatedModelHistory -SelectedModel $modelPath); device = $device; context = $context
     ubatch = $ubatch; threads = $threads; config_path = $configPath
@@ -3401,6 +3489,7 @@ $state = [ordered]@{
     bench_kind = $benchKind; bench_parallel = $benchParallel; manual_bench_kind = $manualBenchKind
     prompt_tokens = $promptTokens; gen_tokens = $genTokens
     depth_mode = $depthMode; depth_tokens = $depthTokens; reps = $reps; json_output = $jsonOutput
+    uncensor_vector = $uncensorVector
     benchmark_upload = $script:BenchmarkUploadDefault
     benchmark_upload_has_github = $script:BenchmarkUploadHasGithubDefault
     benchmark_upload_gh_auth = $script:BenchmarkUploadGhAuthDefault

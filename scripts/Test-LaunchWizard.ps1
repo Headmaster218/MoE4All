@@ -14,6 +14,8 @@ $realStartModelReasoningProbe = ${function:Start-ModelReasoningProbe}
 $realInvokeRecommendedModelDownload = ${function:Invoke-RecommendedModelDownload}
 $realOfferBenchmarkUpload = ${function:Offer-BenchmarkUpload}
 $realInvokeNativeCommandResult = ${function:Invoke-NativeCommandResult}
+$realGetUncensorVectorSpec = ${function:Get-UncensorVectorSpec}
+$realInvokeModelFileDownload = ${function:Invoke-ModelFileDownload}
 $source = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
 if ($source -notmatch 'AI/automation: report the benchmark result') {
     throw 'Windows manual benchmark path is missing the automation guidance'
@@ -90,14 +92,53 @@ function New-ModelFixture {
         Write-GgufString $writer $Template
     } finally { $writer.Dispose() }
 }
+# The pinned direction-vector hash belongs to a file nobody ships in this repository (models/ is
+# gitignored), so the uncensor legs below re-pin the spec to fixture bytes and script the download
+# per origin. That proves the origin→mirror fallback and the consent→command-line wiring with no
+# network and no real 470 KiB vector.
+$script:UncensorFixtureBytes = [System.Text.Encoding]::UTF8.GetBytes('GGUF fixture refusal direction')
+$script:UncensorFixtureSha = ([System.BitConverter]::ToString(
+    ([System.Security.Cryptography.SHA256]::Create()).ComputeHash($script:UncensorFixtureBytes))).Replace('-', '')
+$script:UncensorFixture = $null
+
+function Get-UncensorVectorSpec {
+    if ($null -eq $script:UncensorFixture) { return & $realGetUncensorVectorSpec }
+    $wizardSpec = & $realGetUncensorVectorSpec
+    return @{ Repo = $wizardSpec.Repo; File = $wizardSpec.File; Sha256 = $script:UncensorFixtureSha }
+}
+
+function Invoke-ModelFileDownload {
+    param([string]$Url, [string]$Destination, [string]$Label, [int]$MaximumAttempts = 3)
+    if ($null -eq $script:UncensorFixture) { return & $realInvokeModelFileDownload @PSBoundParameters }
+    $script:UncensorFixture.Urls.Add($Url)
+    foreach ($prefix in $script:UncensorFixture.FailFor) {
+        if ($Url.StartsWith($prefix, [System.StringComparison]::Ordinal)) { throw "fixture endpoint refuses $Url" }
+    }
+    [System.IO.File]::WriteAllBytes($Destination, $script:UncensorFixtureBytes)
+}
+
+function Use-UncensorFixture {
+    param([string[]]$FailFor = @(), [switch]$Cached)
+    # Every leg starts from its own vector state: the fixture directory is shared across legs, so a
+    # vector left by one run would satisfy the next run's cache check and hide the fetch being tested.
+    $path = Get-UncensorVectorPath
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if ($Cached) { [System.IO.File]::WriteAllBytes($path, $script:UncensorFixtureBytes) }
+    $script:UncensorFixture = @{ FailFor = @($FailFor); Urls = [System.Collections.Generic.List[string]]::new() }
+}
+
 function Test-Flow {
-    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Check)
+    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Setup, [scriptblock]$Check)
     $script:Saved = $Saved
     $script:Answers = [System.Collections.Generic.Queue[string]]::new()
     foreach ($value in $Inputs) { $script:Answers.Enqueue($value) }
     $script:Events = [System.Collections.Generic.List[string]]::new()
     $script:Output = [System.Collections.Generic.List[string]]::new()
+    # The download stub below intercepts the real fetcher only for legs that ask for it; a leg that
+    # forgot to reset it would silently swallow another leg's download.
+    $script:UncensorFixture = $null
     $repoRoot = $testRoot
+    if ($Setup) { . $Setup }
     $guiStatePath = Join-Path $testRoot 'no-gui-state.json'
     $infrPath = Join-Path $testRoot 'never-run.exe'
     $InitialModelPath = $InitialPath
@@ -247,11 +288,38 @@ try {
             $previous = $position
         }
     }
-    Test-Flow 'FlashNext native reasoning effort' -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '') -Check {
+    Test-Flow 'FlashNext native reasoning effort' -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'n') -Check {
         Assert ('--think' -in $nativeArgs -and 'xhigh' -in $nativeArgs) 'FlashNext reasoning effort was not emitted'
+        Assert (-not (@($nativeArgs | Where-Object { $_.StartsWith('uncensor.vector=') }).Count)) 'declined projection was still emitted'
+        Assert (-not $state.uncensor_vector) 'a declined projection was saved as consent'
+    }
+    Test-Flow 'uncensor consent reaches the engine after the mirror fallback' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        $urls = @($script:UncensorFixture.Urls)
+        Assert ($urls.Count -eq 2 -and $urls[0].StartsWith('https://huggingface.co/') -and $urls[1].StartsWith('https://hf-mirror.com/')) "direction vector did not fall back to the mirror: $($urls -join ' ')"
+        $vector = Get-UncensorVectorPath
+        Assert ("uncensor.vector=$vector" -in $nativeArgs) 'consented projection never reached the command line'
+        Assert ($state.uncensor_vector -eq $vector) 'the consent was not remembered for the next launch'
+        Assert (($script:Output -join "`n") -match '开启即视为同意') 'the projection ran without showing the consent notice'
+    }
+    Test-Flow 'a verified direction vector is never downloaded again' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co', 'https://hf-mirror.com') -Cached } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        Assert (@($script:UncensorFixture.Urls).Count -eq 0) 'the cached vector was re-downloaded'
+        Assert ("uncensor.vector=$(Get-UncensorVectorPath)" -in $nativeArgs) 'the cached vector was not handed to the engine'
+    }
+    Test-Flow 'uncensor stays off when no endpoint has the vector' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co', 'https://hf-mirror.com') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        Assert (@($script:UncensorFixture.Urls).Count -eq 2) 'both endpoints were not tried'
+        Assert (-not (@($nativeArgs | Where-Object { $_.StartsWith('uncensor.vector=') }).Count)) 'a failed download still enabled the projection'
+        Assert (-not (Test-Path -LiteralPath (Get-UncensorVectorPath))) 'a download nobody verified survived as the direction'
+        Assert (-not $state.uncensor_vector) 'a failed download was saved as consent'
+    }
+    $uncensorSaved = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = $model; device = 'Vulkan0'; uncensor_vector = 'M:\models\cvec.gguf'; reasoning_probe_efforts = @('low', 'medium', 'xhigh') }
+    Test-Flow 'saved consent reuses the vector without re-asking' -Saved $uncensorSaved -Inputs @('') -Check {
+        Assert ('uncensor.vector=M:\models\cvec.gguf' -in $nativeArgs) 'saved consent was not handed to the engine'
+        Assert (-not (@($script:Events | Where-Object { $_ -match 'Enable the refusal-direction projection' }).Count)) 'the saved yes was asked again'
+        Assert (($script:Output -join "`n") -match '开启即视为同意') 'the reuse launched without printing the risk again'
     }
     Test-Flow '35B prompt reasoning effort' -Inputs @('',  $model35,  '',  '',  'y',  'y',  '5',  '',  '',  '',  '') -Check {
         Assert ('--think' -in $nativeArgs -and '--reasoning-effort' -in $nativeArgs -and 'max' -in $nativeArgs) '35B reasoning effort was not emitted'
+        Assert (-not (@($script:Events | Where-Object { $_ -match 'refusal-direction projection' }).Count)) 'a model the projection cannot serve was still asked for consent'
     }
     Test-Flow 'default reasoning disabled' -Inputs @('',  $model,  '',  '',  'y',  'n',  '',  '',  '',  '') -Check {
         Assert ('--no-think' -in $nativeArgs -and -not ('--reasoning-effort' -in $nativeArgs)) 'Disable reasoning failed'
@@ -306,7 +374,7 @@ try {
         Assert ('device.auto_profile=conservative' -in $nativeArgs) 'Legacy quick profile must migrate'
         Assert (-not ($commandText -match 'NEVER EXECUTE')) 'Saved command text must not execute'
     }
-    Test-Flow 'decline saved launch keeps defaults' -Saved $chatSettings -Inputs @('n',  '',  '',  '',  '',  '',  '',  '',  'y',  'y',  '',  '',  '',  '') -Check {
+    Test-Flow 'decline saved launch keeps defaults' -Saved $chatSettings -Inputs @('n',  '',  '',  '',  '',  '',  '',  '',  'y',  'y',  '',  '',  '',  '', 'n') -Check {
         Assert (-not $reuseSavedSettings -and $state.reasoning_effort -eq 'medium') 'Saved defaults were discarded'
     }
     $legacy = [pscustomobject]@{ launch_mode = 'chat'; model = $model; device = 'Vulkan0'; configure_memory = $true; dram_cache = '48g'; ubatch = '3072'; submit_mode = 'fixed'; submit_cap = '256'; max_new = '' }
