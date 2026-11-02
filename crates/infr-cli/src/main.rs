@@ -1324,6 +1324,12 @@ fn run_engine_command(
     // ~46 GiB of COMMIT headroom here, only ~3.5 GiB above where the bomb died); its default
     // (4 GiB) guards imminent death, testing raises it to 8-16 GiB.
     let guard_ram_headroom = resolve_headroom(cfg.device.mem_guard_ram_headroom, 4u64 << 30);
+    // Declare the commit the PLANNER already authorized before arming the breaker: the frozen
+    // process RAM budget (or the user's explicit `device.ram_budget`) is a decision, not a leak, and
+    // on a 96 GiB box with a 6 GiB pagefile a 47 GiB MoE store legitimately settles at ~4 GiB of
+    // remaining commit — below the plain 8 GiB line, which killed two good startups. `None` leaves the
+    // guard on its absolute line.
+    infr_core::memguard::set_authorized_commit_bytes(resolve_headroom(cfg.device.ram_budget, 0));
     infr_core::memguard::configure(
         guard_headroom,
         guard_ram_headroom,

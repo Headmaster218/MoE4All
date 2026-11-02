@@ -104,13 +104,15 @@ cfg_struct! {
         /// weight cache. Unset keeps automatic sizing with system headroom; zero disables the
         /// host cache. Percentages resolve against total physical host RAM.
         ram_budget: Option<SizeSpec> = None,
-        /// `INFR_MEM_GUARD_HEADROOM`: commit-charge circuit-breaker water line. When the system's
-        /// remaining commit headroom (Windows `ullAvailPageFile`, which WDDM device memory also
-        /// charges) drops below this, the process exits with code 87 instead of sliding into a
-        /// paging storm or a driver AV — the 2026-10-19 gray-zone-prefill miss storm grew host
-        /// staging to ~145 GiB through thousands of small allocations no downstream budget caught.
-        /// The default guards hard commit exhaustion only; miss-storm TESTING wants a much taller
-        /// line (e.g. `50%` of RAM) so the trip lands before RAM itself runs out. Zero disables.
+        /// `INFR_MEM_GUARD_HEADROOM`: commit-charge circuit-breaker water line. The process exits
+        /// with code 87 when the system's remaining commit headroom (Windows
+        /// `ullAvailPageFile`, which WDDM device memory also charges) drops below the line MINUS the
+        /// host budget the planner already authorized ([`crate::memguard::set_authorized_commit_bytes`]),
+        /// floored at [`crate::memguard::HARD_FLOOR_BYTES`] — so a 47 GiB MoE store that legitimately
+        /// fills the commit space starts, while allocation past the plan (the 2026-10-19 gray-zone
+        /// miss storm, ~145 GiB of host staging) still stops. The default guards hard commit
+        /// exhaustion only; miss-storm TESTING wants a much taller line (e.g. `50%` of RAM) so the
+        /// trip lands before RAM itself runs out. Zero disables.
         mem_guard_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(
             crate::memguard::DEFAULT_HEADROOM_BYTES,
         )),
