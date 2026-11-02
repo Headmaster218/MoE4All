@@ -315,3 +315,27 @@ endpoint = "https://huggingface.co"
 # number for both, because a bound per axis would multiply — some repos ship 236
 # shards. 0 and 1 both mean strictly one connection, never split.
 pull_jobs = 8
+
+[uncensor]
+# Refusal-direction projection (`crates/infr-uncensor`): projects one direction out of each
+# covered layer's residual, which REMOVES A TRAINED REFUSAL. Off unless `vector` names a file.
+#
+# Support is ONE model family: Qwen3.8-Flash-Next (`general.architecture = qwen4exp`), whose wide
+# multi-stream residual is what gets projected. Naming a file for any other model is a startup
+# ERROR, never a silent ignore — as is an unreadable or truncated file, or a layer range this
+# model has no layers for.
+#
+# Safety, compliance and legal responsibility for what the server then answers stay with the
+# operator, and the model licence's usage terms still apply; enabling the feature is treated as
+# consent. The launch wizard states this before it accepts a yes, and its prompt default AND its
+# 30 s timeout are both "no".
+#
+# llama.cpp-compatible `controlvector` GGUF: one `[n_embd]` f32 direction per layer
+# (`direction.1` …). Empty/absent = the feature does not exist for this session, and generation is
+# bit-for-bit the published model.
+# vector = "D:\models\qwen38-cvec.gguf"
+# Inclusive layer range. Below the first layer the model works out what was asked (projecting there
+# damages comprehension); above the last it has committed to an answer (removing a direction that
+# late reads as rambling). `last_layer` is clipped to the model's depth.
+first_layer = 4
+last_layer = 44

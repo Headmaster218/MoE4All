@@ -389,6 +389,13 @@ knobs! {
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",
     // so the env layer must not filter it out.
     "INFR_PULL_JOBS" => "hub.pull_jobs", Int, Ignored, "4", migrated;
+
+    // ── uncensor (refusal-direction projection, opt-in) ───────────────────────
+    // three launch-time values the engine reads once at model load; `vector` naming a file IS the
+    // request for the projection, so `None` (the default) leaves a session exactly as it was.
+    "INFR_UNCENSOR_VECTOR" => "uncensor.vector", Path, Ignored, r"D:\models\cvec.gguf", migrated;
+    "INFR_UNCENSOR_FIRST_LAYER" => "uncensor.first_layer", Int, Ignored, "8", migrated;
+    "INFR_UNCENSOR_LAST_LAYER" => "uncensor.last_layer", Int, Ignored, "40", migrated;
 }
 
 /// `INFR_*` keys that exist in `crates/*/src` (or a `build.rs`) and deliberately do NOT become

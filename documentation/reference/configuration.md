@@ -28,6 +28,16 @@ infr 只有一个配置值：启动时从四个层级解析一次，然后显式
 - **每个已文档化的 `INFR_*` 变量仍然可用。** 引入 `Config` 的优化专项改变了 _值的去向_，而不是输入内容。现有的 `INFR_PROF_OPS=1 infr bench …` 脚本不受影响。
 - **标志优先于继承的环境变量**，因为 CLI 层位于环境变量层之上。`INFR_CTX=32k infr run … --ctx 8192` 会以 8192 运行。
 
+## 去审查投影：`[uncensor]`
+
+`[uncensor]` 是一张普通配置表，三个键都走同一套层序（TOML → 环境变量 → `--set`）：`vector` 指向 llama.cpp 兼容的 `controlvector` GGUF（每层一条 `[n_embd]` 的 f32 方向，命名 `direction.1` …），`first_layer` / `last_layer` 是**闭区间**层范围，默认 4 与 44，上限按模型实际层数裁剪。环境变量别名：`INFR_UNCENSOR_VECTOR`、`INFR_UNCENSOR_FIRST_LAYER`、`INFR_UNCENSOR_LAST_LAYER`。
+
+**默认关闭**：`vector` 为空或未设置时，这个特性对本会话根本不存在——不分配缓冲、计算图里没有投影算子、生成结果与未引入该特性时逐字节一致。而一旦指名了文件就是要求投影：文件读不到、层范围与模型不符、或模型不是 **Qwen3.8-Flash-Next（`general.architecture = qwen4exp`）**，启动直接**报错退出**，不会悄悄按没投影跑起来。目前只有 qwen4exp 的多流宽残差有这项操作的语义，单流模型不适用。
+
+风险与同意：这里去掉的是模型训练出来的拒绝行为，服务器之后回答什么由操作者承担——安全、合规与法律风险**自行承担**，模型许可证的使用条款依旧适用。启动向导会先显示这段说明再询问，提示符默认值与 30 秒超时**都是"否"**，记住的上次选择不会替这次作答；**开启即视为同意**。
+
+运行期可改的那一半在 API：每次请求的 `uncensor` 字段（Strata 拼写 `experimental_speed_projection` 同样接受，两者取值冲突返回 400）。字段缺省的含义是"沿用本会话当前设置"；开关一旦翻转，该槽位已物化的 KV 前缀会被作废并重读提示词——缓存是在另一种设置下算出来的，留着等于用别的模型续写。见[去审查集成记录](../evidence/changes/models/qwen38-uncensor.md)。
+
 ## 配置文件
 
 ### 查找

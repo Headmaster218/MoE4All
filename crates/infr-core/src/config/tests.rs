@@ -509,6 +509,45 @@ fn gpu_lock_ships_on_and_every_layer_can_disable_the_check() {
     assert!(!cfg.device.gpu_lock);
 }
 
+/// Uncensor ships OFF: naming a direction file is the ONLY way the projection exists, and every
+/// layer that can name one is tested here, because a feature that changes what the server puts on
+/// the wire must not be able to turn itself on through a stale default in some layer.
+#[test]
+fn uncensor_ships_off_and_every_layer_can_name_a_direction_file() {
+    let defaults = Config::default();
+    assert_eq!(
+        defaults.uncensor.vector,
+        None,
+        "no session gets a refusal-direction projection it did not ask for"
+    );
+    assert_eq!((defaults.uncensor.first_layer, defaults.uncensor.last_layer), (4, 44));
+
+    let from_env = Config::load_from_layers(&[env_layer(&[
+        ("INFR_UNCENSOR_VECTOR", "D:/models/cvec.gguf"),
+        ("INFR_UNCENSOR_FIRST_LAYER", "8"),
+        ("INFR_UNCENSOR_LAST_LAYER", "40"),
+    ])]);
+    assert_eq!(
+        from_env.uncensor.vector.as_deref(),
+        Some(std::path::Path::new("D:/models/cvec.gguf"))
+    );
+    assert_eq!((from_env.uncensor.first_layer, from_env.uncensor.last_layer), (8, 40));
+
+    let from_file =
+        Config::load_from_layers(&[file_layer("[uncensor]
+vector = 'cvec.gguf'
+")]);
+    assert_eq!(
+        from_file.uncensor.vector.as_deref(),
+        Some(std::path::Path::new("cvec.gguf"))
+    );
+
+    let mut cfg = Config::default();
+    cli_layer(&["uncensor.vector=cvec.gguf", "uncensor.last_layer=30"]).apply(&mut cfg);
+    assert_eq!(cfg.uncensor.vector.as_deref(), Some(std::path::Path::new("cvec.gguf")));
+    assert_eq!(cfg.uncensor.last_layer, 30);
+}
+
 #[test]
 fn speculative_paths_preserve_explicit_runtime_ab_controls() {
     let defaults = Config::default();
@@ -2104,6 +2143,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_RESPONSE_STORE_ENTRIES",
         "INFR_RESPONSE_STORE_PATH",
         "INFR_NO_GPU_LOCK",
+        "INFR_UNCENSOR_VECTOR",
+        "INFR_UNCENSOR_FIRST_LAYER",
+        "INFR_UNCENSOR_LAST_LAYER",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

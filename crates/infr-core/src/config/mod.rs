@@ -923,6 +923,34 @@ cfg_struct! {
 }
 
 cfg_struct! {
+    /// Refusal-direction projection (`crates/infr-uncensor`): steers a downloaded control vector out
+    /// of the residual so the model answers prompts it was trained to turn down.
+    ///
+    /// OFF by default in every sense: with no `vector` named, nothing is allocated, no op enters the
+    /// graph, and generation is bit-for-bit the published model. SUPPORT IS ONE MODEL FAMILY ONLY —
+    /// Qwen3.8-Flash-Next (`general.architecture = qwen4exp`), whose wide multi-stream residual is
+    /// what gets projected; naming a direction file for any other model is a startup error, not a
+    /// silent no-op. Removing a trained refusal changes the SAFETY behaviour of what this server
+    /// puts on the wire, so compliance with the model licence and with local law is the operator's
+    /// own responsibility, and turning the feature on is treated as that consent. The launch wizard
+    /// asks, defaults to No, and says all of this before it accepts a yes.
+    UncensorCfg / PartialUncensorCfg {
+        /// `INFR_UNCENSOR_VECTOR`: the llama.cpp-compatible `controlvector` GGUF to project — one
+        /// `[n_embd]` f32 direction per layer (`direction.1` …). `None`/empty means the feature does
+        /// not exist for this session. A file that cannot be honoured (wrong model, truncated,
+        /// unreadable) stops startup rather than running without the projection it was named for.
+        vector: Option<PathBuf> = None,
+        /// `INFR_UNCENSOR_FIRST_LAYER`: inclusive first projected layer. The layers below it are
+        /// where the model works out what was asked, so projecting there damages comprehension.
+        first_layer: usize = 4, // `infr_uncensor::DEFAULT_FIRST_LAYER`
+        /// `INFR_UNCENSOR_LAST_LAYER`: inclusive last projected layer, clipped to the model's depth.
+        /// Layers above it have committed to an answer, and a direction removed too late shows up as
+        /// a model that rambles.
+        last_layer: usize = 44, // `infr_uncensor::DEFAULT_LAST_LAYER`
+    }
+}
+
+cfg_struct! {
     /// Speculative decode / MTP.
     SpecCfg / PartialSpecCfg {
         /// `INFR_MTP`: the EXACT string `"1"`. `INFR_MTP=true` does nothing today; the `== "1"`
@@ -1286,6 +1314,8 @@ cfg_struct! {
             kernels: KernelCfg => PartialKernelCfg,
             /// Speculative decode / MTP.
             spec: SpecCfg => PartialSpecCfg,
+            /// Refusal-direction projection (opt-in, one model family).
+            uncensor: UncensorCfg => PartialUncensorCfg,
             /// Multi-GPU.
             multi: MultiCfg => PartialMultiCfg,
             /// Profiling.

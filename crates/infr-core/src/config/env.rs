@@ -220,6 +220,12 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.paged_cache_max = opt_size(get, "INFR_KV_PAGED_CACHE_MAX");
     p.kv.disk_cache_max = opt_size(get, "INFR_KV_DISK_CACHE_MAX");
     p.kv.disk_cache_path = opt_path(get, "INFR_KV_DISK_CACHE_PATH");
+    // Refusal-direction projection (`crates/infr-uncensor`): three launch-time values, read once at
+    // model load. `vector` names the file, and naming it IS the request — so an empty value means
+    // the feature does not exist, which is the default state of every session.
+    p.uncensor.vector = opt_path(get, "INFR_UNCENSOR_VECTOR");
+    p.uncensor.first_layer = num_pos(get, "INFR_UNCENSOR_FIRST_LAYER");
+    p.uncensor.last_layer = num_pos(get, "INFR_UNCENSOR_LAST_LAYER");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");
     p.kv.coopmat_bda = presence(get, "INFR_KV_COOPMAT_BDA");
     p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");

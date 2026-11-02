@@ -3265,6 +3265,7 @@ fn request_sampling(
         presence_penalty: p.presence_penalty.unwrap_or(default_presence_penalty),
         frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
         repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
+        uncensor: p.uncensor,
         ..Default::default()
     }
 }

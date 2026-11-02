@@ -12,7 +12,7 @@ use super::weights::{
     Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
     MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW, QwenLayerHcW,
     QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
-    TurnRecurrentCkpt,
+    TurnRecurrentCkpt, UncensorState,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
@@ -1017,7 +1017,7 @@ pub(crate) fn prepare_parallel_prompt(
 /// per-token) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live unbound-Input
 /// panic at execute. The caller still binds the per-site pieces (hidden/tok_ids, positions,
 /// logits, sampling/h-tap/ipl/SC handles).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn bind_layer_io<'a>(
     b: &mut Bindings<'a>,
     h: &DecodeHandles,
@@ -1033,6 +1033,8 @@ fn bind_layer_io<'a>(
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
     ple_state_buf: &'a Option<Box<dyn Buffer>>,
+    uncensor_dirs_buf: Option<&'a dyn Buffer>,
+    uncensor_scale_buf: Option<&'a dyn Buffer>,
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
@@ -1064,6 +1066,12 @@ fn bind_layer_io<'a>(
     }
     if let (Some(id), Some(buf)) = (h.ple_state, ple_state_buf) {
         b.bind(id, buf.as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.uncensor_dirs, uncensor_dirs_buf) {
+        b.bind(id, buf);
+    }
+    if let (Some(id), Some(buf)) = (h.uncensor_scale, uncensor_scale_buf) {
+        b.bind(id, buf);
     }
 }
 
@@ -1108,6 +1116,8 @@ fn bind_parallel_layer_io<'a>(
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
     primary_ple_state: &'a Option<Box<dyn Buffer>>,
+    primary_uncensor_dirs: Option<&'a dyn Buffer>,
+    primary_uncensor_scale: Option<&'a dyn Buffer>,
     wide: Option<&'a dyn Buffer>,
     ple_embd: Option<&'a dyn Buffer>,
     peers: &'a [SeamKv],
@@ -1129,6 +1139,8 @@ fn bind_parallel_layer_io<'a>(
         primary_wide,
         primary_ple_embd,
         primary_ple_state,
+        primary_uncensor_dirs,
+        primary_uncensor_scale,
     );
     if let (Some(id), Some(buf)) = (h.qwen_wide, wide) {
         b.bind(id, buf);
@@ -1505,6 +1517,11 @@ pub(super) struct DecodeHandles {
     qwen_wide: Option<TensorId>,
     ple_embd: Option<TensorId>,
     ple_state: Option<TensorId>,
+    // The uncensor projection's pair of Input handles (`crates/infr-uncensor`): the session's layer
+    // directions and the 4-byte scale that switches the projection on or off per request. Both
+    // `None` unless a projection is loaded AND this plan's layer range contains a projected layer.
+    uncensor_dirs: Option<TensorId>,
+    uncensor_scale: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     mtp_k_trace: Vec<Option<TensorId>>,
@@ -1790,6 +1807,7 @@ fn finish_pending_seam_slot(
     v_fmt: DType,
     want_ctx: usize,
     kv_ring: bool,
+    uncensor: Option<&infr_uncensor::Projection>,
 ) -> AResult<SeamKv> {
     if let Some(layout) = segmented_layout {
         for layer in 0..cfg.n_layer {
@@ -1863,6 +1881,11 @@ fn finish_pending_seam_slot(
         },
         ple_embd_buf: pending.ple_embd_buf,
         ple_state_buf: pending.ple_state_buf,
+        // A preallocated sibling starts with an empty KV, so it has no `ran` to inherit; the
+        // directions are the session's, re-uploaded into this slot's own buffer.
+        uncensor: uncensor
+            .map(|proj| UncensorState::new(be, proj.clone(), None))
+            .transpose()?,
         mtp_verify_bufs: pending.mtp_verify_bufs,
         max_ctx: want_ctx,
         kv_ring,
@@ -1904,6 +1927,45 @@ struct ParallelPrefillRequest<'a> {
     prepared: &'a [PreparedParallelPrompt],
     peer_stats: &'a mut Vec<GenStats>,
     on_progress: Option<&'a dyn Fn(usize, infr_core::GenerationProgress)>,
+}
+
+/// Uncensor (`crates/infr-uncensor`): honour this request's flag on every slot about to run.
+///
+/// Flipping is a 4-byte upload per slot (the projection is in the graph either way, see
+/// `Op::UncensorProject`), so the graph, the compiled plans and the pipeline caches all stay valid.
+/// What does NOT stay valid is the KV those slots already materialized: a warm prefix computed with
+/// the refusal direction projected out is not a prefix of a run that leaves it in. So a flip drops
+/// that slot's materialized tokens and its prompt prefills from row 0 — the same forced re-read
+/// llama.cpp (`--cvec-mode`) and Strata (`cvec_set_enabled`) do when the setting changes.
+///
+/// Invalidating is PER SLOT, because a slot's tokens are its own: a peer that has never run (a fresh
+/// sibling, or one restored from disk without a recorded setting) must not throw away a warm prefix
+/// the primary never invalidated. Peers are still included, since a parallel plan projects the shared
+/// wide residual once for all lanes with the primary's scale — a lane left on the other setting would
+/// be running a model its own sampler was not sampling from.
+fn uncensor_apply(
+    be: &dyn Backend,
+    primary: &mut SeamKv,
+    peers: &mut [SeamKv],
+    requested: Option<bool>,
+) -> anyhow::Result<()> {
+    let on = infr_uncensor::effective(requested, primary.uncensor.as_ref().and_then(|u| u.ran()));
+    let primary_flipped = match primary.uncensor.as_mut() {
+        Some(u) => u.select(be, on).map_err(|e| anyhow!("{e}"))?,
+        None => false,
+    };
+    if primary_flipped {
+        primary.reset();
+    }
+    for slot in peers.iter_mut() {
+        let Some(u) = slot.uncensor.as_mut() else {
+            continue;
+        };
+        if u.select(be, on).map_err(|e| anyhow!("{e}"))? {
+            slot.reset();
+        }
+    }
+    Ok(())
 }
 
 fn bind_parallel_mtp_traces<'a>(
@@ -3063,7 +3125,7 @@ fn generate_dense_backend_inner(
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
     // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
     mm: Option<&crate::seam::MropePlan>,
-    parallel_decode: Option<&mut ParallelDecodeRequest<'_, '_>>,
+    mut parallel_decode: Option<&mut ParallelDecodeRequest<'_, '_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
     parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
     prepared_single: Option<PreparedParallelPrompt>,
@@ -3865,6 +3927,20 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
+        // Uncensor (`crates/infr-uncensor`): STARTUP decides whether a projection exists at all.
+        // Resolved here, inside cold init, so a downloaded direction file is read once per session
+        // rather than once per request, and so a file that cannot be honoured stops the session
+        // instead of quietly running the model without the projection it was named for. No
+        // no `uncensor.vector` ⇒ none of this exists: no buffer, no op in the graph, no cost.
+        let uncensor = infr_uncensor::resolve(
+            &infr_uncensor::Config::from_config(&ec.uncensor),
+            c.qwen4exp,
+            ne,
+            c.n_layer,
+        )
+        .map_err(|e| anyhow!("{e}"))?
+        .map(|proj| UncensorState::new(be, proj, None))
+        .transpose()?;
         let ple_worker = super::ple::PleWorker::new(g, c, ec.kernels.ple_single_parallel)?
             .map(std::sync::Arc::new);
         let weights = std::sync::Arc::new(SeamWeights {
@@ -3891,6 +3967,7 @@ fn generate_dense_backend_inner(
                 v_fmt,
                 want_ctx,
                 kv_ring,
+                uncensor.as_ref().map(|u| &u.proj),
             )?);
         }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
@@ -3918,6 +3995,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor,
             mtp_verify_bufs,
             max_ctx: want_ctx,
             kv_ring,
@@ -3935,6 +4013,31 @@ fn generate_dense_backend_inner(
             preallocated_siblings,
         });
     }
+    // Uncensor (`crates/infr-uncensor`): each REQUEST decides whether the projection is ON. Decided
+    // here — after cold init has created the buffers, before the prefix-diff below has read the
+    // cached tokens — because the answer changes what this slot's cached KV MEANS: a warm prefix of
+    // activations computed while projecting is not a prefix of a run that does not project, so a
+    // flip drops it and the prompt prefills again. That forced re-read is exactly what llama.cpp and
+    // Strata do when `cvec` flips, and it is the one thing a "just a device-side scalar" switch does
+    // not get for free. A pass that carries no request of its own (an MTP draft, a verifier step, a
+    // speculative re-forward) keeps running whatever the session is already running: verifying
+    // tokens sampled from a differently-projected model would be verifying the wrong model. A slot
+    // whose KV was restored from disk also counts as a flip, since the setting that produced those
+    // rows was never recorded.
+    let uncensor_peers: &mut [SeamKv] = match parallel_prefill.as_deref_mut() {
+        Some(p) => p.peers,
+        None => match parallel_decode.as_deref_mut() {
+            Some(d) => d.peers,
+            None => &mut [],
+        },
+    };
+    uncensor_apply(
+        be,
+        state.as_mut().expect("seam state just initialized"),
+        uncensor_peers,
+        req.and_then(|r| r.sampling().uncensor),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let parallel_prepared = if let Some(parallel) = parallel_prefill.as_deref_mut() {
         if !c.qwen4exp {
             return Err(anyhow!("parallel prefill currently supports qwen4exp only"));
@@ -4053,6 +4156,7 @@ fn generate_dense_backend_inner(
         qwen_wide_buf,
         ple_embd_buf,
         ple_state_buf,
+        uncensor,
         mtp_verify_bufs,
         max_ctx,
         cached,
@@ -4074,6 +4178,10 @@ fn generate_dense_backend_inner(
         kv_ring: _,
     } = state.as_mut().expect("seam state just initialized");
     let segmented_kv_enabled = segmented_kv.enabled;
+    // Uncensor: the two per-slot buffers are bound at every `bind_layer_io` site, so take shared
+    // references once here (the field itself stays untouched for the rest of the call).
+    let uncensor_dirs_buf: Option<&dyn Buffer> = uncensor.as_ref().map(|u| &*u.dirs_buf);
+    let uncensor_scale_buf: Option<&dyn Buffer> = uncensor.as_ref().map(|u| &*u.scale_buf);
     let SeamWeights {
         wbufs,
         wspecs,
@@ -4746,6 +4854,17 @@ fn generate_dense_backend_inner(
             .as_ref()
             .map(|_| g.input(TensorDesc::new(vec![max_ctx, 4], DType::I32)));
         let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
+        // Uncensor (`crates/infr-uncensor`): the session's layer directions — one Input, uploaded
+        // once and never rewritten — and the 4-byte scale the projection reads to run on or off.
+        // Declared only for a span that actually contains a projected layer: a plan over layers the
+        // range does not touch must not declare handles nothing reads, since every declared Input has
+        // to be bound at execute.
+        let uncensor_ids = uncensor.as_ref().and_then(|u| {
+            (l_first..l_end)
+                .any(|l| u.proj.covers(l))
+                .then(|| (g.input(f32d(u.proj.n_floats())), g.input(f32d(1))))
+        });
+        let uncensor_proj = uncensor.as_ref().map(|u| &u.proj);
         let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
         let ple_embd = span_has_ple.then(|| {
             let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
@@ -8507,6 +8626,28 @@ fn generate_dense_backend_inner(
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                 });
+                // Uncensor (`crates/infr-uncensor`): the refusal direction comes out of the wide
+                // residual after this layer's LAST write to it and before the next layer reads it —
+                // the one point in a layer where every stream of every token is present at once. The
+                // strength is the per-request device scalar, so one compiled plan serves projected
+                // and unprojected runs alike; `covers(l)` is exactly the layer range cold init
+                // announced when it read the direction file.
+                if let Some((proj, (dirs, scale))) = uncensor_proj
+                    .zip(uncensor_ids)
+                    .filter(|(proj, _)| proj.covers(l))
+                {
+                    g.push(Op::UncensorProject {
+                        x: wide,
+                        dir: dirs,
+                        dst: wide,
+                        rows: batch as u32,
+                        hc: c.hc_mult as u32,
+                        n_embd: ne as u32,
+                        dir_off: proj.dir_off(l) as u32,
+                        scale: 1.0,
+                        scale_buf: Some(scale),
+                    });
+                }
             } else if lw.hc.is_some() {
                 // Close the FFN wrap, ping-ponging back to `hcr[0]` — the stream the NEXT layer's
                 // attention wrap (and, after the last layer, the model head) reads.
@@ -8789,6 +8930,8 @@ fn generate_dense_backend_inner(
                 qwen_wide,
                 ple_embd,
                 ple_state,
+                uncensor_dirs: uncensor_ids.map(|(d, _)| d),
+                uncensor_scale: uncensor_ids.map(|(_, s)| s),
                 k_cache,
                 v_cache,
                 mtp_k_trace,
@@ -9066,6 +9209,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
                 Some(wide_batch.as_ref()),
                 None,
                 &*parallel.peers,
@@ -9141,6 +9286,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
                 Some(wide_batch.as_ref()),
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
@@ -9533,6 +9680,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
         );
         if plan_sc {
             if dyn_sc {
@@ -9842,6 +9991,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
                 Some(fixed.wide.as_ref()),
                 None,
                 &*parallel.peers,
@@ -9908,6 +10059,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
             Some(fixed.wide.as_ref()),
             has_ple.then_some(fixed.ple.as_ref()),
             &*parallel.peers,
@@ -10246,6 +10399,8 @@ fn generate_dense_backend_inner(
                     qwen_wide_buf,
                     ple_embd_buf,
                     ple_state_buf,
+                    uncensor_dirs_buf,
+                    uncensor_scale_buf,
                 );
                 vb0.bind(
                     vh0.qwen_wide.expect("Qwen VERIFY head has a wide residual"),
@@ -10307,6 +10462,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
             );
             vb.bind(
                 vh.qwen_wide.expect("Qwen VERIFY has a wide residual"),
@@ -10481,6 +10638,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -11082,6 +11241,8 @@ fn generate_dense_backend_inner(
                             qwen_wide_buf,
                             ple_embd_buf,
                             ple_state_buf,
+                            uncensor_dirs_buf,
+                            uncensor_scale_buf,
                             wide_batch.as_deref(),
                             None,
                             &*parallel.peers,
@@ -11121,6 +11282,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                         wide_batch.as_deref(),
                         ple_batch.as_deref(),
                         &*parallel.peers,
@@ -11302,6 +11465,8 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
+                                    uncensor_dirs_buf,
+                                    uncensor_scale_buf,
                                     wide_batch.as_deref(),
                                     if is_main { ple_batch.as_deref() } else { None },
                                     &*parallel.peers,
@@ -12561,6 +12726,8 @@ fn generate_dense_backend_inner(
                                 ple_embd_buf
                             },
                             ple_state_buf,
+                            uncensor_dirs_buf,
+                            uncensor_scale_buf,
                         );
                         debug_assert!(
                             pf_h.logits.is_none(),
@@ -12821,6 +12988,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -13356,6 +13525,8 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
+                                    uncensor_dirs_buf,
+                                    uncensor_scale_buf,
                                 );
                                 if let Some(id) = handles.logits {
                                     bindings.bind(id, logits_buf.as_ref());
@@ -13453,6 +13624,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                     );
                     let ple_buf = ple_embd_buf
                         .as_ref()
@@ -13484,6 +13657,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                     );
                     b1.bind(
                         h1.logits.expect("qwen4exp tail build has logits"),
@@ -13589,6 +13764,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                     );
                     b.bind(
                         h.logits.expect("decode build has logits"),
