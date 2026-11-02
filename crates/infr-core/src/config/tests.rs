@@ -392,6 +392,8 @@ fn default_config_matches_documented_defaults() {
     assert!(!d.device.ubatch_parallel_specified);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);
+    // The GPU startup lock ships ON: a second engine on the same card is a measurement defect.
+    assert!(d.device.gpu_lock);
     // §6.3 / §6.4.
     assert_eq!(d.kv.slots, 4);
     assert_eq!(d.kv.session_cache_dir, None);
@@ -485,6 +487,26 @@ fn gpu_resident_decode_is_shipped_by_default_and_can_be_disabled_explicitly() {
     let mut cfg = defaults;
     cli_layer(&["kernels.vulkan.decode_gpu_resident=false"]).apply(&mut cfg);
     assert!(!cfg.kernels.vulkan.decode_gpu_resident);
+}
+
+/// The GPU startup lock ships ON, and every layer can turn the CHECK off — the field is positive
+/// (`gpu_lock`), so the `INFR_NO_*` spelling inverts it and, like `INFR_CPU_NO_SPINPOOL`, `=0` means
+/// "keep it on" rather than "presence means off".
+#[test]
+fn gpu_lock_ships_on_and_every_layer_can_disable_the_check() {
+    assert!(Config::default().device.gpu_lock);
+
+    for (value, want) in [("", false), ("0", true), ("1", false)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_NO_GPU_LOCK", value)])]);
+        assert_eq!(cfg.device.gpu_lock, want, "INFR_NO_GPU_LOCK={value:?}");
+    }
+
+    let from_file = Config::load_from_layers(&[file_layer("[device]\ngpu_lock = false\n")]);
+    assert!(!from_file.device.gpu_lock);
+
+    let mut cfg = Config::default();
+    cli_layer(&["device.gpu_lock=false"]).apply(&mut cfg);
+    assert!(!cfg.device.gpu_lock);
 }
 
 #[test]
@@ -2081,6 +2103,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_DISK_CACHE_PATH",
         "INFR_RESPONSE_STORE_ENTRIES",
         "INFR_RESPONSE_STORE_PATH",
+        "INFR_NO_GPU_LOCK",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
