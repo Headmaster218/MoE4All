@@ -5,31 +5,35 @@
 .DESCRIPTION
     An affectionate reproduction of the Tencent ACE anti-cheat feeling: it walks the whole disk
     looking for model files, SHA-256s every one of them across all logical processors at once,
-    then establishes - without sending HuggingFace a single request - whether the hub is reachable,
-    pauses for exactly as long as an anti-cheat verification takes when it has nothing to say, and
-    reports the verdict as FAILED.
+    asks HuggingFace exactly one question - are you there? - and, whether or not it was answered
+    (a mirror gets the same one question before anything gives up, because that is what a real
+    client does), pauses for as long as an anti-cheat verification takes when it has nothing to
+    say, and reports FAILED.
 
-    The no-requests rule is not shyness, it is the point: a joke script has no business generating
-    model-info traffic against a public service, so phase 3 opens one TCP connection to host:port,
-    learns what it can learn from that, and closes it. No HTTP verb, no path, no TLS handshake,
-    no User-Agent, no retry, no bulk query. The hashes stay local and the answer stays "FAILED",
-    which is also the most honest verdict a script that never asked can produce.
+    One request per endpoint, and the cheapest shape of it: a HEAD, no body, no path, no query, no
+    retry, no per-model metadata. An earlier revision fetched /api/models/<repo>?blobs=true for
+    every HF cache directory it found, and that is the part a public service would rather a joke
+    did not do. "Are you there" is the honest minimum for the theatre this script is staging, and
+    the hashes still never leave the machine.
 
-    This is a joke, and jokes still cost the person running them real seconds. It is therefore
-    quadruple-fenced:
+    This is a joke, and jokes still cost the person running them real seconds. It is fenced five
+    times deep:
 
       * NOT wired into Start-INFR-Wizard.cmd, infr-wizard.ps1, the engine, the release scripts or
         CI. Nothing runs it automatically. If you want it in a startup path, do not file a bug
         about it - that is the one version of this that would hurt other people.
       * it refuses to do anything at all unless you pass -IAccept.
-      * and then, even with -IAccept given, it prints the warning and asks you to type `y` on the
-        console before starting. The default answer is No, Enter means No, a wrong key means No,
-        and -PromptTimeoutSec seconds of silence means No.
+      * even with -IAccept given, it prints the warning and waits for you to type `y` on the
+        console before it scans. The default answer is No: Enter means No, a wrong key means No,
+        redirected input means No, and -PromptTimeoutSec seconds of silence means No.
+      * and then, after the scan, when the bill can be quoted in real numbers (how many files, how
+        many GiB, how many workers), it asks a SECOND time for a typed `y` before hashing a single
+        byte of any of them.
       * -DryRun shows the whole plan (which drives, which extensions, how many files) without
-        hashing, probing or asking anything, and -LimitFiles / -Root narrow the blast radius
-        further.
+        hashing, asking the hub anything or prompting at all, and -LimitFiles / -Root narrow the
+        blast radius further.
 
-    The confirmation is asked fresh on every single start. There is no "don't ask again", no
+    Both confirmations are asked fresh on every single start. There is no "don't ask again", no
     remembered answer, no environment variable, no config key and no profile entry involved - the
     script reads nothing about you and writes nothing about you. Same for the timeout:
     `-PromptTimeoutSec 1` is not a new default for next time, because there is no next-time state
@@ -50,33 +54,41 @@
     Worker threads for the hash phase. Default: one per logical processor, i.e. the good part.
 
 .PARAMETER HubEndpoint
-    Which host to sniff for reachability. Honours INFR_HF_ENDPOINT, same knob the engine uses, so
-    a mirror works. Only the host and port are used - no request is ever sent to it.
+    What gets asked the one question. Honours INFR_HF_ENDPOINT, same knob the engine uses, so a
+    mirror works. Exactly one HEAD per endpoint is sent - nothing else, ever.
+
+.PARAMETER MirrorEndpoint
+    What gets asked if the hub does not answer. Default https://hf-mirror.com, the endpoint this
+    project's own documentation points users at. The fallback is announced on screen rather than
+    done silently, because a silent mirror swap is the part of a real anti-cheat worth mocking and
+    not worth copying.
 
 .PARAMETER HangSec
     The ACE-flavoured pause: how long phase 3 stares at the ceiling before delivering its verdict.
-    Default 30; 0 reports immediately. Applies whether or not the hub answered, because the
+    Default 30; 0 reports immediately. Applies whether or not anything answered, because the
     discomfort is the feature.
 
 .PARAMETER ConnectTimeoutSec
-    How long the TCP reachability probe waits. Default 5. A probe failure is not an error here,
-    it is just the offline branch.
+    How long each reachability request waits (the hub first, then the mirror). Default 10. A probe
+    failure is not an error here, it is just the offline branch.
 
 .PARAMETER TolerateOffline
-    Do not die when the endpoint is unreachable; fall through to the pause and the verdict.
-    Equivalent to INFR_HF_OFFLINE=1, which is the knob the engine family already uses. Without
-    either, an unreachable hub exits 1 on purpose - that is the original punchline, not a bug.
+    Do not die when neither the hub nor the mirror answers; fall through to the pause and the
+    verdict. Equivalent to INFR_HF_OFFLINE=1, which is the knob the engine family already uses.
+    Without either, an unanswered internet exits 1 on purpose - that is the original punchline,
+    not a bug.
 
 .PARAMETER DryRun
-    Enumerate, report the plan, hash nothing, probe nothing.
+    Enumerate, report the plan, hash nothing, ask nothing, prompt nobody.
 
 .PARAMETER LimitFiles
     Cap the number of files hashed (0 = no cap). Handy while having a laugh.
 
 .PARAMETER PromptTimeoutSec
-    How long the startup confirmation waits for an answer before the answer becomes No.
-    Default 300; 0 disables the timeout and waits forever. Never persisted, never inherited:
-    every start re-asks with the default unless the flag is typed again.
+    How long EACH confirmation - the one before the scan and the one before the hashing - waits for
+    an answer before the answer becomes No. Default 300; 0 disables the timeout and waits forever.
+    Never persisted, never inherited: every start re-asks both with the default unless the flag is
+    typed again.
 
 .PARAMETER IAccept
     Necessary but not sufficient. Lets the script reach the interactive confirmation at all;
@@ -94,13 +106,16 @@
 .EXAMPLE
     $env:INFR_HF_OFFLINE = '1'; powershell -ExecutionPolicy Bypass -File scripts\ace-simulator.MACHINE-SLOWDOWN.ps1 -IAccept
 
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File scripts\ace-simulator.MACHINE-SLOWDOWN.ps1 -IAccept -MirrorEndpoint https://hf-mirror.com
+
 .NOTES
     Windows PowerShell 5.1 compatible on purpose (no ForEach-Object -Parallel), matching the other
     scripts in this folder.
 
-    Exit codes: 0 clean, 1 hub unreachable and -TolerateOffline / INFR_HF_OFFLINE not given,
-    2 refused at a fence, 3 the hub was reachable and verification still FAILED - as it must, since
-    nothing was ever asked.
+    Exit codes: 0 clean, 1 neither the hub nor the mirror answered and no escape hatch was given,
+    2 refused at a fence (there are two typed confirmations now, either can stop it), 3 somebody
+    answered - and verification still FAILED, because a HEAD cannot check a hash.
 #>
 [CmdletBinding()]
 param(
@@ -108,13 +123,14 @@ param(
     [string[]]$Extension = @('.gguf', '.mmproj'),
     [int]$Degree = 0,
     [string]$HubEndpoint = '',
+    [string]$MirrorEndpoint = '',
     [switch]$TolerateOffline,
     [switch]$DryRun,
     [switch]$IAccept,
     [int]$LimitFiles = 0,
     [int]$PromptTimeoutSec = 300,
     [int]$HangSec = 30,
-    [int]$ConnectTimeoutSec = 5
+    [int]$ConnectTimeoutSec = 10
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,6 +140,9 @@ $ProgressPreference = 'SilentlyContinue'
 
 if (-not $HubEndpoint) {
     $HubEndpoint = if ($env:INFR_HF_ENDPOINT) { $env:INFR_HF_ENDPOINT } else { 'https://huggingface.co' }
+}
+if (-not $MirrorEndpoint) {
+    $MirrorEndpoint = if ($env:INFR_HF_MIRROR) { $env:INFR_HF_MIRROR } else { 'https://hf-mirror.com' }
 }
 if ($Degree -le 0) { $Degree = [Environment]::ProcessorCount }
 
@@ -182,6 +201,30 @@ function Read-Confirmation {
     }
 }
 
+# Both gates share one refusal path: say what did NOT happen, in the words the answer deserves, and
+# leave no trace of the answer behind.
+function Stop-UnlessYes {
+    param(
+        [string]$Question,
+        [int]$TimeoutSec,
+        [string]$What
+    )
+    $answer = Read-Confirmation -Question $Question -TimeoutSec $TimeoutSec
+    if ($answer -eq 'y') { return }
+    Write-Host ''
+    if ($answer -eq '') {
+        if ($TimeoutSec -gt 0) {
+            Write-Host "  No answer in $TimeoutSec s - the default is No, so $What did not happen." -ForegroundColor Yellow
+        } else {
+            Write-Host "  No answer - the default is No, so $What did not happen." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "  Answered '$answer' - only 'y' is a yes, so $What did not happen." -ForegroundColor Yellow
+    }
+    Write-Host '  (Nothing about this answer is saved: the next start asks again, defaulting to No.)' -ForegroundColor DarkGray
+    exit 2
+}
+
 Write-Host ''
 Write-Host '  ace-simulator.MACHINE-SLOWDOWN.ps1  -  DANGER, opt-in, read-only' -ForegroundColor DarkYellow
 if ($autoDetected) {
@@ -206,7 +249,7 @@ Write-Host ("           {0:N2} TiB of volumes mounted, {1:N2} TiB of it free" -f
 Write-Host "  roots:   $($Root -join ', ')"
 Write-Host "  types:   $($Extension -join ', ')"
 Write-Host "  hash fs: $Degree workers (one per logical processor)"
-Write-Host "  hub:     $HubEndpoint (reachability only - this script sends it no requests)"
+Write-Host "  hub:     $HubEndpoint (one HEAD, then $MirrorEndpoint only if the hub stays silent)"
 
 if ($Root.Count -eq 0) {
     Write-Host ''
@@ -215,7 +258,7 @@ if ($Root.Count -eq 0) {
 }
 
 if ($DryRun) {
-    Write-Host '  -DryRun: nothing will be hashed and nothing will be probed.' -ForegroundColor DarkGray
+    Write-Host '  -DryRun: nothing hashed, nothing asked, nobody prompted.' -ForegroundColor DarkGray
     exit 0
 }
 if (-not $IAccept) {
@@ -233,21 +276,7 @@ Write-Host '  Disk and CPU go to 100% for as long as it takes. Nothing is writte
 Write-Host '  fast either: your other work - a running engine, a training job, a desktop - stalls.' -ForegroundColor Red
 Write-Host '  -Root / -LimitFiles shrink that; Ctrl+C works; the answer here is not remembered.' -ForegroundColor DarkGray
 
-$answer = Read-Confirmation -Question '  Continue? [y/N] ' -TimeoutSec $PromptTimeoutSec
-if ($answer -ne 'y') {
-    Write-Host ''
-    if ($answer -eq '') {
-        if ($PromptTimeoutSec -gt 0) {
-            Write-Host "  No answer in $PromptTimeoutSec s - default is No, so nothing started." -ForegroundColor Yellow
-        } else {
-            Write-Host '  No answer - default is No, so nothing started.' -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  Answered '$answer' - only 'y' starts it, so nothing started." -ForegroundColor Yellow
-    }
-    Write-Host '  (The answer is never saved: next start asks this again, defaulting to No.)' -ForegroundColor DarkGray
-    exit 2
-}
+Stop-UnlessYes -Question '  Continue? [y/N] ' -TimeoutSec $PromptTimeoutSec -What 'the scan'
 
 # ── phase 1: find the models ─────────────────────────────────────────────────
 Write-Host "`n[1/3] scanning the disk..." -ForegroundColor Cyan
@@ -269,6 +298,16 @@ $totalBytes = [int64]0
 foreach ($f in $found) { $totalBytes += $f.Length }
 Write-Host ("      {0} files, {1:N2} GiB" -f $found.Count, ($totalBytes / 1GB))
 if ($found.Count -eq 0) { Write-Host '      nothing to hash; exiting clean.'; exit 0 }
+
+# ── gate 2: the second confirmation, now that the bill is in real numbers ────
+# The first warning could only speak in volumes and core counts. After the scan the actual figure is
+# known - how many files, how many GiB - so this is the honest moment to ask, and it is asked again
+# with the same default No, the same deadline, the same zero memory of the answer.
+Write-Host ''
+Write-Host ("      the scan is done: {0} model file(s), {1:N2} GiB, about to be read to the end by {2} workers." -f `
+    $found.Count, ($totalBytes / 1GB), $Degree) -ForegroundColor Yellow
+Write-Host '      This is the part that makes the mouse stutter. Nothing has been hashed yet.' -ForegroundColor Yellow
+Stop-UnlessYes -Question '      Hash them all? [y/N] ' -TimeoutSec $PromptTimeoutSec -What 'any hashing'
 
 # ── phase 2: the ACE feeling, i.e. hash all of it, on everything ─────────────
 # A RunspacePool, not [Threading.Tasks.Parallel]::ForEach: under Windows PowerShell 5.1 the
@@ -314,32 +353,48 @@ foreach ($bad in @($records | Where-Object { $_.Error })) {
     Write-Warning "unreadable: $($bad.Path) ($($bad.Error))"
 }
 
-# ── phase 3: is the hub there? ask it nothing, then deliver the verdict ──────
-Write-Host "`n[3/3] probing $HubEndpoint for reachability..." -ForegroundColor Cyan
-# Reachability by SYN and nothing more. The previous revision of this script called
-# `/api/models/<repo>?blobs=true` for every HF cache directory it found, which - however polite -
-# is real inbound traffic against a public service generated by a joke. This version sends zero
-# requests: it resolves nothing itself, opens one TCP socket to host:port, reads nothing, closes.
-# If that comes up the hub exists; if it does not, the hub is offline as far as we can tell.
-$hostName = ([Uri]$HubEndpoint).Host
-$port = ([Uri]$HubEndpoint).Port
-if ($port -le 0 -or $port -gt 65535) { $port = 443 }
-$offlineReason = ''
-if ($env:INFR_HF_OFFLINE -and $env:INFR_HF_OFFLINE -ne '0') {
-    $offlineReason = 'INFR_HF_OFFLINE is set'
-} elseif (-not $hostName) {
-    $offlineReason = "$HubEndpoint has no host part"
-} else {
-    $socket = [Net.Sockets.TcpClient]::new()
+# ── phase 3: one question to the hub, one to the mirror, then the verdict ────
+Write-Host "`n[3/3] asking $HubEndpoint whether it is there (one HEAD - that is the whole ask)..." -ForegroundColor Cyan
+# One request per endpoint, and the cheapest verb in the protocol: no body, no path, no query, no
+# per-model metadata, no retry loop. An earlier revision walked /api/models/<repo>?blobs=true for
+# every HF cache directory it found - a joke generating real lookups against a public service - and
+# "are you there" is all this script actually needs to stage its theatre. ANY status is an answer
+# (200, a 405 on a verb it dislikes, a 429 on a burst); only a transport failure means unreachable.
+$headers = @{ 'User-Agent' = 'moe4all-ace-simulator/1.0 (reachability probe: one HEAD, no body)' }
+
+function Test-EndpointAnswered {
+    param([string]$Endpoint, [int]$TimeoutSec)
     try {
-        $connected = $socket.ConnectAsync($hostName, $port).Wait($ConnectTimeoutSec * 1000)
-        if (-not $connected -or -not $socket.Connected) {
-            $offlineReason = "no TCP answer from ${hostName}:$port in $ConnectTimeoutSec s"
-        }
+        $answer = Invoke-WebRequest -Method Head -Uri $Endpoint -Headers $headers -TimeoutSec $TimeoutSec -UseBasicParsing
+        return @{ Answered = $true; Detail = "HTTP $([int]$answer.StatusCode)" }
     } catch {
-        $offlineReason = $_.Exception.Message
-    } finally {
-        $socket.Close()
+        if ($_.Exception.Response) {
+            return @{ Answered = $true; Detail = "HTTP $([int]$_.Exception.Response.StatusCode)" }
+        }
+        return @{ Answered = $false; Detail = $_.Exception.Message }
+    }
+}
+
+$offlineReason = ''
+$answeredVia = ''
+if ($env:INFR_HF_OFFLINE -and $env:INFR_HF_OFFLINE -ne '0') {
+    # Declared offline: not even the one HEAD leaves the machine.
+    $offlineReason = 'INFR_HF_OFFLINE is set, so the question is not asked at all'
+} else {
+    $hub = Test-EndpointAnswered -Endpoint $HubEndpoint -TimeoutSec $ConnectTimeoutSec
+    if ($hub.Answered) {
+        $answeredVia = $HubEndpoint
+        Write-Host "      $HubEndpoint answered ($($hub.Detail)) - and gets no second request." -ForegroundColor DarkGray
+    } else {
+        Write-Host "      $HubEndpoint stayed silent: $($hub.Detail)" -ForegroundColor Yellow
+        Write-Host "      so, like a real client would: asking $MirrorEndpoint instead." -ForegroundColor Yellow
+        $mirror = Test-EndpointAnswered -Endpoint $MirrorEndpoint -TimeoutSec $ConnectTimeoutSec
+        if ($mirror.Answered) {
+            $answeredVia = $MirrorEndpoint
+            Write-Host "      $MirrorEndpoint answered ($($mirror.Detail)). Mirror verdicts are worth exactly as much." -ForegroundColor DarkGray
+        } else {
+            $offlineReason = "neither $HubEndpoint nor $MirrorEndpoint answered (last failure: $($mirror.Detail))"
+        }
     }
 }
 if ($offlineReason) {
@@ -352,7 +407,7 @@ if ($offlineReason) {
     }
     Write-Host '      staying on the offline branch, as asked - the pause still applies.' -ForegroundColor DarkGray
 } else {
-    Write-Host "      ${hostName}:$port is connectable (that is all this script learns, and all it asks)" -ForegroundColor DarkGray
+    Write-Host "      something is out there ($answeredVia). Nothing was compared, because one HEAD cannot check a hash." -ForegroundColor DarkGray
 }
 
 # The anti-cheat beat: the "verification" that no longer happens takes exactly as long as one that
@@ -362,8 +417,8 @@ if ($HangSec -gt 0) {
     Start-Sleep -Seconds $HangSec
 }
 
-# And the verdict can only ever be one thing. There is no record to compare against, because
-# comparing would mean asking, and asking is exactly what phase 3 refuses to do.
+# And the verdict can only ever be one thing. A HEAD says "somebody is home"; confirming a SHA-256
+# against it would mean asking for the file list, and this script asks for nothing.
 $verdict = if ($offlineReason) { 'NOT CHECKED (offline)' } else { 'CHECK FAILED' }
 foreach ($record in $hashed) {
     Write-Host ("      {0,-12} {1}" -f $verdict, (Split-Path -Leaf $record.Path)) -ForegroundColor Yellow
@@ -371,9 +426,9 @@ foreach ($record in $hashed) {
 
 Write-Host ("`ndone: verdict={0} checked=0 files={1} gib={2:N2} hash-seconds={3:N1}" -f `
     $verdict, $hashed.Count, $gib, $elapsed) -ForegroundColor Green
-Write-Host '  Nothing was sent to HuggingFace, so nothing was confirmed. Same feeling, no traffic.' -ForegroundColor DarkGray
+Write-Host '  At most two HEADs left this machine, no hash ever did, and the feeling is intact.' -ForegroundColor DarkGray
 if (-not $offlineReason) {
-    Write-Host '  Reachable and still failed: the hub is innocent, the script is the anti-cheat.' -ForegroundColor DarkGray
+    Write-Host '  Answered and still failed: the hub is innocent, the script is the anti-cheat.' -ForegroundColor DarkGray
     exit 3
 }
 exit 0
