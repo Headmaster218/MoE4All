@@ -642,16 +642,6 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                             invalid("input", "function_call_output requires output")
                         })?;
                         let content = input_content(output)?;
-                        if !content.is_string()
-                            && content
-                                .as_array()
-                                .is_some_and(|parts| parts.iter().any(|p| p["type"] != "text"))
-                        {
-                            return Err(invalid(
-                                "input",
-                                "function_call_output supports text only",
-                            ));
-                        }
                         let text = if let Some(text) = content.as_str() {
                             text.to_owned()
                         } else {
@@ -662,8 +652,24 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                                 .filter_map(|p| p["text"].as_str())
                                 .collect::<String>()
                         };
+                        // An image inside a tool result is a real shape — a screenshot tool, a
+                        // rendered page, a camera frame — and it needs no engine exception: the DTO
+                        // flattener turns each `image_url` part into one vision sentinel,
+                        // `collect_images` carries the bytes alongside, and the chat template
+                        // renders `content` for the `tool` role like any other role (its marker /
+                        // payload arity check is role-blind too). So pass the part array through
+                        // when it holds an image, and keep the plain string otherwise — text-only
+                        // results reach the engine exactly as they did before.
+                        let content = if content
+                            .as_array()
+                            .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
+                        {
+                            content
+                        } else {
+                            Value::String(text)
+                        };
                         flush_reasoning(messages, &mut pending_reasoning);
-                        let mut m = message("tool", Some(Value::String(text)));
+                        let mut m = message("tool", Some(content));
                         m.tool_call_id = Some(call_id.into());
                         messages.push(m);
                         open_turn = None;
@@ -2824,6 +2830,58 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.param, "input");
+    }
+
+    /// A screenshot-returning tool is the shape real agents send: text AND an image inside
+    /// `function_call_output`. It used to fail the whole turn with "supports text only"; the parts
+    /// now reach the chat `tool` message, where `flatten_content` puts a vision sentinel per image
+    /// and `collect_images` carries the bytes. A text-only result keeps the plain string it always
+    /// was, so no existing wire behaviour moves.
+    #[test]
+    fn tool_output_images_reach_the_vision_path() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture",
+            "input":[
+                {"type":"function_call","call_id":"c1","name":"screenshot","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":[
+                    {"type":"input_text","text":"captured"},
+                    {"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}
+            ]
+        }))
+        .unwrap();
+        let Prepared { chat, .. } = request.into_chat(None, None, None, false).unwrap();
+        let tool = chat
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("the tool result becomes a `tool` message");
+        let parts = tool
+            .content
+            .as_ref()
+            .and_then(|content| content.as_array())
+            .expect("an image forces the content-part shape");
+        assert_eq!(parts.len(), 2, "text then image, in wire order");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"].as_str(),
+            Some("data:image/png;base64,AAAA"),
+            "the DTO shape collect_images understands"
+        );
+
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"fixture",
+            "input":[{"type":"function_call_output","call_id":"c2","output":
+                [{"type":"input_text","text":"only text"}]}]
+        }))
+        .unwrap();
+        let Prepared { chat, .. } = request.into_chat(None, None, None, false).unwrap();
+        let tool = chat
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .unwrap();
+        assert_eq!(tool.content, Some(json!("only text")));
     }
 
     #[test]
