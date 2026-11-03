@@ -623,9 +623,8 @@ fn input_messages(input: &Value, messages: &mut Vec<ChatMessageDto>) -> Result<(
                         let call = json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}});
                         match open_turn {
                             Some(index) => {
-                                let calls = messages[index]
-                                    .tool_calls
-                                    .get_or_insert_with(|| json!([]));
+                                let calls =
+                                    messages[index].tool_calls.get_or_insert_with(|| json!([]));
                                 calls
                                     .as_array_mut()
                                     .expect("tool_calls is always an array")
@@ -904,7 +903,11 @@ fn convert_tools(value: Option<&Value>) -> Result<Option<Value>, ParamError> {
         };
         let unexpected = tool
             .as_object()
-            .and_then(|object| object.keys().find(|key| !outer_allowed.contains(&key.as_str())))
+            .and_then(|object| {
+                object
+                    .keys()
+                    .find(|key| !outer_allowed.contains(&key.as_str()))
+            })
             .or_else(|| {
                 nested.then_some(spec.as_object()?).and_then(|inner| {
                     inner
@@ -918,7 +921,10 @@ fn convert_tools(value: Option<&Value>) -> Result<Option<Value>, ParamError> {
                 format!("unsupported function tool setting: {key}"),
             ));
         }
-        if spec.get("strict").is_some_and(|v| !v.is_null() && v != false) {
+        if spec
+            .get("strict")
+            .is_some_and(|v| !v.is_null() && v != false)
+        {
             return Err(invalid(
                 "tools",
                 "strict function schemas are not supported",
@@ -1040,10 +1046,9 @@ impl ResponsesRequest {
         // level here (chat nests them under `json_schema`). Both API surfaces normalise into the
         // SAME `ResponseFormat` — see `response_format.rs` for the JSON Schema subset gate.
         let (text, response_format) = match self.text {
-            None | Some(Value::Null) => (
-                json!({"format":{"type":"text"},"verbosity":"medium"}),
-                None,
-            ),
+            None | Some(Value::Null) => {
+                (json!({"format":{"type":"text"},"verbosity":"medium"}), None)
+            }
             Some(Value::Object(object)) => {
                 if let Some(key) = object
                     .keys()
@@ -1068,7 +1073,8 @@ impl ResponsesRequest {
                     .filter(|format| !format.is_null())
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"text"}));
-                let parsed = super::response_format::parse_text_format(Some(&format), "text.format")?;
+                let parsed =
+                    super::response_format::parse_text_format(Some(&format), "text.format")?;
                 let text = json!({"format":format,"verbosity":"medium"});
                 (text, chat_wire_format(&parsed))
             }
@@ -1096,8 +1102,7 @@ impl ResponsesRequest {
                 if let Some(effort) = v.get("effort").filter(|x| !x.is_null()) {
                     // `none` = no reasoning: the templates have levels only, so it lands on the
                     // thinking switch (`chat_template_kwargs.enable_thinking`) below.
-                    let (level, off) =
-                        crate::parse_reasoning_effort(effort, "reasoning.effort")?;
+                    let (level, off) = crate::parse_reasoning_effort(effort, "reasoning.effort")?;
                     reasoning_effort = level;
                     reasoning_off = off;
                 }
@@ -1501,7 +1506,10 @@ pub(super) async fn handler(
     body: Result<Json<ResponsesRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = std::time::Instant::now();
-    let shape = body.as_ref().ok().map(|Json(request)| RequestShape::of(request));
+    let shape = body
+        .as_ref()
+        .ok()
+        .map(|Json(request)| RequestShape::of(request));
     let response = handle_request(state, headers, body).await;
     let status = response.status();
     let elapsed_ms = started.elapsed().as_millis();
@@ -3025,7 +3033,10 @@ mod tests {
         }))
         .unwrap();
         let Prepared { chat, meta, .. } = request.into_chat(None, None, None, false).unwrap();
-        assert_eq!(chat.reasoning_effort, None, "no template level is requested");
+        assert_eq!(
+            chat.reasoning_effort, None,
+            "no template level is requested"
+        );
         assert_eq!(
             chat.chat_template_kwargs
                 .as_ref()
@@ -3040,13 +3051,12 @@ mod tests {
             "model":"fixture","input":"hello","reasoning":{"effort":"turbo"}
         }))
         .unwrap();
-        let error = request
-            .into_chat(None, None, None, false)
-            .err()
-            .unwrap();
+        let error = request.into_chat(None, None, None, false).err().unwrap();
         assert_eq!(error.param, "reasoning.effort");
         assert!(
-            error.message.contains("none, minimal, low, medium, high, xhigh or max"),
+            error
+                .message
+                .contains("none, minimal, low, medium, high, xhigh or max"),
             "the error must list the accepted values, got {:?}",
             error.message
         );
@@ -3132,10 +3142,9 @@ mod tests {
         );
         assert_eq!(body["text"]["format"], format);
 
-        let response = post(
-            json!({"model":"fixture","input":"hi","text":{"format":{"type":"json_object"}}}),
-        )
-        .await;
+        let response =
+            post(json!({"model":"fixture","input":"hi","text":{"format":{"type":"json_object"}}}))
+                .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         let text = body["output"][0]["content"][0]["text"].as_str().unwrap();
@@ -3239,11 +3248,20 @@ mod tests {
         }))
         .unwrap();
         let Prepared { chat, .. } = request.into_chat(None, None, None, false).unwrap();
-        assert_eq!(chat.messages.len(), 4, "user, one assistant turn, two tool results");
+        assert_eq!(
+            chat.messages.len(),
+            4,
+            "user, one assistant turn, two tool results"
+        );
         let turn = &chat.messages[1];
         assert_eq!(turn.role, "assistant");
         assert_eq!(turn.reasoning_content.as_deref(), Some("plan"));
-        assert!(turn.content.as_ref().unwrap().to_string().contains("working"));
+        assert!(turn
+            .content
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("working"));
         let calls = turn.tool_calls.as_ref().unwrap().as_array().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0]["id"], "call_1");
@@ -3598,7 +3616,11 @@ mod tests {
         let completed = events.last().unwrap();
         assert_eq!(completed["type"], "response.completed");
         let output = completed["response"]["output"].as_array().unwrap();
-        assert_eq!(output.len(), 2, "both calls survive in the terminal response");
+        assert_eq!(
+            output.len(),
+            2,
+            "both calls survive in the terminal response"
+        );
         assert_eq!(output[0]["arguments"], r#"{"cmd":"dir"}"#);
         assert_eq!(output[1]["arguments"], r#"{"path":"x"}"#);
         assert_eq!(output[1]["call_id"], "call_b");
@@ -3648,12 +3670,18 @@ mod tests {
             );
             match kind {
                 "response.output_item.added" => {
-                    assert_eq!(open, None, "item {index:?} opened while {open:?} was still open");
+                    assert_eq!(
+                        open, None,
+                        "item {index:?} opened while {open:?} was still open"
+                    );
                     open = index;
                     order.push(("added", index));
                 }
                 "response.output_item.done" => {
-                    assert_eq!(open, index, "item {index:?} closed while {open:?} was the open one");
+                    assert_eq!(
+                        open, index,
+                        "item {index:?} closed while {open:?} was the open one"
+                    );
                     open = None;
                     order.push(("done", index));
                 }

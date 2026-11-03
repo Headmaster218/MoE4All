@@ -99,8 +99,8 @@ use gpu_allocator::MemoryLocation;
 
 use infr_core::{
     backend::{
-        Bindings, Buffer, BufferUsage, Capabilities, ExecutionStage,
-        IdleResourceReclaimer, KvFrameCorridor, Plan, SegmentedKvSpec, WeightAllocationBatch,
+        Bindings, Buffer, BufferUsage, Capabilities, ExecutionStage, IdleResourceReclaimer,
+        KvFrameCorridor, Plan, SegmentedKvSpec, WeightAllocationBatch,
     },
     budget::{spill_report_line, SpillNouns, SpillTally},
     config::Config,

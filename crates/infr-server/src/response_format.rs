@@ -179,7 +179,9 @@ pub fn parse_text_format(
         "json_schema" => parse_json_schema_spec(object, param, "text.format"),
         other => Err(invalid(
             param,
-            format!("text.format.type {other:?} is not supported; use text, json_object or json_schema"),
+            format!(
+                "text.format.type {other:?} is not supported; use text, json_object or json_schema"
+            ),
         )),
     }
 }
@@ -216,12 +218,7 @@ fn parse_json_schema_spec(
     let strict = match spec.get("strict").filter(|value| !value.is_null()) {
         None => true,
         Some(Value::Bool(strict)) => *strict,
-        Some(_) => {
-            return Err(invalid(
-                param,
-                format!("{prefix}.strict must be a boolean"),
-            ))
-        }
+        Some(_) => return Err(invalid(param, format!("{prefix}.strict must be a boolean"))),
     };
     if let Some(Value::String(description)) = spec.get("description") {
         if description.len() > 1024 {
@@ -230,7 +227,10 @@ fn parse_json_schema_spec(
                 format!("{prefix}.description must be at most 1024 bytes"),
             ));
         }
-    } else if spec.get("description").is_some_and(|value| !value.is_null()) {
+    } else if spec
+        .get("description")
+        .is_some_and(|value| !value.is_null())
+    {
         return Err(invalid(
             param,
             format!("{prefix}.description must be a string"),
@@ -273,13 +273,13 @@ fn reject_extra_keys(
     param: &'static str,
     prefix: &str,
 ) -> Result<(), ParamError> {
-    if let Some(key) = object
-        .keys()
-        .find(|key| !allowed.contains(&key.as_str()))
-    {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(invalid(
             param,
-            format!("{prefix}.{key} is not supported (allowed: {})", allowed.join(", ")),
+            format!(
+                "{prefix}.{key} is not supported (allowed: {})",
+                allowed.join(", ")
+            ),
         ));
     }
     Ok(())
@@ -295,9 +295,7 @@ fn rejected_keyword(keyword: &str) -> Option<&'static str> {
         "oneOf" => "oneOf is not supported (a grammar cannot enforce \"exactly one\"); use anyOf",
         "not" => "not is not supported",
         "if" | "then" | "else" => "conditional schemas (if/then/else) are not supported",
-        "pattern" | "patternProperties" | "propertyNames" => {
-            "regex constraints are not supported"
-        }
+        "pattern" | "patternProperties" | "propertyNames" => "regex constraints are not supported",
         "format" => "format is not enforced by this server; remove it or validate client-side",
         "contains" | "minContains" | "maxContains" => {
             "array contains constraints are not supported"
@@ -394,16 +392,25 @@ fn validate_schema(
     }
     if let Some(properties) = object.get("properties") {
         let properties = properties.as_object().ok_or_else(|| {
-            invalid(param, format!("{prefix}.schema.properties must be an object"))
+            invalid(
+                param,
+                format!("{prefix}.schema.properties must be an object"),
+            )
         })?;
         for (name, child) in properties {
-            validate_schema(child, param, &format!("{prefix}.schema.properties.{name}"), depth + 1, nodes)?;
+            validate_schema(
+                child,
+                param,
+                &format!("{prefix}.schema.properties.{name}"),
+                depth + 1,
+                nodes,
+            )?;
         }
     }
     if let Some(required) = object.get("required") {
-        let required = required.as_array().ok_or_else(|| {
-            invalid(param, format!("{prefix}.schema.required must be an array"))
-        })?;
+        let required = required
+            .as_array()
+            .ok_or_else(|| invalid(param, format!("{prefix}.schema.required must be an array")))?;
         let properties = object.get("properties").and_then(Value::as_object);
         for name in required {
             let Some(name) = name.as_str().filter(|name| !name.is_empty()) else {
@@ -453,7 +460,13 @@ fn validate_schema(
                 ),
             ));
         }
-        validate_schema(items, param, &format!("{prefix}.schema.items"), depth + 1, nodes)?;
+        validate_schema(
+            items,
+            param,
+            &format!("{prefix}.schema.items"),
+            depth + 1,
+            nodes,
+        )?;
     }
     for keyword in ["anyOf", "allOf"] {
         if let Some(value) = object.get(keyword) {
@@ -487,12 +500,7 @@ fn validate_schema(
             }
         }
     }
-    for keyword in [
-        "minimum",
-        "maximum",
-        "exclusiveMinimum",
-        "exclusiveMaximum",
-    ] {
+    for keyword in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
         if let Some(value) = object.get(keyword) {
             if !value.is_number() {
                 return Err(invalid(
@@ -505,7 +513,11 @@ fn validate_schema(
     Ok(())
 }
 
-fn validate_type_keyword(value: &Value, param: &'static str, prefix: &str) -> Result<(), ParamError> {
+fn validate_type_keyword(
+    value: &Value,
+    param: &'static str,
+    prefix: &str,
+) -> Result<(), ParamError> {
     let names = match value {
         Value::String(name) => std::slice::from_ref(name),
         Value::Array(names) => {
@@ -571,7 +583,9 @@ fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
-        Value::Number(number) if number.as_i64().is_some() || number.as_u64().is_some() => "integer",
+        Value::Number(number) if number.as_i64().is_some() || number.as_u64().is_some() => {
+            "integer"
+        }
         Value::Number(_) => "number",
         Value::String(_) => "string",
         Value::Array(_) => "array",
@@ -624,7 +638,9 @@ fn validate_instance(schema: &Value, value: &Value, path: &str) -> Result<(), St
     }
     if let Some(Value::Array(allowed)) = object.get("enum") {
         if !allowed.iter().any(|candidate| candidate == value) {
-            return Err(format!("{path}: value is not one of the schema's enum values"));
+            return Err(format!(
+                "{path}: value is not one of the schema's enum values"
+            ));
         }
     }
     if let Some(constant) = object.get("const") {
@@ -742,13 +758,19 @@ mod tests {
 
     #[test]
     fn absent_and_text_are_plain_text() {
-        assert_eq!(parse_response_format(None, "response_format").unwrap(), ResponseFormat::Text);
+        assert_eq!(
+            parse_response_format(None, "response_format").unwrap(),
+            ResponseFormat::Text
+        );
         assert_eq!(chat(json!({"type":"text"})).unwrap(), ResponseFormat::Text);
     }
 
     #[test]
     fn json_object_and_json_schema_normalise() {
-        assert_eq!(chat(json!({"type":"json_object"})).unwrap(), ResponseFormat::JsonObject);
+        assert_eq!(
+            chat(json!({"type":"json_object"})).unwrap(),
+            ResponseFormat::JsonObject
+        );
         let format = chat(json!({
             "type":"json_schema",
             "json_schema":{
@@ -764,7 +786,11 @@ mod tests {
         }))
         .unwrap();
         match &format {
-            ResponseFormat::JsonSchema { name, schema, strict } => {
+            ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
                 assert_eq!(name.as_deref(), Some("answer"));
                 assert!(*strict);
                 assert_eq!(schema["properties"]["answer"]["type"], "string");
@@ -793,14 +819,27 @@ mod tests {
     #[test]
     fn unsupported_constructs_are_named_in_the_error() {
         for (schema, needle) in [
-            (json!({"type":"object","properties":{"a":{"$ref":"#/x"}}}), "$ref"),
-            (json!({"type":"object","oneOf":[{"type":"object"}]}), "oneOf"),
+            (
+                json!({"type":"object","properties":{"a":{"$ref":"#/x"}}}),
+                "$ref",
+            ),
+            (
+                json!({"type":"object","oneOf":[{"type":"object"}]}),
+                "oneOf",
+            ),
             (json!({"type":"string","format":"date-time"}), "format"),
-            (json!({"type":"array","items":{"type":"string"},"uniqueItems":true}), "uniqueItems"),
-            (json!({"type":"object","properties":{"a":{"type":"string"}},"patternProperties":{}}), "patternProperties"),
+            (
+                json!({"type":"array","items":{"type":"string"},"uniqueItems":true}),
+                "uniqueItems",
+            ),
+            (
+                json!({"type":"object","properties":{"a":{"type":"string"}},"patternProperties":{}}),
+                "patternProperties",
+            ),
         ] {
-            let error = chat(json!({"type":"json_schema","json_schema":{"name":"x","schema":schema}}))
-                .unwrap_err();
+            let error =
+                chat(json!({"type":"json_schema","json_schema":{"name":"x","schema":schema}}))
+                    .unwrap_err();
             assert_eq!(error.param, "response_format");
             assert!(error.message.contains(needle), "{}", error.message);
         }
@@ -858,7 +897,10 @@ mod tests {
             .verify(r#"{"answer":"ok","extra":1}"#)
             .unwrap_err()
             .contains("additionalProperties"));
-        assert!(format.verify("not json").unwrap_err().contains("not valid JSON"));
+        assert!(format
+            .verify("not json")
+            .unwrap_err()
+            .contains("not valid JSON"));
         assert!(format.verify("").unwrap_err().contains("no content"));
     }
 
@@ -867,6 +909,9 @@ mod tests {
         let format = ResponseFormat::JsonObject;
         assert!(format.verify("{\"a\":1}").is_ok());
         assert!(format.verify("[1]").unwrap_err().contains("JSON object"));
-        assert!(format.verify("text").unwrap_err().contains("not valid JSON"));
+        assert!(format
+            .verify("text")
+            .unwrap_err()
+            .contains("not valid JSON"));
     }
 }

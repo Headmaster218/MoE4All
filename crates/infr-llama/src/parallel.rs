@@ -269,11 +269,7 @@ fn should_handoff_multimodal_to_scheduler(
 /// The multimodal continuation compares in the tree's KEY space, so it has to see the same
 /// projection tag the slot publishes under — otherwise a stable setting would miss its own warm
 /// prefix at position 0.
-fn tagged_key(
-    kv: &SeamKv,
-    key_view: &[u32],
-    req: &RequestCtx,
-) -> Vec<u32> {
+fn tagged_key(kv: &SeamKv, key_view: &[u32], req: &RequestCtx) -> Vec<u32> {
     kv.paged_request_key(key_view, req.sampling().uncensor)
         .unwrap_or_else(|| key_view.to_vec())
 }
@@ -3590,10 +3586,9 @@ impl ParallelSeam {
             );
             let continuation_prefix = continuation
                 .and_then(|index| {
-                    pool.slots[index]
-                        .kv
-                        .as_ref()
-                        .and_then(|kv| kv.continuation_prefix_len_keyed(&tagged_key(kv, key_view, req)))
+                    pool.slots[index].kv.as_ref().and_then(|kv| {
+                        kv.continuation_prefix_len_keyed(&tagged_key(kv, key_view, req))
+                    })
                 })
                 .unwrap_or(0);
             let target = continuation.unwrap_or_else(|| {
@@ -7866,15 +7861,18 @@ mod tests {
             grid_ny: ny,
             fingerprint,
         };
-        let prompt = |images| {
-            expand_multimodal_prompt(&[10, 99, 11], 99, images, 3).expect("valid prompt")
-        };
+        let prompt =
+            |images| expand_multimodal_prompt(&[10, 99, 11], 99, images, 3).expect("valid prompt");
         let (tokens, blue) = prompt(vec![embed([1; 32], 2, 2, 1.0)]);
         let (_, red) = prompt(vec![embed([2; 32], 2, 2, 2.0)]);
         let view = blue.cache_view(&tokens);
         let span = &blue.spans[0];
         let after = span.start + span.n_tokens;
-        assert_eq!(view.len(), tokens.len(), "a key stays addressable per token");
+        assert_eq!(
+            view.len(),
+            tokens.len(),
+            "a key stays addressable per token"
+        );
         assert_eq!(&view[..span.start], &tokens[..span.start]);
         assert_eq!(&view[after..], &tokens[after..]);
         assert!(
@@ -7888,7 +7886,11 @@ mod tests {
             red.cache_view(&tokens),
             "a different picture is a different chain"
         );
-        assert_eq!(view, blue.cache_view(&tokens), "and one picture replays its key exactly");
+        assert_eq!(
+            view,
+            blue.cache_view(&tokens),
+            "and one picture replays its key exactly"
+        );
 
         // The same content at another resolution is another computation: grid AND run length move.
         let (big_tokens, big) = prompt(vec![embed([1; 32], 3, 3, 1.0)]);

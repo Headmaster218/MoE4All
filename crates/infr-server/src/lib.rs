@@ -439,8 +439,7 @@ impl GenParams {
             Some(raw) => parse_reasoning_effort(raw, "reasoning_effort")?,
             None => (None, false),
         };
-        if let (Some(top), Some(nested)) =
-            (requested_level, chat_template_options.reasoning_effort)
+        if let (Some(top), Some(nested)) = (requested_level, chat_template_options.reasoning_effort)
         {
             if top != nested {
                 return Err(ParamError {
@@ -451,8 +450,8 @@ impl GenParams {
                 });
             }
         }
-        chat_template_options.reasoning_effort = requested_level
-            .or(chat_template_options.reasoning_effort);
+        chat_template_options.reasoning_effort =
+            requested_level.or(chat_template_options.reasoning_effort);
         if reasoning_off && chat_template_options.enable_thinking.is_none() {
             // `effort: "none"` = no reasoning. An explicit template `enable_thinking` is the finer
             // control and keeps its say; otherwise the effort decides.
@@ -3943,7 +3942,9 @@ mod tests {
             overflow.to_string(),
             "prompt 33676 + gen 0 exceeds the session KV capacity 32768"
         );
-        assert!(!invalid_request_input(&anyhow::anyhow!("backend: device lost")));
+        assert!(!invalid_request_input(&anyhow::anyhow!(
+            "backend: device lost"
+        )));
     }
 
     /// Router backed by a headless state — no Engine, so /health and /v1/models work
@@ -7055,7 +7056,7 @@ mod tests {
     #[tokio::test]
     async fn structured_non_streaming_returns_the_constrained_json() {
         let resp = non_streaming(
-            deadline_entry(Arc::new(PiecesGen(&[r#"{"answer":"# , r#""ok"}"#]))),
+            deadline_entry(Arc::new(PiecesGen(&[r#"{"answer":"#, r#""ok"}"#]))),
             user_msg(),
             None,
             None,
@@ -7121,7 +7122,8 @@ mod tests {
             }
         }
         assert_eq!(content, r#"{"answer":"ok"}"#, "{wire}");
-        serde_json::from_str::<serde_json::Value>(&content).expect("stream must concatenate to JSON");
+        serde_json::from_str::<serde_json::Value>(&content)
+            .expect("stream must concatenate to JSON");
         assert_eq!(finish.as_deref(), Some("stop"), "{wire}");
     }
 

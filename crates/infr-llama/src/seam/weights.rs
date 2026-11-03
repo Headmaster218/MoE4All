@@ -1716,9 +1716,9 @@ impl SeamKv {
     /// The checkout needs it twice: to address the tree, and to tell the slot that the chain it just
     /// attached WAS materialized under it.
     pub(crate) fn uncensor_setting(&self, requested: Option<bool>) -> Option<bool> {
-        self.uncensor
-            .as_ref()
-            .map(|_| infr_uncensor::effective(requested, self.uncensor.as_ref().and_then(|u| u.ran())))
+        self.uncensor.as_ref().map(|_| {
+            infr_uncensor::effective(requested, self.uncensor.as_ref().and_then(|u| u.ran()))
+        })
     }
 
     /// A tree attach gave this slot rows produced under `on`, so its history no longer comes from the
@@ -1731,7 +1731,11 @@ impl SeamKv {
         }
     }
 
-    pub(crate) fn paged_request_key(&self, tokens: &[u32], requested: Option<bool>) -> Option<Vec<u32>> {
+    pub(crate) fn paged_request_key(
+        &self,
+        tokens: &[u32],
+        requested: Option<bool>,
+    ) -> Option<Vec<u32>> {
         let ran = self.uncensor.as_ref().and_then(|u| u.ran());
         let tag = self.uncensor_key(Some(infr_uncensor::effective(requested, ran)))?;
         let mut view = tokens.to_vec();
@@ -1746,7 +1750,9 @@ impl SeamKv {
     /// field and this slot's last real run), so a lookup addresses the chain the request will
     /// actually compute under.
     pub(crate) fn uncensor_key(&self, on: Option<bool>) -> Option<u32> {
-        self.uncensor.as_ref().map(|_| infr_uncensor::key_token(on.unwrap_or(true)))
+        self.uncensor
+            .as_ref()
+            .map(|_| infr_uncensor::key_token(on.unwrap_or(true)))
     }
 
     /// Record the image spans of the prompt this slot is about to materialize, so its chain is

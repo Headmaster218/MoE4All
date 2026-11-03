@@ -516,11 +516,13 @@ fn gpu_lock_ships_on_and_every_layer_can_disable_the_check() {
 fn uncensor_ships_off_and_every_layer_can_name_a_direction_file() {
     let defaults = Config::default();
     assert_eq!(
-        defaults.uncensor.vector,
-        None,
+        defaults.uncensor.vector, None,
         "no session gets a refusal-direction projection it did not ask for"
     );
-    assert_eq!((defaults.uncensor.first_layer, defaults.uncensor.last_layer), (4, 44));
+    assert_eq!(
+        (defaults.uncensor.first_layer, defaults.uncensor.last_layer),
+        (4, 44)
+    );
 
     let from_env = Config::load_from_layers(&[env_layer(&[
         ("INFR_UNCENSOR_VECTOR", "D:/models/cvec.gguf"),
@@ -531,12 +533,16 @@ fn uncensor_ships_off_and_every_layer_can_name_a_direction_file() {
         from_env.uncensor.vector.as_deref(),
         Some(std::path::Path::new("D:/models/cvec.gguf"))
     );
-    assert_eq!((from_env.uncensor.first_layer, from_env.uncensor.last_layer), (8, 40));
+    assert_eq!(
+        (from_env.uncensor.first_layer, from_env.uncensor.last_layer),
+        (8, 40)
+    );
 
-    let from_file =
-        Config::load_from_layers(&[file_layer("[uncensor]
+    let from_file = Config::load_from_layers(&[file_layer(
+        "[uncensor]
 vector = 'cvec.gguf'
-")]);
+",
+    )]);
     assert_eq!(
         from_file.uncensor.vector.as_deref(),
         Some(std::path::Path::new("cvec.gguf"))
@@ -544,7 +550,10 @@ vector = 'cvec.gguf'
 
     let mut cfg = Config::default();
     cli_layer(&["uncensor.vector=cvec.gguf", "uncensor.last_layer=30"]).apply(&mut cfg);
-    assert_eq!(cfg.uncensor.vector.as_deref(), Some(std::path::Path::new("cvec.gguf")));
+    assert_eq!(
+        cfg.uncensor.vector.as_deref(),
+        Some(std::path::Path::new("cvec.gguf"))
+    );
     assert_eq!(cfg.uncensor.last_layer, 30);
 }
 
