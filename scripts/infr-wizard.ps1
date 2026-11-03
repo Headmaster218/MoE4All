@@ -3019,6 +3019,7 @@ if (-not $reuseSavedSettings) {
         $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
         $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
         $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
+        Write-Host '留空＝自动：按系统 commit 余量标定，并先扣掉下面声明的分页 KV RAM 帧池。填了＝按你说的兑现，越过 Windows 的 commit 上限时由内存熔断结束进程，引擎不再自行缩减。/ Blank = automatic, sized against commit headroom and reduced by the paged KV frame pool declared below. A value is honored verbatim: past the commit ceiling the memory circuit breaker ends the process, the engine no longer trims it for you.' -ForegroundColor DarkGray
         $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
         $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
         $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
@@ -3147,10 +3148,11 @@ if (-not $reuseSavedSettings) {
             Write-Host 'Prerequisites: a Qwen3.5/3.6/3.8 model, Q8_0/Q8_0 KV, kv.dynamic on, and a unified VRAM arena (it is only built when MoE experts are paged - a fully resident model on a roomy device has none). A startup that misses a prerequisite now lists exactly which.' -ForegroundColor DarkGray
             # The tree and its host-RAM frame pool are separate choices: with no pool every frame
             # stays inside the VRAM corridor and a cold prefix evicts instead of sinking.
-            $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回；上限只是预算，按实际下沉量惰性增长，不预占）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit; the cap is a budget, the backing grows lazily, nothing is reserved up front)?' -Default ([bool]$kvPagedCacheMax)
+            $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default ([bool]$kvPagedCacheMax)
             if ($kvPagedRamPool) {
                 if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
-                $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限（显存走廊放不下的冷前缀整链 DMA 下沉到此，命中再换回；host 内存按实际下沉量惰性增长，不预占）/ Paged KV RAM frame-pool cap (cold chains evicted from the VRAM corridor DMA down here and promote back on a hit; the host backing grows lazily with actual demotions, no up-front reservation)' -Default $kvPagedCacheMax -Required
+                Write-Host '帧按实际下沉量惰性增长、开机不预占；但在 Windows 上这个上限会先从自动主机预算里扣掉——WDDM 把显存分配记进同一本 commit 账，同一份内存不许承诺两遍。/ Frames grow lazily with actual demotions and reserve nothing at boot, but on Windows this cap is taken out of the automatic host budget first: WDDM charges device memory to the same commit limit, and one byte cannot be promised twice.' -ForegroundColor DarkGray
+                $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限 / Paged KV RAM frame-pool cap' -Default $kvPagedCacheMax -Required
             } else {
                 $kvPagedCacheMax = ''
                 Write-Host '不分配 RAM 帧池：树只使用显存帧走廊，冷前缀直接逐出、不再下沉。混合递归模型续接所需的状态快照仍保留 512 MiB 主机内存上限，按快照逐个分配、不预占。' -ForegroundColor Yellow
