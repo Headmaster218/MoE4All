@@ -3773,16 +3773,6 @@ fn host_budget_resident_after_fixed(
     }
 }
 
-/// The automatic expert store leaves at most this much of the host envelope for the paged KV
-/// frame pool, whatever the operator declared for `kv.paged_cache_max`.
-///
-/// The pool's own byte cost is not known until prefixes actually demote, and on a box where the
-/// model's host store and the declared pool together exceed what the machine can commit, reserving
-/// the whole declaration up front spends real RAM on expert slots that could have been resident.
-/// The pool is clamped for real at session init instead — see [`HOST_FRAME_RAM_FLOOR`] and
-/// `parallel.rs`'s `clamp_ram_frames_to_commit_room`.
-pub(crate) const HOST_FRAME_POOL_RESERVE: u64 = 4 << 30;
-
 /// Physical RAM the RAM frame pool may never spend: the pager objects, the KV segments created
 /// after the plan, and whatever else on the box grows while a session serves for hours. Measured on
 /// the host's AVAILABLE RAM rather than on Windows' commit headroom on purpose — the commit limit
@@ -3804,7 +3794,6 @@ fn moe_host_backing_for_device(
     total: Option<u64>,
     process_resident: Option<u64>,
     commit_ceiling: Option<u64>,
-    host_frame_pool_bytes: u64,
     payload_bytes: usize,
 ) -> MoeHostBacking {
     // Automatic Windows sizing may supply a post-Vulkan snapshot so WDDM's commit charge is
@@ -3854,19 +3843,17 @@ fn moe_host_backing_for_device(
         // Prefill and Decode read only the ranges they need into their upload destination.
         return MoeHostBacking::Bounded { bytes: 0 };
     }
-    // WDDM charges device-local Vulkan allocations against Windows' system commit limit, so the
-    // live commit snapshot is the ceiling BOTH automatic shapes must respect: an unresolved Auto
-    // request, and the startup-frozen one, which was frozen from available PHYSICAL RAM before any
-    // device byte was committed and can therefore name a store the machine cannot commit. The same
-    // envelope also carries the declared paged frame pool, so the store leaves that room rather
-    // than promising the machine the same bytes twice. Only an explicit operator budget (or the
-    // legacy knobs) stays exact, and the caller says so loudly.
+    // Windows charges device-local Vulkan allocations against the system commit limit, so a caller
+    // that ARMED the breaker's commit axis gets the store clipped to the same live line the process
+    // would be stopped on. Nobody is clipped by default: the commit limit moves under a
+    // system-managed page file, and the frame pool below is clamped for real at session init
+    // (`parallel.rs`), which is where the RAM actually still there is known. An explicit operator
+    // budget is verbatim even when the axis is armed.
     let budget = match ram_request {
         infr_core::hostmem::RamRequest::Auto
-        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => requested_budget
-            .min(commit_ceiling.unwrap_or(u64::MAX))
-            .saturating_sub(host_frame_pool_bytes)
-            .min(payload_bytes as u64),
+        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => {
+            requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
+        }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
         | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
@@ -3896,7 +3883,6 @@ fn moe_host_backing(
         total,
         process_resident,
         commit_ceiling,
-        0,
         payload_bytes,
     )
 }
@@ -4812,7 +4798,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_host_total,
                     process_resident,
                     automatic_commit_ceiling,
-                    planned_paged_pool_bytes.min(HOST_FRAME_POOL_RESERVE),
                     host_bytes,
                 );
                 let (host_kind, host_resident_bytes) = match host_backing {
@@ -4833,8 +4818,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     tracing::info!(
                         available_commit_bytes = available,
                         commit_guard_armed = planned_commit_guard.is_some(),
-                        store_pool_reserve_bytes =
-                            planned_paged_pool_bytes.min(HOST_FRAME_POOL_RESERVE),
+                        paged_pool_bytes = planned_paged_pool_bytes,
                         expert_payload_bytes = host_bytes,
                         selected_host_cache_bytes = host_resident_bytes,
                         "MoE host store sized from physical RAM; Windows commit headroom reported for the record"
@@ -7005,7 +6989,6 @@ mod seam_helper_tests {
                     Some((64 * GIB) as u64),
                     Some((2 * GIB) as u64),
                     None,
-                    0,
                     payload,
                 ),
                 super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7021,7 +7004,6 @@ mod seam_helper_tests {
                 Some((64 * GIB) as u64),
                 Some((8 * GIB) as u64),
                 None,
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7036,7 +7018,6 @@ mod seam_helper_tests {
                 Some((64 * GIB) as u64),
                 Some((2 * GIB) as u64),
                 None,
-                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7069,7 +7050,6 @@ mod seam_helper_tests {
                             Some((64 * GIB) as u64),
                             Some((2 * GIB) as u64),
                             Some(GIB as u64),
-                            0,
                             47 * GIB,
                         ),
                         super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7086,7 +7066,6 @@ mod seam_helper_tests {
                     Some((64 * GIB) as u64),
                     Some((2 * GIB) as u64),
                     Some(GIB as u64),
-                    0,
                     47 * GIB,
                 ),
                 super::MoeHostBacking::Full,
@@ -7101,7 +7080,6 @@ mod seam_helper_tests {
                     Some((64 * GIB) as u64),
                     Some((2 * GIB) as u64),
                     Some(GIB as u64),
-                    0,
                     47 * GIB,
                 ),
                 super::MoeHostBacking::Bounded { bytes: GIB },
@@ -7119,7 +7097,6 @@ mod seam_helper_tests {
                         None,
                         None,
                         None,
-                        0,
                         47 * GIB,
                     ),
                     super::MoeHostBacking::Bounded { bytes: 4 * GIB },
@@ -7472,40 +7449,6 @@ mod seam_helper_tests {
             "a startup-frozen budget is still an estimate made from available PHYSICAL RAM, while \
              WDDM charges this process's device allocations to the commit limit: crossing it is how \
              a 71.73 GiB store exits the box at 5 MiB of commit headroom"
-        );
-        assert_eq!(
-            super::moe_host_backing_for_device(
-                infr_core::config::AutoProfile::Aggressive,
-                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
-                false,
-                Some((56 * GIB) as u64),
-                None,
-                Some(0),
-                None,
-                (16 * GIB) as u64,
-                payload,
-            ),
-            super::MoeHostBacking::Bounded {
-                bytes: 32 * GIB
-            },
-            "the declared frame pool is carved out of the automatic envelope: 48 GiB of store plus \
-             16 GiB of frames is the whole promise, and the store may not also spend it"
-        );
-        assert_eq!(
-            super::moe_host_backing_for_device(
-                infr_core::config::AutoProfile::Aggressive,
-                RamRequest::TotalProcessBudget((50 * GIB) as u64),
-                false,
-                Some((56 * GIB) as u64),
-                None,
-                Some(0),
-                None,
-                (16 * GIB) as u64,
-                payload,
-            ),
-            super::MoeHostBacking::Full,
-            "an explicit budget keeps its own semantics: the operator's envelope is theirs to \
-             oversubscribe, and the breaker is the backstop"
         );
         assert_eq!(
             super::moe_host_backing(

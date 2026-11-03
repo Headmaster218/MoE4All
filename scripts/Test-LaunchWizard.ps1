@@ -16,6 +16,7 @@ $realOfferBenchmarkUpload = ${function:Offer-BenchmarkUpload}
 $realInvokeNativeCommandResult = ${function:Invoke-NativeCommandResult}
 $realGetUncensorVectorSpec = ${function:Get-UncensorVectorSpec}
 $realInvokeModelFileDownload = ${function:Invoke-ModelFileDownload}
+$realTestEndpointReachable = ${function:Test-EndpointReachable}
 $source = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
 if ($source -notmatch 'AI/automation: report the benchmark result') {
     throw 'Windows manual benchmark path is missing the automation guidance'
@@ -107,8 +108,19 @@ function Get-UncensorVectorSpec {
     return @{ Repo = $wizardSpec.Repo; File = $wizardSpec.File; Sha256 = $script:UncensorFixtureSha }
 }
 
+# The wizard's reachability probe is a real TCP connect; a test suite that must touch no network
+# cannot run it, so the legs declare which endpoints answer and the stub reads that list.
+function Test-EndpointReachable {
+    param([string]$BaseUrl, [int]$TimeoutMs = 1500)
+    if ($null -eq $script:UncensorFixture) { return & $realTestEndpointReachable -BaseUrl $BaseUrl -TimeoutMs $TimeoutMs }
+    foreach ($blocked in $script:UncensorFixture.Unreachable) {
+        if ($BaseUrl.StartsWith($blocked, [System.StringComparison]::Ordinal)) { return $false }
+    }
+    return $true
+}
+
 function Invoke-ModelFileDownload {
-    param([string]$Url, [string]$Destination, [string]$Label, [int]$MaximumAttempts = 3)
+    param([string]$Url, [string]$Destination, [string]$Label, [int]$MaximumAttempts = 3, [int]$AttemptTimeoutMs = 30000)
     if ($null -eq $script:UncensorFixture) { return & $realInvokeModelFileDownload @PSBoundParameters }
     $script:UncensorFixture.Urls.Add($Url)
     foreach ($prefix in $script:UncensorFixture.FailFor) {
@@ -118,13 +130,16 @@ function Invoke-ModelFileDownload {
 }
 
 function Use-UncensorFixture {
-    param([string[]]$FailFor = @(), [switch]$Cached)
+    param([string[]]$FailFor = @(), [string[]]$Unreachable = @(), [switch]$Cached)
     # Every leg starts from its own vector state: the fixture directory is shared across legs, so a
     # vector left by one run would satisfy the next run's cache check and hide the fetch being tested.
     $path = Get-UncensorVectorPath
     Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
     if ($Cached) { [System.IO.File]::WriteAllBytes($path, $script:UncensorFixtureBytes) }
-    $script:UncensorFixture = @{ FailFor = @($FailFor); Urls = [System.Collections.Generic.List[string]]::new() }
+    $script:UncensorFixture = @{
+        FailFor = @($FailFor); Unreachable = @($Unreachable)
+        Urls = [System.Collections.Generic.List[string]]::new()
+    }
 }
 
 function Test-Flow {
@@ -300,6 +315,16 @@ try {
         Assert ("uncensor.vector=$vector" -in $nativeArgs) 'consented projection never reached the command line'
         Assert ($state.uncensor_vector -eq $vector) 'the consent was not remembered for the next launch'
         Assert (($script:Output -join "`n") -match '开启即视为同意') 'the projection ran without showing the consent notice'
+    }
+    Test-Flow 'uncensor falls back when the reachable origin stalls' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        $urls = @($script:UncensorFixture.Urls)
+        Assert ($urls.Count -eq 2 -and $urls[0].StartsWith('https://huggingface.co/') -and $urls[1].StartsWith('https://hf-mirror.com/')) "a hub that answers but does not serve did not fall back: $($urls -join ' ')"
+        Assert ($state.uncensor_vector -eq (Get-UncensorVectorPath)) 'the stalled-origin run did not end up on the mirror file'
+    }
+    Test-Flow 'uncensor stays off when neither endpoint answers' -Setup { Use-UncensorFixture -Unreachable @('https://huggingface.co', 'https://hf-mirror.com') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        Assert (@($script:UncensorFixture.Urls).Count -eq 0) 'an unroutable endpoint was still attempted'
+        Assert (-not $state.uncensor_vector -and -not (@($nativeArgs | Where-Object { $_.StartsWith('uncensor.vector=') }).Count)) 'no endpoint answered and the projection still turned on'
+        Assert (($script:Output -join "`n") -match '两个来源都连不上') 'the offline case did not say which half failed — probe skips versus download failures read differently'
     }
     Test-Flow 'a verified direction vector is never downloaded again' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co', 'https://hf-mirror.com') -Cached } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
         Assert (@($script:UncensorFixture.Urls).Count -eq 0) 'the cached vector was re-downloaded'

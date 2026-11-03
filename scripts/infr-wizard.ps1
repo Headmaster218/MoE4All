@@ -724,6 +724,7 @@ function Invoke-FileDownloadWithProgress {
         [int]$ProgressId = 71,
         [int]$ParentProgressId = -1,
         [string]$UserAgent = 'MoE4All-Wizard/1.0',
+        [int]$AttemptTimeoutMs = 30000,
         [switch]$ReplaceExisting
     )
 
@@ -754,7 +755,7 @@ function Invoke-FileDownloadWithProgress {
 
             $request = [System.Net.HttpWebRequest]::Create($Url)
             $request.AllowAutoRedirect = $true
-            $request.Timeout = 30000
+            $request.Timeout = $AttemptTimeoutMs
             $request.ReadWriteTimeout = 120000
             $request.UserAgent = $UserAgent
             if ($resumeAt -gt 0) { $request.AddRange($resumeAt) }
@@ -831,7 +832,8 @@ function Invoke-ModelFileDownload {
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$Label,
-        [int]$MaximumAttempts = 3
+        [int]$MaximumAttempts = 3,
+        [int]$AttemptTimeoutMs = 30000
     )
 
     Invoke-FileDownloadWithProgress `
@@ -839,6 +841,7 @@ function Invoke-ModelFileDownload {
         -Destination $Destination `
         -Label $Label `
         -MaximumAttempts $MaximumAttempts `
+        -AttemptTimeoutMs $AttemptTimeoutMs `
         -ProgressId 71 `
         -ParentProgressId 70
 }
@@ -2320,19 +2323,55 @@ function Test-UncensorVectorCurrent {
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $spec.Sha256
 }
 
+# Whether a host answers at all, decided in about a second instead of in the downloader's 30 s
+# request timeout times three attempts. A TCP connect is deliberately the only test: it separates
+# "this machine has no route to the hub" (mainland China boxes that can only reach the mirror) from
+# "the hub is up but this file is slow", which the download itself has to discover.
+function Test-EndpointReachable {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [int]$TimeoutMs = 1500
+    )
+    try {
+        $probeHost = ([System.Uri]$BaseUrl).Host
+    } catch { return $false }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $wait = $client.ConnectAsync($probeHost, 443).Wait($TimeoutMs)
+        return ($wait -and $client.Connected)
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
 # huggingface.co first, then the mirror: some machines cannot reach the origin at all and others can
-# only reach the origin. A partial download, or one whose hash does not match, is DELETED — never
-# kept as if it were the direction.
+# only reach the origin. A partial download, or one whose hash does not match, is DELETED - never
+# kept as if it were the direction. An endpoint that does not answer the probe is skipped outright,
+# and one that answers gets a short first attempt, so "no route" costs ~1 s and "reachable but
+# stalling" costs 8 s rather than minute-and-a-half of retries before the mirror is even tried.
 function Get-UncensorDirectionVector {
     $spec = Get-UncensorVectorSpec
     $path = Get-UncensorVectorPath
     if (Test-UncensorVectorCurrent) { return $path }
     New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    $attempts = 0
     foreach ($origin in @('https://huggingface.co', 'https://hf-mirror.com')) {
+        if (-not (Test-EndpointReachable -BaseUrl $origin)) {
+            Write-Host "连不上，跳过 / no route to $origin, going straight to the next endpoint" -ForegroundColor DarkGray
+            continue
+        }
         $url = "$origin/$($spec.Repo)/resolve/main/$($spec.File)"
         Write-Host "获取方向文件 / Fetching the direction vector: $url" -ForegroundColor DarkGray
+        # The origin gets one short attempt because it is the one that may be a black hole; the
+        # mirror, once reached, is worth the downloader's full retry ladder.
+        $attempts++
+        $isOrigin = $origin -eq 'https://huggingface.co'
         try {
-            Invoke-ModelFileDownload -Url $url -Destination $path -Label $spec.File
+            Invoke-ModelFileDownload -Url $url -Destination $path -Label $spec.File `
+                -MaximumAttempts $(if ($isOrigin) { 1 } else { 3 }) `
+                -AttemptTimeoutMs $(if ($isOrigin) { 8000 } else { 30000 })
         } catch {
             Write-Host "该来源失败，尝试下一个 / this endpoint failed, trying the next one: $($_.Exception.Message)" -ForegroundColor Yellow
             continue
@@ -2340,6 +2379,9 @@ function Get-UncensorDirectionVector {
         if (Test-UncensorVectorCurrent) { return $path }
         Write-Host "校验和不匹配，已删除 / sha256 mismatch, discarded" -ForegroundColor Yellow
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+    if ($attempts -eq 0) {
+        Write-Host '两个来源都连不上 / neither endpoint answered, so no vector could be fetched' -ForegroundColor Yellow
     }
     return ''
 }
@@ -3151,7 +3193,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default ([bool]$kvPagedCacheMax)
             if ($kvPagedRamPool) {
                 if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
-                Write-Host '帧按实际下沉量惰性增长、开机不预占；但在 Windows 上这份承诺会和专家 store 抢同一本 commit 账（WDDM 把显存分配也记在这里），所以自动预算只让 store 让出至多 4 GiB 给帧池，建树时再按当时的实时余量夹紧帧数，夹不住的冷前缀直接逐出。/ Frames grow lazily with actual demotions and reserve nothing at boot, but on Windows this cap is taken out of the automatic host budget first: WDDM charges device memory to the same commit limit, and one byte cannot be promised twice.' -ForegroundColor DarkGray
+                Write-Host '帧按实际下沉量惰性增长、开机不预占，也不从专家 store 的额度里预扣——分页树建立时按当时的空闲物理内存夹紧帧数（留 1 GiB 不花），夹不住的冷前缀直接逐出、不再下沉。/ Frames grow lazily with actual demotions and reserve nothing at boot, but on Windows this cap is taken out of the automatic host budget first: WDDM charges device memory to the same commit limit, and one byte cannot be promised twice.' -ForegroundColor DarkGray
                 $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限 / Paged KV RAM frame-pool cap' -Default $kvPagedCacheMax -Required
             } else {
                 $kvPagedCacheMax = ''
