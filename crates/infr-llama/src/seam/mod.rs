@@ -3787,6 +3787,12 @@ pub(crate) const HOST_FRAME_POOL_RESERVE: u64 = 4 << 30;
 /// after the plan, and whatever else on the box grows while a session serves for hours.
 pub(crate) const HOST_FRAME_COMMIT_FLOOR: u64 = 1 << 30;
 
+/// Commit headroom the expert store must leave behind it. Measured, not guessed: with the store
+/// sized to `live headroom - 512 MiB` on Qwen3.8-Flash-Next-UD-Q4_K_XL, the load died 1.4 GiB
+/// further on — the KV corridor, the activation workspace and the server objects that land after
+/// this point needed more than half a GiB, and the breaker rightly ended the session at 374 MiB.
+pub(crate) const POST_STORE_COMMIT_SLACK: u64 = 2 << 30;
+
 fn moe_host_backing_for_device(
     profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
@@ -4786,7 +4792,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // An explicit operator budget stays verbatim.
                 let commit_available = infr_core::hostmem::commit_available_bytes();
                 let live_commit_ceiling =
-                    commit_available.map(|bytes| bytes.saturating_sub(512 << 20));
+                    commit_available.map(|bytes| bytes.saturating_sub(POST_STORE_COMMIT_SLACK));
                 let automatic_budget = matches!(
                     ram_request,
                     infr_core::hostmem::RamRequest::Auto
