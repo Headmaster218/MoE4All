@@ -3830,15 +3830,17 @@ fn moe_host_backing_for_device(
         // Prefill and Decode read only the ranges they need into their upload destination.
         return MoeHostBacking::Bounded { bytes: 0 };
     }
-    // WDDM charges device-local Vulkan allocations against Windows' system commit limit. Only an
-    // unresolved live Auto request may be clipped by that late snapshot. A startup-frozen budget
-    // already has exact total-process semantics and must not silently change after model loading.
+    // WDDM charges device-local Vulkan allocations against Windows' system commit limit, so the
+    // live commit snapshot is the ceiling BOTH automatic shapes must respect: an unresolved Auto
+    // request, and the startup-frozen one, which was frozen from available PHYSICAL RAM before any
+    // device byte was committed and can therefore name a store the machine cannot commit. Only an
+    // explicit operator budget (or the legacy knobs) stays exact, and the caller says so loudly.
     let budget = match ram_request {
-        infr_core::hostmem::RamRequest::Auto => {
+        infr_core::hostmem::RamRequest::Auto
+        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => {
             requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
         }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
-        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
         | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
     } as usize;
@@ -4401,6 +4403,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let auto_profile = ec.device.auto_profile;
             let planned_host_available = infr_core::hostmem::available_bytes();
             let planned_host_total = infr_core::hostmem::total_bytes();
+            // The operator has already promised this much host RAM to the paged KV tree. Frames are
+            // claimed lazily, but a Windows commit charge is a commit charge: sizing the expert
+            // store against the full live headroom and letting the tree arrive afterwards is how a
+            // session loads successfully and then exits 87 during the first long conversation.
+            let planned_paged_pool_bytes = infr_core::hostmem::paged_pool_bytes_for_spec(
+                ec.kv.paged_cache_max,
+                planned_host_total,
+            );
             let planned_process_resident = infr_core::hostmem::process_resident_bytes();
             let host_classes: Vec<(usize, usize)> = logical_pools
                 .iter()
@@ -4748,15 +4758,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_process_resident,
                     infr_core::hostmem::process_resident_bytes(),
                 );
-                // Leave a small commit tail for the pager metadata, initial KV segment and server
-                // objects created after this point. This ceiling is a fallback only for a live Auto
-                // request. Startup-frozen and explicit total-process budgets remain exact.
+                // What is left after the declared paged frame pool, minus a small commit tail for
+                // the pager metadata, initial KV segment and server objects created after this
+                // point. BOTH automatic shapes obey it: the startup-frozen budget was derived from
+                // available PHYSICAL RAM, while WDDM charges this process's device-local
+                // allocations against the same system commit limit, so a frozen figure can be a
+                // promise the machine cannot keep. An explicit operator budget stays verbatim.
                 let commit_available = infr_core::hostmem::commit_available_bytes();
-                let live_commit_ceiling =
-                    commit_available.map(|bytes| bytes.saturating_sub(512 << 20));
-                let automatic_commit_ceiling = live_automatic_budget
-                    .then_some(live_commit_ceiling)
-                    .flatten();
+                let live_commit_ceiling = commit_available.map(|bytes| {
+                    bytes
+                        .saturating_sub(512 << 20)
+                        .saturating_sub(planned_paged_pool_bytes)
+                });
+                let automatic_budget = matches!(
+                    ram_request,
+                    infr_core::hostmem::RamRequest::Auto
+                        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
+                );
+                let automatic_commit_ceiling =
+                    automatic_budget.then_some(live_commit_ceiling).flatten();
                 let host_backing = moe_host_backing_for_device(
                     auto_profile,
                     ram_request,
@@ -4782,28 +4802,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     }
                 }
                 if let (Some(available), Some(ceiling)) = (commit_available, live_commit_ceiling) {
-                    if live_automatic_budget {
+                    if automatic_budget {
                         tracing::info!(
                             available_commit_bytes = available,
+                            paged_pool_bytes = planned_paged_pool_bytes,
                             host_cache_commit_ceiling_bytes = ceiling,
+                            expert_payload_bytes = host_bytes,
                             selected_host_cache_bytes = host_resident_bytes,
-                            "MoE Windows automatic commit guard after fixed Vulkan allocations"
+                            "MoE Windows commit ceiling bounded the automatic host store after fixed Vulkan allocations"
                         );
                     } else if host_resident_bytes as u64 > ceiling {
-                        let policy = if matches!(
-                            ram_request,
-                            infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
-                        ) {
-                            "startup-frozen automatic"
-                        } else {
-                            "explicit"
-                        };
                         tracing::warn!(
-                            policy,
                             available_commit_bytes = available,
+                            paged_pool_bytes = planned_paged_pool_bytes,
                             host_cache_commit_ceiling_bytes = ceiling,
                             selected_host_cache_bytes = host_resident_bytes,
-                            "MoE RAM target exceeds the current Windows commit headroom; preserving the exact total-process target without silent reduction"
+                            "MoE RAM target exceeds the current Windows commit headroom; an explicit budget is honored verbatim, so the memory circuit breaker may end this process"
                         );
                     }
                 }
@@ -7029,25 +7043,36 @@ mod seam_helper_tests {
                     );
                 }
             }
-            for request in [
-                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
-                RamRequest::TotalProcessBudget((50 * GIB) as u64),
-            ] {
-                assert_eq!(
-                    super::moe_host_backing_for_device(
-                        profile,
-                        request,
-                        false,
-                        Some(GIB as u64),
-                        Some((64 * GIB) as u64),
-                        Some((2 * GIB) as u64),
-                        Some(GIB as u64),
-                        47 * GIB,
-                    ),
-                    super::MoeHostBacking::Full,
-                    "the UMA fix must not reduce a discrete GPU's frozen or explicit RAM target"
-                );
-            }
+            assert_eq!(
+                super::moe_host_backing_for_device(
+                    profile,
+                    RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                    false,
+                    Some(GIB as u64),
+                    Some((64 * GIB) as u64),
+                    Some((2 * GIB) as u64),
+                    Some(GIB as u64),
+                    47 * GIB,
+                ),
+                super::MoeHostBacking::Full,
+                "the UMA fix must not reduce a discrete GPU's explicit RAM target"
+            );
+            assert_eq!(
+                super::moe_host_backing_for_device(
+                    profile,
+                    RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                    false,
+                    Some(GIB as u64),
+                    Some((64 * GIB) as u64),
+                    Some((2 * GIB) as u64),
+                    Some(GIB as u64),
+                    47 * GIB,
+                ),
+                super::MoeHostBacking::Bounded { bytes: GIB },
+                "a discrete GPU's frozen automatic target obeys the live commit ceiling: on Windows \
+                 that number already carries WDDM's device-memory charge, so promising a 47 GiB \
+                 store against a 1 GiB ceiling is how a session exits 87 mid-load"
+            );
             for unified in [false, true] {
                 assert_eq!(
                     super::moe_host_backing_for_device(
@@ -7365,7 +7390,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn moe_host_backing_applies_post_vulkan_commit_ceiling_only_to_auto() {
+    fn moe_host_backing_applies_post_vulkan_commit_ceiling_to_every_automatic_shape() {
         use infr_core::hostmem::RamRequest;
 
         let payload = 48 * GIB;
@@ -7406,8 +7431,10 @@ mod seam_helper_tests {
                 Some(ceiling as u64),
                 payload,
             ),
-            super::MoeHostBacking::Full,
-            "a startup-frozen automatic budget must not be silently reduced after Vulkan loading"
+            super::MoeHostBacking::Bounded { bytes: ceiling },
+            "a startup-frozen budget is still an estimate made from available PHYSICAL RAM, while \
+             WDDM charges this process's device allocations to the commit limit: crossing it is how \
+             a 71.73 GiB store exits the box at 5 MiB of commit headroom"
         );
         assert_eq!(
             super::moe_host_backing(
@@ -7416,7 +7443,7 @@ mod seam_helper_tests {
                 Some((56 * GIB) as u64),
                 None,
                 Some(0),
-                Some(ceiling as u64),
+                Some((46 * GIB) as u64),
                 payload,
             ),
             super::MoeHostBacking::Bounded {

@@ -329,6 +329,36 @@ const AUTO_AVAILABLE_RESERVE: u64 = 3 << 30;
 /// current process working set is subtracted from `total - reserve` to obtain the new arena size.
 const AGGRESSIVE_TOTAL_RESERVE: u64 = 13 << 30;
 
+/// Commit-tail reserve kept out of the automatic envelope wherever a commit probe exists. The
+/// envelope is spent on things that are NOT yet committed at freeze time (device-local Vulkan
+/// allocations, which WDDM charges to the same limit, and the objects the server builds later),
+/// so the tail is deliberately small and the ceiling does most of the work.
+const AUTO_COMMIT_RESERVE: u64 = 2 << 30;
+
+/// The declared host-RAM frame pool of the paged KV tree (`kv.paged_cache_max`), in bytes.
+///
+/// It is committed host memory whether or not the tree has demoted a prefix yet, so an envelope
+/// that pays for the expert store AND separately promises this pool double-spends the machine.
+/// Percent resolves against total physical RAM, the same base the knob itself uses.
+pub fn paged_pool_bytes_for_spec(spec: Option<crate::SizeSpec>, total: Option<u64>) -> u64 {
+    match spec {
+        None => 0,
+        Some(crate::SizeSpec::Bytes(bytes))
+        | Some(crate::SizeSpec::FrozenAutomaticBytes(bytes)) => bytes,
+        Some(crate::SizeSpec::Percent(fraction)) => {
+            // A percentage the platform cannot resolve stays unresolved: sizing it as zero would
+            // silently hand the whole envelope to the expert store.
+            total
+                .map(|total| (total as f64 * fraction) as u64)
+                .unwrap_or(0)
+        }
+    }
+}
+
+pub(crate) fn declared_paged_pool_bytes(config: &crate::config::Config, total: Option<u64>) -> u64 {
+    paged_pool_bytes_for_spec(config.kv.paged_cache_max, total)
+}
+
 /// One startup-time automatic RAM decision after it has been frozen into
 /// `device.ram_budget`. From this point on it deliberately follows the explicit total-process
 /// budget path, including its process-resident subtraction and allocation behaviour.
@@ -338,6 +368,11 @@ pub struct FrozenAutomaticRamBudget {
     pub budget_bytes: u64,
     pub startup_available_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
+    /// System commit headroom at freeze time, where the platform reports one (Windows).
+    pub commit_available_bytes: Option<u64>,
+    /// The `kv.paged_cache_max` pool carved out of the envelope, so the expert store is never
+    /// promised memory the tree has already been told to keep.
+    pub paged_pool_bytes: u64,
 }
 
 /// Resolve an unset automatic RAM policy once, before model or backend construction.
@@ -350,13 +385,15 @@ pub fn freeze_automatic_ram_budget(
 ) -> Option<FrozenAutomaticRamBudget> {
     let available = available_bytes();
     let total = total_bytes();
-    freeze_automatic_ram_budget_for_snapshot(config, available, total)
+    let commit_available = commit_available_bytes();
+    freeze_automatic_ram_budget_for_snapshot(config, available, total, commit_available)
 }
 
 fn freeze_automatic_ram_budget_for_snapshot(
     config: &mut crate::config::Config,
     available: Option<u64>,
     total: Option<u64>,
+    commit_available: Option<u64>,
 ) -> Option<FrozenAutomaticRamBudget> {
     if config.device.ram_budget.is_some()
         || config.paging.dram.is_some()
@@ -365,11 +402,24 @@ fn freeze_automatic_ram_budget_for_snapshot(
         return None;
     }
     let profile = config.device.auto_profile;
-    let budget_bytes = match profile {
+    let physical_budget = match profile {
         crate::config::AutoProfile::Conservative => {
             available?.saturating_sub(AUTO_AVAILABLE_RESERVE)
         }
         crate::config::AutoProfile::Aggressive => total?.saturating_sub(AGGRESSIVE_TOTAL_RESERVE),
+    };
+    // Where the platform reports a commit ceiling (Windows), it is the tighter of the two axes and
+    // it also carries WDDM device allocations, so physical availability alone can authorize a store
+    // the machine cannot commit. Without that probe the established physical sizing stands
+    // unchanged, which keeps Linux byte-for-byte what it was.
+    let paged_pool_bytes = declared_paged_pool_bytes(config, total);
+    let budget_bytes = match commit_available {
+        Some(commit) => physical_budget.min(
+            commit
+                .saturating_sub(AUTO_COMMIT_RESERVE)
+                .saturating_sub(paged_pool_bytes),
+        ),
+        None => physical_budget,
     };
     config.device.ram_budget = Some(crate::SizeSpec::FrozenAutomaticBytes(budget_bytes));
     Some(FrozenAutomaticRamBudget {
@@ -377,6 +427,8 @@ fn freeze_automatic_ram_budget_for_snapshot(
         budget_bytes,
         startup_available_bytes: available,
         total_bytes: total,
+        commit_available_bytes: commit_available,
+        paged_pool_bytes,
     })
 }
 
@@ -871,6 +923,7 @@ mod tests {
             &mut conservative,
             Some(48 * GIB),
             Some(64 * GIB),
+            None,
         )
         .expect("conservative startup budget");
         assert_eq!(frozen.budget_bytes, 45 * GIB);
@@ -885,12 +938,92 @@ mod tests {
             &mut aggressive,
             Some(48 * GIB),
             Some(64 * GIB),
+            None,
         )
         .expect("aggressive startup budget");
         assert_eq!(frozen.budget_bytes, 51 * GIB);
         assert_eq!(
             aggressive.device.ram_budget,
             Some(crate::SizeSpec::FrozenAutomaticBytes(51 * GIB))
+        );
+    }
+
+    #[test]
+    fn automatic_ram_budget_obeys_the_commit_ceiling_and_carries_the_declared_frame_pool() {
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        // This box: 95.4 GiB physical, 83 GiB available, commit ceiling 104.6 GB with ~21 GB held
+        // by the desktop, and a 16 GiB paged RAM frame pool declared by the operator.
+        let available = 83 * GIB;
+        let total = 95 * GIB;
+        let commit = 84 * GIB;
+        let mut config = crate::config::Config::default();
+        config.kv.paged_cache_max = Some(crate::SizeSpec::Bytes(16 * GIB));
+        let frozen = freeze_automatic_ram_budget_for_snapshot(
+            &mut config,
+            Some(available),
+            Some(total),
+            Some(commit),
+        )
+        .expect("a commit probe is a complete enough snapshot");
+        assert_eq!(frozen.paged_pool_bytes, 16 * GIB);
+        assert_eq!(
+            frozen.budget_bytes,
+            commit - AUTO_COMMIT_RESERVE - 16 * GIB,
+            "the envelope must be what is left after the declared frame pool, not what physical RAM \
+             appears to offer"
+        );
+        assert!(
+            frozen.budget_bytes < available - AUTO_AVAILABLE_RESERVE,
+            "a frozen budget of {:.2} GiB must sit below the physical-only figure of {:.2} GiB",
+            gib(frozen.budget_bytes),
+            gib(available - AUTO_AVAILABLE_RESERVE)
+        );
+
+        // No commit probe (Linux and macOS): the established physical sizing is untouched, and a
+        // declared pool does not reduce it, so an unchanged platform cannot regress.
+        let mut quiet = crate::config::Config::default();
+        quiet.kv.paged_cache_max = Some(crate::SizeSpec::Bytes(16 * GIB));
+        let frozen = freeze_automatic_ram_budget_for_snapshot(
+            &mut quiet,
+            Some(available),
+            Some(total),
+            None,
+        )
+        .expect("physical snapshot");
+        assert_eq!(frozen.budget_bytes, available - AUTO_AVAILABLE_RESERVE);
+        assert_eq!(frozen.paged_pool_bytes, 16 * GIB);
+
+        // A percentage pool resolves against physical RAM, the same base the knob itself uses.
+        let mut percent = crate::config::Config::default();
+        percent.kv.paged = true;
+        percent.kv.paged_cache_max = Some(crate::SizeSpec::Percent(0.25));
+        let frozen = freeze_automatic_ram_budget_for_snapshot(
+            &mut percent,
+            Some(available),
+            Some(total),
+            Some(commit),
+        )
+        .expect("percent resolves");
+        assert_eq!(frozen.paged_pool_bytes, (total as f64 * 0.25) as u64);
+    }
+
+    #[test]
+    fn paged_pool_spec_resolves_to_a_declared_commit_charge() {
+        let gib = 1u64 << 30;
+        assert_eq!(paged_pool_bytes_for_spec(None, Some(64 * gib)), 0);
+        assert_eq!(
+            paged_pool_bytes_for_spec(Some(crate::SizeSpec::Bytes(16 * gib)), Some(64 * gib)),
+            16 * gib,
+            "the declared ceiling is the charge the host store must leave room for"
+        );
+        assert_eq!(
+            paged_pool_bytes_for_spec(Some(crate::SizeSpec::Percent(0.25)), Some(64 * gib)),
+            16 * gib
+        );
+        assert_eq!(
+            paged_pool_bytes_for_spec(Some(crate::SizeSpec::Percent(0.25)), None),
+            0,
+            "a percentage with no RAM total must not silently become the whole envelope"
         );
     }
 
@@ -1009,7 +1142,12 @@ mod tests {
         let mut explicit = crate::config::Config::default();
         explicit.device.ram_budget = Some(crate::SizeSpec::Bytes(32 * GIB));
         assert_eq!(
-            freeze_automatic_ram_budget_for_snapshot(&mut explicit, Some(48 * GIB), Some(64 * GIB)),
+            freeze_automatic_ram_budget_for_snapshot(
+                &mut explicit,
+                Some(48 * GIB),
+                Some(64 * GIB),
+                None
+            ),
             None
         );
         assert_eq!(
@@ -1020,14 +1158,24 @@ mod tests {
         let mut legacy = crate::config::Config::default();
         legacy.paging.dram = Some(crate::SizeSpec::Bytes(7 * GIB));
         assert_eq!(
-            freeze_automatic_ram_budget_for_snapshot(&mut legacy, Some(48 * GIB), Some(64 * GIB)),
+            freeze_automatic_ram_budget_for_snapshot(
+                &mut legacy,
+                Some(48 * GIB),
+                Some(64 * GIB),
+                None
+            ),
             None
         );
 
         let mut bypass = crate::config::Config::default();
         bypass.paging.dram_bypass = true;
         assert_eq!(
-            freeze_automatic_ram_budget_for_snapshot(&mut bypass, Some(48 * GIB), Some(64 * GIB)),
+            freeze_automatic_ram_budget_for_snapshot(
+                &mut bypass,
+                Some(48 * GIB),
+                Some(64 * GIB),
+                None
+            ),
             None
         );
     }

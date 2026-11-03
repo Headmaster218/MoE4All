@@ -1299,6 +1299,8 @@ fn run_engine_command(
             auto_profile = %frozen.profile,
             startup_available_host_bytes = ?frozen.startup_available_bytes,
             total_host_bytes = ?frozen.total_bytes,
+            available_commit_bytes = ?frozen.commit_available_bytes,
+            paged_pool_bytes = frozen.paged_pool_bytes,
             total_process_ram_budget_bytes = frozen.budget_bytes,
             "automatic RAM budget frozen at process startup; applying explicit total-process budget semantics"
         );
