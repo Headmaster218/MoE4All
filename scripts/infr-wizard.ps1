@@ -3151,7 +3151,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default ([bool]$kvPagedCacheMax)
             if ($kvPagedRamPool) {
                 if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
-                Write-Host '帧按实际下沉量惰性增长、开机不预占；但在 Windows 上这个上限会先从自动主机预算里扣掉——WDDM 把显存分配记进同一本 commit 账，同一份内存不许承诺两遍。/ Frames grow lazily with actual demotions and reserve nothing at boot, but on Windows this cap is taken out of the automatic host budget first: WDDM charges device memory to the same commit limit, and one byte cannot be promised twice.' -ForegroundColor DarkGray
+                Write-Host '帧按实际下沉量惰性增长、开机不预占；但在 Windows 上这份承诺会和专家 store 抢同一本 commit 账（WDDM 把显存分配也记在这里），所以自动预算只让 store 让出至多 4 GiB 给帧池，建树时再按当时的实时余量夹紧帧数，夹不住的冷前缀直接逐出。/ Frames grow lazily with actual demotions and reserve nothing at boot, but on Windows this cap is taken out of the automatic host budget first: WDDM charges device memory to the same commit limit, and one byte cannot be promised twice.' -ForegroundColor DarkGray
                 $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限 / Paged KV RAM frame-pool cap' -Default $kvPagedCacheMax -Required
             } else {
                 $kvPagedCacheMax = ''

@@ -269,6 +269,27 @@ fn should_handoff_multimodal_to_scheduler(
 /// The multimodal continuation compares in the tree's KEY space, so it has to see the same
 /// projection tag the slot publishes under — otherwise a stable setting would miss its own warm
 /// prefix at position 0.
+/// How many host-RAM frames the paged tree may actually claim.
+///
+/// `kv.paged_cache_max` is a promise about history the tree would LIKE to keep, but every frame it
+/// demotes is committed heap in the same process that has already charged the Windows commit limit
+/// with its device allocations and preloaded its expert store. Clamping here lets the store be as
+/// large as the machine can carry and lets the pool take what is genuinely left — past that a cold
+/// chain evicts instead of sinking, which is slower than a hit and infinitely better than the
+/// memory circuit breaker ending the session. Platforms with no commit probe (`None`) keep the
+/// declared size unchanged.
+fn clamp_ram_frames_to_commit_room(
+    declared: usize,
+    frame_bytes: u64,
+    commit_available: Option<u64>,
+) -> usize {
+    let Some(live) = commit_available else {
+        return declared;
+    };
+    let room = live.saturating_sub(crate::seam::HOST_FRAME_COMMIT_FLOOR);
+    ((room / frame_bytes.max(1)) as usize).min(declared)
+}
+
 fn tagged_key(kv: &SeamKv, key_view: &[u32], req: &RequestCtx) -> Vec<u32> {
     kv.paged_request_key(key_view, req.sampling().uncensor)
         .unwrap_or_else(|| key_view.to_vec())
@@ -1826,7 +1847,25 @@ impl ParallelSeam {
             // big budget costs nothing until prefixes actually demote. Zero budget keeps the tier off
             // and the tree behaves exactly like Phase B (cold entries evict instead of sink) — which
             // is the whole point of `kv.paged`, the switch that asks for a tree without a pool.
-            let ram_frames = (paged_budget / frame_bytes) as usize;
+            let ram_frames = {
+                let declared = (paged_budget / frame_bytes) as usize;
+                let live = infr_core::hostmem::commit_available_bytes();
+                let allowed = clamp_ram_frames_to_commit_room(declared, frame_bytes, live);
+                if allowed < declared {
+                    tracing::warn!(
+                        declared_frames = declared,
+                        allowed_frames = allowed,
+                        frame_bytes,
+                        declared_pool_bytes = paged_budget,
+                        allowed_pool_bytes = allowed as u64 * frame_bytes,
+                        commit_available_bytes = ?live,
+                        "paged KV RAM tier clamped to what this machine can still commit after the \
+                         expert store; cold prefixes past that evict instead of sinking (Windows \
+                         charges this process's device allocations to the same commit limit)"
+                    );
+                }
+                allowed
+            };
             // Phase D: `kv.disk_cache_max` sizes the sparse-file tier behind RAM. Resolution
             // mirrors the RAM budget's grammar (percent = of physical RAM, an odd denominator
             // for disk but consistent); zero/unset keeps the two-tier cascade byte-for-byte off.
@@ -6852,16 +6891,49 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        concurrent_mtp_profitable, concurrent_mtp_ready, deliver_lookup_prefix,
-        expand_multimodal_prompt, long_prefill_cohort_limit, long_prefill_phase_prompt_end,
-        lookup_fallback_reason, lookup_greedy_eligible, lookup_scheduler_supported,
-        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
-        phase_for_remaining_prefill, pick_continuation, repair_lookup_predictions, scheduler_mode,
-        scheduler_requested, should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback,
-        token_lane_sort_key, BatchPhase, LookupBatchState, LookupTokenDelivery,
-        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        clamp_ram_frames_to_commit_room, concurrent_mtp_profitable, concurrent_mtp_ready,
+        deliver_lookup_prefix, expand_multimodal_prompt, long_prefill_cohort_limit,
+        long_prefill_phase_prompt_end, lookup_fallback_reason, lookup_greedy_eligible,
+        lookup_scheduler_supported, mtp_accepted_rows, mtp_context_profitable, multimodal_key,
+        multimodal_token_position, phase_for_remaining_prefill, pick_continuation,
+        repair_lookup_predictions, scheduler_mode, scheduler_requested,
+        should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback, token_lane_sort_key,
+        BatchPhase, LookupBatchState, LookupTokenDelivery, MultimodalEmbedding, SchedulerMode,
+        SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn ram_frame_pool_clamps_to_live_commit_room_and_ignores_platforms_without_it() {
+        let gib = 1u64 << 30;
+        let frame = 4 * 1024 * 1024; // 4 MiB per frame at the shipped 64-token page
+        let declared = ((16 * gib) / frame) as usize; // 4096 frames, the operator's promise
+        assert_eq!(
+            clamp_ram_frames_to_commit_room(declared, frame, None),
+            declared,
+            "no commit probe (Linux/macOS) must not change the declared pool"
+        );
+        // Plenty of headroom: the declaration stands.
+        assert_eq!(
+            clamp_ram_frames_to_commit_room(declared, frame, Some(40 * gib)),
+            declared
+        );
+        // The measured box: expert store and device allocations already spent the headroom, so
+        // 1 GiB of floor above what is left is what the tree may commit.
+        let live = 5 * gib;
+        let allowed = clamp_ram_frames_to_commit_room(declared, frame, Some(live));
+        assert_eq!(
+            allowed * frame as usize,
+            (live - crate::seam::HOST_FRAME_COMMIT_FLOOR) as usize,
+            "the pool takes the room between the floor and the live headroom, no more"
+        );
+        assert!(allowed < declared);
+        // No headroom at all is zero frames — evict, never trip.
+        assert_eq!(
+            clamp_ram_frames_to_commit_room(declared, frame, Some(gib)),
+            0
+        );
+    }
 
     #[test]
     fn lookup_delivery_exhausts_widths_caps_and_disconnect_prefixes() {
