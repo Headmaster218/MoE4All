@@ -33,20 +33,23 @@
 //! module is for: allocation BEYOND the plan — a staging floodgate opening at GiB/s — and hard
 //! commit exhaustion.
 
+//! **The commit axis ships OFF (`device.mem_guard_headroom`, default `None`).** The axis is
+//! incompatible with a system-managed page file, which is the Windows default: the limit is not a
+//! constant but a number the OS moves while the process loads, measured on one machine with one
+//! binary and identical flags — the same 71.73 GiB MoE store saw a commit limit of 104.6 GB at
+//! 13:00 (trip, exit 87 at 5 MiB left) and 116.8 GB at 13:35 (served the whole session at 0.1 GB
+//! left). Sizing and stopping against a moving ceiling costs throughput and still does not catch
+//! the flood. Operators who want the line — dedicated page file at its cap, or a box shared with
+//! other people's jobs — set it explicitly, and the host-store planner then obeys the same number
+//! it stops on (see `seam::moe_host_backing_for_device`). The physical-RAM axis below is unaffected
+//! by page-file policy and stays armed by default.
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Exit code of a breaker trip — distinct from signal deaths (130/143) and panics (101), so test
 /// scripts can tell "the guard saved the box" from any other failure.
 pub const EXIT_CODE: i32 = 87;
-
-/// Water line when the knob is unset: guards hard commit exhaustion only. Miss-storm testing wants
-/// a much taller line (e.g. `50%` on a big-RAM box) so the trip lands before RAM itself runs out.
-///
-/// The line is a margin OVER the engine's own authorized host budget (see
-/// [`set_authorized_commit_bytes`]), not an absolute claim about the machine: a model that legitimately
-/// needs 47 GiB of commit on a 102 GiB-commit box used to be unable to start at all.
-pub const DEFAULT_HEADROOM_BYTES: u64 = 8u64 << 30;
 
 /// The absolute floor the commit axis never relaxes below, however large the authorized plan is:
 /// at this level of remaining commit the next allocation is the one that wedges the driver.

@@ -3779,13 +3779,16 @@ fn host_budget_resident_after_fixed(
 /// The pool's own byte cost is not known until prefixes actually demote, and on a box where the
 /// model's host store and the declared pool together exceed what the machine can commit, reserving
 /// the whole declaration up front spends real RAM on expert slots that could have been resident.
-/// The pool is clamped for real at session init instead — see [`HOST_FRAME_COMMIT_FLOOR`] and
+/// The pool is clamped for real at session init instead — see [`HOST_FRAME_RAM_FLOOR`] and
 /// `parallel.rs`'s `clamp_ram_frames_to_commit_room`.
 pub(crate) const HOST_FRAME_POOL_RESERVE: u64 = 4 << 30;
 
-/// Commit headroom the RAM frame pool may never spend: the pager objects, the KV segments created
-/// after the plan, and whatever else on the box grows while a session serves for hours.
-pub(crate) const HOST_FRAME_COMMIT_FLOOR: u64 = 1 << 30;
+/// Physical RAM the RAM frame pool may never spend: the pager objects, the KV segments created
+/// after the plan, and whatever else on the box grows while a session serves for hours. Measured on
+/// the host's AVAILABLE RAM rather than on Windows' commit headroom on purpose — the commit limit
+/// moves under a system-managed page file, and a pool clamped against a moving number silently
+/// loses its RAM tier at the worst possible moment (session init, after the store took everything).
+pub(crate) const HOST_FRAME_RAM_FLOOR: u64 = 1 << 30;
 
 /// Commit headroom the expert store must leave behind it. Measured, not guessed: with the store
 /// sized to `live headroom - 512 MiB` on Qwen3.8-Flash-Next-UD-Q4_K_XL, the load died 1.4 GiB
@@ -4428,6 +4431,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let auto_profile = ec.device.auto_profile;
             let planned_host_available = infr_core::hostmem::available_bytes();
             let planned_host_total = infr_core::hostmem::total_bytes();
+            // Was the breaker's commit axis armed? Then — and only then — the store obeys the same
+            // line the process would be ended on. `Bytes(0)` means "axis disabled" per the config's
+            // own grammar.
+            let planned_commit_guard = ec.device.mem_guard_headroom.and_then(|spec| {
+                let bytes = spec.resolve(planned_host_total.unwrap_or(0));
+                (bytes > 0).then_some(bytes)
+            });
             // The operator has already promised this much host RAM to the paged KV tree. Frames are
             // claimed lazily, but a Windows commit charge is a commit charge: sizing the expert
             // store against the full live headroom and letting the tree arrive afterwards is how a
@@ -4783,23 +4793,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_process_resident,
                     infr_core::hostmem::process_resident_bytes(),
                 );
-                // What is left after a small commit tail for the pager metadata, initial KV segment
-                // and server objects created after this point; the declared frame pool is taken out
-                // of the store inside `moe_host_backing_for_device`, not twice here. BOTH automatic
-                // shapes obey this: the startup-frozen budget was derived from available PHYSICAL
-                // RAM, while WDDM charges this process's device-local allocations against the same
-                // system commit limit, so a frozen figure can be a promise the machine cannot keep.
-                // An explicit operator budget stays verbatim.
+                // The commit ceiling is obeyed ONLY when the operator has armed the breaker's commit
+                // axis (`device.mem_guard_headroom`, off by default). Reason, measured on this box:
+                // a system-managed page file moves the commit limit between launches of the same
+                // binary — the same 71.73 GiB store saw a 104.6 GB limit, then a 116.8 GB one — so
+                // sizing against it both loses ~35% of throughput to a number that is about to grow
+                // and does not catch the flood it was meant to prevent. An armed axis is a request
+                // to obey the same line the process will exit on, so then the store leaves slack.
                 let commit_available = infr_core::hostmem::commit_available_bytes();
                 let live_commit_ceiling =
                     commit_available.map(|bytes| bytes.saturating_sub(POST_STORE_COMMIT_SLACK));
-                let automatic_budget = matches!(
-                    ram_request,
-                    infr_core::hostmem::RamRequest::Auto
-                        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
-                );
-                let automatic_commit_ceiling =
-                    automatic_budget.then_some(live_commit_ceiling).flatten();
+                let automatic_commit_ceiling = planned_commit_guard.and(live_commit_ceiling);
                 let host_backing = moe_host_backing_for_device(
                     auto_profile,
                     ram_request,
@@ -4825,25 +4829,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         ));
                     }
                 }
-                if let (Some(available), Some(ceiling)) = (commit_available, live_commit_ceiling) {
-                    if automatic_budget {
-                        tracing::info!(
-                            available_commit_bytes = available,
-                            paged_pool_bytes = planned_paged_pool_bytes,
-                            store_pool_reserve_bytes =
-                                planned_paged_pool_bytes.min(HOST_FRAME_POOL_RESERVE),
-                            host_cache_commit_ceiling_bytes = ceiling,
-                            expert_payload_bytes = host_bytes,
-                            selected_host_cache_bytes = host_resident_bytes,
-                            "MoE Windows commit ceiling bounded the automatic host store after fixed Vulkan allocations"
-                        );
-                    } else if host_resident_bytes as u64 > ceiling {
+                if let Some(available) = commit_available {
+                    tracing::info!(
+                        available_commit_bytes = available,
+                        commit_guard_armed = planned_commit_guard.is_some(),
+                        store_pool_reserve_bytes =
+                            planned_paged_pool_bytes.min(HOST_FRAME_POOL_RESERVE),
+                        expert_payload_bytes = host_bytes,
+                        selected_host_cache_bytes = host_resident_bytes,
+                        "MoE host store sized from physical RAM; Windows commit headroom reported for the record"
+                    );
+                    if planned_commit_guard.is_none() && host_resident_bytes as u64 > available {
                         tracing::warn!(
                             available_commit_bytes = available,
-                            paged_pool_bytes = planned_paged_pool_bytes,
-                            host_cache_commit_ceiling_bytes = ceiling,
                             selected_host_cache_bytes = host_resident_bytes,
-                            "MoE RAM target exceeds the current Windows commit headroom; an explicit budget is honored verbatim, so the memory circuit breaker may end this process"
+                            "the host store exceeds the commit headroom Windows reports right now, \
+                             and the breaker's commit axis is off: a system-managed page file \
+                             normally absorbs this, and when it cannot the allocation fails inside \
+                             the driver instead of as a clean exit 87. Set \
+                             device.mem_guard_headroom to size and stop against this line instead."
                         );
                     }
                 }

@@ -1308,7 +1308,11 @@ fn run_engine_command(
     let cfg = Arc::new(cfg);
     // The memory circuit breaker (2026-10-19/20 memory-bomb conviction): exit at the water line
     // instead of letting a miss storm page the box or AV the driver. Percentages resolve against
-    // total physical RAM, like the host-budget knobs; `None` arms that axis at its hard default.
+    // total physical RAM, like the host-budget knobs. The COMMIT axis is off unless the operator
+    // asks for it: a system-managed page file moves that limit mid-session, so a line drawn against
+    // it ends healthy launches (measured: the same store, 104.6 GB limit then 116.8 GB, same
+    // binary). The physical-RAM axis keeps its default because physical availability is not
+    // re-sized underneath the process.
     let resolve_headroom = |spec: Option<infr_core::SizeSpec>, fallback: u64| -> u64 {
         match spec {
             Some(infr_core::SizeSpec::Bytes(bytes))
@@ -1318,10 +1322,7 @@ fn run_engine_command(
             None => fallback,
         }
     };
-    let guard_headroom = resolve_headroom(
-        cfg.device.mem_guard_headroom,
-        infr_core::memguard::DEFAULT_HEADROOM_BYTES,
-    );
+    let guard_headroom = resolve_headroom(cfg.device.mem_guard_headroom, 0);
     // The physical-RAM axis is the sensitive one on big-budget boxes (a healthy boot keeps
     // ~46 GiB of COMMIT headroom here, only ~3.5 GiB above where the bomb died); its default
     // (4 GiB) guards imminent death, testing raises it to 8-16 GiB.

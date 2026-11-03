@@ -104,24 +104,28 @@ cfg_struct! {
         /// weight cache. Unset keeps automatic sizing with system headroom; zero disables the
         /// host cache. Percentages resolve against total physical host RAM.
         ram_budget: Option<SizeSpec> = None,
-        /// `INFR_MEM_GUARD_HEADROOM`: commit-charge circuit-breaker water line. The process exits
-        /// with code 87 when the system's remaining commit headroom (Windows
-        /// `ullAvailPageFile`, which WDDM device memory also charges) drops below the line MINUS the
-        /// host budget the planner already authorized ([`crate::memguard::set_authorized_commit_bytes`]),
-        /// floored at [`crate::memguard::HARD_FLOOR_BYTES`] — so a 47 GiB MoE store that legitimately
-        /// fills the commit space starts, while allocation past the plan (the 2026-10-19 gray-zone
-        /// miss storm, ~145 GiB of host staging) still stops. The default guards hard commit
-        /// exhaustion only; miss-storm TESTING wants a much taller line (e.g. `50%` of RAM) so the
-        /// trip lands before RAM itself runs out. Zero disables.
-        mem_guard_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(
-            crate::memguard::DEFAULT_HEADROOM_BYTES,
-        )),
+        /// `INFR_MEM_GUARD_HEADROOM`: commit-charge circuit-breaker water line. When set, the
+        /// process exits with code 87 if the system's remaining commit headroom (Windows
+        /// `ullAvailPageFile`, which WDDM device memory also charges) drops below the line MINUS
+        /// the host budget the planner already authorized
+        /// ([`crate::memguard::set_authorized_commit_bytes`]), floored at
+        /// [`crate::memguard::HARD_FLOOR_BYTES`].
+        ///
+        /// **Default OFF, because the axis does not exist as a stable quantity on a machine with a
+        /// system-managed page file.** Windows moves the commit limit while the process is loading:
+        /// the same 71.73 GiB MoE store measured 104.6 GB of commit limit at 13:00 (and the breaker
+        /// ended the session at 5 MiB), then 116.8 GB at 13:35 for the same binary and flags. A
+        /// water line drawn against a moving ceiling ends healthy launches and does not catch the
+        /// real flood, so the guard here is opt-in: set a size (e.g. `1GiB`) to arm it, or use the
+        /// physical-RAM axis below, which is unaffected by page-file policy. Miss-storm TESTING wants
+        /// a tall line here so the trip lands before RAM itself runs out.
+        mem_guard_headroom: Option<SizeSpec> = None,
         /// `INFR_MEM_GUARD_RAM_HEADROOM`: the breaker's PHYSICAL-RAM water line — the sensitive
         /// axis on big-budget boxes, where a healthy boot legitimately keeps only ~46 GiB of
         /// commit headroom while the active working set (not commit) is what overruns RAM into a
-        /// paging storm. Trips when available physical RAM drops below this. The default guards
-        /// imminent death only; miss-storm TESTING wants a taller line (e.g. 8-16 GiB) that lands
-        /// before the storm starts. Zero disables this axis.
+        /// paging storm. Trips when available physical RAM drops below this. This axis stays armed
+        /// by default because physical availability is not re-sized under the process the way the
+        /// commit limit is. Zero disables this axis.
         mem_guard_ram_headroom: Option<SizeSpec> = Some(SizeSpec::Bytes(4u64 << 30)),
         /// `INFR_MEM_GUARD_POLL_MS`: breaker poll interval; inline checks at the staging floodgates
         /// cover the ramps between polls.
