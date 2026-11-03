@@ -329,11 +329,22 @@ const AUTO_AVAILABLE_RESERVE: u64 = 3 << 30;
 /// current process working set is subtracted from `total - reserve` to obtain the new arena size.
 const AGGRESSIVE_TOTAL_RESERVE: u64 = 13 << 30;
 
-/// Commit-tail reserve kept out of the automatic envelope wherever a commit probe exists. The
-/// envelope is spent on things that are NOT yet committed at freeze time (device-local Vulkan
-/// allocations, which WDDM charges to the same limit, and the objects the server builds later),
-/// so the tail is deliberately small and the ceiling does most of the work.
-const AUTO_COMMIT_RESERVE: u64 = 2 << 30;
+/// How much startup commit headroom each automatic profile keeps OFF the table. This is not a
+/// rounding margin: it is what the process has NOT committed yet at freeze time and will, namely
+/// its own device-local Vulkan allocations (WDDM charges those to the same limit), the pager
+/// objects and KV segments created after the plan, and whatever else on the box grows while a
+/// session serves for hours. Conservative keeps 20 GiB, aggressive 10 GiB.
+const AUTO_COMMIT_MARGIN_CONSERVATIVE: u64 = 20 << 30;
+const AUTO_COMMIT_MARGIN_AGGRESSIVE: u64 = 10 << 30;
+
+/// The automatic profile's commit margin — the byte figure the host budget may never exceed,
+/// however much RAM the machine appears to have free.
+pub fn commit_margin_bytes(profile: crate::config::AutoProfile) -> u64 {
+    match profile {
+        crate::config::AutoProfile::Conservative => AUTO_COMMIT_MARGIN_CONSERVATIVE,
+        crate::config::AutoProfile::Aggressive => AUTO_COMMIT_MARGIN_AGGRESSIVE,
+    }
+}
 
 /// The declared host-RAM frame pool of the paged KV tree (`kv.paged_cache_max`), in bytes.
 ///
@@ -408,17 +419,14 @@ fn freeze_automatic_ram_budget_for_snapshot(
         }
         crate::config::AutoProfile::Aggressive => total?.saturating_sub(AGGRESSIVE_TOTAL_RESERVE),
     };
-    // Where the platform reports a commit ceiling (Windows), it is the tighter of the two axes and
-    // it also carries WDDM device allocations, so physical availability alone can authorize a store
-    // the machine cannot commit. Without that probe the established physical sizing stands
-    // unchanged, which keeps Linux byte-for-byte what it was.
+    // Where the platform reports a commit ceiling (Windows) it is the tighter of the two axes,
+    // because WDDM charges this process's device-local allocations to it as well. The envelope is
+    // therefore the whole host promise — expert store PLUS the declared paged frame pool, which
+    // the store leaves room for when it is sized — minus the profile's commit margin. Without the
+    // probe the established physical sizing stands unchanged, which keeps Linux byte-for-byte.
     let paged_pool_bytes = declared_paged_pool_bytes(config, total);
     let budget_bytes = match commit_available {
-        Some(commit) => physical_budget.min(
-            commit
-                .saturating_sub(AUTO_COMMIT_RESERVE)
-                .saturating_sub(paged_pool_bytes),
-        ),
+        Some(commit) => physical_budget.min(commit.saturating_sub(commit_margin_bytes(profile))),
         None => physical_budget,
     };
     config.device.ram_budget = Some(crate::SizeSpec::FrozenAutomaticBytes(budget_bytes));
@@ -968,15 +976,33 @@ mod tests {
         assert_eq!(frozen.paged_pool_bytes, 16 * GIB);
         assert_eq!(
             frozen.budget_bytes,
-            commit - AUTO_COMMIT_RESERVE - 16 * GIB,
-            "the envelope must be what is left after the declared frame pool, not what physical RAM \
-             appears to offer"
+            commit - commit_margin_bytes(crate::config::AutoProfile::Conservative),
+            "the envelope is the whole host promise — store plus the declared pool — kept under \
+             the profile's commit margin"
         );
         assert!(
             frozen.budget_bytes < available - AUTO_AVAILABLE_RESERVE,
             "a frozen budget of {:.2} GiB must sit below the physical-only figure of {:.2} GiB",
             gib(frozen.budget_bytes),
             gib(available - AUTO_AVAILABLE_RESERVE)
+        );
+
+        // The aggressive profile spends more of the same headroom and keeps a smaller margin.
+        let mut keen = crate::config::Config::default();
+        keen.device.auto_profile = crate::config::AutoProfile::Aggressive;
+        keen.kv.paged_cache_max = Some(crate::SizeSpec::Bytes(16 * GIB));
+        let frozen = freeze_automatic_ram_budget_for_snapshot(
+            &mut keen,
+            Some(available),
+            Some(total),
+            Some(commit),
+        )
+        .expect("aggressive commit snapshot");
+        assert_eq!(
+            frozen.budget_bytes,
+            (total - AGGRESSIVE_TOTAL_RESERVE)
+                .min(commit - commit_margin_bytes(crate::config::AutoProfile::Aggressive)),
+            "aggressive keeps 10 GiB off the table where conservative keeps 20"
         );
 
         // No commit probe (Linux and macOS): the established physical sizing is untouched, and a

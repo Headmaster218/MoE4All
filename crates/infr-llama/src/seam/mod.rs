@@ -3781,6 +3781,7 @@ fn moe_host_backing_for_device(
     total: Option<u64>,
     process_resident: Option<u64>,
     commit_ceiling: Option<u64>,
+    host_frame_pool_bytes: u64,
     payload_bytes: usize,
 ) -> MoeHostBacking {
     // Automatic Windows sizing may supply a post-Vulkan snapshot so WDDM's commit charge is
@@ -3833,13 +3834,16 @@ fn moe_host_backing_for_device(
     // WDDM charges device-local Vulkan allocations against Windows' system commit limit, so the
     // live commit snapshot is the ceiling BOTH automatic shapes must respect: an unresolved Auto
     // request, and the startup-frozen one, which was frozen from available PHYSICAL RAM before any
-    // device byte was committed and can therefore name a store the machine cannot commit. Only an
-    // explicit operator budget (or the legacy knobs) stays exact, and the caller says so loudly.
+    // device byte was committed and can therefore name a store the machine cannot commit. The same
+    // envelope also carries the declared paged frame pool, so the store leaves that room rather
+    // than promising the machine the same bytes twice. Only an explicit operator budget (or the
+    // legacy knobs) stays exact, and the caller says so loudly.
     let budget = match ram_request {
         infr_core::hostmem::RamRequest::Auto
-        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => {
-            requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
-        }
+        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => requested_budget
+            .min(commit_ceiling.unwrap_or(u64::MAX))
+            .saturating_sub(host_frame_pool_bytes)
+            .min(payload_bytes as u64),
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
         | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
@@ -3869,6 +3873,7 @@ fn moe_host_backing(
         total,
         process_resident,
         commit_ceiling,
+        0,
         payload_bytes,
     )
 }
@@ -4758,18 +4763,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_process_resident,
                     infr_core::hostmem::process_resident_bytes(),
                 );
-                // What is left after the declared paged frame pool, minus a small commit tail for
-                // the pager metadata, initial KV segment and server objects created after this
-                // point. BOTH automatic shapes obey it: the startup-frozen budget was derived from
-                // available PHYSICAL RAM, while WDDM charges this process's device-local
-                // allocations against the same system commit limit, so a frozen figure can be a
-                // promise the machine cannot keep. An explicit operator budget stays verbatim.
+                // What is left after a small commit tail for the pager metadata, initial KV segment
+                // and server objects created after this point; the declared frame pool is taken out
+                // of the store inside `moe_host_backing_for_device`, not twice here. BOTH automatic
+                // shapes obey this: the startup-frozen budget was derived from available PHYSICAL
+                // RAM, while WDDM charges this process's device-local allocations against the same
+                // system commit limit, so a frozen figure can be a promise the machine cannot keep.
+                // An explicit operator budget stays verbatim.
                 let commit_available = infr_core::hostmem::commit_available_bytes();
-                let live_commit_ceiling = commit_available.map(|bytes| {
-                    bytes
-                        .saturating_sub(512 << 20)
-                        .saturating_sub(planned_paged_pool_bytes)
-                });
+                let live_commit_ceiling =
+                    commit_available.map(|bytes| bytes.saturating_sub(512 << 20));
                 let automatic_budget = matches!(
                     ram_request,
                     infr_core::hostmem::RamRequest::Auto
@@ -4785,6 +4788,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_host_total,
                     process_resident,
                     automatic_commit_ceiling,
+                    planned_paged_pool_bytes,
                     host_bytes,
                 );
                 let (host_kind, host_resident_bytes) = match host_backing {
@@ -6975,6 +6979,7 @@ mod seam_helper_tests {
                     Some((64 * GIB) as u64),
                     Some((2 * GIB) as u64),
                     None,
+                    0,
                     payload,
                 ),
                 super::MoeHostBacking::Bounded { bytes: 0 },
@@ -6990,6 +6995,7 @@ mod seam_helper_tests {
                 Some((64 * GIB) as u64),
                 Some((8 * GIB) as u64),
                 None,
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7004,6 +7010,7 @@ mod seam_helper_tests {
                 Some((64 * GIB) as u64),
                 Some((2 * GIB) as u64),
                 None,
+                0,
                 payload,
             ),
             super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7036,6 +7043,7 @@ mod seam_helper_tests {
                             Some((64 * GIB) as u64),
                             Some((2 * GIB) as u64),
                             Some(GIB as u64),
+                            0,
                             47 * GIB,
                         ),
                         super::MoeHostBacking::Bounded { bytes: 0 },
@@ -7052,6 +7060,7 @@ mod seam_helper_tests {
                     Some((64 * GIB) as u64),
                     Some((2 * GIB) as u64),
                     Some(GIB as u64),
+                    0,
                     47 * GIB,
                 ),
                 super::MoeHostBacking::Full,
@@ -7066,6 +7075,7 @@ mod seam_helper_tests {
                     Some((64 * GIB) as u64),
                     Some((2 * GIB) as u64),
                     Some(GIB as u64),
+                    0,
                     47 * GIB,
                 ),
                 super::MoeHostBacking::Bounded { bytes: GIB },
@@ -7083,6 +7093,7 @@ mod seam_helper_tests {
                         None,
                         None,
                         None,
+                        0,
                         47 * GIB,
                     ),
                     super::MoeHostBacking::Bounded { bytes: 4 * GIB },
@@ -7435,6 +7446,40 @@ mod seam_helper_tests {
             "a startup-frozen budget is still an estimate made from available PHYSICAL RAM, while \
              WDDM charges this process's device allocations to the commit limit: crossing it is how \
              a 71.73 GiB store exits the box at 5 MiB of commit headroom"
+        );
+        assert_eq!(
+            super::moe_host_backing_for_device(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                false,
+                Some((56 * GIB) as u64),
+                None,
+                Some(0),
+                None,
+                (16 * GIB) as u64,
+                payload,
+            ),
+            super::MoeHostBacking::Bounded {
+                bytes: 32 * GIB
+            },
+            "the declared frame pool is carved out of the automatic envelope: 48 GiB of store plus \
+             16 GiB of frames is the whole promise, and the store may not also spend it"
+        );
+        assert_eq!(
+            super::moe_host_backing_for_device(
+                infr_core::config::AutoProfile::Aggressive,
+                RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                false,
+                Some((56 * GIB) as u64),
+                None,
+                Some(0),
+                None,
+                (16 * GIB) as u64,
+                payload,
+            ),
+            super::MoeHostBacking::Full,
+            "an explicit budget keeps its own semantics: the operator's envelope is theirs to \
+             oversubscribe, and the breaker is the backstop"
         );
         assert_eq!(
             super::moe_host_backing(
