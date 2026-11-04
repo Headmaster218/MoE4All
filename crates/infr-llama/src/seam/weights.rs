@@ -520,6 +520,11 @@ pub(crate) struct SeamKv {
     pub(super) kv_ring: bool,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
+    /// `cached` still matches what EVERY LAYER has written, even though this turn ended in error:
+    /// the prefill sweep stopped BETWEEN two chunks. The error paths in [`crate::seam`] keep the
+    /// ledger when this is set and empty it otherwise, because a slot cut off in the middle of a
+    /// chunk carries recurrent/PLE state past the spine — resuming at the spine would then be wrong.
+    pub(super) ledger_matches_kv: bool,
     /// This conversation's image spans in the shared paged-KV tree's key space; empty for a text
     /// conversation. `cached` stays the REAL ids the model runs on — the tree is addressed through
     /// these blocks instead, which is what lets an image-bearing chain be reused without ever being
@@ -1681,6 +1686,7 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        self.ledger_matches_kv = false;
         self.image_cache_spans.clear();
         self.invalidate_turn_checkpoint();
         self.invalidate_delta_checkpoint();
@@ -1773,6 +1779,7 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        self.ledger_matches_kv = false;
         self.image_cache_spans.clear();
         self.invalidate_turn_checkpoint();
         self.invalidate_delta_checkpoint();
@@ -2457,6 +2464,7 @@ impl SeamKv {
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
+            ledger_matches_kv: false,
             // A forked slot materializes nothing yet, so it has no image identity to key by — and
             // `seed_from` below carries the source's spans whenever it copies real rows.
             image_cache_spans: Vec::new(),
@@ -3042,6 +3050,7 @@ mod tests {
             max_ctx: 16,
             kv_ring: false,
             cached: vec![10, 20, 30, 40],
+            ledger_matches_kv: false,
             image_cache_spans: Vec::new(),
             uncensor: None,
             denoise_cache: None,

@@ -312,6 +312,7 @@ impl SeamKv {
         // of trusting the stale committed-depth counter and reading a released address.
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
+        self.ledger_matches_kv = false;
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
@@ -501,6 +502,7 @@ impl SeamKv {
             .map_err(|error| anyhow!("sync before paged KV detach: {error}"))?;
         self.segmented_kv.committed_tokens = 0;
         self.cached.clear();
+        self.ledger_matches_kv = false;
         self.image_cache_spans.clear();
         self.paged_frontier = None;
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {

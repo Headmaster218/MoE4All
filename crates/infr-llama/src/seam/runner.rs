@@ -1890,6 +1890,7 @@ fn finish_pending_seam_slot(
         max_ctx: want_ctx,
         kv_ring,
         cached: Vec::new(),
+        ledger_matches_kv: false,
         image_cache_spans: Vec::new(),
         denoise_cache: None,
         self_cond_w: None,
@@ -4000,6 +4001,7 @@ fn generate_dense_backend_inner(
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
+            ledger_matches_kv: false,
             image_cache_spans: Vec::new(),
             denoise_cache: None,
             self_cond_w: None,
@@ -4160,6 +4162,7 @@ fn generate_dense_backend_inner(
         mtp_verify_bufs,
         max_ctx,
         cached,
+        ledger_matches_kv,
         // Read only through `set_image_cache_spans` / `paged_cache_view`, both of which own the
         // conversation-level lifecycle; the generation loop materializes REAL token ids.
         image_cache_spans: _,
@@ -9376,13 +9379,14 @@ fn generate_dense_backend_inner(
         }
 
         let elapsed = t0.elapsed().as_secs_f64();
-        if cursors[0] == targets[0] {
-            *cached = parallel.prompts[0][..targets[0]].to_vec();
-        }
+        // A cursor advances only after its chunk's KV rows are written, so the depth each lane
+        // reached is a truthful spine whether or not the sweep finished. Recording it on an abort (a
+        // client cancel, a deadline) is what lets the next checkout publish that prefix to the radix
+        // tree; gating it on completion threw minutes of prefill away and made the retry start from
+        // token 0.
+        *cached = parallel.prompts[0][..cursors[0]].to_vec();
         for lane in 1..lanes {
-            if cursors[lane] == targets[lane] {
-                parallel.peers[lane - 1].cached = parallel.prompts[lane][..targets[lane]].to_vec();
-            }
+            parallel.peers[lane - 1].cached = parallel.prompts[lane][..cursors[lane]].to_vec();
         }
         let stats = (0..lanes)
             .map(|lane| GenStats {
@@ -12419,10 +12423,28 @@ fn generate_dense_backend_inner(
                         // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
                         // The chunk that was already in flight is not cut off — the backend drains it and
                         // returns `Error::Aborted` from `be.execute` below, which lands here as the same
-                        // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
-                        // so this is an error and not a partial success; the CLI turns the latched signal
-                        // into the conventional 130/143 exit status regardless of what this call returns.
+                        // bail. No generation was produced, so this is an error and not a partial
+                        // success; the CLI turns the latched signal into the conventional 130/143 exit
+                        // status regardless of what this call returns. What WAS produced is a prefix:
+                        // the chunks that already ran hold their KV rows, so the spine is handed to
+                        // the session before the error escapes and the next checkout publishes it to
+                        // the radix tree. A client that cancels mid-prefill then pays for the tail on
+                        // its retry instead of the entire prompt.
                         if crate::sampling::abort_requested(req) {
+                            // Chunk-major sweeps one whole-model span per chunk, so `cstart` is the
+                            // deepest position every layer has written. Layer-major runs one span
+                            // across the whole group before the next, so only the chunks BEFORE this
+                            // group are complete at every layer — and `group_start` indexes chunks, so
+                            // its token position has to come from the chunk itself.
+                            let prefilled = if layer_major {
+                                chunks[group_start].0
+                            } else {
+                                cstart
+                            };
+                            *cached = prompt[..prefilled].to_vec();
+                            // Stop BETWEEN chunks, at a position every layer reached: vouch for the
+                            // ledger so `crate::seam`'s error path does not wipe it.
+                            *ledger_matches_kv = true;
                             anyhow::bail!("aborted: shutdown requested");
                         }
                         let _timeline_prefill_chunk = if materialize_only {
