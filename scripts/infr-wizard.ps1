@@ -3061,7 +3061,7 @@ if (-not $reuseSavedSettings) {
         $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
         $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
         $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
-        Write-Host '留空＝自动：按系统 commit 余量标定，并先扣掉下面声明的分页 KV RAM 帧池。填了＝按你说的兑现，越过 Windows 的 commit 上限时由内存熔断结束进程，引擎不再自行缩减。/ Blank = automatic, sized against commit headroom and reduced by the paged KV frame pool declared below. A value is honored verbatim: past the commit ceiling the memory circuit breaker ends the process, the engine no longer trims it for you.' -ForegroundColor DarkGray
+        Write-Host '留空＝自动：按物理内存标定——保守档＝当前空闲减 3 GiB，激进档＝总量减 13 GiB。Windows 的 commit 余量只记录、不绑定：系统托管的页面文件会在两次启动之间移动这条线，同一份 71.73 GiB 的 store 先见过 104.6 GB 的上限、又见过 116.8 GB，拿它标定等于拿将要变长的数丢吞吐。你把熔断的 commit 轴（device.mem_guard_headroom）显式打开时，自动档才改为留 2 GiB commit 余量。填了＝按你说的兑现，引擎不再替你缩减。/ Blank = automatic, sized from PHYSICAL RAM: conservative gives free-minus-3 GiB, aggressive total-minus-13 GiB. Commit headroom is reported, never obeyed, because a system-managed page file moves that line between launches. Arm the commit axis of the breaker (device.mem_guard_headroom) and the automatic store leaves 2 GiB of commit slack instead. A value is honored verbatim; the engine does not trim it for you.' -ForegroundColor DarkGray
         $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
         $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
         $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
@@ -3193,7 +3193,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default ([bool]$kvPagedCacheMax)
             if ($kvPagedRamPool) {
                 if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
-                Write-Host '帧按实际下沉量惰性增长、开机不预占，也不从专家 store 的额度里预扣——分页树建立时按当时的空闲物理内存夹紧帧数（留 1 GiB 不花），夹不住的冷前缀直接逐出、不再下沉。/ Frames grow lazily with actual demotions and reserve nothing at boot, but on Windows this cap is taken out of the automatic host budget first: WDDM charges device memory to the same commit limit, and one byte cannot be promised twice.' -ForegroundColor DarkGray
+                Write-Host '帧按实际下沉量惰性增长、开机不预占，也不从专家 store 的额度里预扣——分页树建立时按当时的空闲物理内存夹紧帧数（留 1 GiB 不花），夹不住的冷前缀直接逐出、不再下沉。/ Frames grow lazily with actual demotions, reserve nothing at boot and are no longer pre-carved from the expert store budget: on Windows the paged tree clamps the frame count against the free physical RAM it sees, leaving 1 GiB unspent, and a cold prefix that cannot fit evicts instead of sinking.' -ForegroundColor DarkGray
                 $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限 / Paged KV RAM frame-pool cap' -Default $kvPagedCacheMax -Required
             } else {
                 $kvPagedCacheMax = ''
