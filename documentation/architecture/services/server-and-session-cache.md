@@ -34,7 +34,10 @@ Responses API 把请求映射到内部 Chat Completions 路径，并以 Response
 3. 渲染稳定 prompt，尝试复用 prefix/session state。
 4. Prefill 和 Decode/MTP。
 5. 将 reasoning/content/tool delta 编码为 SSE 或一次性响应。
-6. 客户端断开时设置 cancel latch，runtime 在安全边界停止并释放 slot。
+6. 客户端断开时设置 cancel latch，runtime 在安全边界停止并释放 slot。停在 prefill 的两个 chunk 之间时，
+   每一层都已写到那条 spine，账本因此保留：重试从那里续算，而不是从 token 0 重跑整段 prompt。
+7. 流式响应的 `response.created`/`response.in_progress` 由 Responses 层在建流时自己出具 id 与时间戳，不等第一个 token；
+   长 prefill 期间唯一外发的字节是 keep-alive 注释，客户端不该为了看到开场事件而等待预填充完成。
 
 llama.cpp compatibility embedding runner 仅对进程 readiness probe 保留启动超时，不再对整个 Embedding 请求施加固定 600 秒 deadline；
 不要将此行为与 `serve.request_timeout_secs` 混为一谈。
