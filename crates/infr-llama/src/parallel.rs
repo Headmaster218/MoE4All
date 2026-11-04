@@ -5191,8 +5191,14 @@ impl ParallelSeam {
     fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, mut error: anyhow::Error) {
         let numerical = crate::sampling::is_numerical_corruption(&error);
         for work in active.iter_mut() {
-            if numerical || self.mtp_heads.is_some() || work.lookup.is_some() {
+            if numerical {
+                // Non-finite output is corrupt state: no voucher survives it.
                 work.kv.as_mut().expect("batch work owns a KV slot").reset();
+            } else if self.mtp_heads.is_some() || work.lookup.is_some() {
+                work.kv
+                    .as_mut()
+                    .expect("batch work owns a KV slot")
+                    .reset_after_failed_turn();
             }
         }
         if numerical {
@@ -6087,7 +6093,7 @@ impl ParallelSeam {
             // Any error after arming/Verify/restore may leave recurrent state ahead of
             // published tokens. Never return that slot as a reusable apparent prefix.
             if let Some(kv) = work.kv.as_mut() {
-                kv.reset();
+                kv.reset_after_failed_turn();
             }
             if let Some(lookup) = work.lookup.as_mut() {
                 lookup.pending_proposal = None;
@@ -6810,7 +6816,7 @@ impl ParallelSeam {
                 );
             }
             if let Some(kv) = guard.kv.as_mut() {
-                kv.reset();
+                kv.reset_after_failed_turn();
             }
         }
         let (legacy_ids, stats) = result?;

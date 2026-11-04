@@ -994,9 +994,7 @@ pub(crate) fn generate_dense_vulkan_session(
         // ledger, because every layer wrote exactly up to the spine it recorded — so a client that
         // cancels mid-prefill pays for the tail on its retry instead of the whole prompt.
         if let Some(kv) = state.as_mut() {
-            if !kv.ledger_matches_kv {
-                kv.reset();
-            }
+            kv.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -1053,9 +1051,7 @@ pub(crate) fn generate_dense_vulkan_prepared_prefill_session(
     );
     if result.is_err() {
         if let Some(slot) = state.as_mut() {
-            if !slot.ledger_matches_kv {
-                slot.reset();
-            }
+            slot.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -1167,14 +1163,10 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
     if out.is_err() {
         // A slot only keeps its ledger when the sweep vouched for it between chunks.
         if let Some(slot) = primary.as_mut() {
-            if !slot.ledger_matches_kv {
-                slot.reset();
-            }
+            slot.reset_after_failed_turn();
         }
         for slot in peers {
-            if !slot.ledger_matches_kv {
-                slot.reset();
-            }
+            slot.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -1261,14 +1253,10 @@ pub(crate) fn generate_dense_vulkan_parallel_verify_session(
     if result.is_err() {
         // A slot only keeps its ledger when the sweep vouched for it between chunks.
         if let Some(slot) = primary.as_mut() {
-            if !slot.ledger_matches_kv {
-                slot.reset();
-            }
+            slot.reset_after_failed_turn();
         }
         for slot in peers {
-            if !slot.ledger_matches_kv {
-                slot.reset();
-            }
+            slot.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }

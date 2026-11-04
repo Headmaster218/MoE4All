@@ -1775,6 +1775,21 @@ impl SeamKv {
         !self.segmented_kv.chain.is_empty()
     }
 
+    /// A turn that ended in error must not hand its slot back as reusable... unless the prefill
+    /// sweep vouched for its ledger: stopping BETWEEN two chunks leaves `cached` exactly equal to
+    /// what every layer wrote, and then the next checkout publishes that prefix to the radix tree
+    /// instead of losing minutes of work to a client cancel. Anything else (a cut-off mid-chunk, a
+    /// failed decode step) keeps the empty-ledger rule.
+    ///
+    /// Every failed-generation guard calls this, so the rule has one home. A caller that knows the
+    /// state is CORRUPT (non-finite output) calls [`Self::reset`] instead — that survives any
+    /// voucher.
+    pub(crate) fn reset_after_failed_turn(&mut self) {
+        if !self.ledger_matches_kv {
+            self.reset();
+        }
+    }
+
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
