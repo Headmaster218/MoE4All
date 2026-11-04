@@ -9,6 +9,7 @@ use std::sync::Arc;
 mod benchmark_artifact;
 mod benchmark_hardware;
 mod diagnostics;
+mod speech;
 mod submission;
 mod submission_validation;
 mod transcription;
@@ -526,7 +527,7 @@ enum Cmd {
     },
     /// Serve any non-empty combination of chat, embedding and transcription models.
     #[command(group(clap::ArgGroup::new("modules")
-        .args(["model", "embedding_model", "transcription_model"])
+        .args(["model", "embedding_model", "transcription_model", "speech_model"])
         .required(true)
         .multiple(true)))]
     Serve {
@@ -534,6 +535,8 @@ enum Cmd {
         model: Option<String>,
         #[command(flatten)]
         transcription: transcription::ServeOptions,
+        #[command(flatten)]
+        speech: speech::ServeOptions,
         /// Optional Qwen3.8 vision projector GGUF. Image parts are accepted through the OpenAI
         /// chat API as data URIs or base64 strings; projector weights are request-scoped.
         #[arg(long, value_name = "PATH", requires = "model")]
@@ -583,6 +586,12 @@ enum Cmd {
         model: String,
         #[command(flatten)]
         options: transcription::FileOptions,
+    },
+    /// Synthesize a clip with native Melo GGUF and an external lexicon (tts feature).
+    Speak {
+        model: String,
+        #[command(flatten)]
+        options: speech::FileOptions,
     },
     /// Start a native embedding-only OpenAI-compatible HTTP API (GGUF, CPU or Vulkan).
     ServeEmbedding {
@@ -876,6 +885,7 @@ fn command_model(cmd: &Cmd) -> Option<&str> {
     match cmd {
         Cmd::Run { model, .. }
         | Cmd::Transcribe { model, .. }
+        | Cmd::Speak { model, .. }
         | Cmd::ServeEmbedding { model, .. }
         | Cmd::Bench { model, .. } => Some(model),
         Cmd::Serve { model, .. } => model.as_deref(),
@@ -894,6 +904,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Run { .. } => "run",
         Cmd::Serve { .. } => "serve",
         Cmd::Transcribe { .. } => "transcribe",
+        Cmd::Speak { .. } => "speak",
         Cmd::ServeEmbedding { .. } => "serve-embedding",
         Cmd::Multi { .. } => "multi",
         Cmd::Bench { .. } => "bench",
@@ -1534,6 +1545,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         }
         Cmd::Pull { .. }
         | Cmd::Transcribe { .. }
+        | Cmd::Speak { .. }
         | Cmd::Devices
         | Cmd::Report { .. }
         | Cmd::Submission { .. }
@@ -1572,6 +1584,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         Cmd::Serve {
             model,
             transcription,
+            speech,
             mmproj,
             embedding_model,
             embedding_idle_timeout,
@@ -1582,6 +1595,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         } => cmd_serve(
             model.as_deref(),
             &transcription,
+            &speech,
             mmproj.as_deref(),
             embedding_model.as_deref(),
             embedding_idle_timeout,
@@ -1592,6 +1606,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             specified,
         ),
         Cmd::Transcribe { model, options } => transcription::transcribe(&model, options, cfg),
+        Cmd::Speak { model, options } => speech::speak(&model, options, cfg),
         Cmd::ServeEmbedding {
             model,
             embedding_idle_timeout,
@@ -6996,6 +7011,7 @@ fn apply_model_sampling_defaults(
 fn cmd_serve(
     model: Option<&str>,
     transcription: &transcription::ServeOptions,
+    speech: &speech::ServeOptions,
     mmproj: Option<&Path>,
     embedding_model: Option<&str>,
     embedding_idle_timeout: u64,
@@ -7005,12 +7021,14 @@ fn cmd_serve(
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
+    speech.validate()?;
     validate_serve_modules(
         model,
         embedding_model,
         transcription,
         mmproj,
         embedding_runner,
+        speech.speech_model.is_some(),
     )?;
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let audio = transcription.load(cfg)?;
@@ -7028,7 +7046,7 @@ fn cmd_serve(
             )?;
             state = state.with_embedding(embedding, id, parallel);
         }
-        let state = transcription.attach(state, audio);
+        let state = speech.attach(transcription.attach(state, audio), cfg)?;
         diagnostics::mark_runtime();
         return tokio::runtime::Runtime::new()?.block_on(infr_server::serve_state(state, sockaddr));
     };
@@ -7163,7 +7181,7 @@ fn cmd_serve(
         if let Some((embedding_id, embedding)) = embedding {
             state = state.with_embedding(embedding, embedding_id, 1);
         }
-        let state = transcription.attach(state, audio);
+        let state = speech.attach(transcription.attach(state, audio), cfg)?;
         return rt.block_on(infr_server::serve_state(state, sockaddr));
     }
 
@@ -7206,7 +7224,7 @@ fn cmd_serve(
         if let Some((embedding_id, embedding)) = embedding {
             state = state.with_embedding(embedding, embedding_id, 1);
         }
-        let state = transcription.attach(state, audio);
+        let state = speech.attach(transcription.attach(state, audio), cfg)?;
         rt.block_on(infr_server::serve_state(state, sockaddr))
     }
 }
@@ -7217,10 +7235,14 @@ fn validate_serve_modules(
     transcription: &transcription::ServeOptions,
     mmproj: Option<&Path>,
     embedding_runner: Option<&Path>,
+    speech_enabled: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        model.is_some() || embedding_model.is_some() || transcription.transcription_model.is_some(),
-        "serve requires a chat model, --embedding-model or --transcription-model"
+        model.is_some()
+            || embedding_model.is_some()
+            || transcription.transcription_model.is_some()
+            || speech_enabled,
+        "serve requires a chat model, --embedding-model, --transcription-model or --speech-model"
     );
     anyhow::ensure!(
         mmproj.is_none() || model.is_some(),

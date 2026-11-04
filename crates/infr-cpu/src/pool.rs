@@ -196,11 +196,19 @@ impl SpinPool {
         cfg: &CpuCfg,
         n_threads: usize,
     ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        Self::new_bounded_min_spin(cfg, n_threads, 256)
+    }
+
+    pub(crate) fn new_bounded_min_spin(
+        cfg: &CpuCfg,
+        n_threads: usize,
+        min_spin: u32,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let fallback = rayon::ThreadPoolBuilder::new()
             .num_threads(n_threads.max(1))
             .thread_name(|i| format!("infr-cpu-fallback-{i}"))
             .build()?;
-        let mut pool = Self::new_sized(cfg, n_threads);
+        let mut pool = Self::new_sized_min_spin(cfg, n_threads, min_spin);
         pool.bounded_rayon = Some(fallback);
         Ok(pool)
     }

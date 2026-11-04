@@ -55,6 +55,8 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
 mod responses;
+#[cfg(feature = "tts")]
+pub mod speech;
 mod transcription;
 
 #[cfg(test)]
@@ -2086,6 +2088,8 @@ pub struct AppState {
     /// slots; future unified memory policy coordinates the resources below this API boundary.
     embeddings: Arc<Vec<EmbeddingEntry>>,
     transcription: Option<transcription::Entry>,
+    #[cfg(feature = "tts")]
+    speech: Option<speech::Entry>,
     transcription_upload_dir: Option<std::path::PathBuf>,
     /// The resolved process configuration (S7). The handler reads `serve.api_key` and
     /// `serve.max_tokens_cap` off it instead of the environment; it is an EXPLICIT constructor
@@ -2114,6 +2118,8 @@ impl AppState {
             cfg,
             stats: Arc::default(),
             transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
             transcription_upload_dir: None,
         }
     }
@@ -2140,6 +2146,8 @@ impl AppState {
             cfg,
             stats: Arc::default(),
             transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
             transcription_upload_dir: None,
         }
     }
@@ -2169,6 +2177,8 @@ impl AppState {
             cfg,
             stats: Arc::default(),
             transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
             transcription_upload_dir: None,
         }
     }
@@ -2186,6 +2196,8 @@ impl AppState {
             cfg,
             stats: Arc::default(),
             transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
             transcription_upload_dir: None,
         }
     }
@@ -2256,6 +2268,13 @@ impl AppState {
         self
     }
 
+    /// Attach native CPU speech with independent admission and lifecycle.
+    #[cfg(feature = "tts")]
+    pub fn with_speech(mut self, synthesizer: Arc<dyn infr_tts::Synthesizer>) -> Self {
+        self.speech = Some(speech::Entry::new(synthesizer));
+        self
+    }
+
     /// Controlled upload directory; defaults to <executable directory>/data/audio-upload.
     pub fn with_transcription_upload_dir(
         mut self,
@@ -2277,7 +2296,7 @@ impl AppState {
 
 /// Build the axum [`Router`].  Extracted so tests can call it with a [`AppState::headless`] state.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
@@ -2285,8 +2304,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings_handler))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         // Merge after the chat body limit so audio's 128 MiB cap stays route-local.
-        .merge(transcription::router())
-        .with_state(state)
+        .merge(transcription::router());
+    #[cfg(feature = "tts")]
+    let router = router.merge(speech::router());
+    router.with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,6 +2381,8 @@ pub async fn serve_with_embedding(
 pub async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
     let n_models =
         state.models.len() + state.embeddings.len() + usize::from(state.transcription.is_some());
+    #[cfg(feature = "tts")]
+    let n_models = n_models + usize::from(state.speech.is_some());
     anyhow::ensure!(
         n_models > 0,
         "server requires at least one hosted capability"
@@ -2458,6 +2481,19 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
         {
             data.push(ModelCard {
                 id: audio.transcriber.model_id().to_owned(),
+                object: "model",
+                owned_by: "local",
+            });
+        }
+    }
+    #[cfg(feature = "tts")]
+    if let Some(speech) = &state.speech {
+        if !data
+            .iter()
+            .any(|card| card.id == speech.synthesizer.model_id())
+        {
+            data.push(ModelCard {
+                id: speech.synthesizer.model_id().to_owned(),
                 object: "model",
                 owned_by: "local",
             });

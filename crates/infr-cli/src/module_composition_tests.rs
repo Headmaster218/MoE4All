@@ -52,6 +52,7 @@ fn all_seven_nonempty_module_combinations_parse_and_validate() {
             &transcription,
             mmproj.as_deref(),
             embedding_runner.as_deref(),
+            false,
         )
         .unwrap();
     }
@@ -93,13 +94,14 @@ fn empty_combinations_and_unattached_projectors_or_runners_are_rejected() {
     let Cmd::Serve { transcription, .. } = command(&serve_args(2)) else {
         unreachable!();
     };
-    assert!(validate_serve_modules(None, None, &transcription, None, None).is_err());
+    assert!(validate_serve_modules(None, None, &transcription, None, None, false).is_err());
     assert!(validate_serve_modules(
         None,
         Some("embed.gguf"),
         &transcription,
         Some(Path::new("vision.gguf")),
-        None
+        None,
+        false
     )
     .is_err());
     assert!(validate_serve_modules(
@@ -107,7 +109,8 @@ fn empty_combinations_and_unattached_projectors_or_runners_are_rejected() {
         None,
         &transcription,
         None,
-        Some(Path::new("runner"))
+        Some(Path::new("runner")),
+        false
     )
     .is_err());
     for modules in [1, 3, 5, 7] {

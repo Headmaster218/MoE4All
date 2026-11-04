@@ -15,6 +15,10 @@ mod pool;
 pub mod task_pool;
 pub mod turbo;
 
+#[cfg(feature = "f32-gemm")]
+mod dense_f32;
+#[cfg(feature = "f32-gemm-profile")]
+pub mod f32_profile;
 mod kernels;
 mod moe;
 mod quant;
@@ -33,12 +37,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    dot, dot_bf16, dot_f16, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
-    vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
-    vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
-    vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
-    vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch, vec_dot_q2_0_batch, vec_dot_q2k,
-    vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
+    dot, dot_bf16, dot_f16, dot_f32_batch, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch,
+    vec_dot_iq1s, vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs,
+    vec_dot_iq2xs_batch, vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch,
+    vec_dot_iq3xxs, vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs,
+    vec_dot_iq4xs_batch, vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch, vec_dot_q2_0_batch,
+    vec_dot_q2k, vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
     vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
     vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, vec_dot_tq1_0,
@@ -279,6 +283,12 @@ pub struct CpuBackend {
     /// per-read `std::env::var` calls it replaced. It is not a bridge to be deleted — it is the
     /// documented no-argument constructor.
     cfg: Arc<Config>,
+    /// Explicit opt-in for dense CPU capabilities such as the native vocoder.
+    /// Existing LLM/ASR constructors retain their original numeric path.
+    #[cfg(feature = "f32-gemm")]
+    dense_f32_gemm: bool,
+    #[cfg(feature = "f32-gemm")]
+    dense_f32_threads: usize,
 }
 
 /// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
@@ -308,6 +318,10 @@ impl CpuBackend {
             repack6_cache: Mutex::default(),
             pool: std::sync::OnceLock::new(),
             cfg,
+            #[cfg(feature = "f32-gemm")]
+            dense_f32_gemm: false,
+            #[cfg(feature = "f32-gemm")]
+            dense_f32_threads: 4,
         }
     }
 
@@ -319,9 +333,34 @@ impl CpuBackend {
         }
         let pool = pool::SpinPool::new_bounded(&cfg.kernels.cpu, threads)
             .map_err(|e| Error::backend(format!("create bounded CPU pool: {e}")))?;
-        let backend = Self::new_with(cfg);
+        #[allow(unused_mut)]
+        let mut backend = Self::new_with(cfg);
+        #[cfg(feature = "f32-gemm")]
+        {
+            backend.dense_f32_threads = threads;
+        }
         let _ = backend.pool.set(pool);
         Ok(backend)
+    }
+
+    /// Use packed, portable SGEMM for multirow F32 Linear operations. The
+    /// library's own threading is disabled: only this backend's pool executes
+    /// output blocks. No weight cache or additional model copy is retained.
+    #[cfg(feature = "f32-gemm")]
+    pub fn with_f32_gemm(mut self) -> Result<Self> {
+        // Dense vocoder graphs have short serial packing gaps between many
+        // small GEMMs. Keep this isolated pool hot across a short burst; it
+        // still parks after the bounded spin budget when synthesis is idle.
+        let pool = pool::SpinPool::new_bounded_min_spin(
+            &self.cfg.kernels.cpu,
+            self.dense_f32_threads,
+            self.cfg.kernels.cpu.spin.min(16_384).max(256),
+        )
+        .map_err(|e| Error::backend(format!("create dense F32 CPU pool: {e}")))?;
+        let _old = self.pool.take();
+        let _ = self.pool.set(pool);
+        self.dense_f32_gemm = true;
+        Ok(self)
     }
 
     /// A backend in REFERENCE mode: every quantized `Op::Linear` (dense and MoE-expert) decodes
@@ -1258,6 +1297,13 @@ impl Backend for CpuBackend {
                     let row0 = w_off as usize / in_f;
                     let wbytes: &[u8] = &bytes[row0 * bpr..(row0 + out_f) * bpr];
                     let mut out = vec![0f32; m * out_f];
+                    #[cfg(feature = "f32-gemm")]
+                    if self.dense_f32_gemm && !reference && dt == DType::F32 {
+                        let weights: &[f32] = bytemuck::cast_slice(wbytes);
+                        self.compute_dense_f32(xs, weights, m, in_f, out_f, &mut out);
+                        vals[dst.0 as usize] = out;
+                        continue;
+                    }
                     // REFERENCE mode (see `CpuBackend::reference`): decode the weight row to f32 and
                     // take a plain f32 dot, so the ONLY error is the weight's own quantization —
                     // the int8-activation kernels below carry ~4e-3 relative error, which flips
@@ -1705,9 +1751,7 @@ impl Backend for CpuBackend {
                                     DType::Tq1_0 => vec_dot_tq1_0_batch(row, &q8s, in_f, chunk),
                                     DType::F32 => {
                                         let w32: &[f32] = bytemuck::cast_slice(row);
-                                        for r in 0..m {
-                                            chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
-                                        }
+                                        dot_f32_batch(w32, xs, in_f, chunk);
                                     }
                                     DType::F16 => {
                                         for r in 0..m {
@@ -5432,6 +5476,87 @@ mod tests {
             }
             assert_eq!(got[0], got[2], "rows={rows} projection A");
             assert_eq!(got[1], got[3], "rows={rows} projection B");
+        }
+    }
+
+    #[cfg(feature = "f32-gemm")]
+    #[test]
+    fn opt_in_f32_gemm_matches_original_linear_for_matrix_tails() {
+        use infr_core::TensorDesc;
+        for (rows, input, output) in [
+            (1, 7, 9),
+            (8, 7, 8),
+            (9, 33, 9),
+            (32, 96, 192),
+            (128, 384, 128),
+            (16, 2816, 256),
+        ] {
+            let xs = (0..rows * input)
+                .map(|i| (i as f32 * 0.071).sin() * 0.25)
+                .collect::<Vec<_>>();
+            let ws = (0..output * input)
+                .map(|i| (i as f32 * 0.037).cos() * 0.125)
+                .collect::<Vec<_>>();
+            let run = |gemm: bool| {
+                let backend =
+                    CpuBackend::new_with_thread_limit(Arc::new(Config::default()), 2).unwrap();
+                let backend = if gemm {
+                    backend.with_f32_gemm().unwrap()
+                } else {
+                    backend
+                };
+                let mut graph = Graph::new();
+                let x = graph.input(TensorDesc::new(vec![rows, input], DType::F32));
+                let w = graph.weight(TensorDesc::new(vec![output, input], DType::F32));
+                let y = graph.output(TensorDesc::new(vec![rows, output], DType::F32));
+                graph.push(Op::Linear {
+                    x,
+                    weight: w,
+                    dst: y,
+                    m: rows as u32,
+                    in_f: input as u32,
+                    out_f: output as u32,
+                    w_off: 0,
+                });
+                let xb = backend
+                    .alloc(xs.len() * 4, BufferUsage::Activations)
+                    .unwrap();
+                let wb = backend.alloc(ws.len() * 4, BufferUsage::Weights).unwrap();
+                let yb = backend
+                    .alloc(rows * output * 4, BufferUsage::Activations)
+                    .unwrap();
+                backend
+                    .upload(xb.as_ref(), bytemuck::cast_slice(&xs))
+                    .unwrap();
+                backend
+                    .upload(wb.as_ref(), bytemuck::cast_slice(&ws))
+                    .unwrap();
+                let mut bindings = Bindings::new();
+                bindings
+                    .bind(x, xb.as_ref())
+                    .bind(w, wb.as_ref())
+                    .bind(y, yb.as_ref());
+                let plan = backend.compile(&graph).unwrap();
+                backend.execute(plan.as_ref(), &bindings).unwrap();
+                let mut result = vec![0f32; rows * output];
+                backend
+                    .download(yb.as_ref(), bytemuck::cast_slice_mut(&mut result))
+                    .unwrap();
+                result
+            };
+            let expected = run(false);
+            let actual = run(true);
+            let mut err = 0f64;
+            let mut energy = 0f64;
+            for (&a, &b) in actual.iter().zip(&expected) {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "matrix [{rows},{input},{output}] {a} != {b}"
+                );
+                err += (a as f64 - b as f64).powi(2);
+                energy += (b as f64).powi(2);
+            }
+            assert!((err / energy.max(1e-20)).sqrt() < 1e-5);
         }
     }
 

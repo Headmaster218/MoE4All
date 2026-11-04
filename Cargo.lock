@@ -1285,6 +1285,7 @@ dependencies = [
  "infr-llama",
  "infr-prof-rt",
  "infr-server",
+ "infr-tts",
  "infr-vision",
  "infr-vulkan",
  "libc",
@@ -1330,6 +1331,7 @@ dependencies = [
  "infr-prof",
  "infr-prof-rt",
  "infr-testkit",
+ "matrixmultiply",
  "rayon",
  "tracing",
 ]
@@ -1464,6 +1466,7 @@ dependencies = [
  "infr-chat",
  "infr-core",
  "infr-engine",
+ "infr-tts",
  "serde",
  "serde_json",
  "subtle",
@@ -1481,6 +1484,20 @@ dependencies = [
  "half",
  "infr-core",
  "infr-gguf",
+]
+
+[[package]]
+name = "infr-tts"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "infr-core",
+ "infr-cpu",
+ "infr-gguf",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1699,6 +1716,16 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matrixmultiply"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f607c237553f086e7043417a51df26b2eb899d3caff94e6a67592ff992fedc7"
+dependencies = [
+ "autocfg",
+ "rawpointer",
+]
 
 [[package]]
 name = "memchr"
@@ -2177,6 +2204,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
+
+[[package]]
+name = "rawpointer"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
 
 [[package]]
 name = "rayon"
