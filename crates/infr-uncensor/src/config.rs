@@ -85,18 +85,21 @@ mod tests {
             (DEFAULT_FIRST_LAYER, DEFAULT_LAST_LAYER)
         );
 
-        let mut table = infr_core::config::UncensorCfg::default();
-        table.vector = Some(PathBuf::from("directions.gguf"));
-        table.first_layer = 2;
-        table.last_layer = 9;
+        let table = infr_core::config::UncensorCfg {
+            vector: Some(PathBuf::from("directions.gguf")),
+            first_layer: 2,
+            last_layer: 9,
+        };
         let cfg = Config::from_config(&table);
         assert_eq!(cfg.vector, Some(PathBuf::from("directions.gguf")));
         assert!(cfg.enabled());
         assert_eq!((cfg.first_layer, cfg.last_layer), (2, 9));
 
         // An empty path is "off", not "a file called nothing".
-        let mut table = infr_core::config::UncensorCfg::default();
-        table.vector = Some(PathBuf::new());
+        let table = infr_core::config::UncensorCfg {
+            vector: Some(PathBuf::new()),
+            ..Default::default()
+        };
         assert!(!Config::from_config(&table).enabled());
     }
 }
