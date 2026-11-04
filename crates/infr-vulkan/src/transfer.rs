@@ -49,6 +49,13 @@ pub(crate) struct DedicatedTransferQueue {
     slots: Vec<DedicatedTransferCommandSlot>,
     cursor: usize,
     next_value: u64,
+    /// Timeline value of the most recent submit, 0 before the first one. Every later submit waits
+    /// on it at `TRANSFER`, so uploads are totally ordered on this queue: `cmdCopyBuffer`s from
+    /// different submits can otherwise write the same reused destination range concurrently
+    /// (Vulkan has no implicit memory dependency across submissions, even on one queue) — the
+    /// cross-submit WAW that VVL reports as SYNC-HAZARD-WRITE-AFTER-WRITE. The host-side
+    /// per-command-slot wait below only protects the command buffer, not the copied memory.
+    last_value: u64,
     profile_query_pool: vk::QueryPool,
     profile_timestamp_period_ns: f32,
     profile_timestamp_valid_bits: u32,
@@ -146,6 +153,7 @@ impl DedicatedTransferQueue {
                 .collect(),
             cursor: 0,
             next_value: 1,
+            last_value: 0,
             profile_query_pool,
             profile_timestamp_period_ns: timestamp_period_ns,
             profile_timestamp_valid_bits: timestamp_valid_bits,
@@ -355,15 +363,28 @@ impl DedicatedTransferQueue {
             .next_value
             .checked_add(1)
             .ok_or_else(|| be("dedicated transfer timeline value overflow"))?;
+        let previous_value = self.last_value;
         let commands = [slot.cmd];
         let signals = [self.timeline];
         let signal_values = [value];
+        let previous_values = [previous_value];
         let mut timeline =
             vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
-        let submit = vk::SubmitInfo::default()
+        // Chain every submit to its predecessor (see `last_value`). The same timeline semaphore is
+        // in both the wait and signal set; value N-1 < N, which is the legal ascending case.
+        let chain_previous = previous_value != 0;
+        if chain_previous {
+            timeline = timeline.wait_semaphore_values(&previous_values);
+        }
+        let mut submit = vk::SubmitInfo::default()
             .command_buffers(&commands)
             .signal_semaphores(&signals)
             .push_next(&mut timeline);
+        if chain_previous {
+            submit = submit
+                .wait_semaphores(&signals)
+                .wait_dst_stage_mask(&[vk::PipelineStageFlags::TRANSFER]);
+        }
         let submit_span = infr_core::timeline::span("dma_queue_submit");
         let worker_submit =
             infr_core::timeline::background_span("resident_producer_dma_queue_submit");
@@ -371,6 +392,7 @@ impl DedicatedTransferQueue {
             query.submitted();
         }
         shared.submit_dedicated_transfer(self.queue, &submit)?;
+        self.last_value = value;
         drop(worker_submit);
         drop(submit_span);
         slot.timeline_query = timeline_query;
@@ -1208,6 +1230,9 @@ fn make_dedicated_host_transfer_buffer(
     shared: &Arc<VulkanShared>,
     size: usize,
 ) -> Result<VkBuffer> {
+    // Floodgate inline check (2026-10-19 miss-storm conviction): host-visible staging is where
+    // the ramp reached GiB/s. Stop at the water line instead of queueing another allocation.
+    infr_core::memguard::check();
     let memory_type = shared
         .host_overflow_type
         .ok_or_else(|| be("background transfer has no host-visible system-memory type"))?;
@@ -1292,6 +1317,8 @@ impl VulkanBackend {
     /// exposes one. This prevents a small RDNA2 ReBAR heap from being consumed by the fallback
     /// that exists precisely because the expert arena did not fit that heap.
     fn make_host_transfer_buffer(&self, size: usize) -> Result<(VkBuffer, bool)> {
+        // Floodgate inline check — see `make_dedicated_host_transfer_buffer`.
+        infr_core::memguard::check();
         let Some(memory_type) = self.shared.host_overflow_type else {
             return self
                 .make_buf(size, MemoryLocation::CpuToGpu, "host-transfer-staging")
@@ -1830,5 +1857,65 @@ mod tests {
         drop(command_keepalive);
         assert_eq!(plan.shed_unused_import_tails(32), 32);
         assert!(plan.imported_ranges(&host[32..]).is_none());
+    }
+
+    /// Cross-submit WAW regression for the dedicated transfer queue: two submissions write the
+    /// SAME destination range and are only separated by the queue's own timeline chain. Run with
+    /// the Khronos validation layer and `khronos_validation.validate_sync = true`: without the
+    /// chain it reports SYNC-HAZARD-WRITE-AFTER-WRITE on the second submit (different command
+    /// slots do not order each other); with it, nothing. The content check also proves the later
+    /// upload wins.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; run under VVL to inspect the submit-to-submit WAW"]
+    fn overlapping_dedicated_transfer_submits_are_ordered() {
+        use ash::vk;
+        use gpu_allocator::MemoryLocation;
+        use infr_core::backend::Backend as _;
+
+        // Large enough that the first copy is still in flight when the second is submitted.
+        const BYTES: usize = 128 << 20;
+        let be = crate::VulkanBackend::new().expect("Vulkan device");
+        assert!(
+            be.shared.dedicated_transfer.is_some(),
+            "device has no dedicated transfer queue; nothing to order"
+        );
+        let staging = |value: u8, label: &str| {
+            let buf = be
+                .make_buf(BYTES, MemoryLocation::GpuToCpu, label)
+                .expect("host-visible staging");
+            let ptr = buf.mapped_ptr().expect("staging is mapped");
+            crate::copy_to_mapped(&vec![value; BYTES], ptr);
+            Arc::new(buf) as Arc<dyn Buffer>
+        };
+        let src1 = staging(0x11, "waw-src1");
+        let src2 = staging(0x22, "waw-src2");
+        let dst = Arc::new(
+            be.make_buf(BYTES, MemoryLocation::GpuOnly, "waw-dst")
+                .expect("device destination"),
+        ) as Arc<dyn Buffer>;
+        let batch = |src: &Arc<dyn Buffer>| super::TransferCopyBatch {
+            src: Arc::clone(src),
+            dst: Arc::clone(&dst),
+            regions: vec![vk::BufferCopy::default().size(BYTES as u64)],
+        };
+        let first = be
+            .shared
+            .submit_transfer_batches(&[batch(&src1)])
+            .unwrap()
+            .expect("dedicated transfer queue");
+        let second = be
+            .shared
+            .submit_transfer_batches(&[batch(&src2)])
+            .unwrap()
+            .expect("dedicated transfer queue");
+        assert!(second > first, "timeline values must advance");
+        be.shared.wait_dedicated_transfer(second).unwrap();
+
+        let mut got = vec![0u8; BYTES];
+        be.download(dst.as_ref(), &mut got).unwrap();
+        assert!(
+            got.iter().all(|&b| b == 0x22),
+            "the later upload must win the WAW"
+        );
     }
 }

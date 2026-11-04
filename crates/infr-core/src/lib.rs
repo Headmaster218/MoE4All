@@ -16,6 +16,9 @@ pub mod fusion;
 /// llama.cpp's `gguf-split` filename convention — shared by the hub (is the set complete?) and the
 /// GGUF loader (which files make up this model?).
 pub mod gguf_split;
+/// The cross-process GPU startup lock: refuse to start a second engine on the same card, and the
+/// stable `INFR-E1001` / `INFR-W100x` diagnostic codes that go with it.
+pub mod gpu_lock;
 pub mod graph;
 pub mod hostmem;
 pub mod hostpager;
@@ -24,6 +27,9 @@ pub mod iquant_grids;
 /// envelope, durability, and the poisoned-blob tripwire, once.
 pub mod kernel_cache;
 pub mod loader;
+/// The commit-charge circuit breaker — exit the process at the water line instead of letting a
+/// miss storm page the box or AV the driver (2026-10-19 conviction).
+pub mod memguard;
 pub mod pager;
 pub mod pager_profile;
 /// The per-op profiling seam every backend reports through — one collector, one label grammar,

@@ -97,6 +97,14 @@ layout(binding = 0) readonly buffer IQ2GridB { uint G_IQ2S[]; };
 #elif defined(IQ3_GRID_BUFFER)
 layout(binding = 0) readonly buffer IQ3GridB { uint G_IQ3S[]; };
 #define GRID_INIT
+#elif defined(IQ3XXS_GRID_BUFFER)
+// IQ3_XXS stages TWO tables in the LDS build (G_IQ3XXS 256 words + KSIGNS 128 words — the only
+// grid format whose dq reads a second table). The buffer twin carries both in the one binding-0
+// block, contiguous in declaration order: host buffer = 256 IQ3XXS_GRID words then 128 KSIGNS
+// words (see VulkanBackend init's iq3xxs_grid build). Sized members keep the offsets fixed so the
+// host layout needs no runtime query.
+layout(binding = 0) readonly buffer IQ3XXSGridB { uint G_IQ3XXS[256]; uint KSIGNS[128]; };
+#define GRID_INIT
 #elif defined(USE_GRID)
 #include "native_grids.glsl"
 #define GRID_INIT grid_init()

@@ -1376,6 +1376,7 @@ dependencies = [
  "infr-metal",
  "infr-prof",
  "infr-prof-rt",
+ "infr-uncensor",
  "infr-vulkan",
  "llguidance",
  "rayon",
@@ -1427,6 +1428,7 @@ dependencies = [
  "infr-chat",
  "infr-core",
  "infr-engine",
+ "infr-uncensor",
  "serde",
  "serde_json",
  "subtle",
@@ -1444,6 +1446,18 @@ dependencies = [
  "half",
  "infr-core",
  "infr-gguf",
+]
+
+[[package]]
+name = "infr-uncensor"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "infr-core",
+ "infr-gguf",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

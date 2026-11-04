@@ -886,6 +886,121 @@ fn command_message(cmd: &Cmd) -> Option<&str> {
     }
 }
 
+/// Whether THIS subcommand puts a model on a GPU in this process. The set is the same as
+/// [`should_record_diagnostics`]'s, but the two are deliberately separate predicates: a diagnostics
+/// bundle and a device reservation can stop agreeing at any time, and this one getting wider by
+/// accident would block starts.
+///
+/// `compare` is NOT in it — it owns no device, it shells out to `infr bench` one cell at a time, and
+/// each of those children takes the lock for its own lifetime. That is what keeps the sweep honest
+/// against a server started elsewhere without deadlocking against itself.
+fn gpu_workload(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Run { .. }
+            | Cmd::Serve { .. }
+            | Cmd::ServeEmbedding { .. }
+            | Cmd::Multi { .. }
+            | Cmd::Bench {
+                estimate_only: false,
+                ..
+            }
+    )
+}
+
+/// What the lock's banner should say about us, so the process that gets refused can name the
+/// process that refused it. Command + model, never the message text.
+fn lock_label(cmd: &Cmd) -> String {
+    match command_model(cmd) {
+        Some(model) => format!("{} {model}", command_name(cmd)),
+        None => command_name(cmd).to_string(),
+    }
+}
+
+/// Take the machine's GPU startup lock before this process touches a device.
+///
+/// Two engines on one card each size their unified VRAM arena against the other's footprint, so
+/// both the serving and the measurement degrade — and the ONLY symptom is the number. The lock is
+/// `infr_core::gpu_lock`: a loopback `bind()` (kernel-owned, so a `kill -9`'d holder releases it
+/// instantly) plus a one-line identity banner, which is what makes the refusal evidence-based.
+/// Everything it cannot prove is a warning, never a block: see the codes below.
+///
+/// The returned guard is process-scoped by design — the caller holds it until the subcommand
+/// returns. `Ok(None)` means "not our business" (a non-GPU command, `--dev cpu`, a bypassed check,
+/// or an unprovable holder).
+fn acquire_gpu_startup_lock(
+    cmd: &Cmd,
+    cfg: &Config,
+) -> anyhow::Result<Option<infr_core::gpu_lock::Lock>> {
+    use infr_core::gpu_lock as lock;
+    if !gpu_workload(cmd) {
+        return Ok(None);
+    }
+    let backend = selected_backend(cfg)?;
+    if matches!(backend, Backend::Cpu) {
+        return Ok(None);
+    }
+    let device = dev_spec_of(&backend);
+    if !cfg.device.gpu_lock {
+        let (code, config, bypass) = (lock::CODE_BYPASSED, lock::CONFIG_PATH, lock::ENV_BYPASS);
+        tracing::warn!(
+            "{code}: GPU startup lock check is OFF (`{config}` / `{bypass}`) — a second infr on \
+             device `{device}` will not be detected, and the two will share one VRAM arena."
+        );
+        return Ok(None);
+    }
+    match lock::acquire(&device, &lock_label(cmd)) {
+        lock::Outcome::Held(guard) => {
+            tracing::debug!("GPU startup lock held for device `{device}`");
+            Ok(Some(guard))
+        }
+        lock::Outcome::Conflict(holder) => {
+            let (code, bypass, config, bypass_code) = (
+                lock::CODE_CONFLICT,
+                lock::ENV_BYPASS,
+                lock::CONFIG_PATH,
+                lock::CODE_BYPASSED,
+            );
+            Err(anyhow!(format!(
+                "{code}: another infr is already running on device `{device}` — {holder}. Two \
+                 engines on one card split its VRAM arena and its memory bandwidth, so this start \
+                 would both serve worse and measure worse than either alone.\nStop that process, or \
+                 aim this one at another device with `--dev`, or set `{bypass}=1` / `--set \
+                 {config}=false` to start anyway — that logs {bypass_code} and skips the check."
+            )))
+        }
+        lock::Outcome::Skipped(skip) => {
+            match skip {
+                lock::Skipped::OtherDevice(holder) => {
+                    let code = lock::CODE_OTHER_DEVICE;
+                    tracing::warn!(
+                        "{code}: another infr holds the startup lock for device `{}` \
+                         ({holder}) — assuming separate GPUs, this start is not blocked.",
+                        holder.device,
+                    );
+                }
+                lock::Skipped::NotIdentifiable(why) => {
+                    let code = lock::CODE_NOT_IDENTIFIABLE;
+                    tracing::warn!(
+                        "{code}: {why} — the holder could not be identified as infr, so this \
+                         start is not blocked, but a process MAY already share the device."
+                    );
+                }
+                lock::Skipped::BindFailed(error) => {
+                    let code = lock::CODE_BIND_FAILED;
+                    let port = lock::PORT;
+                    tracing::warn!(
+                        "{code}: could not bind the GPU startup lock on 127.0.0.1:{port} ({error}) \
+                         — nothing was checked, so a concurrent infr on this device would go \
+                         unnoticed."
+                    );
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn sanitize_launch_arguments(
     arguments: impl IntoIterator<Item = String>,
     model: Option<&str>,
@@ -1184,11 +1299,48 @@ fn run_engine_command(
             auto_profile = %frozen.profile,
             startup_available_host_bytes = ?frozen.startup_available_bytes,
             total_host_bytes = ?frozen.total_bytes,
+            available_commit_bytes = ?frozen.commit_available_bytes,
+            paged_pool_bytes = frozen.paged_pool_bytes,
             total_process_ram_budget_bytes = frozen.budget_bytes,
             "automatic RAM budget frozen at process startup; applying explicit total-process budget semantics"
         );
     }
     let cfg = Arc::new(cfg);
+    // The memory circuit breaker (2026-10-19/20 memory-bomb conviction): exit at the water line
+    // instead of letting a miss storm page the box or AV the driver. Percentages resolve against
+    // total physical RAM, like the host-budget knobs. The COMMIT axis is off unless the operator
+    // asks for it: a system-managed page file moves that limit mid-session, so a line drawn against
+    // it ends healthy launches (measured: the same store, 104.6 GB limit then 116.8 GB, same
+    // binary). The physical-RAM axis keeps its default because physical availability is not
+    // re-sized underneath the process.
+    let resolve_headroom = |spec: Option<infr_core::SizeSpec>, fallback: u64| -> u64 {
+        match spec {
+            Some(infr_core::SizeSpec::Bytes(bytes))
+            | Some(infr_core::SizeSpec::FrozenAutomaticBytes(bytes)) => bytes,
+            Some(infr_core::SizeSpec::Percent(fraction)) => infr_core::hostmem::total_bytes()
+                .map_or(fallback, |total| (total as f64 * fraction) as u64),
+            None => fallback,
+        }
+    };
+    let guard_headroom = resolve_headroom(cfg.device.mem_guard_headroom, 0);
+    // The physical-RAM axis is the sensitive one on big-budget boxes (a healthy boot keeps
+    // ~46 GiB of COMMIT headroom here, only ~3.5 GiB above where the bomb died); its default
+    // (4 GiB) guards imminent death, testing raises it to 8-16 GiB.
+    let guard_ram_headroom = resolve_headroom(cfg.device.mem_guard_ram_headroom, 4u64 << 30);
+    // Declare the commit the PLANNER already authorized before arming the breaker: the frozen
+    // process RAM budget (or the user's explicit `device.ram_budget`) is a decision, not a leak, and
+    // on a 96 GiB box with a 6 GiB pagefile a 47 GiB MoE store legitimately settles at ~4 GiB of
+    // remaining commit — below the plain 8 GiB line, which killed two good startups. `None` leaves the
+    // guard on its absolute line.
+    infr_core::memguard::set_authorized_commit_bytes(resolve_headroom(cfg.device.ram_budget, 0));
+    infr_core::memguard::configure(
+        guard_headroom,
+        guard_ram_headroom,
+        cfg.device.mem_guard_poll_ms,
+    );
+    // BEFORE anything touches the device: refuse a start that would share a GPU with a live `infr`.
+    // The guard is held for the whole subcommand — see [`acquire_gpu_startup_lock`].
+    let _gpu_lock = acquire_gpu_startup_lock(&cmd, &cfg)?;
     install_shutdown_file_watcher(cfg.serve.shutdown_file.as_deref())?;
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);
@@ -2158,7 +2310,11 @@ impl ThinkRender {
                 // lock (see `on_signal`'s doc); `tracing` allocates and locks.
                 print!("{t}");
             }
-            infr_engine::Delta::ToolCall { .. } => {}
+            // `infr run` shows the call it dispatches, not the JSON as it is written: the read-ahead
+            // deltas would only print the same arguments before the finished call.
+            infr_engine::Delta::ToolCall { .. }
+            | infr_engine::Delta::ToolCallBegin { .. }
+            | infr_engine::Delta::ToolCallArgs { .. } => {}
         }
     }
 }
@@ -2840,7 +2996,8 @@ fn metal_chat_model(
 /// primitive `infr run`/`bench` drive (persistent session ⇒ per-request suffix-only prefill), and
 /// streams through the same [`ChatStream`] splitter (reasoning/content/auto-parsed tool calls).
 /// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
-/// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
+/// `generate_constrained` (llama.cpp-parity reliability), but its JSON body still goes through the
+/// same splitter, so the call's name and argument members stream progressively on both paths.
 /// SERIALISED: the backend is a `&mut`-only `ChatModel` with a single KV session, so concurrent
 /// requests take turns behind a `Mutex`. Used for CPU / Metal / diffusion-gemma, which have no
 /// multi-slot engine — `cmd_serve` pins those to `--parallel 1` so the queueing is explicit rather
@@ -3111,6 +3268,7 @@ fn request_sampling(
         presence_penalty: p.presence_penalty.unwrap_or(default_presence_penalty),
         frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
         repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
+        uncensor: p.uncensor,
         ..Default::default()
     }
 }
@@ -3254,10 +3412,66 @@ fn run_chat(
             .request_ctx(request_sampling(params, be.default_presence_penalty()))
             .with_external_abort(cancel.clone())
             .with_progress(progress);
+        // Structured output: ONE JSON-schema constraint over the WHOLE reply, applied from the
+        // first token. The server refuses `tools` + structured output, so this never competes
+        // with the forced-tool path below, and there is NO unconstrained fallback: a constraint
+        // that cannot be built or completed is reported to the client, never downgraded to free
+        // text (the server re-validates the finished text as a second line of defence).
+        if let Some(schema) = params.response_format.schema() {
+            if !images.is_empty() {
+                anyhow::bail!("structured output is not supported together with image inputs yet");
+            }
+            if infr_engine::prompt_prefills_think(&prompt) {
+                return Err(anyhow::Error::new(infr_core::error::InvalidInput(
+                    "structured output is enforced from the first token, but this model's \
+                     template prefills a thinking block; disable thinking \
+                     (chat_template_kwargs.enable_thinking=false / INFR_NO_THINK=1) or use \
+                     plain text"
+                        .to_string(),
+                )));
+            }
+            let mut constraint = be.renderer().output_constraint(&schema).map_err(|error| {
+                anyhow::Error::new(infr_core::error::InvalidInput(format!(
+                    "response_format json_schema cannot be compiled: {error}"
+                )))
+            })?;
+            let mut stream = infr_engine::ChatStream::new(false);
+            let mut od = |delta: infr_engine::Delta| on_delta(delta);
+            let stats = be.generate(
+                &prompt,
+                checkpoint_prefixes,
+                max_new,
+                Some(&mut constraint),
+                &req,
+                &mut |piece: &str| {
+                    stream.push(piece, &mut od);
+                    // Client disconnected (server latched `cancel`): stop this decode promptly.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        req.abort();
+                    }
+                },
+            )?;
+            stream.finish(&mut od);
+            return Ok(infr_server::ChatOutcome {
+                // Truncation is the one case the grammar cannot rescue: the server turns an
+                // unparsable body into an explicit error rather than a half-JSON "success".
+                finish: if stats.n_gen >= max_new {
+                    infr_server::Finish::Length
+                } else {
+                    infr_server::Finish::Stop
+                },
+                prompt_tokens: stats.n_prompt.saturating_add(stats.n_cached) as u32,
+                cached_prompt_tokens: stats.n_cached as u32,
+                completion_tokens: stats.n_gen as u32,
+            });
+        }
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
-        // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
-        // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
+        // seam decode). Prime the assistant turn with the <tool_call> opener and read the
+        // constrained JSON through the SAME splitter the unconstrained path uses: the primed
+        // opener makes it a bare-JSON call, so the name and every completed argument member
+        // stream out while the call is still generating instead of arriving as one frame at the
+        // end. On any failure fall back to unconstrained (mirrors LlamaGenerator).
         let forced_constraint = be.renderer().tool_constraint(tools, tool_choice)?;
         if !images.is_empty() && forced_constraint.is_some() {
             anyhow::bail!("forced tool calls are not supported together with image inputs yet");
@@ -3265,63 +3479,97 @@ fn run_chat(
         if let Some(mut constraint) = forced_constraint {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
-            let mut tokens = (0u32, 0u32);
-            let mut cached_tokens = 0u32;
-            let emitted = match be.generate(
-                &primed,
-                checkpoint_prefixes,
-                max_new,
-                Some(&mut constraint),
-                &req,
-                &mut |p: &str| {
-                    body.push_str(p);
-                    // Client disconnected (server latched `cancel`): stop this constrained decode.
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        req.abort();
+            let mut stream = infr_engine::ChatStream::new(true);
+            // What the client already holds. Once a call's name has gone out the unconstrained
+            // retry below would open a SECOND call on top of it, so the fallback is only allowed
+            // while nothing has been announced.
+            let mut began = false;
+            let mut calls = 0usize;
+            let (gen_res, is_call) = {
+                let mut od = |d: infr_engine::Delta| {
+                    match &d {
+                        infr_engine::Delta::ToolCallBegin { .. } => began = true,
+                        infr_engine::Delta::ToolCall { .. } => calls += 1,
+                        _ => {}
                     }
-                },
-            ) {
+                    on_delta(d);
+                };
+                let res = be.generate(
+                    &primed,
+                    checkpoint_prefixes,
+                    max_new,
+                    Some(&mut constraint),
+                    &req,
+                    &mut |p: &str| {
+                        body.push_str(p);
+                        stream.push(p, &mut od);
+                        // Client disconnected (server latched `cancel`): stop this constrained decode.
+                        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            req.abort();
+                        }
+                    },
+                );
+                // Only finish the splitter when the constrained body really is a call: a truncated
+                // body would otherwise be re-emitted as content on top of the fragments already out.
+                let complete = body.trim().trim_end_matches("</tool_call>").trim();
+                let is_call = res.is_ok()
+                    && serde_json::from_str::<serde_json::Value>(complete)
+                        .ok()
+                        .is_some_and(|v| v.get("name").and_then(|n| n.as_str()).is_some());
+                if is_call {
+                    // Flush held-back tails and dispatch the authoritative finished call, whose
+                    // arguments the streamed fragments are a prefix of.
+                    stream.finish(&mut od);
+                }
+                (res, is_call)
+            };
+            match gen_res {
                 Ok(gstats) => {
-                    tokens = (
-                        gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
-                        gstats.n_gen as u32,
-                    );
-                    cached_tokens = gstats.n_cached as u32;
-                    let body = body.trim().trim_end_matches("</tool_call>").trim();
-                    match serde_json::from_str::<serde_json::Value>(body) {
-                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
-                            let arguments = val
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            on_delta(infr_engine::Delta::ToolCall {
-                                name: name.to_string(),
-                                arguments: serde_json::to_string(&arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            });
-                        }),
-                        Err(_) => None,
+                    if is_call && calls > 0 {
+                        return Ok(infr_server::ChatOutcome {
+                            finish: infr_server::Finish::ToolCalls,
+                            prompt_tokens: gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
+                            cached_prompt_tokens: gstats.n_cached as u32,
+                            completion_tokens: gstats.n_gen as u32,
+                        });
                     }
-                    .is_some()
+                    if began && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        // The decode was stopped from outside (client gone or deadline): nobody is
+                        // waiting for a retry, and the server already decides how to report an
+                        // aborted request, so hand back what ran instead of inventing an error.
+                        return Ok(infr_server::ChatOutcome {
+                            finish: if gstats.n_gen >= max_new {
+                                infr_server::Finish::Length
+                            } else {
+                                infr_server::Finish::Stop
+                            },
+                            prompt_tokens: gstats.n_prompt.saturating_add(gstats.n_cached) as u32,
+                            cached_prompt_tokens: gstats.n_cached as u32,
+                            completion_tokens: gstats.n_gen as u32,
+                        });
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("[tools] seam grammar-constrained generation failed ({e})");
-                    false
+                    if began {
+                        return Err(e);
+                    }
                 }
-            };
-            if emitted {
-                return Ok(infr_server::ChatOutcome {
-                    finish: infr_server::Finish::ToolCalls,
-                    prompt_tokens: tokens.0,
-                    cached_prompt_tokens: cached_tokens,
-                    completion_tokens: tokens.1,
-                });
             }
-            // The constrained attempt advanced the serialised session past the primed `<tool_call>`
-            // opener + the (unparseable) body. Reset it so the unconstrained retry below re-prefills
-            // the clean `prompt` from scratch, instead of inheriting that divergent KV state and
-            // relying on the seam's common-prefix rewind to unwind it. No-op on the multi-slot
-            // engine (each request already gets a fresh best-prefix slot).
+            if began {
+                // The client already holds this call's name (and whatever arguments streamed). A
+                // retry cannot start it over — it would append a second call's arguments to the
+                // first one — so stop and say why instead of emitting a duplicate.
+                anyhow::bail!(
+                    "forced tool call ended before its arguments were complete (max_tokens \
+                     reached?); refusing to retry unconstrained after streaming began"
+                );
+            }
+            // Nothing was announced, so the constrained attempt can be discarded. Reset the
+            // serialised session so the unconstrained retry below re-prefills the clean `prompt`
+            // from scratch, instead of inheriting that divergent KV state and relying on the seam's
+            // common-prefix rewind to unwind it. No-op on the multi-slot engine (each request
+            // already gets a fresh best-prefix slot).
             be.reset();
             tracing::warn!(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
@@ -7008,7 +7256,29 @@ fn cmd_serve(
         let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
         let vision = mmproj
             .map(|path| {
-                let backend = engine.fork_vision_backend()?;
+                let backend = if engine.unified_vram_stats().is_none() {
+                    // The primary session loaded every MoE expert resident, so the pager never
+                    // built its arena. Give the vision client a private one; the LLM keeps its
+                    // normal allocation path and is not re-routed through a late arena.
+                    let projector_bytes = std::fs::metadata(path).map_or(0u64, |meta| meta.len());
+                    let desired = (projector_bytes + (3u64 << 30)).next_multiple_of(256u64 << 20);
+                    let room = engine.unified_alloc_room();
+                    let bytes = desired.min(room.saturating_sub(512u64 << 20));
+                    if bytes < projector_bytes + (1u64 << 30) {
+                        anyhow::bail!(
+                            "vision needs a private unified VRAM arena, but only {} MiB of the \
+                             device budget is free; lower --ctx, close other GPU processes, or \
+                             reserve an expert cache with --set paging.cache",
+                            room >> 20
+                        );
+                    }
+                    engine.fork_vision_backend_with_arena(
+                        usize::try_from(bytes)
+                            .context("vision arena exceeds the host address space")?,
+                    )?
+                } else {
+                    engine.fork_vision_backend()?
+                };
                 let vision =
                     infr_vision::NativeVisionEngine::load_vulkan_with_backend(path, backend)?;
                 let llm_dim = engine.model().config().n_embd;

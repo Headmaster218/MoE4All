@@ -392,6 +392,8 @@ fn default_config_matches_documented_defaults() {
     assert!(!d.device.ubatch_parallel_specified);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);
+    // The GPU startup lock ships ON: a second engine on the same card is a measurement defect.
+    assert!(d.device.gpu_lock);
     // §6.3 / §6.4.
     assert_eq!(d.kv.slots, 4);
     assert_eq!(d.kv.session_cache_dir, None);
@@ -400,6 +402,10 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kv.session_cache_ttl_hours, 24);
     assert!(d.kv.ring);
     assert!(d.kv.dynamic);
+    // §6.3: the paged tree is opt-in and its RAM tier is a SEPARATE opt-in on top of it.
+    assert!(!d.kv.paged);
+    assert_eq!(d.kv.paged_cache_max, None);
+    assert_eq!(d.kv.paged_page_tokens, 32 * 1024);
     assert!(!d.kv.force_q8);
     assert_eq!(d.paging.trace, None);
     assert!(!d.paging.expert_prefetch);
@@ -481,6 +487,74 @@ fn gpu_resident_decode_is_shipped_by_default_and_can_be_disabled_explicitly() {
     let mut cfg = defaults;
     cli_layer(&["kernels.vulkan.decode_gpu_resident=false"]).apply(&mut cfg);
     assert!(!cfg.kernels.vulkan.decode_gpu_resident);
+}
+
+/// The GPU startup lock ships ON, and every layer can turn the CHECK off — the field is positive
+/// (`gpu_lock`), so the `INFR_NO_*` spelling inverts it and, like `INFR_CPU_NO_SPINPOOL`, `=0` means
+/// "keep it on" rather than "presence means off".
+#[test]
+fn gpu_lock_ships_on_and_every_layer_can_disable_the_check() {
+    assert!(Config::default().device.gpu_lock);
+
+    for (value, want) in [("", false), ("0", true), ("1", false)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_NO_GPU_LOCK", value)])]);
+        assert_eq!(cfg.device.gpu_lock, want, "INFR_NO_GPU_LOCK={value:?}");
+    }
+
+    let from_file = Config::load_from_layers(&[file_layer("[device]\ngpu_lock = false\n")]);
+    assert!(!from_file.device.gpu_lock);
+
+    let mut cfg = Config::default();
+    cli_layer(&["device.gpu_lock=false"]).apply(&mut cfg);
+    assert!(!cfg.device.gpu_lock);
+}
+
+/// Uncensor ships OFF: naming a direction file is the ONLY way the projection exists, and every
+/// layer that can name one is tested here, because a feature that changes what the server puts on
+/// the wire must not be able to turn itself on through a stale default in some layer.
+#[test]
+fn uncensor_ships_off_and_every_layer_can_name_a_direction_file() {
+    let defaults = Config::default();
+    assert_eq!(
+        defaults.uncensor.vector, None,
+        "no session gets a refusal-direction projection it did not ask for"
+    );
+    assert_eq!(
+        (defaults.uncensor.first_layer, defaults.uncensor.last_layer),
+        (4, 44)
+    );
+
+    let from_env = Config::load_from_layers(&[env_layer(&[
+        ("INFR_UNCENSOR_VECTOR", "D:/models/cvec.gguf"),
+        ("INFR_UNCENSOR_FIRST_LAYER", "8"),
+        ("INFR_UNCENSOR_LAST_LAYER", "40"),
+    ])]);
+    assert_eq!(
+        from_env.uncensor.vector.as_deref(),
+        Some(std::path::Path::new("D:/models/cvec.gguf"))
+    );
+    assert_eq!(
+        (from_env.uncensor.first_layer, from_env.uncensor.last_layer),
+        (8, 40)
+    );
+
+    let from_file = Config::load_from_layers(&[file_layer(
+        "[uncensor]
+vector = 'cvec.gguf'
+",
+    )]);
+    assert_eq!(
+        from_file.uncensor.vector.as_deref(),
+        Some(std::path::Path::new("cvec.gguf"))
+    );
+
+    let mut cfg = Config::default();
+    cli_layer(&["uncensor.vector=cvec.gguf", "uncensor.last_layer=30"]).apply(&mut cfg);
+    assert_eq!(
+        cfg.uncensor.vector.as_deref(),
+        Some(std::path::Path::new("cvec.gguf"))
+    );
+    assert_eq!(cfg.uncensor.last_layer, 30);
 }
 
 #[test]
@@ -1417,6 +1491,10 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_NO_MOE_SHARED_SLOT",
         "INFR_IMAGE_CODEC_DIR",
         "INFR_IMAGE_CODEC_FIXTURES",
+        // Chrome-trace dump filters read directly by infr-vulkan/src/timeline.rs: they shape
+        // trace output only, carry no runtime semantics, and are accounted in NOT_MIGRATED.
+        "INFR_TIMELINE_RAW_KERNELS",
+        "INFR_TIMELINE_RAW_UNKNOWN",
     ];
 
     let Some(crates) = repo_crates_dir() else {
@@ -1830,6 +1908,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_SPEC_DEBUG",
         "INFR_SPEC_DRAFT",
         "INFR_SPEC_K",
+        "INFR_SPEC_MTP_MIN_ALPHA",
         "INFR_TENSOR_PARALLEL",
         "INFR_TP_HOST",
         "INFR_UBATCH",
@@ -2038,6 +2117,9 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// they were born reading `Config` (`docs/config-plan.md` R3), so they are `migrated` from
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
+        "INFR_MEM_GUARD_HEADROOM",
+        "INFR_MEM_GUARD_RAM_HEADROOM",
+        "INFR_MEM_GUARD_POLL_MS",
         "INFR_RAM_BUDGET",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
@@ -2045,6 +2127,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_LAYER_MAJOR",
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
+        "INFR_AMDVLK_HD256_FLASH",
         "INFR_NO_Q8_DECODE_CHUNK1024",
         "INFR_Q8_DECODE_REPLAY_CHUNK1024",
         "INFR_NO_Q8_QK_I8",
@@ -2060,6 +2143,18 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SESSION_IDLE_SECS",
         "INFR_KV_SESSION_CACHE_MAX",
         "INFR_KV_SESSION_CACHE_TTL_HOURS",
+        "INFR_KV_RAM_CACHE_MAX",
+        "INFR_KV_PAGED",
+        "INFR_KV_PAGED_PAGE_TOKENS",
+        "INFR_KV_PAGED_CACHE_MAX",
+        "INFR_KV_DISK_CACHE_MAX",
+        "INFR_KV_DISK_CACHE_PATH",
+        "INFR_RESPONSE_STORE_ENTRIES",
+        "INFR_RESPONSE_STORE_PATH",
+        "INFR_NO_GPU_LOCK",
+        "INFR_UNCENSOR_VECTOR",
+        "INFR_UNCENSOR_FIRST_LAYER",
+        "INFR_UNCENSOR_LAST_LAYER",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

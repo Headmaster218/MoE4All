@@ -21,12 +21,17 @@ const MIB_F64: f64 = (1u64 << 20) as f64;
 const GIB_F64: f64 = (1u64 << 30) as f64;
 
 pub mod model;
+// Pure two-tier frame bookkeeping for the paged KV cache; the Vulkan wiring
+// lands in Phase B/C, so nothing consumes it yet.
+#[allow(dead_code)]
+pub(crate) mod kv_frame_pool;
 mod ple;
 mod runner;
 mod sc;
 mod segmented_kv;
 #[path = "../parallel_token_delivery.rs"]
 pub(crate) mod token_delivery;
+pub(crate) use segmented_kv::SegmentedKvLayout;
 pub(crate) use segmented_kv::KV_GROW_ROWS;
 mod session_state;
 mod weight_upload;
@@ -836,14 +841,80 @@ pub struct ImageSpanEmbeds {
     pub embeds: std::sync::Arc<Vec<f32>>,
 }
 
+/// Marks a token id as an image-cache key rather than a vocabulary token. Every key id has it
+/// set and every real token id clears it, so a text chain and an image chain can never match
+/// each other INSIDE an image span.
+pub const IMAGE_CACHE_TOKEN_BIT: u32 = 1 << 31;
+
+/// One image span in the shared paged-KV tree's KEY space.
+///
+/// The tree addresses a KV chain by its token vector, and an image span is `grid_nx * grid_ny`
+/// copies of the SAME image-pad token: two different pictures would publish an identical chain,
+/// and the second reader would be handed the first one's attention rows. `ids` replaces that run
+/// with content-derived pseudo-tokens carrying [`IMAGE_CACHE_TOKEN_BIT`], which no real
+/// vocabulary id reaches. The substitution is length-preserving, so page alignment, snapshot
+/// boundaries and chain promotion keep working on the key exactly as they do on tokens.
+#[derive(Clone)]
+pub struct ImageCacheSpan {
+    /// First expanded prompt token of this image.
+    pub start: usize,
+    /// One reserved-range id per image-token position.
+    pub ids: std::sync::Arc<Vec<u32>>,
+}
+
+/// Stamp a tree key with the projection setting its rows were computed under, by overwriting the
+/// first position with one of the two reserved ids (`infr_uncensor::key_token`). Only the first
+/// position moves, so the rest of the key — text prefixes included — still matches across settings
+/// for the sessions that never load a direction file. A no-op on an empty key.
+pub(crate) fn tag_uncensor_key(view: &mut [u32], token: u32) {
+    if let Some(first) = view.first_mut() {
+        *first = token;
+    }
+}
+
+/// `tokens` seen through the tree's key space: each recorded image span's pad run is replaced by
+/// that image's content block and everything else stays as it is. Positions at or past
+/// `tokens.len()` are ignored, so a partial conversation — truncated, or attached mid-prompt —
+/// keys itself without any clipping by the caller. Spans are ordered and disjoint, the way
+/// `expand_multimodal_prompt` builds them.
+pub(crate) fn image_cache_view(tokens: &[u32], spans: &[ImageCacheSpan]) -> Vec<u32> {
+    if spans.is_empty() {
+        return tokens.to_vec();
+    }
+    let mut view = Vec::with_capacity(tokens.len());
+    let mut next = 0usize;
+    for span in spans {
+        if span.start >= tokens.len() {
+            break;
+        }
+        view.extend_from_slice(&tokens[next..span.start]);
+        let keep = (span.start + span.ids.len()).min(tokens.len()) - span.start;
+        view.extend_from_slice(&span.ids[..keep]);
+        next = span.start + keep;
+    }
+    view.extend_from_slice(&tokens[next..]);
+    view
+}
+
 /// Qwen multimodal RoPE data for one request. Text-only callers pass `None` and retain the
 /// original graph and cache behavior.
 pub struct MropePlan {
     /// Row-major `(T, H, W, E)` positions for every expanded prompt token.
     pub prompt_pos4: Vec<i32>,
     pub spans: Vec<ImageSpanEmbeds>,
+    /// This request's image spans in the paged-KV tree's key space — parallel to [`Self::spans`],
+    /// and the only form of them a shared cache may be addressed by.
+    pub cache_spans: Vec<ImageCacheSpan>,
     /// Position used by the first generated token; later generated tokens advance linearly.
     pub decode_base: i32,
+}
+
+impl MropePlan {
+    /// The tree key of this request's expanded prompt: what its chain is published under, and
+    /// what the slot keeps materializing under afterwards.
+    pub fn cache_view(&self, tokens: &[u32]) -> Vec<u32> {
+        image_cache_view(tokens, &self.cache_spans)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -919,8 +990,11 @@ pub(crate) fn generate_dense_vulkan_session(
         // Never return that half-advanced slot to a persistent session pool as reusable. Keeping
         // the allocations and weights is safe; an empty token ledger makes the next request take
         // the existing full-reset + full-prefill path from position zero.
+        // One case is exempt: a prefill sweep that stopped BETWEEN two chunks vouched for its
+        // ledger, because every layer wrote exactly up to the spine it recorded — so a client that
+        // cancels mid-prefill pays for the tail on its retry instead of the whole prompt.
         if let Some(kv) = state.as_mut() {
-            kv.reset();
+            kv.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -977,7 +1051,7 @@ pub(crate) fn generate_dense_vulkan_prepared_prefill_session(
     );
     if result.is_err() {
         if let Some(slot) = state.as_mut() {
-            slot.reset();
+            slot.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -1087,11 +1161,12 @@ pub(crate) fn generate_dense_vulkan_parallel_prefill_session(
         req,
     );
     if out.is_err() {
+        // A slot only keeps its ledger when the sweep vouched for it between chunks.
         if let Some(slot) = primary.as_mut() {
-            slot.reset();
+            slot.reset_after_failed_turn();
         }
         for slot in peers {
-            slot.reset();
+            slot.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -1176,11 +1251,12 @@ pub(crate) fn generate_dense_vulkan_parallel_verify_session(
         want_hidden,
     );
     if result.is_err() {
+        // A slot only keeps its ledger when the sweep vouched for it between chunks.
         if let Some(slot) = primary.as_mut() {
-            slot.reset();
+            slot.reset_after_failed_turn();
         }
         for slot in peers {
-            slot.reset();
+            slot.reset_after_failed_turn();
         }
         vk.release_moe_load_reservation();
     }
@@ -1589,7 +1665,8 @@ const QWEN4_ACT_RESERVE_PAD: (u64, u64) = (4, 3);
 const QWEN4_PLAN_OVERLAP_RESERVE: u64 = 64 * 1024 * 1024;
 
 /// Batched-prefill micro-batch: rows per prefill chunk (`device.ubatch` / `INFR_UBATCH`, default
-/// 4096 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE
+/// 5120 on a discrete GPU — but see [`default_ubatch_rows`] for the INTEGRATED-GPU default and the
+/// measurements behind that number). ONE
 /// reader funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all
 /// derive from this, because the ring's correctness bound is "window + one whole prefill chunk".
 ///
@@ -1709,18 +1786,32 @@ fn first_successful_moe_ubatch<T, E>(
     Ok(None)
 }
 
-/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 4096 rows on a
-/// discrete GPU in both profiles, EXCEPT on an integrated GPU, where a chunk that big is a single
-/// multi-second command buffer and trips
-/// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
-/// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 5120 rows on a
+/// discrete GPU, EXCEPT on an integrated GPU, where a chunk that big is a single multi-second
+/// command buffer and trips the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` ->
+/// `VK_ERROR_DEVICE_LOST`). See [`infr_core::integrated_ubatch_rows`] for the measurements behind
+/// the smaller default.
+///
+/// 5120 is measured, not guessed, and UBATCH IS THE FIRST ALLOCATION: its runtime reserve comes off
+/// the top of the unified arena (`ModelMemoryPlan::runtime_elastic`, ~1.5 GiB per 1024 rows on
+/// Qwen3.8-Flash-Next) and the expert cache is whatever remains, so this constant is the knob that
+/// decides how much VRAM the experts get. Two independent measurements put the knee here:
+/// RDNA3 measurements put the knee here. `kernel-bench --sweep-m` (Vulkan coopmat, the model's two
+/// MoE shapes) peaks at m=4096 (640x2560, 52.9 TF) and 2560x1280 keeps climbing only to 8192
+/// (48.9 -> 54.1 TF). Qwen3.8-Flash-Next (48 layers, 512 experts top-10, 4.27 bpw) pp30000 on the
+/// 7900 XTX with `kv.paged=true`, ctx 30016: ub 2048 = 1110.9 t/s, 4096 = 1591.3, 5120 = 1712.2,
+/// 6144 = 1728.4 (+0.9%). 5120 is the tallest rung that still holds all FOUR prefill lanes; 6144
+/// drops to 3 lanes and pays 1.5 GiB of expert cache for that last 0.9%.
+/// A GPU too small for 5120's reserve loses nothing: the plan's placement sweep starts at this
+/// height and walks [`ubatch_fallbacks_below`] down until the expert cache clears the prefill floor,
+/// so aiming high costs one CPU-side plan recomputation.
 ///
 /// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
-/// `device_class()` is `None`) uses the profile default.
+/// `device_class()` is `None`) uses this default.
 fn default_ubatch_rows(_profile: infr_core::config::AutoProfile) -> usize {
     match infr_vulkan::device_class() {
         Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 4096,
+        _ => 5120,
     }
 }
 
@@ -2514,6 +2605,57 @@ pub(crate) fn segmented_kv_wanted(
         && v_fmt == DType::Q8_0
 }
 
+/// Every condition a persistent session-state tier still needs, as one readable list. The tree, the
+/// RAM pool and the disk cache all release a conversation's rows and re-attach them elsewhere, which
+/// IS [`segmented_kv_wanted`] — plus one runtime fact that no `kv.*` key controls: the segments are
+/// claimed from the unified VRAM arena, which only exists once the MoE experts are paged. Invariant
+/// (guarded by `segmented_kv_requires_q8_on_both_sides`): the list is empty exactly when the layout
+/// is available, so a refusal can always name the gate the session missed.
+pub(crate) fn segmented_kv_blockers(
+    cfg: &Config,
+    ec: &EngineConfig,
+    ring: bool,
+    k_fmt: DType,
+    v_fmt: DType,
+    arena_available: bool,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !(cfg.qwen35 || cfg.qwen4exp) {
+        blockers
+            .push("this architecture has no segmented KV layout (only Qwen3.5/3.6/3.8 do)".into());
+    }
+    if !ec.kv.dynamic {
+        blockers.push("kv.dynamic is off (INFR_NO_DYNAMIC_KV, or --set kv.dynamic=false)".into());
+    }
+    if ec.kv.overflow {
+        blockers.push(
+            "kv.overflow is on: the overflow layout owns the KV rows, so none can be released"
+                .into(),
+        );
+    }
+    if ring {
+        blockers.push(
+            "the sliding-window layers were allocated as window-sized rings (kv.ring), which drop \
+             the early prefix rows a restore needs"
+                .into(),
+        );
+    }
+    if k_fmt != DType::Q8_0 || v_fmt != DType::Q8_0 {
+        blockers.push(format!(
+            "KV is {k_fmt:?}/{v_fmt:?}; the layout commits Q8_0/Q8_0 segments only"
+        ));
+    }
+    if !arena_available {
+        blockers.push(
+            "there is no unified VRAM arena: every MoE expert loaded resident, so no elastic device \
+             pool exists to back or re-attach segments (an arena appears only when experts are \
+             paged - reserve one with paging.cache / INFR_CACHE, or lower the device budget)"
+                .into(),
+        );
+    }
+    blockers
+}
+
 /// Per-slot persistent state as the allocator must reserve it. Dynamic Qwen caches occupy whole
 /// 32K physical segments, while recurrent/checkpoint state keeps its exact byte size.
 fn kv_state_reserve_bytes(
@@ -2533,8 +2675,14 @@ fn kv_state_reserve_bytes(
     if !segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt) {
         return logical;
     }
-    let layout = segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx.max(1), k_fmt, v_fmt)
-        .expect("segmented Qwen state has a layout");
+    let layout = segmented_kv::SegmentedKvLayout::for_qwen(
+        cfg,
+        want_ctx.max(1),
+        k_fmt,
+        v_fmt,
+        ec.kv.paged_page_tokens,
+    )
+    .expect("segmented Qwen state has a layout");
     logical
         .saturating_sub(layout.logical_bytes())
         .saturating_add(layout.committed_bytes(want_ctx))
@@ -3630,6 +3778,19 @@ fn host_budget_resident_after_fixed(
     }
 }
 
+/// Physical RAM the RAM frame pool may never spend: the pager objects, the KV segments created
+/// after the plan, and whatever else on the box grows while a session serves for hours. Measured on
+/// the host's AVAILABLE RAM rather than on Windows' commit headroom on purpose — the commit limit
+/// moves under a system-managed page file, and a pool clamped against a moving number silently
+/// loses its RAM tier at the worst possible moment (session init, after the store took everything).
+pub(crate) const HOST_FRAME_RAM_FLOOR: u64 = 1 << 30;
+
+/// Commit headroom the expert store must leave behind it. Measured, not guessed: with the store
+/// sized to `live headroom - 512 MiB` on Qwen3.8-Flash-Next-UD-Q4_K_XL, the load died 1.4 GiB
+/// further on — the KV corridor, the activation workspace and the server objects that land after
+/// this point needed more than half a GiB, and the breaker rightly ended the session at 374 MiB.
+pub(crate) const POST_STORE_COMMIT_SLACK: u64 = 2 << 30;
+
 fn moe_host_backing_for_device(
     profile: infr_core::config::AutoProfile,
     ram_request: infr_core::hostmem::RamRequest,
@@ -3687,15 +3848,18 @@ fn moe_host_backing_for_device(
         // Prefill and Decode read only the ranges they need into their upload destination.
         return MoeHostBacking::Bounded { bytes: 0 };
     }
-    // WDDM charges device-local Vulkan allocations against Windows' system commit limit. Only an
-    // unresolved live Auto request may be clipped by that late snapshot. A startup-frozen budget
-    // already has exact total-process semantics and must not silently change after model loading.
+    // Windows charges device-local Vulkan allocations against the system commit limit, so a caller
+    // that ARMED the breaker's commit axis gets the store clipped to the same live line the process
+    // would be stopped on. Nobody is clipped by default: the commit limit moves under a
+    // system-managed page file, and the frame pool below is clamped for real at session init
+    // (`parallel.rs`), which is where the RAM actually still there is known. An explicit operator
+    // budget is verbatim even when the axis is armed.
     let budget = match ram_request {
-        infr_core::hostmem::RamRequest::Auto => {
+        infr_core::hostmem::RamRequest::Auto
+        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_) => {
             requested_budget.min(commit_ceiling.unwrap_or(u64::MAX))
         }
         infr_core::hostmem::RamRequest::TotalProcessBudget(_)
-        | infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
         | infr_core::hostmem::RamRequest::LegacyCacheBudget(_)
         | infr_core::hostmem::RamRequest::Bypass => requested_budget,
     } as usize;
@@ -3883,8 +4047,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let k_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_k);
         let v_fmt = vulkan_kv_fmt_for_budget(cfg, ec, ec.kv.type_v);
         let dynamic_layout = segmented_kv_wanted(cfg, ec, ring, k_fmt, v_fmt).then(|| {
-            segmented_kv::SegmentedKvLayout::for_qwen(cfg, want_ctx, k_fmt, v_fmt)
-                .expect("Qwen hybrid models have segmented KV geometry")
+            segmented_kv::SegmentedKvLayout::for_qwen(
+                cfg,
+                want_ctx,
+                k_fmt,
+                v_fmt,
+                ec.kv.paged_page_tokens,
+            )
+            .expect("Qwen hybrid models have segmented KV geometry")
         });
         let dynamic_kv_reserve_per_slot = dynamic_layout
             .as_ref()
@@ -4252,6 +4422,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let auto_profile = ec.device.auto_profile;
             let planned_host_available = infr_core::hostmem::available_bytes();
             let planned_host_total = infr_core::hostmem::total_bytes();
+            // Was the breaker's commit axis armed? Then — and only then — the store obeys the same
+            // line the process would be ended on. `Bytes(0)` means "axis disabled" per the config's
+            // own grammar.
+            let planned_commit_guard = ec.device.mem_guard_headroom.and_then(|spec| {
+                let bytes = spec.resolve(planned_host_total.unwrap_or(0));
+                (bytes > 0).then_some(bytes)
+            });
+            // The operator has already promised this much host RAM to the paged KV tree. Frames are
+            // claimed lazily, but a Windows commit charge is a commit charge: sizing the expert
+            // store against the full live headroom and letting the tree arrive afterwards is how a
+            // session loads successfully and then exits 87 during the first long conversation.
+            let planned_paged_pool_bytes = infr_core::hostmem::paged_pool_bytes_for_spec(
+                ec.kv.paged_cache_max,
+                planned_host_total,
+            );
             let planned_process_resident = infr_core::hostmem::process_resident_bytes();
             let host_classes: Vec<(usize, usize)> = logical_pools
                 .iter()
@@ -4599,15 +4784,17 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     planned_process_resident,
                     infr_core::hostmem::process_resident_bytes(),
                 );
-                // Leave a small commit tail for the pager metadata, initial KV segment and server
-                // objects created after this point. This ceiling is a fallback only for a live Auto
-                // request. Startup-frozen and explicit total-process budgets remain exact.
+                // The commit ceiling is obeyed ONLY when the operator has armed the breaker's commit
+                // axis (`device.mem_guard_headroom`, off by default). Reason, measured on this box:
+                // a system-managed page file moves the commit limit between launches of the same
+                // binary — the same 71.73 GiB store saw a 104.6 GB limit, then a 116.8 GB one — so
+                // sizing against it both loses ~35% of throughput to a number that is about to grow
+                // and does not catch the flood it was meant to prevent. An armed axis is a request
+                // to obey the same line the process will exit on, so then the store leaves slack.
                 let commit_available = infr_core::hostmem::commit_available_bytes();
                 let live_commit_ceiling =
-                    commit_available.map(|bytes| bytes.saturating_sub(512 << 20));
-                let automatic_commit_ceiling = live_automatic_budget
-                    .then_some(live_commit_ceiling)
-                    .flatten();
+                    commit_available.map(|bytes| bytes.saturating_sub(POST_STORE_COMMIT_SLACK));
+                let automatic_commit_ceiling = planned_commit_guard.and(live_commit_ceiling);
                 let host_backing = moe_host_backing_for_device(
                     auto_profile,
                     ram_request,
@@ -4632,29 +4819,24 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         ));
                     }
                 }
-                if let (Some(available), Some(ceiling)) = (commit_available, live_commit_ceiling) {
-                    if live_automatic_budget {
-                        tracing::info!(
-                            available_commit_bytes = available,
-                            host_cache_commit_ceiling_bytes = ceiling,
-                            selected_host_cache_bytes = host_resident_bytes,
-                            "MoE Windows automatic commit guard after fixed Vulkan allocations"
-                        );
-                    } else if host_resident_bytes as u64 > ceiling {
-                        let policy = if matches!(
-                            ram_request,
-                            infr_core::hostmem::RamRequest::FrozenAutomaticBudget(_)
-                        ) {
-                            "startup-frozen automatic"
-                        } else {
-                            "explicit"
-                        };
+                if let Some(available) = commit_available {
+                    tracing::info!(
+                        available_commit_bytes = available,
+                        commit_guard_armed = planned_commit_guard.is_some(),
+                        paged_pool_bytes = planned_paged_pool_bytes,
+                        expert_payload_bytes = host_bytes,
+                        selected_host_cache_bytes = host_resident_bytes,
+                        "MoE host store sized from physical RAM; Windows commit headroom reported for the record"
+                    );
+                    if planned_commit_guard.is_none() && host_resident_bytes as u64 > available {
                         tracing::warn!(
-                            policy,
                             available_commit_bytes = available,
-                            host_cache_commit_ceiling_bytes = ceiling,
                             selected_host_cache_bytes = host_resident_bytes,
-                            "MoE RAM target exceeds the current Windows commit headroom; preserving the exact total-process target without silent reduction"
+                            "the host store exceeds the commit headroom Windows reports right now, \
+                             and the breaker's commit axis is off: a system-managed page file \
+                             normally absorbs this, and when it cannot the allocation fails inside \
+                             the driver instead of as a clean exit 87. Set \
+                             device.mem_guard_headroom to size and stop against this line instead."
                         );
                     }
                 }
@@ -6880,25 +7062,36 @@ mod seam_helper_tests {
                     );
                 }
             }
-            for request in [
-                RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
-                RamRequest::TotalProcessBudget((50 * GIB) as u64),
-            ] {
-                assert_eq!(
-                    super::moe_host_backing_for_device(
-                        profile,
-                        request,
-                        false,
-                        Some(GIB as u64),
-                        Some((64 * GIB) as u64),
-                        Some((2 * GIB) as u64),
-                        Some(GIB as u64),
-                        47 * GIB,
-                    ),
-                    super::MoeHostBacking::Full,
-                    "the UMA fix must not reduce a discrete GPU's frozen or explicit RAM target"
-                );
-            }
+            assert_eq!(
+                super::moe_host_backing_for_device(
+                    profile,
+                    RamRequest::TotalProcessBudget((50 * GIB) as u64),
+                    false,
+                    Some(GIB as u64),
+                    Some((64 * GIB) as u64),
+                    Some((2 * GIB) as u64),
+                    Some(GIB as u64),
+                    47 * GIB,
+                ),
+                super::MoeHostBacking::Full,
+                "the UMA fix must not reduce a discrete GPU's explicit RAM target"
+            );
+            assert_eq!(
+                super::moe_host_backing_for_device(
+                    profile,
+                    RamRequest::FrozenAutomaticBudget((50 * GIB) as u64),
+                    false,
+                    Some(GIB as u64),
+                    Some((64 * GIB) as u64),
+                    Some((2 * GIB) as u64),
+                    Some(GIB as u64),
+                    47 * GIB,
+                ),
+                super::MoeHostBacking::Bounded { bytes: GIB },
+                "a discrete GPU's frozen automatic target obeys the live commit ceiling: on Windows \
+                 that number already carries WDDM's device-memory charge, so promising a 47 GiB \
+                 store against a 1 GiB ceiling is how a session exits 87 mid-load"
+            );
             for unified in [false, true] {
                 assert_eq!(
                     super::moe_host_backing_for_device(
@@ -7216,7 +7409,7 @@ mod seam_helper_tests {
     }
 
     #[test]
-    fn moe_host_backing_applies_post_vulkan_commit_ceiling_only_to_auto() {
+    fn moe_host_backing_applies_post_vulkan_commit_ceiling_to_every_automatic_shape() {
         use infr_core::hostmem::RamRequest;
 
         let payload = 48 * GIB;
@@ -7257,8 +7450,10 @@ mod seam_helper_tests {
                 Some(ceiling as u64),
                 payload,
             ),
-            super::MoeHostBacking::Full,
-            "a startup-frozen automatic budget must not be silently reduced after Vulkan loading"
+            super::MoeHostBacking::Bounded { bytes: ceiling },
+            "a startup-frozen budget is still an estimate made from available PHYSICAL RAM, while \
+             WDDM charges this process's device allocations to the commit limit: crossing it is how \
+             a 71.73 GiB store exits the box at 5 MiB of commit headroom"
         );
         assert_eq!(
             super::moe_host_backing(
@@ -7267,7 +7462,7 @@ mod seam_helper_tests {
                 Some((56 * GIB) as u64),
                 None,
                 Some(0),
-                Some(ceiling as u64),
+                Some((46 * GIB) as u64),
                 payload,
             ),
             super::MoeHostBacking::Bounded {
@@ -7396,16 +7591,16 @@ mod seam_helper_tests {
         assert!(!super::user_pinned_ubatch(&unset));
         assert_eq!(
             super::ubatch_rows(&unset),
-            4096,
-            "no pin, no iGPU: both profiles start at 4096 and let placement fall back"
+            5120,
+            "no pin, no iGPU: both profiles start at the measured 5120 and let placement fall back"
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_rows(&aggressive),
-            4096,
-            "the aggressive discrete default uses a larger prefill chunk"
+            5120,
+            "the aggressive discrete default uses the same measured prefill chunk"
         );
 
         let pinned = EngineConfig {
@@ -7434,7 +7629,7 @@ mod seam_helper_tests {
         );
         assert_eq!(
             super::ubatch_rows(&adaptive),
-            4096,
+            5120,
             "…and the height falls back"
         );
     }
@@ -7443,10 +7638,10 @@ mod seam_helper_tests {
     fn explicit_ubatch_also_governs_parallel_prefill_unless_overridden() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let mut ec = EngineConfig::default();
-        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 5120);
 
         ec.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows_parallel(&ec), 4096);
+        assert_eq!(super::ubatch_rows_parallel(&ec), 5120);
 
         ec.device.ubatch = Some(3072);
         ec.device.ubatch_specified = true;
@@ -7463,17 +7658,17 @@ mod seam_helper_tests {
         let mut automatic = EngineConfig::default();
         automatic.spec.mtp = true;
 
-        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(super::ubatch_rows(&automatic), 5120);
         assert_eq!(
             super::ubatch_candidates(&automatic),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         automatic.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
-        assert_eq!(super::ubatch_rows(&automatic), 4096);
+        assert_eq!(super::ubatch_rows(&automatic), 5120);
         assert_eq!(
             super::ubatch_candidates(&automatic),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         automatic.device.ubatch = Some(3072);
@@ -7667,6 +7862,38 @@ mod seam_helper_tests {
             DType::Q8_0,
             DType::Q8_0
         ));
+
+        // A refused session-state tier prints `segmented_kv_blockers` as the reason, so the list has
+        // to be empty exactly when the layout is available — including `arena_available`, the runner's
+        // one extra term that no `kv.*` key controls (a device with room for every expert resident
+        // never builds the arena and used to fail with a message about Qwen models and Q8 KV).
+        for (ring, k, v, arena) in [
+            (false, DType::Q8_0, DType::Q8_0, true),
+            (true, DType::Q8_0, DType::Q8_0, true),
+            (false, DType::F16, DType::Q8_0, true),
+            (false, DType::Q8_0, DType::Q8_0, false),
+        ] {
+            let blockers = super::segmented_kv_blockers(&cfg, &ec, ring, k, v, arena);
+            assert_eq!(
+                blockers.is_empty(),
+                super::segmented_kv_wanted(&cfg, &ec, ring, k, v) && arena,
+                "blockers {blockers:?} disagree at ring={ring} k={k:?} v={v:?} arena={arena}"
+            );
+        }
+        let no_arena =
+            super::segmented_kv_blockers(&cfg, &ec, false, DType::Q8_0, DType::Q8_0, false);
+        assert!(no_arena
+            .iter()
+            .any(|b| b.contains("unified VRAM arena") && b.contains("paging.cache")));
+        let plain = Config {
+            qwen35: false,
+            ..cfg.clone()
+        };
+        assert!(
+            super::segmented_kv_blockers(&plain, &ec, false, DType::Q8_0, DType::Q8_0, true)
+                .iter()
+                .any(|b| b.contains("Qwen3.5/3.6/3.8"))
+        );
     }
 
     #[test]
@@ -9000,17 +9227,17 @@ mod seam_helper_tests {
     fn dense_ubatch_ladder_is_the_only_one() {
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let unset = EngineConfig::default();
-        assert_eq!(super::ubatch_rows(&unset), 4096);
+        assert_eq!(super::ubatch_rows(&unset), 5120);
         assert_eq!(
             super::ubatch_candidates(&unset),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
 
         let mut aggressive = EngineConfig::default();
         aggressive.device.auto_profile = infr_core::config::AutoProfile::Aggressive;
         assert_eq!(
             super::ubatch_candidates(&aggressive),
-            vec![4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
+            vec![5120, 4608, 4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256]
         );
         assert_eq!(
             super::ubatch_fallbacks_below(3072),

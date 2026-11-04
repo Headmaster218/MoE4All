@@ -15,6 +15,18 @@ mod draft_vocab;
 
 pub const DRAFT_TOKENS: usize = 4;
 
+/// Draft acceptance (`accepted / drafted`) measured by the most recent MTP cycles, published so
+/// the NEXT request can decide whether a VERIFY cycle still pays for itself (`spec.mtp_min_alpha`).
+/// `u32::MAX` means "no cycle yet". Cycles before the fourth are ignored: the first few carry the
+/// trunk's prime warm-up and would trip the breaker on any request.
+static LAST_ALPHA_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Most recent measured draft acceptance, or `None` before this process has completed four cycles.
+pub fn last_alpha() -> Option<f32> {
+    let bits = LAST_ALPHA_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    (bits != u32::MAX).then(|| f32::from_bits(bits))
+}
+
 fn refill_verify_feed(
     feed: &mut Vec<u32>,
     committed: &[u32],
@@ -2950,6 +2962,14 @@ impl Qwen4MtpRuntime {
                 .count();
             let accepted = accepted_spec + 1;
             timing.total_accepted += accepted_spec;
+            // Publish the rolling acceptance so the next request can step aside when drafting is
+            // not paying for its VERIFY rows (`spec.mtp_min_alpha`). Skip the prime cycles.
+            if cycle >= 4 {
+                LAST_ALPHA_BITS.store(
+                    (timing.alpha() as f32).to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             // Retain only the deliverable prefix; EOS itself occupies one committed row.
             let retained = retained_draft_rows(
                 &feed[n_past..n_past + accepted],

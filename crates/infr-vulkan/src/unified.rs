@@ -418,25 +418,16 @@ impl ExpertArenaLayout {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn plan_claim_with_reservations(
+    /// The ranges a fresh claim routes around: live non-Expert allocations, already-booked KV
+    /// coordinates, and protected Expert slots that are still live. Shared by elastic planning and
+    /// the split-reservation path so both measure exactly the same free space.
+    fn corridor_blockers(
         &self,
         live: &[UnifiedRange],
-        requested: &[usize],
-        class: UnifiedVramClass,
-        corridor: Range<usize>,
-        direction: ClaimDirection,
+        live_experts: &HashSet<(usize, usize, usize)>,
         protected_experts: &[ExpertSlotId],
         reservations: &[PlannedRange],
-    ) -> Result<UnifiedClaimPlan> {
-        if class == UnifiedVramClass::Expert || requested.is_empty() {
-            return Err(be("elastic claim needs non-Expert bytes"));
-        }
-        let live_experts: HashSet<_> = live
-            .iter()
-            .filter(|range| range.class == UnifiedVramClass::Expert)
-            .map(|range| (range.shard, range.offset, range.len))
-            .collect();
+    ) -> Result<Vec<PlannedRange>> {
         let mut blockers: Vec<PlannedRange> = live
             .iter()
             .filter(|range| range.class != UnifiedVramClass::Expert)
@@ -468,6 +459,30 @@ impl ExpertArenaLayout {
                 });
             }
         }
+        Ok(blockers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_claim_with_reservations(
+        &self,
+        live: &[UnifiedRange],
+        requested: &[usize],
+        class: UnifiedVramClass,
+        corridor: Range<usize>,
+        direction: ClaimDirection,
+        protected_experts: &[ExpertSlotId],
+        reservations: &[PlannedRange],
+    ) -> Result<UnifiedClaimPlan> {
+        if class == UnifiedVramClass::Expert || requested.is_empty() {
+            return Err(be("elastic claim needs non-Expert bytes"));
+        }
+        let live_experts: HashSet<_> = live
+            .iter()
+            .filter(|range| range.class == UnifiedVramClass::Expert)
+            .map(|range| (range.shard, range.offset, range.len))
+            .collect();
+        let mut blockers =
+            self.corridor_blockers(live, &live_experts, protected_experts, reservations)?;
         let pieces = self.physical_pieces(corridor);
         let mut ordered = Vec::with_capacity(requested.len());
         for (index, &requested_len) in requested.iter().enumerate() {
@@ -881,6 +896,82 @@ fn gap_stats(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> (usize, usize,
         }
     }
     (total, largest, count)
+}
+
+/// Aligned free intervals available to a low-direction claim, mirroring [`find_low_gap`]'s cursor
+/// arithmetic so the offsets are exactly where a low claim would place bytes. The split-reservation
+/// path tiles these directly — one whole-frame chunk per gap — because the sharded arena cannot
+/// satisfy a multi-GiB space as a single contiguous run.
+fn free_gaps(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> Vec<ArenaPiece> {
+    let mut gaps = Vec::new();
+    for piece in pieces {
+        let mut occupied: Vec<_> = blockers
+            .iter()
+            .filter(|range| range.shard == piece.shard)
+            .map(|range| (range.offset, range.offset.saturating_add(range.len)))
+            .filter(|&(start, end)| start < piece.end && end > piece.start)
+            .collect();
+        occupied.sort_unstable();
+        let Some(mut cursor) = align_up(piece.start, UNIFIED_ALIGN) else {
+            continue;
+        };
+        for (start, end) in occupied {
+            if cursor < start {
+                gaps.push(ArenaPiece {
+                    shard: piece.shard,
+                    start: cursor,
+                    end: start,
+                });
+            }
+            let Some(next) = align_up(cursor.max(end), UNIFIED_ALIGN) else {
+                break;
+            };
+            cursor = next;
+            if cursor >= piece.end {
+                break;
+            }
+        }
+        if cursor < piece.end {
+            gaps.push(ArenaPiece {
+                shard: piece.shard,
+                start: cursor,
+                end: piece.end,
+            });
+        }
+    }
+    gaps
+}
+
+/// Tile `total` bytes of `frame_bytes`-sized frames across `gaps`, largest gap first: pack the
+/// biggest chunks where there is room, then the leftovers into smaller tails. Returns the per-gap
+/// chunks (each a whole number of frames, starting at its gap's aligned offset). The plan is
+/// best-effort: when the gaps cannot hold the whole request it still returns every whole frame that
+/// fits, so the caller can degrade the frame count instead of refusing to start. The stored
+/// reservation is re-sorted by coordinate on read, so the largest-first order here is only for
+/// keeping the tiling dense.
+fn plan_kv_tiling(gaps: &[ArenaPiece], total: usize, frame_bytes: usize) -> Vec<PlannedRange> {
+    let mut ordered = gaps.to_vec();
+    ordered.sort_unstable_by_key(|gap| std::cmp::Reverse(gap.end - gap.start));
+    let mut ranges = Vec::new();
+    let mut remaining = total;
+    for gap in ordered {
+        if remaining == 0 {
+            break;
+        }
+        let usable = (gap.end - gap.start) / frame_bytes * frame_bytes;
+        if usable == 0 {
+            continue;
+        }
+        let len = remaining.min(usable);
+        ranges.push(PlannedRange {
+            shard: gap.shard,
+            offset: gap.start,
+            len,
+            requested_len: len,
+        });
+        remaining -= len;
+    }
+    ranges
 }
 
 fn ranges_overlap(a_offset: usize, a_len: usize, b_offset: usize, b_len: usize) -> bool {
@@ -1537,6 +1628,68 @@ impl UnifiedVramPool {
             .checked_add(1)
             .ok_or_else(|| be("KV reservation id overflow"))?;
         let ranges = plan.ranges().to_vec();
+        state.ranges.insert(id, ranges.clone());
+        Ok(Arc::new(UnifiedKvReservation {
+            id,
+            ranges,
+            state: Arc::clone(&self.kv_reservations),
+        }))
+    }
+
+    /// Reserve a KV layout that TILES the free gaps of the KV corridor instead of demanding one
+    /// contiguous run. The unified arena is built from ~2 GiB ReBAR shard pieces, so a space larger
+    /// than one shard's largest free gap — e.g. ctx 262144 wants 4.31 GiB — can only be reserved as
+    /// several corridors. `total` is split into whole-frame chunks (`frame_bytes` granularity, which
+    /// must itself be `UNIFIED_ALIGN`-aligned), one per gap, largest gap first. The returned ranges
+    /// are consumed exactly like [`Self::reserve_kv_layout`]'s single range: the caller installs each
+    /// as a corridor and keeps frame indices global across the split.
+    ///
+    /// Alignment can leave the request a frame or two short even when raw bytes suffice — each gap
+    /// floors independently to a whole number of frames. In that case this returns the best-effort
+    /// layout (every frame that fits); only a corridor that cannot hold a single frame is an error.
+    pub(crate) fn reserve_kv_layout_split(
+        &self,
+        total: usize,
+        frame_bytes: usize,
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<Arc<UnifiedKvReservation>> {
+        if frame_bytes == 0 || !frame_bytes.is_multiple_of(UNIFIED_ALIGN) {
+            return Err(be(format!(
+                "split KV reservation frame size {frame_bytes} is not a multiple of {UNIFIED_ALIGN}"
+            )));
+        }
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("KV reservations require an expert-aware unified VRAM layout"))?;
+        let live = self.ranges.allocations();
+        let live_experts: HashSet<_> = live
+            .iter()
+            .filter(|range| range.class == UnifiedVramClass::Expert)
+            .map(|range| (range.shard, range.offset, range.len))
+            .collect();
+        let mut state = self.kv_reservations.lock().unwrap();
+        let existing: Vec<_> = state.ranges.values().flatten().copied().collect();
+        let blockers =
+            layout.corridor_blockers(&live, &live_experts, protected_experts, &existing)?;
+        let pieces = layout.physical_pieces(layout.kv_corridor());
+        let gaps = free_gaps(&pieces, &blockers);
+        // Best-effort tiling: never more than requested, but possibly fewer whole frames when the
+        // gaps cannot hold the whole request. The caller degrades the frame count accordingly.
+        let ranges = plan_kv_tiling(&gaps, total, frame_bytes);
+        if ranges.is_empty() {
+            let (free_bytes, largest_gap, gap_count) = gap_stats(&pieces, &blockers);
+            return Err(be(format!(
+                "KV split reservation cannot place a single {frame_bytes}-byte frame in its frozen \
+                 arena corridor: available={free_bytes} bytes in {gap_count} gap(s), \
+                 largest_gap={largest_gap} bytes"
+            )));
+        }
+        let id = state.next_id;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| be("KV reservation id overflow"))?;
         state.ranges.insert(id, ranges.clone());
         Ok(Arc::new(UnifiedKvReservation {
             id,
@@ -2308,5 +2461,66 @@ mod tests {
         assert_eq!(allocation.range().offset, 0);
         assert_eq!(allocation.range().len, 512);
         drop(barrier);
+    }
+
+    #[test]
+    fn kv_tiling_splits_a_request_across_free_gaps() {
+        // Two ~2 GiB-shard stand-ins: a request larger than one shard's gap (1536 > 1024) must be
+        // tiled, one whole-frame chunk per gap, rather than reported as unfittable.
+        let gaps = [
+            ArenaPiece {
+                shard: 0,
+                start: 0,
+                end: 1024,
+            },
+            ArenaPiece {
+                shard: 1,
+                start: 0,
+                end: 1024,
+            },
+        ];
+        let ranges = plan_kv_tiling(&gaps, 1536, 256);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|r| (r.shard, r.offset, r.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 1024), (1, 0, 512)]
+        );
+        // Best-effort: a frame larger than every gap yields nothing, while an over-sized request
+        // returns every whole frame that fits (2048 of the 4096 asked) instead of failing outright.
+        assert!(plan_kv_tiling(&gaps, 2048, 2048).is_empty());
+        assert_eq!(
+            plan_kv_tiling(&gaps, 4096, 256)
+                .iter()
+                .map(|r| r.len)
+                .sum::<usize>(),
+            2048
+        );
+        assert!(plan_kv_tiling(&[], 256, 256).is_empty());
+    }
+
+    #[test]
+    fn free_gaps_split_around_blockers_and_align_the_head() {
+        let pieces = [ArenaPiece {
+            shard: 0,
+            start: 8,
+            end: 1024,
+        }];
+        let blockers = [PlannedRange {
+            shard: 0,
+            offset: 512,
+            len: 256,
+            requested_len: 256,
+        }];
+        // The unaligned 8-byte head is dropped (cursor snaps to 256), leaving a hole before the
+        // blocker and the free tail after it.
+        let gaps = free_gaps(&pieces, &blockers);
+        assert_eq!(
+            gaps.iter()
+                .map(|g| (g.shard, g.start, g.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 256, 512), (0, 768, 1024)]
+        );
     }
 }
