@@ -25,6 +25,10 @@ use infr_gguf::{dequant::dequant_block, Gguf};
 
 use crate::frontend::{Features, FrontendConfig};
 
+#[cfg(test)]
+#[path = "model_diagnostics.rs"]
+mod diagnostics;
+
 #[path = "sensevoice_gguf.rs"]
 mod gguf_compat;
 pub use gguf_compat::SenseVoiceConfig;
@@ -271,6 +275,8 @@ impl SenseVoiceModel {
         hidden = self.run_norm("encoder.tp_norm", rows, hidden.as_ref(), trace)?;
         // Chunk only the independent CTC projection, never the bidirectional
         // encoder. Bound logits workspace to 32*vocab floats even for long chunks.
+        #[cfg(test)]
+        let ctc_started = std::time::Instant::now();
         let mut greedy = Vec::with_capacity(rows);
         for start in (0..rows).step_by(CTC_CHUNK_ROWS) {
             crate::check_cancel(cancel)?;
@@ -295,6 +301,25 @@ impl SenseVoiceModel {
         crate::check_cancel(cancel)?;
         // The first four time steps supervise language/emotion/event/ITN, not
         // speech CTC. Start a fresh collapse at the first acoustic frame.
+        #[cfg(test)]
+        {
+            let decode_started = std::time::Instant::now();
+            let text = decode_ctc(&greedy[4..], self.config.blank_id, &self.tokens);
+            diagnostics::record(
+                "ctc.decode",
+                0.0,
+                0.0,
+                decode_started.elapsed().as_secs_f64(),
+            );
+            diagnostics::record(
+                "ctc.pipeline",
+                0.0,
+                0.0,
+                ctc_started.elapsed().as_secs_f64(),
+            );
+            text
+        }
+        #[cfg(not(test))]
         decode_ctc(&greedy[4..], self.config.blank_id, &self.tokens)
     }
 
@@ -637,6 +662,8 @@ impl<'a> Stage<'a> {
         trace: &mut Option<&mut TraceCallback<'_>>,
         output_name: &str,
     ) -> Result<Box<dyn Buffer>> {
+        #[cfg(test)]
+        let stage_started = std::time::Instant::now();
         let mut outputs = self
             .graph
             .outputs
@@ -654,14 +681,27 @@ impl<'a> Stage<'a> {
             for (id, buffer) in self.owned.iter().chain(outputs.iter()) {
                 bindings.bind(*id, buffer.as_ref());
             }
+            #[cfg(test)]
+            let compile_started = std::time::Instant::now();
             let plan = self
                 .backend
                 .compile(&self.graph)
                 .with_context(|| format!("compile {output_name}"))?;
+            #[cfg(test)]
+            let compile_seconds = compile_started.elapsed().as_secs_f64();
+            #[cfg(test)]
+            let execute_started = std::time::Instant::now();
             self.backend
                 .execute(plan.as_ref(), &bindings)
                 .with_context(|| format!("execute {output_name}"))?;
             self.backend.sync()?;
+            #[cfg(test)]
+            diagnostics::record(
+                output_name,
+                compile_seconds,
+                execute_started.elapsed().as_secs_f64(),
+                stage_started.elapsed().as_secs_f64(),
+            );
         }
         if let Some(cb) = trace.as_deref_mut() {
             for (name, id) in self
