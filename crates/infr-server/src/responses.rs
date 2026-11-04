@@ -1681,7 +1681,26 @@ fn response_id(chat_id: &str) -> String {
     )
 }
 
+/// The id a streamed response gets when it is minted here instead of derived from the chat
+/// completion id: the same `resp_<ms>-<seq>` shape, from the same process counter, so it stays
+/// unique across two turns opened in one millisecond.
+fn mint_response_id() -> String {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("resp_{ms}-{}", ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
 fn response_base(id: &str, created: i64, model: &str, meta: &Meta) -> Value {
+    // `model` is the entry that ACTUALLY answered, and the chat layer names it only in its first
+    // chunk. An opening snapshot therefore has nothing to report, and unknown is `null` — never an
+    // empty string and never a guess at the model the request asked for.
+    let model = if model.is_empty() {
+        Value::Null
+    } else {
+        json!(model)
+    };
     json!({
         "id":id,"object":"response","created_at":created,"completed_at":null,
         "status":"in_progress","background":false,
@@ -1914,7 +1933,7 @@ struct StreamState {
     buffer: Vec<u8>,
     pending: VecDeque<Bytes>,
     meta: Meta,
-    id: Option<String>,
+    id: String,
     created: i64,
     model: String,
     sequence: u64,
@@ -1964,51 +1983,57 @@ impl StreamState {
             .or_else(|| upstream["type"].as_str())
             .unwrap_or("server_error");
         let message = upstream["message"].as_str().unwrap_or("generation failed");
-        if let Some(id) = self.id.clone() {
-            let mut response = response_base(&id, self.created, &self.model, &self.meta);
-            response["status"] = json!("failed");
-            response["error"] = json!({"code":code,"message":message});
-            // No handle on a failed turn: it is never stored, so nothing could resolve one.
-            let mut items = output_items(&id, &self.reasoning, &self.content, &self.calls, false);
-            // A failed stream has no item-completion boundary. Keep only items
-            // that were actually started, and leave unfinished items in progress.
-            if self.content_index.is_none() && self.content.is_empty() {
-                items.retain(|item| item["type"] != "message");
-            }
-            for item in &mut items {
-                if (item["type"] == "reasoning" && self.reasoning_index.is_some())
-                    || (item["type"] == "message" && self.content_index.is_some())
-                {
-                    item["status"] = json!("in_progress");
-                }
-            }
-            response["output"] = json!(items);
-            self.emit("response.failed", json!({"response":response}));
-        } else {
-            self.emit(
-                "error",
-                json!({"code":code,"message":message,"param":upstream.get("param")}),
-            );
+        // `open()` ran before the first poll, so a failure — including one on the very first frame
+        // — lands inside a response the client can already address by id, and the stream still
+        // ends on a terminal event instead of a bare `error` that leaves the turn unresolved.
+        let id = self.id.clone();
+        let mut response = response_base(&id, self.created, &self.model, &self.meta);
+        response["status"] = json!("failed");
+        response["error"] = json!({"code":code,"message":message});
+        // No handle on a failed turn: it is never stored, so nothing could resolve one.
+        let mut items = output_items(&id, &self.reasoning, &self.content, &self.calls, false);
+        // A failed stream has no item-completion boundary. Keep only items
+        // that were actually started, and leave unfinished items in progress.
+        if self.content_index.is_none() && self.content.is_empty() {
+            items.retain(|item| item["type"] != "message");
         }
+        for item in &mut items {
+            if (item["type"] == "reasoning" && self.reasoning_index.is_some())
+                || (item["type"] == "message" && self.content_index.is_some())
+            {
+                item["status"] = json!("in_progress");
+            }
+        }
+        response["output"] = json!(items);
+        self.emit("response.failed", json!({"response":response}));
         self.terminal = true;
     }
 
-    fn start(&mut self, chunk: &Value) {
-        if self.id.is_some() {
-            return;
-        }
-        let id = response_id(chunk["id"].as_str().unwrap_or("unknown"));
-        self.created = chunk["created"].as_i64().unwrap_or_default();
-        self.model = chunk["model"].as_str().unwrap_or("").into();
-        self.id = Some(id.clone());
-        let mut response = response_base(&id, self.created, &self.model, &self.meta);
-        response["status"] = json!("in_progress");
-        self.emit("response.created", json!({"response":response}));
+    /// Open the stream: the response identity and the two `in_progress` events are minted here,
+    /// before the first upstream chunk. A 150 K-token prefill answers no chunk for minutes, and a
+    /// client that starts its idle timer at `response.created` (or wants the id to cancel with)
+    /// cannot wait that long — giving up costs it the whole prefill again.
+    fn open(&mut self) {
+        self.id = mint_response_id();
+        self.created = unix_ts();
+        let response = response_base(&self.id, self.created, "", &self.meta);
+        self.emit("response.created", json!({"response":response.clone()}));
         self.emit("response.in_progress", json!({"response":response}));
     }
 
+    /// Take the two fields the opening snapshot could not know: the chat layer names them only when
+    /// it builds its first chunk, and `model` must be the entry that ACTUALLY answers.
+    fn adopt(&mut self, chunk: &Value) {
+        if let Some(created) = chunk["created"].as_i64() {
+            self.created = created;
+        }
+        if let Some(model) = chunk["model"].as_str() {
+            self.model = model.to_string();
+        }
+    }
+
     fn reasoning_delta(&mut self, delta: &str) {
-        let id = self.id.clone().unwrap();
+        let id = self.id.clone();
         let index = if let Some(index) = self.reasoning_index {
             index
         } else {
@@ -2031,7 +2056,7 @@ impl StreamState {
     }
 
     fn content_delta(&mut self, delta: &str) {
-        let id = self.id.clone().unwrap();
+        let id = self.id.clone();
         let index = if let Some(index) = self.content_index {
             index
         } else {
@@ -2051,7 +2076,7 @@ impl StreamState {
     }
 
     fn finish_items(&mut self, include_empty_message: bool) {
-        let id = self.id.clone().unwrap();
+        let id = self.id.clone();
         if let Some(index) = self.reasoning_index.take() {
             let text = self.reasoning.clone();
             self.emit("response.reasoning_summary_text.done", json!({"item_id":format!("rs_{id}"),"output_index":index,"summary_index":0,"text":text}));
@@ -2095,7 +2120,7 @@ impl StreamState {
         if call["id"].is_string() && self.calls[slot]["id"].is_null() {
             self.calls[slot]["id"] = call["id"].clone();
         }
-        let id = self.id.clone().unwrap();
+        let id = self.id.clone();
         let item_id = format!("fc_{id}_{slot}");
         let output_index = self.open_calls[slot].output_index;
         if !self.open_calls[slot].added {
@@ -2184,7 +2209,7 @@ impl StreamState {
         if !self.open_calls[slot].added || self.open_calls[slot].closed {
             return;
         }
-        let Some(id) = self.id.clone() else { return };
+        let id = self.id.clone();
         let output_index = self.open_calls[slot].output_index;
         let arguments = self.calls[slot]["function"]["arguments"]
             .as_str()
@@ -2221,7 +2246,7 @@ impl StreamState {
             self.fail(&chunk["error"]);
             return;
         }
-        self.start(&chunk);
+        self.adopt(&chunk);
         let choice = &chunk["choices"][0];
         if let Some(delta) = choice["delta"]["reasoning_content"].as_str() {
             self.reasoning_delta(delta);
@@ -2237,7 +2262,7 @@ impl StreamState {
         if !choice["finish_reason"].is_null() {
             self.finish_items(true);
             self.finish_calls();
-            let id = self.id.clone().unwrap();
+            let id = self.id.clone();
             let mut response = response_base(&id, self.created, &self.model, &self.meta);
             let incomplete = choice["finish_reason"] == "length";
             response["status"] = json!(if incomplete {
@@ -2313,12 +2338,12 @@ impl StreamState {
 
 fn stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Response {
     let source = Box::pin(response.into_body().into_data_stream());
-    let state = StreamState {
+    let mut state = StreamState {
         source,
         buffer: Vec::new(),
         pending: VecDeque::new(),
         meta,
-        id: None,
+        id: String::new(),
         created: 0,
         model: String::new(),
         sequence: 0,
@@ -2334,6 +2359,10 @@ fn stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Res
         terminal: false,
         save,
     };
+    // The two opening events are minted here, so the very first poll already has bytes to hand the
+    // client — before the source has produced anything. What a client waits for to consider the
+    // turn live must not be the first token, which a 150 K-token prefill withholds for minutes.
+    state.open();
     let translated = stream::unfold(state, |mut state| async move {
         loop {
             if let Some(bytes) = state.pending.pop_front() {
@@ -3430,34 +3459,73 @@ mod tests {
         );
     }
 
+    /// A long prefill answers no chat chunk for minutes, so the opening events — and with them the
+    /// response id a client needs in order to follow or cancel the turn — are minted by this layer
+    /// instead of lifted from the first delta. A client that keys its own idle timer on
+    /// `response.created` must not be the one that pays for the wait.
     #[tokio::test]
-    async fn stream_error_before_creation_has_flat_error_shape() {
+    async fn opening_events_reach_the_client_before_the_first_upstream_chunk() {
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model":"fixture","input":"hi"})).unwrap();
+        let meta = request.into_chat(None, None, None, false).unwrap().meta;
+        let silent = Response::new(Body::from_stream(stream::pending::<
+            Result<Bytes, axum::Error>,
+        >()));
+        let mut data = stream_response(silent, meta, None)
+            .into_body()
+            .into_data_stream();
+        let mut events: Vec<Value> = Vec::new();
+        for _ in 0..2 {
+            let bytes = data
+                .next()
+                .await
+                .expect("the stream opens before any upstream chunk")
+                .expect("the opening events are a valid body write");
+            let wire = String::from_utf8(bytes.to_vec()).unwrap();
+            events.extend(
+                wire.split("\n\n")
+                    .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+                    .map(|payload| serde_json::from_str(payload).unwrap()),
+            );
+        }
+        assert_eq!(
+            events.len(),
+            2,
+            "created and in_progress are the first two events: {events:?}"
+        );
+        assert_eq!(events[0]["type"], "response.created");
+        assert_eq!(events[1]["type"], "response.in_progress");
+        let id = events[0]["response"]["id"].as_str().unwrap();
+        assert!(id.starts_with("resp_"), "server-minted id: {id}");
+        assert_eq!(events[1]["response"]["id"], id);
+        assert_eq!(events[0]["response"]["status"], "in_progress");
+        assert!(
+            events[0]["response"]["model"].is_null(),
+            "which entry answers is only known once the chat layer speaks"
+        );
+        assert_eq!(events[0]["sequence_number"], 0);
+        assert_eq!(events[1]["sequence_number"], 1);
+    }
+
+    /// The turn is already a named response before the upstream says anything, so a failure on the
+    /// very first frame lands as that response's terminal `response.failed` — not a bare `error`
+    /// event that leaves the client holding an opened response with no ending.
+    #[tokio::test]
+    async fn error_on_the_first_frame_ends_the_response_it_opened() {
         let request: ResponsesRequest =
             serde_json::from_value(json!({"model":"fixture","input":"hi"})).unwrap();
         let meta = request.into_chat(None, None, None, false).unwrap().meta;
         let upstream = Response::new(Body::from(
             "data: {\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}\n\n",
         ));
-        let response = stream_response(upstream, meta, None);
-        let wire = String::from_utf8(
-            response
-                .into_body()
-                .collect()
-                .await
-                .unwrap()
-                .to_bytes()
-                .to_vec(),
-        )
-        .unwrap();
-        let event: Value = serde_json::from_str(
-            wire.lines()
-                .find_map(|line| line.strip_prefix("data: "))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(event["type"], "error");
-        assert_eq!(event["message"], "boom");
-        assert!(event.get("error").is_none());
+        let events = sse_events(stream_response(upstream, meta, None)).await;
+        assert_eq!(events[0]["type"], "response.created");
+        let failed = events.last().unwrap();
+        assert_eq!(failed["type"], "response.failed");
+        assert_eq!(failed["response"]["id"], events[0]["response"]["id"]);
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(failed["response"]["error"]["message"], "boom");
+        assert!(failed["response"]["model"].is_null());
     }
 
     #[tokio::test]
@@ -3999,6 +4067,10 @@ mod tests {
             None,
         );
         let events = sse_events(response).await;
+        // The handle belongs to the response the CLIENT was given, so it is checked against the id
+        // the opening event carried — not against the upstream chat id, which never reaches this API.
+        let id = events[0]["response"]["id"].as_str().unwrap().to_string();
+        let handle = format!("rehs_{id}");
         let handles: Vec<&str> = events
             .iter()
             .filter(|event| event["item"]["type"] == "reasoning")
@@ -4010,11 +4082,11 @@ mod tests {
             })
             .map(|event| event["item"]["encrypted_content"].as_str().unwrap())
             .collect();
-        assert_eq!(handles, vec!["rehs_resp_9", "rehs_resp_9"]);
+        assert_eq!(handles, vec![handle.as_str(), handle.as_str()]);
         let completed = events.last().unwrap();
         assert_eq!(
             completed["response"]["output"][0]["encrypted_content"],
-            "rehs_resp_9"
+            handle
         );
     }
 

@@ -57,8 +57,12 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
+/// How often a live SSE stream emits an `: keep-alive` comment while its generator sends nothing.
+/// The floor is a client's own idle detection, and the strictest one seen here gives up well inside
+/// a long prefill, so the interval stays far below any plausible first-token wait; the comment
+/// bytes are wire activity only and carry no OpenAI delta.
 #[cfg(not(test))]
-const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
