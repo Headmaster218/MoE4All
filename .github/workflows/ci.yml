@@ -159,6 +159,43 @@ jobs:
       - if: always()
         run: sccache --show-stats
 
+  launcher-windows:
+    name: Windows launcher and updater
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify both Windows entries without loading models
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:MOE4ALL_WORK_ROOT = Join-Path $env:RUNNER_TEMP 'moe4all-work'
+          $task = '20261106-020000-launcher-ci'
+          $env:MOE4ALL_WIZARD_TEST_TMP = Join-Path $env:MOE4ALL_WORK_ROOT "tmp\moe4all\$task"
+          New-Item -ItemType Directory -Force -Path $env:MOE4ALL_WIZARD_TEST_TMP | Out-Null
+          $env:TEMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          $env:TMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          $launcher = Join-Path $env:MOE4ALL_WIZARD_TEST_TMP 'MoE4All Engine.exe'
+          $evidence = Join-Path $env:MOE4ALL_WORK_ROOT "evidence\moe4all\$task"
+          .\scripts\build-windows-launcher.ps1 -OutputPath $launcher
+          .\scripts\Test-WizardStartupPolicy.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          .\scripts\Test-BenchmarkStartupGuide.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          powershell.exe -NoProfile -STA -File .\scripts\Test-WizardStartupDialogs.ps1 -EvidenceDirectory $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Native startup dialog checks failed.' }
+          powershell.exe -NoProfile -STA -File .\scripts\Test-WizardBrand.ps1 -LauncherPath $launcher -EvidenceDirectory $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher icon checks failed.' }
+          .\scripts\Test-EngineUpdateDualEntry.ps1 -TaskId $task -WindowLauncherPath $launcher
+      - name: Preserve updater diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-launcher-checks
+          path: ${{ runner.temp }}/moe4all-work/evidence/moe4all/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # CPU generation goldens against REAL models. The `cpu_golden_*` /
   # `cpu_kv_*` tests in `infr-llama/tests/cpu_backend.rs` self-skip when the
   # GGUF isn't in the HF cache (see the `need_model!` macro), so on a bare
@@ -290,6 +327,13 @@ jobs:
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
       - name: macOS launch wizard and package smoke tests
         run: /bin/zsh scripts/smoke-macos-wizard.zsh
+      - name: macOS automatic update and benchmark reminders
+        env:
+          MOE4ALL_WORK_ROOT: ${{ runner.temp }}/moe4all-work
+        run: |
+          mkdir -p "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          /bin/zsh scripts/test-benchmark-startup-guide.sh macos "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          /bin/zsh scripts/test-wizard-reminders.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/reminders" macos
       - name: macOS submission routes and receipt handoff
         env:
           TMPDIR: ${{ runner.temp }}
@@ -300,7 +344,7 @@ jobs:
   gate:
     name: PR gate
     if: always()
-    needs: [classify, submission-data, fmt, clippy, test, cpu-goldens, build, metal-check, test-macos]
+    needs: [classify, submission-data, fmt, clippy, test, launcher-windows, cpu-goldens, build, metal-check, test-macos]
     runs-on: ubuntu-26.04
     steps:
       - name: Require the applicable checks
@@ -315,12 +359,13 @@ jobs:
           BUILD: ${{ needs.build.result }}
           METAL_CHECK: ${{ needs.metal-check.result }}
           TEST_MACOS: ${{ needs.test-macos.result }}
+          LAUNCHER_WINDOWS: ${{ needs.launcher-windows.result }}
         run: |
           [[ "$CLASSIFY" == success ]]
           if [[ "$SUBMISSION_ONLY" == true ]]; then
             [[ "$SUBMISSION_DATA" == success ]]
           else
-            for result in "$FMT" "$CLIPPY" "$TEST" "$CPU_GOLDENS" "$BUILD" "$METAL_CHECK" "$TEST_MACOS"; do
+            for result in "$FMT" "$CLIPPY" "$TEST" "$CPU_GOLDENS" "$BUILD" "$METAL_CHECK" "$TEST_MACOS" "$LAUNCHER_WINDOWS"; do
               [[ "$result" == success ]]
             done
           fi

@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($PSVersionTable.PSEdition -ne 'Desktop') { throw 'Run this inbox .NET fixture suite with powershell.exe (Windows PowerShell 5.1).' }
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$workRoot = 'D:\AIinfr\infr\local-work'
+$workRoot = if ($env:MOE4ALL_WORK_ROOT) { [IO.Path]::GetFullPath($env:MOE4ALL_WORK_ROOT) } else { Join-Path $repoRoot 'local-work' }
 $runId = [guid]::NewGuid().ToString('N')
 $staging = Join-Path $workRoot "staging\moe4all\$TaskId\ota\$runId"
 $evidence = Join-Path $workRoot "evidence\moe4all\$TaskId\ota\$runId"
