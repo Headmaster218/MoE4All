@@ -3,12 +3,49 @@ param(
     [Parameter(Position = 0)][string]$InitialModelPath = '',
     [switch]$DryRun,
     [switch]$SkipUpdateCheck,
+    [switch]$PreviewUi,
+    [switch]$ClassicWizard,
+    [switch]$WindowWizard,
+    [string]$DesktopExecutionPlanPath = '',
     [string]$PostUpdateProbePath = '',
     [string]$ExpectedPostUpdateVersion = '',
     [switch]$ExitAfterPostUpdateProbe
 )
 
 $ErrorActionPreference = 'Stop'
+if ($ClassicWizard -and $WindowWizard) { throw 'Choose either the console entry or the window entry.' }
+
+function Test-WizardOperationCancelled {
+    param([Exception]$Exception)
+    while ($null -ne $Exception) { if ($Exception.GetType().FullName -eq 'MoE4All.Launcher.NativePromptCanceledException') { return $true }; $Exception=$Exception.InnerException }
+    return $false
+}
+
+function Assert-WizardOperationActive {
+    if ($script:NativePromptsEnabled -and ('MoE4All.Launcher.NativePrompt' -as [type])) { [MoE4All.Launcher.NativePrompt]::CheckCancellation() }
+}
+
+function Wait-WizardOperation {
+    param([int]$Milliseconds)
+    if (-not $script:NativePromptsEnabled) { Start-Sleep -Milliseconds $Milliseconds; return }
+    for ($remaining=$Milliseconds; $remaining -gt 0; $remaining-=100) { Assert-WizardOperationActive; Start-Sleep -Milliseconds ([Math]::Min(100,$remaining)) }
+}
+
+trap {
+    $wizardException = $_.Exception
+    while ($null -ne $wizardException) {
+        if ($wizardException.GetType().FullName -eq 'MoE4All.Launcher.NativePromptCanceledException') {
+            if ('MoE4All.Launcher.NativeWizard' -as [type]) { [MoE4All.Launcher.NativeWizard]::RestoreConsole() }
+            exit 44
+        }
+        $wizardException = $wizardException.InnerException
+    }
+    if ($script:NativePromptsEnabled -and ('MoE4All.Launcher.NativeWizard' -as [type])) {
+        if ('MoE4All.Launcher.NativePrompt' -as [type]) { [MoE4All.Launcher.NativePrompt]::ShowError($_.Exception.Message); [MoE4All.Launcher.NativeWizard]::RestoreConsole(); exit 46 }
+        [MoE4All.Launcher.NativeWizard]::RestoreConsole()
+    }
+    throw
+}
 
 try {
     $utf8 = [System.Text.UTF8Encoding]::new($false)
@@ -39,133 +76,12 @@ $guiStatePath = Join-Path $dataDir 'state.json'
 $pendingSubmissionDir = Join-Path $dataDir 'private\pending-submissions'
 $script:Saved = $null
 
-if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+if (-not $DesktopExecutionPlanPath -and -not $PreviewUi -and (Test-Path -LiteralPath $statePath -PathType Leaf)) {
     try {
         $script:Saved = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
         Write-Warning "无法读取上次设置，将使用默认值。Could not read saved settings; defaults will be used."
     }
-}
-
-function Test-WizardOperationCancelled {
-    param([Exception]$Exception)
-    while ($null -ne $Exception) { if ($Exception.GetType().FullName -eq 'MoE4All.Launcher.NativePromptCanceledException') { return $true }; $Exception=$Exception.InnerException }
-    return $false
-}
-
-function Assert-WizardOperationActive {
-    if ($script:NativePromptsEnabled -and ('MoE4All.Launcher.NativePrompt' -as [type])) { [MoE4All.Launcher.NativePrompt]::CheckCancellation() }
-}
-
-function Wait-WizardOperation {
-    param([int]$Milliseconds)
-    if (-not $script:NativePromptsEnabled) { Start-Sleep -Milliseconds $Milliseconds; return }
-    for ($remaining=$Milliseconds; $remaining -gt 0; $remaining-=100) { Assert-WizardOperationActive; Start-Sleep -Milliseconds ([Math]::Min(100,$remaining)) }
-}
-
-function Invoke-Moe4AllSubmissionTransfer {
-    param(
-        [Parameter(Mandatory = $true)]$Client,
-        [Parameter(Mandatory = $true)]$Request,
-        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
-        [int]$Attempt = 1,
-        [int]$TotalAttempts = 1
-    )
-
-    # Keep the deadline and cancellation checks in the wizard, independently of
-    # HttpClient's timer. ResponseContentRead includes the complete response body.
-    $cancellation = [System.Threading.CancellationTokenSource]::new()
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    $pending = $null
-    $completed = $false
-    $nextNotice = 5
-    try {
-        $cancellation.CancelAfter([TimeSpan]::FromSeconds($TimeoutSeconds))
-        $pending = $Client.SendAsync($Request, [System.Net.Http.HttpCompletionOption]::ResponseContentRead, $cancellation.Token)
-        while (-not $pending.IsCompleted) {
-            Assert-WizardOperationActive
-            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
-                throw [System.TimeoutException]::new('提交服务请求超时；本地文件仍保留。Submission request timed out; the local file is preserved.')
-            }
-            if ($timer.Elapsed.TotalSeconds -ge $nextNotice) {
-                Write-Host ("正在等待上传服务：第 {0}/{1} 次，已等 {2} 秒，上限 {3} 秒。 / Waiting for submission service: attempt {0}/{1}, {2}s elapsed, {3}s limit." -f $Attempt, $TotalAttempts, [int]$timer.Elapsed.TotalSeconds, $TimeoutSeconds) -ForegroundColor DarkGray
-                $nextNotice += 5
-            }
-            Start-Sleep -Milliseconds 100
-        }
-        Assert-WizardOperationActive
-        try {
-            $response = $pending.GetAwaiter().GetResult()
-        } catch {
-            if ($cancellation.IsCancellationRequested) {
-                throw [System.TimeoutException]::new('提交服务请求超时；本地文件仍保留。Submission request timed out; the local file is preserved.')
-            }
-            throw
-        }
-        $completed = $true
-        return $response
-    } finally {
-        if (-not $completed) {
-            $cancellation.Cancel()
-            # Also release a response that won the race with cancellation.
-            if ($null -ne $pending -and $pending.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
-                $pending.GetAwaiter().GetResult().Dispose()
-            }
-        }
-        $timer.Stop()
-        $cancellation.Dispose()
-    }
-}
-
-function Get-SpeechSettings {
-    return [pscustomobject]@{
-        Enabled = ([string](Get-SavedValue 'server_speech' $false) -ieq 'true')
-        Model = [string](Get-SavedValue 'speech_model' '')
-        Lexicon = [string](Get-SavedValue 'speech_lexicon' '')
-        Threads = [string](Get-SavedValue 'speech_threads' '4')
-        IdleTimeout = [string](Get-SavedValue 'speech_idle_timeout' '300')
-        MaxOutputSeconds = [string](Get-SavedValue 'speech_max_output_seconds' '30')
-    }
-}
-
-function Read-SpeechSettings {
-    param($Settings)
-    if (-not $Settings.Enabled) { return }
-    Write-Host '语音合成使用独立 CPU 服务，首次请求加载，空闲后释放；需要支持 TTS 的引擎。/ Speech synthesis uses an independent lazy CPU service and requires a TTS-enabled build.' -ForegroundColor DarkGray
-    Write-Host '选择配套的原生 Melo GGUF 与资源目录。当前推荐目录暂无合成下载项。/ Select a matching native Melo GGUF and asset directory; no speech download is currently in the catalog.' -ForegroundColor DarkGray
-    Write-Host '输出 WAV/PCM 完整片段；音色、语速和格式由 API 请求指定。/ Returns complete WAV/PCM clips; voice, speed and format are set per API request.' -ForegroundColor DarkGray
-    while ($true) {
-        $Settings.Model = Read-TextValue -Label '合成 GGUF 文件 / Speech GGUF file' -Default $Settings.Model -Required
-        $Settings.Lexicon = Read-TextValue -Label '合成资源目录，含 lexicon.txt、tokens.txt、config.json / Speech asset directory' -Default $Settings.Lexicon -Required
-        $Settings.Threads = Read-IntegerValue -Label '合成 CPU 线程数 / Speech CPU threads' -Default $Settings.Threads -Minimum 1 -Maximum 256
-        $Settings.IdleTimeout = Read-TextValue -Label '合成空闲释放秒数，0 为常驻 / Speech idle seconds, 0 keeps resident' -Default $Settings.IdleTimeout -Required
-        $Settings.MaxOutputSeconds = Read-TextValue -Label '每段合成时长上限，1-120 秒 / Speech clip duration cap, 1-120 seconds' -Default $Settings.MaxOutputSeconds -Required
-        try { Add-SpeechArguments -Arguments ([Collections.Generic.List[string]]::new()) -Settings $Settings; return }
-        catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
-    }
-}
-
-function Add-SpeechArguments {
-    param([System.Collections.Generic.List[string]]$Arguments, $Settings)
-    if (-not $Settings.Enabled) { return }
-    foreach ($value in @($Settings.Model, $Settings.Lexicon)) {
-        if ([string]::IsNullOrWhiteSpace([string]$value) -or [string]$value -match '[\x00-\x1f\x7f]') { throw 'Speech requires a model file and asset directory without control characters.' }
-    }
-    $model = ConvertTo-FullPath $Settings.Model
-    $lexicon = ConvertTo-FullPath $Settings.Lexicon
-    if (-not (Test-Path -LiteralPath $model -PathType Leaf) -or [IO.Path]::GetExtension($model) -ine '.gguf') { throw 'Speech requires a native Melo GGUF file.' }
-    if (-not (Test-Path -LiteralPath $lexicon -PathType Container)) { throw 'Speech assets must be a directory containing lexicon.txt, tokens.txt and config.json.' }
-    foreach ($asset in @('lexicon.txt', 'tokens.txt', 'config.json')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $lexicon $asset) -PathType Leaf)) { throw "Speech asset directory is missing $asset" }
-    }
-    $threadCount = 0; $idleSeconds = [UInt64]0; $seconds = [single]0
-    if ([string]$Settings.Threads -notmatch '^\d+$' -or -not [int]::TryParse([string]$Settings.Threads, [ref]$threadCount) -or $threadCount -lt 1 -or $threadCount -gt 256) { throw 'Speech CPU threads must be in 1..256.' }
-    if ([string]$Settings.IdleTimeout -notmatch '^\d+$' -or -not [UInt64]::TryParse([string]$Settings.IdleTimeout, [ref]$idleSeconds)) { throw 'Speech idle timeout must be unsigned whole seconds; 0 keeps resident.' }
-    if (-not [single]::TryParse([string]$Settings.MaxOutputSeconds, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -or [single]::IsNaN($seconds) -or [single]::IsInfinity($seconds) -or $seconds -lt 1 -or $seconds -gt 120) { throw 'Speech output duration must be in 1..120 seconds.' }
-    $Settings.Model = $model; $Settings.Lexicon = $lexicon
-    foreach ($value in @('--speech-model', $model, '--speech-lexicon', $lexicon, '--speech-threads', [string]$threadCount,
-        '--speech-idle-timeout', $idleSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
-        '--speech-max-output-seconds', $seconds.ToString('R', [Globalization.CultureInfo]::InvariantCulture))) { [void]$Arguments.Add($value) }
 }
 
 function Get-SavedValue {
@@ -182,6 +98,43 @@ function Get-SavedValue {
     return $Default
 }
 
+
+
+function Test-WizardConsoleInput {
+    if ($script:NativePromptsEnabled -or $env:MOE4ALL_DESKTOP_IO -eq '1') { return $false }
+    # ReadKey is an enhancement for a real console, never for scripts or redirected input.
+    try {
+        return ($Host.Name -eq 'ConsoleHost' -and -not [Console]::IsInputRedirected -and
+            -not [Console]::IsOutputRedirected -and [Environment]::UserInteractive -and -not $env:CI)
+    } catch { return $false }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 function Get-BenchmarkGuideNow {
     return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
@@ -193,7 +146,7 @@ function Test-BenchmarkGuideInteractive {
 }
 
 function Get-BenchmarkGuideState {
-    $result = [pscustomobject]@{ submitted = $false; next_remind_at = [long]0 }
+    $result = [pscustomobject]@{ submitted = $false; next_remind_at = [long]0; last_prompt_version = ''; last_submitted_version = ''; reminder_reason = 'first_use' }
     $path = Join-Path $dataDir 'private\benchmark-first-submission.json'
     try {
         if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -201,21 +154,30 @@ function Get-BenchmarkGuideState {
             if ($value.submitted -is [bool] -and $value.submitted) { $result.submitted = $true }
             $next = [long]0
             if ([long]::TryParse([string]$value.next_remind_at, [ref]$next) -and $next -ge 0) { $result.next_remind_at = $next }
+            foreach ($key in @('last_prompt_version','last_submitted_version')) {
+                $property=$value.PSObject.Properties[$key]
+                if ($property -and [string]$property.Value -match '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { $result.$key=[string]$property.Value }
+            }
+            if ($value.PSObject.Properties['reminder_reason'] -and $value.reminder_reason -eq 'new_version') { $result.reminder_reason='new_version' }
         }
     } catch { } # A damaged reminder must not stop normal startup.
     return $result
 }
 
 function Save-BenchmarkGuideState {
-    param([bool]$Submitted = $false, [long]$NextRemindAt = 0)
+    param([bool]$Submitted = $false, [long]$NextRemindAt = 0, [string]$PromptVersion = '', [string]$SubmittedVersion = '', [ValidateSet('','first_use','new_version')][string]$ReminderReason = '')
     if ($DryRun) { return }
     $temporary = $null
     try {
         $previous = Get-BenchmarkGuideState
+        if($previous.last_submitted_version -eq (Get-BenchmarkGuideVersion) -and $SubmittedVersion -ne $previous.last_submitted_version){$SubmittedVersion=$previous.last_submitted_version}
         $value = [ordered]@{
-            schema_version = 1
+            schema_version = 2
             submitted = ($Submitted -or $previous.submitted)
-            next_remind_at = [Math]::Max($NextRemindAt, $previous.next_remind_at)
+            next_remind_at = $(if ($PSBoundParameters.ContainsKey('NextRemindAt')) { [Math]::Max(0,$NextRemindAt) } else { $previous.next_remind_at })
+            last_prompt_version = $(if ($PromptVersion) { $PromptVersion } else { $previous.last_prompt_version })
+            last_submitted_version = $(if ($SubmittedVersion) { $SubmittedVersion } else { $previous.last_submitted_version })
+            reminder_reason = $(if ($ReminderReason) { $ReminderReason } else { $previous.reminder_reason })
         }
         $directory = Join-Path $dataDir 'private'
         [void][IO.Directory]::CreateDirectory($directory)
@@ -229,8 +191,17 @@ function Save-BenchmarkGuideState {
 }
 
 function Set-BenchmarkSubmissionSucceeded {
-    param([string]$Kind)
-    if ($Kind -eq 'benchmark' -and -not $DryRun) { Save-BenchmarkGuideState -Submitted $true }
+    param([string]$Kind, [string]$ReportVersion = '')
+    if ($Kind -ne 'benchmark' -or $DryRun) { return }
+    if (-not $PSBoundParameters.ContainsKey('ReportVersion')) { $ReportVersion = Get-BenchmarkGuideVersion }
+    if ($ReportVersion -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { $ReportVersion='' }
+    Save-BenchmarkGuideState -Submitted $true -SubmittedVersion $ReportVersion
+}
+
+function Get-BenchmarkGuideVersion {
+    $version = [string](Get-Variable -Name productVersion -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+    if ($version -match '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { return $version }
+    return ''
 }
 
 function Test-BenchmarkBodyReceipt {
@@ -246,24 +217,47 @@ function Test-BenchmarkBodyReceipt {
 }
 
 function Invoke-BenchmarkStartupGuide {
-    param([bool]$Interactive = $false, [bool]$JsonAutomation = $false)
+    param([bool]$Interactive = $false, [bool]$JsonAutomation = $false, [switch]$Window)
     if (-not $Interactive -or $DryRun -or $JsonAutomation) { return $false }
+    $version=Get-BenchmarkGuideVersion
+    if (-not $version) { return $false }
     $guide = Get-BenchmarkGuideState
-    if ($guide.submitted) { return $false }
+    if ($guide.last_submitted_version -eq $version) { return $false }
     # Only stored body-received metadata is historical proof; a saved browser choice is not.
     $receipts = Join-Path $dataDir 'private\submission-receipts'
-    foreach ($file in @(Get-ChildItem -LiteralPath $receipts -Filter '*.private-receipt.json' -File -ErrorAction SilentlyContinue)) {
+    foreach ($file in @($(if (-not $guide.submitted) { Get-ChildItem -LiteralPath $receipts -Filter '*.private-receipt.json' -File -ErrorAction SilentlyContinue }))) {
         try {
             $receipt = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-            if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded benchmark; return $false }
+            if (Test-BenchmarkBodyReceipt $receipt) {
+                $receiptVersion=if($receipt.PSObject.Properties['engine_version']){[string]$receipt.engine_version}else{''}
+                Set-BenchmarkSubmissionSucceeded benchmark -ReportVersion $receiptVersion
+                $guide=Get-BenchmarkGuideState
+                if ($guide.last_submitted_version -eq $version) { return $false }
+                break
+            }
         } catch { } # Never print private receipt contents or parser errors.
     }
     $now = Get-BenchmarkGuideNow
-    if ($now -lt $guide.next_remind_at) { return $false }
+    $previousVersion=if($guide.last_prompt_version){$guide.last_prompt_version}else{$guide.last_submitted_version}
+    $changed=($previousVersion -and $previousVersion -ne $version) -or ($guide.submitted -and -not $previousVersion)
+    if (-not $changed -and $now -lt $guide.next_remind_at) { return $false }
+    $newVersion=$changed -or ($guide.last_prompt_version -eq $version -and $guide.reminder_reason -eq 'new_version')
+    $reason=if($newVersion){'new_version'}else{'first_use'}
+    $delay=if($newVersion){604800}else{172800}
     # Persist before asking so EOF, cancellation and failed benchmarks also get a cooldown.
-    Save-BenchmarkGuideState -NextRemindAt ($now + 172800)
-    Write-Host "`n邀请你跑一次快速 Benchmark，分享成绩到 MoE4All.com 排行榜！" -ForegroundColor Cyan
-    Write-Host 'Run a quick benchmark and share your result on the MoE4All.com leaderboard!'
+    Save-BenchmarkGuideState -NextRemindAt ($now + $delay) -PromptVersion $version -ReminderReason $reason
+    if ($Window) {
+        $language=[string](Get-SavedValue 'wizard_language' '')
+        $english=$language -eq 'en' -or (-not $language -and [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -ne 'zh')
+        return ([MoE4All.Launcher.NativeStartupPrompts]::Benchmark($version,[bool]$newVersion,[bool]$english) -eq 'try')
+    }
+    if ($newVersion) {
+        Write-Host "`n已更新到 v$version，要不要再测一次 Benchmark，看看这次的表现？" -ForegroundColor Cyan
+        Write-Host "Updated to v$version. Run another benchmark and see how this version performs?"
+    } else {
+        Write-Host "`n欢迎使用 MoE4All！要不要先跑一次快速 Benchmark，看看这台设备的表现？" -ForegroundColor Cyan
+        Write-Host 'Welcome to MoE4All! Try a quick benchmark and see how your device performs.'
+    }
     Write-Host '上传前仍会征求同意。You will be asked before uploading.'
     $answer = Read-Choice -Label '来试试吗？/ Give it a try?' -DefaultValue 'later' -Options @(
         [pscustomobject]@{ Key = '1'; Value = 'try'; Label = '试试！ / Try it!' }
@@ -278,6 +272,10 @@ function Read-TextValue {
         [AllowEmptyString()][string]$Default = '',
         [switch]$Required
     )
+    if ($DesktopExecutionPlanPath -and $env:MOE4ALL_DESKTOP_IO -eq '1') {
+        do { $value = Read-WizardRuntimeResponse -Prompt $Label -InputType 'text' -DefaultValue $Default } while ($Required -and [string]::IsNullOrWhiteSpace($value))
+        return $value.Trim()
+    }
     while ($true) {
         $suffix = if ([string]::IsNullOrWhiteSpace($Default)) { '' } else { " [$Default]" }
         $value = Read-Host "$Label$suffix"
@@ -378,6 +376,10 @@ function Read-YesNo {
         [Parameter(Mandatory = $true)][string]$Label,
         [bool]$Default = $true
     )
+    if ($DesktopExecutionPlanPath -and $env:MOE4ALL_DESKTOP_IO -eq '1') {
+        $value = Read-WizardRuntimeResponse -Prompt $Label -InputType 'confirm' -DefaultValue $(if ($Default) { 'y' } else { 'n' })
+        return $value -eq 'y'
+    }
     $hint = if ($Default) { '[Y/n]' } else { '[y/N]' }
     while ($true) {
         $value = (Read-Host "$Label $hint").Trim().ToLowerInvariant()
@@ -411,12 +413,24 @@ function Read-SecretValue {
     }
 }
 
+
+
+
+
+
+
 function Read-Choice {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
         [Parameter(Mandatory = $true)][object[]]$Options,
         [Parameter(Mandatory = $true)][string]$DefaultValue
     )
+    if ($DesktopExecutionPlanPath -and $env:MOE4ALL_DESKTOP_IO -eq '1' -and $launchMode -eq 'benchmark') {
+        $value = Read-WizardRuntimeResponse -Prompt $Label -InputType 'choice' -DefaultValue $DefaultValue -Options $Options
+        $selected = $Options | Where-Object { $_.Key -eq $value -or $_.Value -eq $value } | Select-Object -First 1
+        if ($null -eq $selected) { throw 'Unknown window selection.' }
+        return [string]$selected.Value
+    }
     Write-Host "`n$Label" -ForegroundColor Cyan
     foreach ($option in $Options) {
         $marker = if ($option.Value -eq $DefaultValue) { '*' } else { ' ' }
@@ -742,13 +756,20 @@ function ConvertTo-FullPath {
 }
 
 function Get-RecommendedModelCatalog {
+    $notesVersion = [string](Get-Variable -Name productVersion -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+    $notesUrl = 'https://github.com/Headmaster218/MoE4All/releases/latest'
+    if ($notesVersion -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { $notesUrl = 'https://github.com/Headmaster218/MoE4All/releases/tag/release-' + $notesVersion }
     $flashDirectory = 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+    # Same weights, upstream re-split into three files; the old 33 shards now return 403.
+    $flashRevision = 'f5b0b790eebb89033c48091c26abf74c1b385940'
+    $flashSizes = @(44866868384,11258338528,38400184512)
     $flashFiles = @()
-    for ($i = 1; $i -le 33; $i++) {
-        $fileName = 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-{0:D5}-of-00033.gguf' -f $i
+    for ($i = 1; $i -le 3; $i++) {
+        $fileName = 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-{0:D5}-of-00003.gguf' -f $i
         $flashFiles += [pscustomobject]@{
-            Url = "https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/$flashDirectory/$fileName`?download=true"
+            Url = "https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/$flashRevision/$fileName`?download=true"
             RelativePath = Join-Path $flashDirectory $fileName
+            Bytes = [long]$flashSizes[$i - 1]
         }
     }
 
@@ -756,68 +777,87 @@ function Get-RecommendedModelCatalog {
         [pscustomobject]@{
             Id = 'qwen35-balanced'
             Kind = 'llm'
-            Name = 'Qwen3.6 35B APEX-I-Balanced'
+            Name = 'Qwen3.6-35B-A3B-APEX-I-Balanced'
             InfoUrl = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/blob/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
             Primary = 'Qwen3.6-35B-A3B-APEX-I-Balanced\Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
             Files = @([pscustomobject]@{
                 Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true'
                 RelativePath = 'Qwen3.6-35B-A3B-APEX-I-Balanced\Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
+                Bytes = 25624957632
             })
         }
         [pscustomobject]@{
             Id = 'flashnext-427'
             Kind = 'llm'
-            Name = 'Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64（33 个分片 / 33 shards）'
-            InfoUrl = "https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/$flashDirectory"
-            Primary = "$flashDirectory\Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf"
+            Name = 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
+            InfoUrl = "https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/$flashRevision"
+            Primary = "$flashDirectory\Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf"
             Files = $flashFiles
         }
         [pscustomobject]@{
             Id = 'flashnext-vision'
             Kind = 'vision'
-            Name = 'Qwen3.8 Flash-Next F16 视觉文件 / vision projector'
+            Name = 'mmproj-Qwen3.8-Flash-Next-F16'
             InfoUrl = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/blob/main/mmproj-Qwen3.8-Flash-Next-F16.gguf'
             Primary = "$flashDirectory\mmproj-Qwen3.8-Flash-Next-F16.gguf"
             Files = @([pscustomobject]@{
                 Url = 'https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true'
                 RelativePath = "$flashDirectory\mmproj-Qwen3.8-Flash-Next-F16.gguf"
+                Bytes = 904003840
             })
         }
         [pscustomobject]@{
             Id = 'qwen3-embedding-06b-q8'
             Kind = 'embedding'
-            Name = 'Qwen3-Embedding 0.6B Q8_0'
+            Name = 'Qwen3-Embedding-0.6B-Q8_0'
             InfoUrl = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/blob/main/Qwen3-Embedding-0.6B-Q8_0.gguf'
             Primary = 'Qwen3-Embedding-0.6B-Q8_0\Qwen3-Embedding-0.6B-Q8_0.gguf'
             Files = @([pscustomobject]@{
                 Url = 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true'
                 RelativePath = 'Qwen3-Embedding-0.6B-Q8_0\Qwen3-Embedding-0.6B-Q8_0.gguf'
+                Bytes = 639150592
             })
         }
         [pscustomobject]@{
             Id = 'sensevoice-small-q8'
             Kind = 'audio'
-            Name = 'SenseVoice Small Q8_0（约 278 MiB / about 278 MiB）'
+            Name = 'SenseVoice-Small-Q8_0'
             InfoUrl = 'https://huggingface.co/lovemefan/sense-voice-gguf/blob/main/sense-voice-small-q8_0.gguf'
             Primary = 'SenseVoice-Small-Q8_0\sense-voice-small-q8_0.gguf'
             Files = @([pscustomobject]@{
                 Url = 'https://huggingface.co/lovemefan/sense-voice-gguf/resolve/main/sense-voice-small-q8_0.gguf?download=true'
                 RelativePath = 'SenseVoice-Small-Q8_0\sense-voice-small-q8_0.gguf'
+                Bytes = 291985952
+            })
+        }
+        [pscustomobject]@{
+            Id = 'qwen35-vision'
+            Kind = 'vision'
+            Name = 'Qwen3.6-35B-A3B · mmproj.gguf'
+            Description = '35B 配套视觉投影文件 / Matching Qwen3.6-35B vision projector'
+            InfoUrl = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/blob/main/mmproj.gguf'
+            Primary = 'Qwen3.6-35B-A3B-APEX-I-Balanced\mmproj.gguf'
+            Files = @([pscustomobject]@{
+                Url = 'https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/mmproj.gguf?download=true'
+                RelativePath = 'Qwen3.6-35B-A3B-APEX-I-Balanced\mmproj.gguf'
+                Bytes = 902822624
             })
         }
         [pscustomobject]@{
             Id = 'melotts-chinese-native-f32'
             Kind = 'speech'
-            Name = 'MeloTTS 中文原生 CPU / Chinese native CPU speech'
+            Name = 'MeloTTS-Chinese-Native-F32'
             Downloadable = $false
-            UnavailableReason = '原生包已本地验证并备妥，等待公共下载托管；用户无需转换。Native package validated locally; public download hosting is pending. End users do not need conversion.'
+            UnavailableReason = '下载与转换步骤见本版本发行说明；提供配套转换脚本，不自动安装依赖。See this version''s release notes for setup and the conversion script; dependencies are not installed automatically.'
+            InstructionsUrl = $notesUrl
             LocalPackageReady = $true
             PackageFileName = 'MeloTTS-Chinese-Native-F32-v1.zip'
+            PackageBytes = 155780558
             PackageScript = 'scripts/package-native-speech.ps1'
             ModelSha256 = '6d0d6fffe43cf6dea169f584c07bbb1a43756f37958ba9f9b78e27e8f9b32cc2'
             ModelBytes = 164882176
             SourceCommit = '66a4434a518a3b6d124756952977f0b10f0e9a76'
-            InfoUrl = 'https://huggingface.co/myshell-ai/MeloTTS-Chinese/tree/af5d207a364ea4208c6f589c89f57f88414bdd16'
+            InfoUrl = $notesUrl
             # These are conversion inputs, deliberately not downloadable runtime files.
             SourceUrls = @(
                 'https://huggingface.co/myshell-ai/MeloTTS-Chinese/tree/af5d207a364ea4208c6f589c89f57f88414bdd16'
@@ -839,14 +879,16 @@ function Show-RecommendedModelDownloads {
     $matching = @(Get-RecommendedModelCatalog | Where-Object { $Kind -eq 'all' -or $_.Kind -eq $Kind })
     foreach ($download in $matching) {
         Write-Host " $($download.Name)"
+        $downloadBytes = if ($download.PSObject.Properties['PackageBytes']) { [long]$download.PackageBytes } else { [long](($download.Files | Measure-Object -Property Bytes -Sum).Sum) }
+        if ($downloadBytes -gt 0) { Write-Host "   $(Format-DownloadBytes $downloadBytes)" -ForegroundColor DarkGray }
         Write-Host "   $($download.InfoUrl)" -ForegroundColor DarkGray
         if ($download.PSObject.Properties['Downloadable'] -and -not $download.Downloadable) {
             Write-Host "   $($download.UnavailableReason)" -ForegroundColor Yellow
         }
     }
     if (@($matching | Where-Object { -not $_.PSObject.Properties['Downloadable'] -or $_.Downloadable }).Count -eq 0) { return }
-    Write-Host '在模型列表选择 D，可一次选择一个或多个项目下载到安装目录下的 models 文件夹。' -ForegroundColor DarkGray
-    Write-Host 'Choose D in the model list to download one or more items into the models folder beside the launcher.' -ForegroundColor DarkGray
+    Write-Host '在模型列表选择 D，可选择下载项目和保存目录；默认是安装目录下的 models。' -ForegroundColor DarkGray
+    Write-Host 'Choose D to select downloads and a destination; the default is models beside the launcher.' -ForegroundColor DarkGray
 }
 
 function Format-DownloadBytes {
@@ -873,6 +915,9 @@ function Invoke-FileDownloadWithProgress {
     if (Test-Path -LiteralPath $Destination -PathType Leaf) {
         $existingFile = Get-Item -LiteralPath $Destination
         if (-not $ReplaceExisting -and $existingFile.Length -gt 0) {
+            if ($ExpectedBytes -gt 0 -and $existingFile.Length -ne $ExpectedBytes) {
+                throw "已存在的文件大小不符，请选择其他目录 / Existing file size differs; choose another folder: $Destination"
+            }
             Write-Host "已存在，跳过 / Already present: $Destination" -ForegroundColor DarkGray
             return
         }
@@ -922,6 +967,7 @@ function Invoke-FileDownloadWithProgress {
             $buffer = [byte[]]::new(1048576)
 
             while (($read = $sourceStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                Assert-WizardOperationActive
                 $targetStream.Write($buffer, 0, $read)
                 $downloaded += $read
                 $speed = if ($started.Elapsed.TotalSeconds -gt 0) { [long](($downloaded - $resumeAt) / $started.Elapsed.TotalSeconds) } else { 0L }
@@ -947,12 +993,14 @@ function Invoke-FileDownloadWithProgress {
             if ($requiredBytes -gt 0 -and $actualBytes -ne $requiredBytes) {
                 throw "下载大小不完整 / Incomplete download: $actualBytes of $requiredBytes bytes"
             }
+            Assert-WizardOperationActive
             Move-Item -LiteralPath $partialPath -Destination $Destination -Force
             $completeArguments = @{ Id = $ProgressId; Activity = $Label; Completed = $true }
             if ($ParentProgressId -ge 0) { $completeArguments.ParentId = $ParentProgressId }
             Write-Progress @completeArguments
             return
         } catch {
+            if (Test-WizardOperationCancelled $_.Exception) { throw }
             $completeArguments = @{ Id = $ProgressId; Activity = $Label; Completed = $true }
             if ($ParentProgressId -ge 0) { $completeArguments.ParentId = $ParentProgressId }
             Write-Progress @completeArguments
@@ -974,7 +1022,8 @@ function Invoke-ModelFileDownload {
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$Label,
-        [int]$MaximumAttempts = 3
+        [int]$MaximumAttempts = 3,
+        [long]$ExpectedBytes = 0
     )
 
     Invoke-FileDownloadWithProgress `
@@ -982,8 +1031,41 @@ function Invoke-ModelFileDownload {
         -Destination $Destination `
         -Label $Label `
         -MaximumAttempts $MaximumAttempts `
+        -ExpectedBytes $ExpectedBytes `
         -ProgressId 71 `
         -ParentProgressId 70
+}
+
+function Save-ModelDownloadDirectory {
+    param([string]$Directory)
+    $settingsFile = Get-Variable -Scope Script -Name statePath -ValueOnly -ErrorAction SilentlyContinue
+    $isDryRun = Get-Variable -Scope Script -Name DryRun -ValueOnly -ErrorAction SilentlyContinue
+    if (-not $settingsFile -or $isDryRun) { return }
+    $temporary = $null
+    try {
+        $preferences = if (Test-Path -LiteralPath $settingsFile -PathType Leaf) { [IO.File]::ReadAllText($settingsFile) | ConvertFrom-Json } else { [pscustomobject]@{} }
+        $preferences | Add-Member -NotePropertyName download_dir -NotePropertyValue $Directory -Force
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($settingsFile))
+        $temporary = $settingsFile + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+        [IO.File]::WriteAllText($temporary, ($preferences | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($true))
+        if ([IO.File]::Exists($settingsFile)) { [IO.File]::Replace($temporary,$settingsFile,[Management.Automation.Language.NullString]::Value) } else { [IO.File]::Move($temporary,$settingsFile) }
+    } catch { Write-Warning '下载目录本轮仍有效，但未能保存。The download folder is active for this run but could not be saved.' }
+    finally { if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Force } }
+}
+
+function Get-ModelDownloadDirectory {
+    param([switch]$Choose)
+    $savedDirectory = [string](Get-SavedValue 'download_dir' '')
+    $directory = if ($savedDirectory) { ConvertTo-FullPath $savedDirectory } else { Join-Path $repoRoot 'models' }
+    if ($Choose -and -not $script:ModelDownloadDirectoryChosen) {
+        $directory = ConvertTo-FullPath (Read-TextValue -Label '模型下载目录 / Model download folder' -Default $directory -Required)
+        if (Test-Path -LiteralPath $directory -PathType Leaf) { throw '下载目录不能是文件 / Download folder cannot be a file.' }
+        if ($null -eq $script:Saved) { $script:Saved = [pscustomobject]@{} }
+        $script:Saved | Add-Member -NotePropertyName download_dir -NotePropertyValue $directory -Force
+        Save-ModelDownloadDirectory -Directory $directory
+        $script:ModelDownloadDirectoryChosen = $true
+    }
+    return $directory
 }
 
 function Invoke-RecommendedModelDownload {
@@ -991,7 +1073,8 @@ function Invoke-RecommendedModelDownload {
 
     $bundle = @(Get-RecommendedModelCatalog | Where-Object { $_.Id -eq $Id }) | Select-Object -First 1
     if ($null -eq $bundle) { throw "Unknown recommended download: $Id" }
-    $modelsRoot = Join-Path $repoRoot 'models'
+    if ($bundle.PSObject.Properties['Downloadable'] -and -not $bundle.Downloadable) { throw $bundle.UnavailableReason }
+    $modelsRoot = Get-ModelDownloadDirectory -Choose
     $files = @($bundle.Files)
     Write-Host "`n下载 / Download: $($bundle.Name)" -ForegroundColor Cyan
     Write-Host "目录 / Folder: $modelsRoot" -ForegroundColor DarkGray
@@ -1001,7 +1084,7 @@ function Invoke-RecommendedModelDownload {
             $destination = Join-Path $modelsRoot $file.RelativePath
             $activity = "[$($i + 1)/$($files.Count)] $([System.IO.Path]::GetFileName($destination))"
             Write-Progress -Id 70 -Activity $bundle.Name -Status $activity -PercentComplete ([int](100 * $i / $files.Count))
-            Invoke-ModelFileDownload -Url $file.Url -Destination $destination -Label $activity
+            Invoke-ModelFileDownload -Url $file.Url -Destination $destination -Label $activity -ExpectedBytes $file.Bytes
         }
     } finally {
         Write-Progress -Id 70 -Activity $bundle.Name -Completed
@@ -1015,27 +1098,43 @@ function Invoke-RecommendedModelDownload {
     return $primary
 }
 
+function Open-ModelSetupGuide {
+    param([Parameter(Mandatory = $true)][string]$Url)
+    if ($Url -notmatch '^https://github\.com/Headmaster218/MoE4All/releases/(?:latest|tag/release-\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$') { throw 'Invalid model setup guide URL.' }
+    Write-Host "安装说明 / Setup guide: $Url" -ForegroundColor Cyan
+    try { Start-Process -FilePath $Url -ErrorAction Stop | Out-Null }
+    catch { Write-Warning '无法打开浏览器，请复制上面的链接。Could not open a browser; copy the link above.' }
+}
+
 function Select-RecommendedDownloads {
     param([ValidateSet('all','llm','vision','embedding','audio','speech')][string]$Kind='all')
     $matching = @(Get-RecommendedModelCatalog | Where-Object { $Kind -eq 'all' -or $_.Kind -eq $Kind })
+    $guides = @($matching | Where-Object { $_.PSObject.Properties['InstructionsUrl'] -and $_.InstructionsUrl })
     $catalog = @($matching | Where-Object { -not $_.PSObject.Properties['Downloadable'] -or $_.Downloadable })
     foreach ($unavailable in @($matching | Where-Object { $_.PSObject.Properties['Downloadable'] -and -not $_.Downloadable })) {
         Write-Host (" {0}: {1}" -f $unavailable.Name, $unavailable.UnavailableReason) -ForegroundColor Yellow
     }
-    if ($catalog.Count -eq 0) { return @() }
+    if ($catalog.Count -eq 0) {
+        if ($guides.Count -gt 0) { Open-ModelSetupGuide -Url $guides[0].InstructionsUrl }
+        return @()
+    }
     while ($true) {
         Write-Host "`n下载模型与组件 / Download models and components" -ForegroundColor Cyan
         for ($i = 0; $i -lt $catalog.Count; $i++) {
             $bundle = $catalog[$i]
-            $primary = Join-Path (Join-Path $repoRoot 'models') $bundle.Primary
+            $primary = Join-Path (Get-ModelDownloadDirectory) $bundle.Primary
             $status = if (Test-Path -LiteralPath $primary -PathType Leaf) { ' [已下载 / installed]' } else { '' }
             Write-Host (" [{0}] {1}{2}" -f ($i + 1), $bundle.Name, $status)
+            $bytes = [long](($bundle.Files | Measure-Object -Property Bytes -Sum).Sum)
+            Write-Host "     $(Format-DownloadBytes $bytes) · $($bundle.Files.Count) 个文件 / file(s)" -ForegroundColor DarkGray
             Write-Host "     $($bundle.InfoUrl)" -ForegroundColor DarkGray
         }
         Write-Host ' [A] 全部 / All'
+        if ($guides.Count -gt 0) { Write-Host ' [S] 语音合成安装说明 / Speech setup guide' }
         Write-Host ' [B] 返回 / Back'
         $raw = (Read-Host '选择一个或多个编号，用逗号分隔 / Select one or more numbers, comma-separated').Trim()
         if ($raw -match '^(b|back|返回)$') { return @() }
+        if ($raw -match '^(s|speech|guide)$' -and $guides.Count -gt 0) { Open-ModelSetupGuide -Url $guides[0].InstructionsUrl; return @() }
 
         $indexes = [System.Collections.Generic.List[int]]::new()
         $seenIndexes = [System.Collections.Generic.HashSet[int]]::new()
@@ -1122,7 +1221,7 @@ function Select-ModelPath {
     }
 
     foreach ($bundle in @(Get-RecommendedModelCatalog | Where-Object { $_.Kind -eq 'llm' })) {
-        $candidate = Join-Path (Join-Path $repoRoot 'models') $bundle.Primary
+        $candidate = Join-Path (Get-ModelDownloadDirectory) $bundle.Primary
         if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and $seen.Add($candidate)) {
             [void]$models.Add($candidate)
         }
@@ -1145,7 +1244,7 @@ function Select-ModelPath {
         if ($choice -match '^(d|download|下载)$') {
             $null = @(Select-RecommendedDownloads)
             foreach ($bundle in @(Get-RecommendedModelCatalog | Where-Object { $_.Kind -eq 'llm' })) {
-                $candidate = Join-Path (Join-Path $repoRoot 'models') $bundle.Primary
+                $candidate = Join-Path (Get-ModelDownloadDirectory) $bundle.Primary
                 if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and $seen.Add($candidate)) {
                     [void]$models.Add($candidate)
                 }
@@ -1623,7 +1722,7 @@ function Invoke-GhSubmissionUpload {
             if ($listed.ExitCode -ne 0 -or $prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'could not create or reuse pull request' }
         }
         if ($prUrl -notmatch '^https://github\.com/Headmaster218/MoE4All/pull/[0-9]+$') { throw 'GitHub did not return a valid report PR URL' }
-        Set-BenchmarkSubmissionSucceeded -Kind $Kind
+        Set-BenchmarkSubmissionSucceeded -Kind $Kind -ReportVersion ([string]$value.engine_version)
         Write-Host "PR 已创建 / PR created: $prUrl" -ForegroundColor Green
         return $true
     } catch {
@@ -1669,7 +1768,11 @@ function Save-BenchmarkUploadPreferences {
 }
 
 function Read-BenchmarkUploadConsent {
-    $answer = Read-YesNo -Label '愿意公开提交这份 benchmark 结果吗？/ Submit this benchmark result publicly?' -Default $script:BenchmarkUploadDefault
+    if ($DesktopExecutionPlanPath -and $env:MOE4ALL_DESKTOP_IO -eq '1') {
+        $answer = (Read-WizardRuntimeResponse -Prompt '愿意公开提交这份 Benchmark 结果吗？/ Submit this Benchmark result publicly?' -InputType 'confirm' -DefaultValue $(if($script:BenchmarkUploadDefault){'y'}else{'n'}) -AffirmativeText '提交结果 / Submit results' -NegativeText '暂不提交 / Not now') -eq 'y'
+    } else {
+        $answer = Read-YesNo -Label '愿意公开提交这份 benchmark 结果吗？/ Submit this benchmark result publicly?' -Default $script:BenchmarkUploadDefault
+    }
     $script:BenchmarkUploadDefault = $answer
     Save-BenchmarkUploadPreferences
     return $answer
@@ -1836,6 +1939,60 @@ function New-Moe4AllSubmissionApiException {
     return $exception
 }
 
+function Invoke-Moe4AllSubmissionTransfer {
+    param(
+        [Parameter(Mandatory = $true)]$Client,
+        [Parameter(Mandatory = $true)]$Request,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
+        [int]$Attempt = 1,
+        [int]$TotalAttempts = 1
+    )
+
+    # Keep the deadline and cancellation checks in the wizard, independently of
+    # HttpClient's timer. ResponseContentRead includes the complete response body.
+    $cancellation = [System.Threading.CancellationTokenSource]::new()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $pending = $null
+    $completed = $false
+    $nextNotice = 5
+    try {
+        $cancellation.CancelAfter([TimeSpan]::FromSeconds($TimeoutSeconds))
+        $pending = $Client.SendAsync($Request, [System.Net.Http.HttpCompletionOption]::ResponseContentRead, $cancellation.Token)
+        while (-not $pending.IsCompleted) {
+            Assert-WizardOperationActive
+            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                throw [System.TimeoutException]::new('提交服务请求超时；本地文件仍保留。Submission request timed out; the local file is preserved.')
+            }
+            if ($timer.Elapsed.TotalSeconds -ge $nextNotice) {
+                Write-Host ("正在等待上传服务：第 {0}/{1} 次，已等 {2} 秒，上限 {3} 秒。 / Waiting for submission service: attempt {0}/{1}, {2}s elapsed, {3}s limit." -f $Attempt, $TotalAttempts, [int]$timer.Elapsed.TotalSeconds, $TimeoutSeconds) -ForegroundColor DarkGray
+                $nextNotice += 5
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        Assert-WizardOperationActive
+        try {
+            $response = $pending.GetAwaiter().GetResult()
+        } catch {
+            if ($cancellation.IsCancellationRequested) {
+                throw [System.TimeoutException]::new('提交服务请求超时；本地文件仍保留。Submission request timed out; the local file is preserved.')
+            }
+            throw
+        }
+        $completed = $true
+        return $response
+    } finally {
+        if (-not $completed) {
+            $cancellation.Cancel()
+            # Also release a response that won the race with cancellation.
+            if ($null -ne $pending -and $pending.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
+                $pending.GetAwaiter().GetResult().Dispose()
+            }
+        }
+        $timer.Stop()
+        $cancellation.Dispose()
+    }
+}
+
 function Invoke-Moe4AllSubmissionApi {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('GET', 'POST')][string]$Method,
@@ -1985,6 +2142,7 @@ function Save-Moe4AllSubmissionReceipt {
         public_url = [string]$Receipt.public_url
         saved_at_utc = [DateTime]::UtcNow.ToString('o')
     }
+    if($Receipt.PSObject.Properties['engine_version'] -and [string]$Receipt.engine_version -match '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$'){$saved.engine_version=[string]$Receipt.engine_version}
     [System.IO.File]::WriteAllText($path, (($saved | ConvertTo-Json -Depth 5) + "`n"), [System.Text.UTF8Encoding]::new($false))
     return $path
 }
@@ -2090,8 +2248,10 @@ function Invoke-WebsiteSubmissionUpload {
     if ([int]$receipt.api_version -ne 1 -or [string]$receipt.kind -ne $Kind -or [string]$receipt.report_id -ne $reportId -or $submittedHash -ne $fileHash -or [string]$receipt.status -notin $allowedStatuses) {
         throw '提交回执与本地文件不匹配。Submission receipt does not match the local file.'
     }
+    $reportVersion=[string]$payload.engine_version
+    if ($Kind -eq 'benchmark' -and $reportVersion -match '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') { $receipt | Add-Member -NotePropertyName engine_version -NotePropertyValue $reportVersion -Force }
     $receiptPath = Save-Moe4AllSubmissionReceipt -Receipt $receipt -ApiBase $config.ApiBase
-    if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded -Kind $Kind }
+    if (Test-BenchmarkBodyReceipt $receipt) { Set-BenchmarkSubmissionSucceeded -Kind $Kind -ReportVersion $reportVersion }
     if ([string]$receipt.status -eq 'delivery_failed') {
         Write-Warning '该报告此前转发失败，正文已清理；请重新导出新报告。This report previously failed delivery; export a new report to try again.'
     } elseif ([string]$receipt.status -eq 'rejected') {
@@ -2269,7 +2429,7 @@ function Offer-SubmissionUpload {
         [switch]$ConsentAlreadyGranted
     )
 
-    try { [void](Test-SubmissionForUpload -Path $Path -Kind $Kind) } catch { Write-Warning $_.Exception.Message; return $false }
+    try { $submission = Test-SubmissionForUpload -Path $Path -Kind $Kind } catch { Write-Warning $_.Exception.Message; return $false }
     if (-not $ConsentAlreadyGranted) {
         if ($Kind -eq 'error') {
             $consent = Read-YesNo -Label '愿意公开提交这份错误报告吗？/ Submit this error report publicly?' -Default $script:ErrorUploadDefault
@@ -2304,7 +2464,7 @@ function Offer-SubmissionUpload {
                             return (Invoke-GhSubmissionUpload -Path $Path -Kind $Kind -Retry:($attempt -gt 1))
                         }
                         if ($gitUploaded) { Remove-PendingSubmission -Path $pendingPath; return $true }
-                    } catch { Write-Warning "GitHub CLI 上传失败：$($_.Exception.Message) / GitHub CLI upload failed." }
+                    } catch { if (Test-WizardOperationCancelled $_.Exception) { throw }; Write-Warning "GitHub CLI 上传失败：$($_.Exception.Message) / GitHub CLI upload failed." }
                     if ($script:SubmissionUploadCancelled -or $script:SubmissionValidationFailed) { return $false }
                 }
             }
@@ -2313,18 +2473,19 @@ function Offer-SubmissionUpload {
         }
         if ($channel -eq 'browser') {
             try { Open-SubmissionBrowserUpload -Path $Path -Kind $Kind } catch {
+                if (Test-WizardOperationCancelled $_.Exception) { throw }
                 Write-Warning "未能自动打开 GitHub，请保留本地报告。Could not open GitHub: $($_.Exception.Message)"
             }
             Write-Host '完成网页操作后再选择；向导不会查询网页提交结果。Choose after completing the web steps; the wizard does not query their result.'
             $action = Read-SubmissionNextAction -Browser
-            if ($action -eq 'sent') { Set-BenchmarkSubmissionSucceeded -Kind $Kind; Remove-PendingSubmission -Path $pendingPath; return $true }
+            if ($action -eq 'sent') { Set-BenchmarkSubmissionSucceeded -Kind $Kind -ReportVersion ([string]$submission.engine_version); Remove-PendingSubmission -Path $pendingPath; return $true }
             if ($action -eq 'reopen') { continue }
             if ($action -eq 'cloudflare') { $channel = 'cloudflare' } else { break }
         }
         if ($channel -eq 'cloudflare') {
             try {
                 if (Invoke-WebsiteSubmissionUpload -Path $Path -Kind $Kind) { Remove-PendingSubmission -Path $pendingPath; return $true }
-            } catch { Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed." }
+            } catch { if (Test-WizardOperationCancelled $_.Exception) { throw }; Write-Warning "Cloudflare 中转失败：$($_.Exception.Message) / Cloudflare relay failed." }
             $action = Read-SubmissionNextAction
             if ($action -eq 'retry') { continue }
             if ($action -eq 'channel') { $channel = 'choose'; continue }
@@ -2353,8 +2514,29 @@ function Invoke-BenchmarkUploadSafely {
     }
 }
 
+function Open-BenchmarkLeaderboard {
+    $browser = [Diagnostics.ProcessStartInfo]::new()
+    $browser.FileName = 'https://moe4all.com/community/'
+    $browser.UseShellExecute = $true
+    [void][Diagnostics.Process]::Start($browser)
+}
+
+function Offer-BenchmarkLeaderboard {
+    try {
+        if ($DesktopExecutionPlanPath -and $env:MOE4ALL_DESKTOP_IO -eq '1') {
+            $open = (Read-WizardRuntimeResponse -Prompt '要打开性能排行榜看看吗？/ Would you like to see the benchmark leaderboard?' -InputType 'confirm' -DefaultValue 'n' -Title 'Benchmark · 排行榜 / Benchmark · Leaderboard' -AffirmativeText '打开排行榜 / Open leaderboard' -NegativeText '不了，结束 / No, finish') -eq 'y'
+        } else {
+            $open = Read-YesNo -Label '要打开性能排行榜看看吗？/ Would you like to see the benchmark leaderboard?' -Default $false
+        }
+        if ($open) { Open-BenchmarkLeaderboard }
+    } catch {
+        Write-Warning ('排行榜未打开；测试结果已保留。The leaderboard did not open; benchmark results are retained. ' + $_.Exception.Message)
+    }
+}
+
 function Offer-PendingSubmissions {
-    if ($script:PendingSubmissionPrompted) { return }
+    param([switch]$ExplicitAction)
+    if ($script:PendingSubmissionPrompted -and -not $ExplicitAction) { return }
     $pending = @(Get-PendingSubmissions)
     if ($pending.Count -eq 0) { $script:PendingSubmissionPrompted = $true; return }
     $script:PendingSubmissionPrompted = $true
@@ -2527,6 +2709,62 @@ function Add-TranscriptionArguments {
     $Settings.UploadDir = ConvertTo-FullPath $Settings.UploadDir
     foreach ($value in @('--transcription-model', $path, '--transcription-dev', 'cpu', '--transcription-threads', [string]$threadCount,
         '--transcription-idle-timeout', [string]$idleSeconds, '--transcription-upload-dir', $Settings.UploadDir)) { [void]$Arguments.Add($value) }
+}
+
+function Get-SpeechSettings {
+    return [pscustomobject]@{
+        Enabled = ([string](Get-SavedValue 'server_speech' $false) -ieq 'true')
+        Model = [string](Get-SavedValue 'speech_model' '')
+        Lexicon = [string](Get-SavedValue 'speech_lexicon' '')
+        Threads = [string](Get-SavedValue 'speech_threads' '4')
+        IdleTimeout = [string](Get-SavedValue 'speech_idle_timeout' '300')
+        MaxOutputSeconds = [string](Get-SavedValue 'speech_max_output_seconds' '30')
+    }
+}
+
+function Read-SpeechSettings {
+    param($Settings)
+    if (-not $Settings.Enabled) { return }
+    Write-Host '语音合成使用独立 CPU 服务，首次请求加载，空闲后释放；需要支持 TTS 的引擎。/ Speech synthesis uses an independent lazy CPU service and requires a TTS-enabled build.' -ForegroundColor DarkGray
+    Write-Host '选择配套的原生 Melo GGUF 与资源目录；输入 D 查看本版本安装与转换说明。/ Select matching native Melo assets; enter D for this version''s setup and conversion guide.' -ForegroundColor DarkGray
+    Write-Host '输出 WAV/PCM 完整片段；音色、语速和格式由 API 请求指定。/ Returns complete WAV/PCM clips; voice, speed and format are set per API request.' -ForegroundColor DarkGray
+    while ($true) {
+        $modelInput = Read-TextValue -Label '合成 GGUF 文件 / Speech GGUF file' -Default $Settings.Model -Required
+        if ($modelInput -match '^(d|download|下载)$') {
+            [void](Select-RecommendedDownloads -Kind speech)
+            continue
+        }
+        $Settings.Model = $modelInput
+        $Settings.Lexicon = Read-TextValue -Label '合成资源目录，含 lexicon.txt、tokens.txt、config.json / Speech asset directory' -Default $Settings.Lexicon -Required
+        $Settings.Threads = Read-IntegerValue -Label '合成 CPU 线程数 / Speech CPU threads' -Default $Settings.Threads -Minimum 1 -Maximum 256
+        $Settings.IdleTimeout = Read-TextValue -Label '合成空闲释放秒数，0 为常驻 / Speech idle seconds, 0 keeps resident' -Default $Settings.IdleTimeout -Required
+        $Settings.MaxOutputSeconds = Read-TextValue -Label '每段合成时长上限，1-120 秒 / Speech clip duration cap, 1-120 seconds' -Default $Settings.MaxOutputSeconds -Required
+        try { Add-SpeechArguments -Arguments ([Collections.Generic.List[string]]::new()) -Settings $Settings; return }
+        catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
+    }
+}
+
+function Add-SpeechArguments {
+    param([System.Collections.Generic.List[string]]$Arguments, $Settings)
+    if (-not $Settings.Enabled) { return }
+    foreach ($value in @($Settings.Model, $Settings.Lexicon)) {
+        if ([string]::IsNullOrWhiteSpace([string]$value) -or [string]$value -match '[\x00-\x1f\x7f]') { throw 'Speech requires a model file and asset directory without control characters.' }
+    }
+    $model = ConvertTo-FullPath $Settings.Model
+    $lexicon = ConvertTo-FullPath $Settings.Lexicon
+    if (-not (Test-Path -LiteralPath $model -PathType Leaf) -or [IO.Path]::GetExtension($model) -ine '.gguf') { throw 'Speech requires a native Melo GGUF file.' }
+    if (-not (Test-Path -LiteralPath $lexicon -PathType Container)) { throw 'Speech assets must be a directory containing lexicon.txt, tokens.txt and config.json.' }
+    foreach ($asset in @('lexicon.txt', 'tokens.txt', 'config.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $lexicon $asset) -PathType Leaf)) { throw "Speech asset directory is missing $asset" }
+    }
+    $threadCount = 0; $idleSeconds = [UInt64]0; $seconds = [single]0
+    if ([string]$Settings.Threads -notmatch '^\d+$' -or -not [int]::TryParse([string]$Settings.Threads, [ref]$threadCount) -or $threadCount -lt 1 -or $threadCount -gt 256) { throw 'Speech CPU threads must be in 1..256.' }
+    if ([string]$Settings.IdleTimeout -notmatch '^\d+$' -or -not [UInt64]::TryParse([string]$Settings.IdleTimeout, [ref]$idleSeconds)) { throw 'Speech idle timeout must be unsigned whole seconds; 0 keeps resident.' }
+    if (-not [single]::TryParse([string]$Settings.MaxOutputSeconds, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -or [single]::IsNaN($seconds) -or [single]::IsInfinity($seconds) -or $seconds -lt 1 -or $seconds -gt 120) { throw 'Speech output duration must be in 1..120 seconds.' }
+    $Settings.Model = $model; $Settings.Lexicon = $lexicon
+    foreach ($value in @('--speech-model', $model, '--speech-lexicon', $lexicon, '--speech-threads', [string]$threadCount,
+        '--speech-idle-timeout', $idleSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+        '--speech-max-output-seconds', $seconds.ToString('R', [Globalization.CultureInfo]::InvariantCulture))) { [void]$Arguments.Add($value) }
 }
 
 function Find-VisionProjectorPath {
@@ -2786,27 +3024,45 @@ function Show-EngineReleaseNotes {
 }
 
 function Read-EngineUpdateAction {
-    param([Parameter(Mandatory = $true)]$Release)
+    param([Parameter(Mandatory = $true)]$Release, [switch]$Window, [string]$CurrentVersion = '')
+
+    if ($Window) {
+        $language=[string](Get-SavedValue 'wizard_language' '')
+        $english=$language -eq 'en' -or (-not $language -and [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -ne 'zh')
+        $url='https://github.com/Headmaster218/MoE4All/releases/tag/'+[string]$Release.Tag
+        return [MoE4All.Launcher.NativeStartupPrompts]::Update($CurrentVersion,[string]$Release.Version,(Format-Moe4AllReleaseNotes -Notes ([string]$Release.Notes)),$url,[bool]$english)
+    }
 
     while ($true) {
         Write-Host "`n发现新版本 / Update available: $($Release.Tag)" -ForegroundColor Yellow
-        Write-Host '   [1] 查看更新说明 / View release notes'
-        Write-Host '   [2] 下载并更新 / Download and update'
-        Write-Host ' * [3] 暂不更新（默认）/ Not now (default)'
-        $value = (Read-Host '选择 [3] / Select [3]').Trim().ToLowerInvariant()
+        if ($Release.PSObject.Properties['Notes']) { Write-Host (Format-Moe4AllReleaseNotes -Notes ([string]$Release.Notes)) }
+        Write-Host ('Release Note: https://github.com/Headmaster218/MoE4All/releases/tag/'+[string]$Release.Tag) -ForegroundColor Cyan
+        Write-Host '   [1] 更新 / Update'
+        Write-Host ' * [2] 下次更新（默认）/ Next time (default)'
+        Write-Host '   [3] 三天后再提醒 / Remind me in 3 days'
+        Write-Host '   [R] 打开完整发行说明 / Open full release notes'
+        $value = (Read-Host '选择 [2] / Select [2]').Trim().ToLowerInvariant()
         if (-not $value) { return 'skip' }
         switch ($value) {
-            { $_ -in @('1', 'r', 'release', 'notes') } {
-                Show-EngineReleaseNotes -Release $Release
+            { $_ -in @('r', 'release', 'notes') } {
+                Open-EngineReleaseNotes -Release $Release
                 continue
             }
-            { $_ -in @('2', 'y', 'yes', 'update') } { return 'update' }
-            { $_ -in @('3', 'n', 'no', 'later') } { return 'skip' }
+            { $_ -in @('1', 'y', 'yes', 'update') } { return 'update' }
+            { $_ -in @('2', 'n', 'no', 'later', 'skip') } { return 'skip' }
+            { $_ -in @('3', 'snooze') } { return 'snooze' }
             default {
-                Write-Host '请选择 1、2 或 3；回车暂不更新。Select 1, 2 or 3; Enter skips the update.' -ForegroundColor Yellow
+                Write-Host '请选择 1、2、3 或 R；回车下次更新。Select 1, 2, 3 or R; Enter skips this time.' -ForegroundColor Yellow
             }
         }
     }
+}
+
+function Open-EngineReleaseNotes {
+    param([Parameter(Mandatory=$true)]$Release)
+    Show-EngineReleaseNotes -Release $Release
+    if([string]$Release.Tag -notmatch '^release-\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$'){return}
+    try{Start-Process -FilePath ('https://github.com/Headmaster218/MoE4All/releases/tag/'+[string]$Release.Tag) -ErrorAction Stop|Out-Null}catch{}
 }
 
 function Test-EngineProcessRunning {
@@ -2920,11 +3176,14 @@ function Invoke-EngineSelfUpdate {
             ([string]$PID)
             '-LauncherProcessId'
             ([string]$launcherProcessId)
+            '-RelaunchEntry'
+            $(if ($WindowWizard) { 'window' } else { 'console' })
             '-CleanupRoot'
             ('"' + $runRoot + '"')
             '-DeleteSelf'
         ) -join ' '
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentText -WorkingDirectory $repoRoot -WindowStyle Normal | Out-Null
+        $updateWindowStyle = if ($WindowWizard) { 'Hidden' } else { 'Normal' }
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentText -WorkingDirectory $repoRoot -WindowStyle $updateWindowStyle | Out-Null
         Write-Host '更新包已准备完成，向导将退出并由更新助手完成替换。Update is staged; the helper will finish after this wizard exits.' -ForegroundColor Green
         exit 42
     } catch {
@@ -2951,18 +3210,63 @@ function Show-PendingUpdateResult {
     }
 }
 
+function Get-EngineUpdateReminder {
+    $result=[pscustomobject]@{release_tag='';next_remind_at=[long]0}
+    try {
+        $path=Join-Path $dataDir 'private\update-reminder.json'
+        if(Test-Path -LiteralPath $path -PathType Leaf){
+            $saved=[IO.File]::ReadAllText($path)|ConvertFrom-Json;$time=[long]0
+            if([string]$saved.release_tag -match '^release-\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -and [long]::TryParse([string]$saved.next_remind_at,[ref]$time) -and $time-ge 0){$result.release_tag=[string]$saved.release_tag;$result.next_remind_at=$time}
+        }
+    }catch{}
+    return $result
+}
+
+function Save-EngineUpdateReminder {
+    param([string]$Tag,[ValidateSet('update','skip','snooze')][string]$Action)
+    if($DryRun){return};$temporary=$null
+    try {
+        $directory=Join-Path $dataDir 'private';[void][IO.Directory]::CreateDirectory($directory)
+        $path=Join-Path $directory 'update-reminder.json';$temporary=$path+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+        $next=if($Action-eq'snooze'){(Get-BenchmarkGuideNow)+259200}else{0}
+        $value=[ordered]@{schema_version=1;release_tag=$Tag;next_remind_at=$next}
+        [IO.File]::WriteAllText($temporary,($value|ConvertTo-Json),[Text.UTF8Encoding]::new($false))
+        if([IO.File]::Exists($path)){[IO.File]::Replace($temporary,$path,[Management.Automation.Language.NullString]::Value)}else{[IO.File]::Move($temporary,$path)}
+    }catch{Write-Warning '无法保存更新提醒，仍可正常启动。Could not save the update reminder; startup continues.'}
+    finally{if($temporary -and [IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
+}
+
+function Start-EngineUpdateProbe {
+    param([string]$CurrentVersion)
+    $disabled=[Environment]::GetEnvironmentVariable('MOE4ALL_NO_UPDATE_CHECK','Process')
+    if($SkipUpdateCheck -or $DryRun -or $disabled-match '^(1|true|yes|on)$' -or $script:EngineUpdateProbe){return}
+    $runner=$null
+    try{
+        $runner=[PowerShell]::Create()
+        $text='param($common,$version) . $common; function Get-LatestEngineRelease {'+${function:Get-LatestEngineRelease}.ToString()+'}; Get-LatestEngineRelease -CurrentVersion $version'
+        [void]$runner.AddScript($text).AddArgument($updateCommonPath).AddArgument($CurrentVersion)
+        $script:EngineUpdateProbe=[pscustomobject]@{Runner=$runner;Async=$runner.BeginInvoke()}
+    }catch{if($runner){$runner.Dispose()};$script:EngineUpdateProbe=$null}
+}
+
 function Show-UpdateStatus {
-    param([Parameter(Mandatory = $true)][string]$CurrentVersion)
+    param([Parameter(Mandatory = $true)][string]$CurrentVersion,[switch]$Window,[switch]$Force)
 
     $disabled = [Environment]::GetEnvironmentVariable('MOE4ALL_NO_UPDATE_CHECK', 'Process')
-    if ($SkipUpdateCheck -or $disabled -match '^(1|true|yes|on)$') { return }
+    if ($SkipUpdateCheck -or $DryRun -or $disabled -match '^(1|true|yes|on)$') { return }
     $current = ConvertTo-Moe4AllSemVer $CurrentVersion
     if ($null -eq $current) { return }
 
     try {
-        $release = Get-LatestEngineRelease -CurrentVersion $CurrentVersion
+        if($script:EngineUpdateProbe){
+            $probe=$script:EngineUpdateProbe;$script:EngineUpdateProbe=$null
+            try{if(-not $probe.Async.AsyncWaitHandle.WaitOne(6000)){throw 'Update check timed out'};$release=@($probe.Runner.EndInvoke($probe.Async))|Select-Object -First 1;if(-not $release){throw 'Update check returned no release'}}finally{$probe.Runner.Dispose()}
+        }else{$release = Get-LatestEngineRelease -CurrentVersion $CurrentVersion}
         if ((Compare-Moe4AllSemVer $release.SemVer $current) -gt 0) {
-            $action = Read-EngineUpdateAction -Release $release
+            $reminder=Get-EngineUpdateReminder
+            if(-not $Force -and $reminder.release_tag-eq$release.Tag -and (Get-BenchmarkGuideNow)-lt$reminder.next_remind_at){return}
+            $action = Read-EngineUpdateAction -Release $release -Window:$Window -CurrentVersion $CurrentVersion
+            Save-EngineUpdateReminder -Tag $release.Tag -Action $action
             if ($action -eq 'update') { [void](Invoke-EngineSelfUpdate -Release $release) }
         } else {
             Write-Host "更新检查 / Update check: v$CurrentVersion is current" -ForegroundColor DarkGray
@@ -2991,12 +3295,299 @@ function Write-PostUpdateProbe {
     New-Item -ItemType Directory -Path $updateRoot -Force | Out-Null
     $probe = [ordered]@{
         version = $Version
+        entry = $(if ($WindowWizard) { 'window' } else { 'console' })
         process_id = $PID
         at = [DateTimeOffset]::Now.ToString('o')
     }
     $temporary = "$probePath.moe4all-new-$([guid]::NewGuid().ToString('N'))"
     [System.IO.File]::WriteAllText($temporary, ($probe | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temporary -Destination $probePath -Force
+}
+
+function Get-WizardExecutionVariableNames {
+    # Never restore caller-selected variable names, paths, or secrets from JSON.
+    @('nativeArgs', 'launchMode', 'modelPath', 'serverAddr', 'serverAuth',
+      'serverEmbedding', 'serverVision', 'llmEnabled', 'transcription', 'speech',
+      'benchKind', 'manualBenchKind', 'promptTokens', 'genTokens', 'depthMode',
+      'depthTokens', 'reps', 'productVersion', 'device', 'setupMode', 'kvTypeK', 'kvTypeV')
+}
+
+function Get-WizardExecutionPreferenceNames {
+    @('BenchmarkUploadDefault', 'BenchmarkUploadHasGithubDefault', 'BenchmarkUploadGhAuthDefault',
+      'BenchmarkUploadFallbackDefault', 'SubmissionBrowserActionDefault', 'SubmissionFailureActionDefault',
+      'SubmissionPendingRetryDefault', 'ErrorUploadDefault', 'BenchmarkGuideActive', 'PendingSubmissionPrompted')
+}
+
+function New-WizardExecutionPlan {
+    $values = [ordered]@{}
+    foreach ($name in Get-WizardExecutionVariableNames) {
+        $values[$name] = (Get-Variable -Name $name -Scope 1 -ValueOnly -ErrorAction SilentlyContinue)
+    }
+    $values['nativeArgs'] = [string[]]@($values['nativeArgs'])
+    # Only Enabled is needed for the server startup message; model/paths already live in argv.
+    $values['transcription'] = [pscustomobject]@{ Enabled = [bool]$values['transcription'].Enabled }
+    $values['speech'] = [pscustomobject]@{ Enabled = ([string]$values['speech'].Enabled -ieq 'true') }
+    $preferences = [ordered]@{}
+    foreach ($name in Get-WizardExecutionPreferenceNames) {
+        $preferences[$name] = Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    }
+    [pscustomobject]@{ SchemaVersion = 1; RepoRoot = $repoRoot; EngineIdentity = $null
+        Variables = [pscustomobject]$values; Preferences = [pscustomobject]$preferences }
+}
+
+function Get-WizardExecutionPlanDirectory {
+    # A source checkout can also contain infr.exe; .git takes priority over package detection.
+    if ($script:IsPackagedInstall -and -not (Test-Path -LiteralPath (Join-Path $repoRoot '.git'))) {
+        return [IO.Path]::GetFullPath((Join-Path $repoRoot 'gui-data\private\launch'))
+    }
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        $identity = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($repoRoot.ToLowerInvariant()))).Replace('-', '').Substring(0, 20).ToLowerInvariant()
+    } finally { $hash.Dispose() }
+    $generatedRoot = if ($env:MOE4ALL_WORK_ROOT) { [IO.Path]::GetFullPath($env:MOE4ALL_WORK_ROOT) }
+        elseif ($repoRoot.StartsWith('D:\AIinfr\', [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath 'D:\AIinfr\disk_usage_rule.md')) { 'D:\AIinfr\infr\local-work' }
+        else { Join-Path $repoRoot 'local-work' }
+    return (Join-Path $generatedRoot "runtime\moe4all\wizard-$identity\launch")
+}
+
+function Assert-WizardExecutionPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            if (((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Execution plans cannot use reparse points.'
+            }
+        }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
+function Get-WizardExecutionEngineIdentity {
+    $stream = [IO.File]::Open($infrPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        [pscustomobject]@{ Path = [IO.Path]::GetFullPath($infrPath); Length = $stream.Length
+            LastWriteTimeUtcTicks = [IO.File]::GetLastWriteTimeUtc($infrPath).Ticks
+            Sha256 = [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+    } finally { $hash.Dispose(); $stream.Dispose() }
+}
+
+function Read-WizardExecutionPlan {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $directory = Get-WizardExecutionPlanDirectory
+    if (-not [string]::Equals([IO.Path]::GetDirectoryName($fullPath), $directory, [StringComparison]::OrdinalIgnoreCase) -or
+        [IO.Path]::GetFileName($fullPath) -notmatch '^launch-[a-f0-9]{32}\.json$') {
+        throw 'Execution plan is outside the controlled launch directory.'
+    }
+    Assert-WizardExecutionPath -Path $fullPath
+    $stream = [IO.File]::Open($fullPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -eq 0 -or $stream.Length -gt 131072) { throw 'Execution plan must be at most 128 KiB.' }
+        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $true)
+        try { $plan = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+    if ($null -eq $plan -or $plan.SchemaVersion -ne 1 -or
+        -not [string]::Equals([string]$plan.RepoRoot, $repoRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Execution plan does not match this installation or schema.'
+    }
+    $actual = Get-WizardExecutionEngineIdentity
+    foreach ($name in @('Path', 'Length', 'LastWriteTimeUtcTicks', 'Sha256')) {
+        if ($null -eq $plan.EngineIdentity -or [string]$plan.EngineIdentity.$name -ine [string]$actual.$name) {
+            throw 'Execution plan does not match the current engine file.'
+        }
+    }
+    foreach ($section in @('Variables', 'Preferences')) {
+        $allowed = if ($section -eq 'Variables') { @(Get-WizardExecutionVariableNames) } else { @(Get-WizardExecutionPreferenceNames) }
+        $names = @($plan.$section.PSObject.Properties.Name)
+        if ($names.Count -ne $allowed.Count -or @($names | Where-Object { $_ -cnotin $allowed }).Count -or
+            @($allowed | Where-Object { $_ -cnotin $names }).Count) { throw 'Invalid execution plan fields.' }
+    }
+    if ($plan.Variables.launchMode -notin @('chat', 'server', 'benchmark') -or
+        $plan.Variables.nativeArgs -isnot [array] -or $plan.Variables.nativeArgs.Count -eq 0 -or
+        @($plan.Variables.nativeArgs | Where-Object { $_ -isnot [string] }).Count) { throw 'Invalid execution plan command.' }
+    return $plan
+}
+
+function Invoke-WizardDesktopExecution {
+    param([Parameter(Mandatory = $true)][object]$Plan, [bool]$English = $false)
+    $planPath = $null
+    $ownsPlan = $false
+    $desktopCompleted = $false
+    $previousApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
+    $previousDesktopIo = [Environment]::GetEnvironmentVariable('MOE4ALL_DESKTOP_IO', 'Process')
+    try {
+        # The desktop conversation uses the existing streaming API: multiline input,
+        # roles and reasoning stay structured instead of parsing terminal output.
+        $chatEndpoint=''
+        if($Plan.Variables.launchMode -eq 'chat' -and $Plan.Variables.nativeArgs[0] -eq 'run'){
+            $Plan=$Plan|ConvertTo-Json -Depth 8 -Compress|ConvertFrom-Json
+            $portProbe=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+            $portProbe.Start();try{$chatPort=([Net.IPEndPoint]$portProbe.LocalEndpoint).Port}finally{$portProbe.Stop()}
+            $chatArguments=[Collections.Generic.List[string]]::new([string[]]$Plan.Variables.nativeArgs)
+            $chatArguments[0]='serve';$chatArguments.Add('--addr');$chatArguments.Add("127.0.0.1:$chatPort");$chatArguments.Add('--parallel');$chatArguments.Add('1')
+            $Plan.Variables.nativeArgs=$chatArguments.ToArray()
+            $chatEndpoint="http://127.0.0.1:$chatPort/v1"
+            [Environment]::SetEnvironmentVariable('INFR_API_KEY',[guid]::NewGuid().ToString('N'),'Process')
+        }
+        $Plan.EngineIdentity = Get-WizardExecutionEngineIdentity
+        $payload = [Text.UTF8Encoding]::new($false).GetBytes(($Plan | ConvertTo-Json -Depth 8 -Compress))
+        if ($payload.Length -gt 131072) { throw 'Execution plan exceeds 128 KiB.' }
+        $directory = Get-WizardExecutionPlanDirectory
+        Assert-WizardExecutionPath -Path $directory
+        [void][IO.Directory]::CreateDirectory($directory)
+        Assert-WizardExecutionPath -Path $directory
+        $planPath = Join-Path $directory ('launch-' + [guid]::NewGuid().ToString('N') + '.json')
+        $stream = [IO.File]::Open($planPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $ownsPlan = $true
+        try { $stream.Write($payload, 0, $payload.Length) } finally { $stream.Dispose() }
+        if ($Plan.Variables.launchMode -eq 'server' -and $Plan.Variables.serverAuth) {
+            [Environment]::SetEnvironmentVariable('INFR_API_KEY', $serverApiKey, 'Process')
+        }
+        [Environment]::SetEnvironmentVariable('MOE4ALL_DESKTOP_IO', '1', 'Process')
+        $childArguments = [string[]]@('-NoLogo', '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $PSScriptRoot 'infr-wizard.ps1'), '-DesktopExecutionPlanPath', $planPath)
+        $desktopEndpoint = if($chatEndpoint){$chatEndpoint}elseif ($Plan.Variables.launchMode -eq 'server') { 'http://' + (Get-ClientAddress ([string]$Plan.Variables.serverAddr)) + '/v1' } else { '' }
+        $desktopResult = [MoE4All.Launcher.NativeRuntime]::Run('powershell.exe', $childArguments, $repoRoot,
+            [string]$Plan.Variables.launchMode, [string]$Plan.Variables.modelPath, $desktopEndpoint, $English)
+        $desktopCompleted=$true
+        return $desktopResult
+    } finally {
+        [Environment]::SetEnvironmentVariable('INFR_API_KEY', $previousApiKey, 'Process')
+        [Environment]::SetEnvironmentVariable('MOE4ALL_DESKTOP_IO', $previousDesktopIo, 'Process')
+        if ($ownsPlan) { Remove-Item -LiteralPath $planPath -Force -ErrorAction SilentlyContinue }
+        if ($desktopCompleted -and ('MoE4All.Launcher.NativeWizard' -as [type])) { [MoE4All.Launcher.NativeWizard]::RestoreConsole() }
+    }
+}
+
+function Invoke-WizardExecutionPlan {
+    param([Parameter(Mandatory = $true)][object]$Plan)
+    foreach ($name in Get-WizardExecutionVariableNames) {
+        Set-Variable -Name $name -Scope Local -Value $Plan.Variables.$name
+    }
+    $nativeArgs = [string[]]@($nativeArgs)
+    foreach ($name in Get-WizardExecutionPreferenceNames) {
+        Set-Variable -Name $name -Scope Script -Value $Plan.Preferences.$name
+    }
+    if ($DesktopExecutionPlanPath) {
+        $serverApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
+    }
+    if ($launchMode -eq 'server') {
+        $clientAddress = Get-ClientAddress $serverAddr
+        Write-Host "`nAPI 地址 / API base URL: http://$clientAddress/v1" -ForegroundColor Cyan
+        Write-Host "健康检查 / Health check: http://$clientAddress/health"
+        Write-Host '兼容 OpenAI 客户端时，将 Base URL 设为上面的 /v1 地址。' -ForegroundColor DarkGray
+        Write-Host 'For OpenAI clients, use the /v1 address above as the Base URL.' -ForegroundColor DarkGray
+        if ($serverEmbedding) {
+            Write-Host "Embedding API: http://$clientAddress/v1/embeddings" -ForegroundColor Cyan
+        }
+        if ($transcription.Enabled) {
+            Write-Host "本地语音转录 API / Local transcription API: http://$clientAddress/v1/audio/transcriptions (WAV/PCM, CPU)" -ForegroundColor Cyan
+        }
+        if ($speech.Enabled) {
+            Write-Host "本地语音合成 API / Local speech synthesis API: http://$clientAddress/v1/audio/speech (WAV/PCM, CPU)" -ForegroundColor Cyan
+        }
+        if ($llmEnabled -and $serverVision) {
+            Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
+            Write-Host 'Vision chat enabled: send an image_url data URI in /v1/chat/completions content parts.' -ForegroundColor Cyan
+        }
+        Write-Host '按 Ctrl+C 停止服务器。Press Ctrl+C to stop the server.' -ForegroundColor Yellow
+    } elseif ($launchMode -eq 'chat') {
+        if($DesktopExecutionPlanPath){
+            Write-Host "`n正在准备聊天；模型加载完成后会自动进入对话。" -ForegroundColor Cyan
+            Write-Host 'Preparing chat; the conversation opens automatically when the model is ready.' -ForegroundColor DarkGray
+        }else{
+            Write-Host "`n模型加载完成后，在 > 提示符输入消息；输入 exit、quit 或 :q 退出。" -ForegroundColor Cyan
+            Write-Host 'After the model loads, type at the > prompt; use exit, quit or :q to leave.' -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host "`n启动中 / Starting..." -ForegroundColor Green
+    $benchmarkFilesBefore = @()
+    if ($launchMode -eq 'benchmark') { $benchmarkFilesBefore = @(Get-BenchmarkSubmissionSnapshot) }
+    $errorReportsBefore = @(Get-ErrorSubmissionSnapshot)
+    $benchmarkResultPath = $null
+    $previousApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
+    $hadApiKey = $null -ne $previousApiKey
+    $previousDiagnosticDir = [Environment]::GetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', 'Process')
+    $hadDiagnosticDir = $null -ne $previousDiagnosticDir
+    [Environment]::SetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', (Join-Path $repoRoot 'diagnostics'), 'Process')
+    if ($launchMode -eq 'server' -and $serverAuth) {
+        [Environment]::SetEnvironmentVariable('INFR_API_KEY', $serverApiKey, 'Process')
+    }
+    Push-Location $repoRoot
+    try {
+        if ($launchMode -eq 'benchmark' -and $benchKind -eq 'manual') {
+            $manualJson = ((& $infrPath @nativeArgs) -join "`n").Trim()
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0) {
+                try {
+                    $benchmarkResultPath = Write-ManualBenchmarkResult -RawJson $manualJson -ModelPath $modelPath -Kind $manualBenchKind -PromptTokens $promptTokens -GenTokens $genTokens -DepthMode $depthMode -DepthTokens $depthTokens -Repetitions $reps
+                } catch {
+                    Write-Warning "手动 benchmark 结果保存失败：$($_.Exception.Message) / Could not save the manual benchmark result."
+                }
+            }
+        } else {
+            & $infrPath @nativeArgs
+            $exitCode = $LASTEXITCODE
+        }
+    } finally {
+        Pop-Location
+        if ($launchMode -eq 'server' -and $serverAuth) {
+            $restoreApiKey = if ($hadApiKey) { $previousApiKey } else { $null }
+            [Environment]::SetEnvironmentVariable('INFR_API_KEY', $restoreApiKey, 'Process')
+        }
+        $restoreDiagnosticDir = if ($hadDiagnosticDir) { $previousDiagnosticDir } else { $null }
+        [Environment]::SetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', $restoreDiagnosticDir, 'Process')
+    }
+    if ($null -eq $exitCode) { $exitCode = 0 }
+    Write-Host "`nMoE4All / infr 退出码 / exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { 'Green' } else { 'Red' })
+    if ($launchMode -eq 'benchmark' -and $benchKind -ne 'manual') {
+        $before = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($path in $benchmarkFilesBefore) { [void]$before.Add($path) }
+        $benchmarkResultPath = @(Get-BenchmarkSubmissionSnapshot | Where-Object { -not $before.Contains($_) } | Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending | Select-Object -First 1)
+        if ($benchmarkResultPath.Count -gt 0) { $benchmarkResultPath = [string]$benchmarkResultPath[0] } else { $benchmarkResultPath = $null }
+    }
+    $benchmarkUploadRequested = $false
+    if ($benchmarkResultPath) {
+        if($DesktopExecutionPlanPath){try{Show-WizardRuntimeBenchmarkResult -Path $benchmarkResultPath}catch{Write-Warning ('结果界面加载失败，原始报告保留。Could not display results; the report is retained. '+$_.Exception.Message)}}
+        $benchmarkUploadRequested = Read-BenchmarkUploadConsent
+    }
+    if ($benchmarkResultPath -and $benchmarkUploadRequested) {
+        Invoke-BenchmarkUploadSafely -Path $benchmarkResultPath -ConsentAlreadyGranted
+    }
+    $knownReports = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $errorReportsBefore) { [void]$knownReports.Add($path) }
+    if ($exitCode -ne 0) {
+        $fatalReport = @(Get-ErrorSubmissionSnapshot | Where-Object { -not $knownReports.Contains($_) } | Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending | Select-Object -First 1)
+        if ($fatalReport.Count -gt 0) {
+            try { [void](Complete-ErrorReport -Source ([string]$fatalReport[0])) } catch { Write-Warning "错误报告补充失败：$($_.Exception.Message) / Could not complete the error report." }
+        }
+    }
+    if ($launchMode -eq 'benchmark' -and $benchmarkResultPath) { Offer-BenchmarkLeaderboard }
+    exit $exitCode
+}
+
+if ($DesktopExecutionPlanPath) {
+    if ($DryRun -or $PreviewUi) { throw 'Desktop execution cannot be combined with DryRun or PreviewUi.' }
+    # Native child prompts remain in the owning runtime window; no second GUI host.
+    . (Join-Path $PSScriptRoot 'wizard-runtime-bridge.ps1')
+    $desktopPlan = Read-WizardExecutionPlan -Path $DesktopExecutionPlanPath
+    Invoke-WizardExecutionPlan -Plan $desktopPlan
+}
+
+if ($PreviewUi) {
+    . (Join-Path $PSScriptRoot 'infr-dashboard.ps1')
+    if ($WindowWizard -or (Test-WizardConsoleInput)) { $null = Invoke-WizardDashboard -Saved $null -Demo }
+    else {
+        . (Join-Path $PSScriptRoot 'infr-dashboard-state.ps1')
+        Initialize-DashboardRuntime
+        $demoState = Get-DashboardInitialState -Saved $null
+        $demoSchema = Get-DashboardSchema -State $demoState -DeviceOptions @()
+        Write-Output ([MoE4All.Launcher.Dashboard]::Snapshot(($demoState|ConvertTo-Json -Depth 20 -Compress),($demoSchema|ConvertTo-Json -Depth 20 -Compress),'home',132,42,$false))
+    }
+    exit 0
 }
 
 if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf)) {
@@ -3008,6 +3599,7 @@ if ($PostUpdateProbePath) {
     Write-PostUpdateProbe -Path $PostUpdateProbePath -Version $productVersion
     if ($ExitAfterPostUpdateProbe) { exit 43 }
 }
+if (-not $WindowWizard) {
 Clear-Host
 Write-Host '============================================================' -ForegroundColor Green
 $banner = @'
@@ -3029,12 +3621,41 @@ Write-Host 'MoE4All 启动向导 / MoE4All Launch Wizard' -ForegroundColor Green
 Write-Host '上次设置会作为默认值；直接回车即可复用。Press Enter to reuse the previous value.'
 Write-Host "引擎 / Engine: $infrPath" -ForegroundColor DarkGray
 Show-PendingUpdateResult
-Show-UpdateStatus -CurrentVersion $productVersion
-
+}
+$script:DashboardAccepted = $false
+$script:DashboardApiKey = ''
+$script:DashboardPendingPrompted = $false
+$script:DashboardBenchmarkGuideActive = $false
+$useDashboard = [bool]$WindowWizard -and -not $DryRun
+if ($useDashboard) {
+    try {
+        . (Join-Path $PSScriptRoot 'infr-dashboard.ps1')
+        $dashboardResult = Invoke-WizardDashboard -Saved $script:Saved
+        if ($null -eq $dashboardResult) { exit 44 }
+        $script:Saved = $dashboardResult.State
+        $script:DashboardApiKey = $dashboardResult.ApiKey
+        $script:DashboardPendingPrompted = [bool]$script:PendingSubmissionPrompted
+        $script:DashboardAccepted = $true
+        $script:NativePromptsEnabled = $true
+    } catch {
+        $dashboardException = $_.Exception
+        while ($null -ne $dashboardException) {
+            if ($dashboardException.GetType().FullName -eq 'MoE4All.Launcher.NativePromptCanceledException') { throw }
+            $dashboardException = $dashboardException.InnerException
+        }
+        if ('MoE4All.Launcher.NativeWizard' -as [type]) { [MoE4All.Launcher.NativeWizard]::RestoreConsole() }
+        # The EXE entry has no terminal for the compatibility wizard to read from.
+        # Let the bootstrap present the error instead of waiting on invisible input.
+        if ($WindowWizard) { throw }
+        Write-Warning ('工作台不可用，将进入兼容向导。Dashboard unavailable; using the compatible wizard. ' + $_.Exception.Message)
+    }
+}
+if (-not $useDashboard -or -not $script:DashboardAccepted) { Show-UpdateStatus -CurrentVersion $productVersion }
 $reuseSavedSettings = $false
-$script:BenchmarkGuideActive = Invoke-BenchmarkStartupGuide -Interactive (Test-BenchmarkGuideInteractive) -JsonAutomation ([bool](Get-SavedValue 'json_output' $false))
+$script:BenchmarkGuideActive = if ($script:DashboardAccepted) { [bool]$script:DashboardBenchmarkGuideActive } else { Invoke-BenchmarkStartupGuide -Interactive (Test-BenchmarkGuideInteractive) }
 $savedModel = [string](Get-SavedValue 'model' '')
-if (-not $script:BenchmarkGuideActive -and $null -ne $script:Saved -and -not $InitialModelPath) {
+if ($script:DashboardAccepted) { $reuseSavedSettings = $true }
+elseif (-not $script:BenchmarkGuideActive -and $null -ne $script:Saved -and -not $InitialModelPath) {
     if (Test-SavedWizardModels) {
         $reuseSavedSettings = Read-YesNo -Label '是否按上次设置直接启动？/ Start with the previous settings?' -Default $true
     } else {
@@ -3123,7 +3744,7 @@ $script:SubmissionFailureActionDefault = [string](Get-SavedValue 'submission_fai
 $script:SubmissionPendingRetryDefault = [bool](Get-SavedValue 'submission_pending_retry' $true)
 $script:ErrorUploadDefault = [bool](Get-SavedValue 'error_upload' $false)
 if ($script:BenchmarkUploadFallbackDefault -notin @('folder', 'clipboard', 'skip')) { $script:BenchmarkUploadFallbackDefault = 'folder' }
-$script:PendingSubmissionPrompted = $false
+$script:PendingSubmissionPrompted = [bool]$script:DashboardPendingPrompted
 if (-not $DryRun) { Offer-PendingSubmissions }
 $maxNew = [string](Get-SavedValue 'max_new' '65536')
 $configureSampling = [bool](Get-SavedValue 'configure_sampling' $false)
@@ -3209,7 +3830,6 @@ if (-not $reuseSavedSettings) {
         Read-TranscriptionSettings -Settings $transcription
         Read-SpeechSettings -Settings $speech
     }
-
     if ($llmEnabled -or $serverEmbedding) {
         if ($launchMode -eq 'server') {
             Write-Host 'LLM 和 Embedding 共用所选设备；语音转录固定使用 CPU。/ LLM and Embedding share the selected device; transcription always uses the CPU.' -ForegroundColor DarkGray
@@ -3303,7 +3923,6 @@ if (-not $reuseSavedSettings) {
         if ($setupMode -eq 'manual') {
             $customSets = Read-TextValue -Label '额外 --set，以分号分隔，留空为无 / Extra --set entries separated by semicolons, blank for none' -Default $customSets
         }
-
         if ($launchMode -ne 'benchmark') {
             $configureThinking = Read-YesNo -Label '是否配置默认思考？/ Configure default reasoning?' -Default $configureThinking
             if ($configureThinking) {
@@ -3456,7 +4075,8 @@ if (-not $reuseSavedSettings) {
 
 if ($launchMode -eq 'server') {
     if ($serverAuth) {
-        $serverApiKey = Read-SecretValue -Label 'API key（隐藏输入且不会保存）/ API key (hidden and not saved)'
+        if ($script:DashboardAccepted -and $script:DashboardApiKey) { $serverApiKey = $script:DashboardApiKey }
+        else { $serverApiKey = Read-SecretValue -Label 'API key（隐藏输入且不会保存）/ API key (hidden and not saved)' }
     } elseif (-not (Test-IsLoopbackAddress $serverAddr)) {
         Write-Host '警告：该监听地址可能被其他设备访问，且当前未启用鉴权。' -ForegroundColor Yellow
         Write-Host 'Warning: this address may be reachable by other devices and authentication is disabled.' -ForegroundColor Yellow
@@ -3626,6 +4246,9 @@ if ($llmEnabled -and $null -ne $script:ModelReasoningProbe -and $script:ModelRea
     [void](Get-ModelReasoningEfforts -ModelPath $modelPath)
 }
 $state = [ordered]@{
+    wizard_language = [string](Get-SavedValue 'wizard_language' '')
+    wizard_theme = [string](Get-SavedValue 'wizard_theme' 'system')
+    download_dir = Get-ModelDownloadDirectory
     launch_mode = $launchMode; setup_mode = $setupMode; model = $modelPath
     model_history = @(if ($llmEnabled) { Get-UpdatedModelHistory -SelectedModel $modelPath } else { Get-SavedValue 'model_history' @() })
     device = $device; context = $context
@@ -3675,8 +4298,8 @@ $state = [ordered]@{
 }
 if (-not $llmEnabled) { Restore-DisabledLlmState -State $state }
 if (-not $DryRun -and -not $script:PendingSubmissionPrompted) { Offer-PendingSubmissions }
-Write-Host "`n最终命令 / Final command" -ForegroundColor Green
-Write-Host $commandText -ForegroundColor White
+Write-Host "`n最终命令 / Final command" -ForegroundColor Cyan
+Write-Host $commandText -ForegroundColor DarkGray
 if ($launchMode -eq 'server' -and $serverAuth) {
     Write-Host 'API key 将通过当前子进程环境传入，未显示在命令中，也不会保存。' -ForegroundColor DarkGray
     Write-Host 'The API key is passed through the child-process environment; it is hidden above and not saved.' -ForegroundColor DarkGray
@@ -3694,90 +4317,13 @@ if ($DryRun) {
     Write-Host 'DryRun：未启动。DryRun: command was not started.' -ForegroundColor Yellow
     exit 0
 }
-if ($launchMode -eq 'server') {
-    $clientAddress = Get-ClientAddress $serverAddr
-    Write-Host "`nAPI 地址 / API base URL: http://$clientAddress/v1" -ForegroundColor Cyan
-    Write-Host "健康检查 / Health check: http://$clientAddress/health"
-    Write-Host '兼容 OpenAI 客户端时，将 Base URL 设为上面的 /v1 地址。' -ForegroundColor DarkGray
-    Write-Host 'For OpenAI clients, use the /v1 address above as the Base URL.' -ForegroundColor DarkGray
-    if ($serverEmbedding) {
-        Write-Host "Embedding API: http://$clientAddress/v1/embeddings" -ForegroundColor Cyan
-    }
-    if ($transcription.Enabled) {
-        Write-Host "本地语音转录 API / Local transcription API: http://$clientAddress/v1/audio/transcriptions (WAV/PCM, CPU)" -ForegroundColor Cyan
-    }
-    if ($speech.Enabled) {
-        Write-Host "本地语音合成 API / Local speech synthesis API: http://$clientAddress/v1/audio/speech (WAV/PCM, CPU)" -ForegroundColor Cyan
-    }
-    if ($llmEnabled -and $serverVision) {
-        Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
-        Write-Host 'Vision chat enabled: send an image_url data URI in /v1/chat/completions content parts.' -ForegroundColor Cyan
-    }
-    Write-Host '按 Ctrl+C 停止服务器。Press Ctrl+C to stop the server.' -ForegroundColor Yellow
-} elseif ($launchMode -eq 'chat') {
-    Write-Host "`n模型加载完成后，在 > 提示符输入消息；输入 exit、quit 或 :q 退出。" -ForegroundColor Cyan
-    Write-Host 'After the model loads, type at the > prompt; use exit, quit or :q to leave.' -ForegroundColor DarkGray
+$executionPlan = New-WizardExecutionPlan
+if ($script:DashboardAccepted -and -not $ClassicWizard -and -not $DesktopExecutionPlanPath) {
+    $desktopLanguage = [string]$script:Saved.wizard_language
+    $desktopEnglish = $desktopLanguage -eq 'en' -or (-not $desktopLanguage -and [Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -ne 'zh')
+    $desktopExitCode = Invoke-WizardDesktopExecution -Plan $executionPlan -English $desktopEnglish
+    # Internal CMD sentinels avoid pause/console output after the native completion screen.
+    if ($desktopExitCode -eq 0) { exit 45 }
+    exit 46
 }
-
-Write-Host "`n启动中 / Starting..." -ForegroundColor Green
-$benchmarkFilesBefore = @()
-if ($launchMode -eq 'benchmark') { $benchmarkFilesBefore = @(Get-BenchmarkSubmissionSnapshot) }
-$errorReportsBefore = @(Get-ErrorSubmissionSnapshot)
-$benchmarkResultPath = $null
-$previousApiKey = [Environment]::GetEnvironmentVariable('INFR_API_KEY', 'Process')
-$hadApiKey = $null -ne $previousApiKey
-$previousDiagnosticDir = [Environment]::GetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', 'Process')
-$hadDiagnosticDir = $null -ne $previousDiagnosticDir
-[Environment]::SetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', (Join-Path $repoRoot 'diagnostics'), 'Process')
-if ($launchMode -eq 'server' -and $serverAuth) {
-    [Environment]::SetEnvironmentVariable('INFR_API_KEY', $serverApiKey, 'Process')
-}
-Push-Location $repoRoot
-try {
-    if ($launchMode -eq 'benchmark' -and $benchKind -eq 'manual') {
-        $manualJson = ((& $infrPath @nativeArgs) -join "`n").Trim()
-        $exitCode = $LASTEXITCODE
-        if ($exitCode -eq 0) {
-            try {
-                $benchmarkResultPath = Write-ManualBenchmarkResult -RawJson $manualJson -ModelPath $modelPath -Kind $manualBenchKind -PromptTokens $promptTokens -GenTokens $genTokens -DepthMode $depthMode -DepthTokens $depthTokens -Repetitions $reps
-            } catch {
-                Write-Warning "手动 benchmark 结果保存失败：$($_.Exception.Message) / Could not save the manual benchmark result."
-            }
-        }
-    } else {
-        & $infrPath @nativeArgs
-        $exitCode = $LASTEXITCODE
-    }
-} finally {
-    Pop-Location
-    if ($launchMode -eq 'server' -and $serverAuth) {
-        $restoreApiKey = if ($hadApiKey) { $previousApiKey } else { $null }
-        [Environment]::SetEnvironmentVariable('INFR_API_KEY', $restoreApiKey, 'Process')
-    }
-    $restoreDiagnosticDir = if ($hadDiagnosticDir) { $previousDiagnosticDir } else { $null }
-    [Environment]::SetEnvironmentVariable('INFR_DIAGNOSTIC_DIR', $restoreDiagnosticDir, 'Process')
-}
-if ($null -eq $exitCode) { $exitCode = 0 }
-Write-Host "`nMoE4All / infr 退出码 / exit code: $exitCode" -ForegroundColor $(if ($exitCode -eq 0) { 'Green' } else { 'Red' })
-if ($launchMode -eq 'benchmark' -and $benchKind -ne 'manual') {
-    $before = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($path in $benchmarkFilesBefore) { [void]$before.Add($path) }
-    $benchmarkResultPath = @(Get-BenchmarkSubmissionSnapshot | Where-Object { -not $before.Contains($_) } | Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending | Select-Object -First 1)
-    if ($benchmarkResultPath.Count -gt 0) { $benchmarkResultPath = [string]$benchmarkResultPath[0] } else { $benchmarkResultPath = $null }
-}
-$benchmarkUploadRequested = $false
-if ($benchmarkResultPath) {
-    $benchmarkUploadRequested = Read-BenchmarkUploadConsent
-}
-if ($benchmarkResultPath -and $benchmarkUploadRequested) {
-    Invoke-BenchmarkUploadSafely -Path $benchmarkResultPath -ConsentAlreadyGranted
-}
-$knownReports = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($path in $errorReportsBefore) { [void]$knownReports.Add($path) }
-if ($exitCode -ne 0) {
-    $fatalReport = @(Get-ErrorSubmissionSnapshot | Where-Object { -not $knownReports.Contains($_) } | Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending | Select-Object -First 1)
-    if ($fatalReport.Count -gt 0) {
-        try { [void](Complete-ErrorReport -Source ([string]$fatalReport[0])) } catch { Write-Warning "错误报告补充失败：$($_.Exception.Message) / Could not complete the error report." }
-    }
-}
-exit $exitCode
+Invoke-WizardExecutionPlan -Plan $executionPlan

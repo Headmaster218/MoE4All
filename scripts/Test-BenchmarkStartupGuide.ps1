@@ -36,6 +36,7 @@ function Reset-Case([string]$Name) {
     $script:dataDir = Join-Path $testRoot $Name
     $script:statePath = Join-Path $dataDir 'wizard-state.json'
     $script:DryRun = $false; $script:Now = [long]1800000000
+    $script:productVersion='1.3.0'
     $script:Prompts = 0; $script:Answer = 'later'; $script:Cancel = $false
     $script:BenchmarkGuideActive = $false
     $script:guidePath = Join-Path $dataDir 'private\benchmark-first-submission.json'
@@ -80,6 +81,7 @@ foreach ($mode in @('headless', 'dry', 'json')) {
 }
 
 $receipt = [pscustomobject]@{
+    engine_version = '1.3.0'
     api_version = 1; kind = 'benchmark'; receipt_id = 'rc_fixture'; report_id = 'report-fixture'
     file_sha256 = ('a' * 64); payload_sha256 = ('b' * 64)
     status = 'forwarding'; received_at = '2026-10-25T00:00:00Z'; receipt_token = 'never-log-this-fixture-secret'

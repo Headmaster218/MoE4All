@@ -91,8 +91,11 @@ function New-ModelFixture {
     } finally { $writer.Dispose() }
 }
 function Test-Flow {
-    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Check)
+    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Check, [switch]$Dashboard, [string]$DashboardKey = '')
     $script:Saved = $Saved
+    $script:DashboardAccepted = [bool]$Dashboard
+    $script:DashboardApiKey = $DashboardKey
+    $script:DashboardPendingPrompted = $false
     $script:Answers = [System.Collections.Generic.Queue[string]]::new()
     foreach ($value in $Inputs) { $script:Answers.Enqueue($value) }
     $script:Events = [System.Collections.Generic.List[string]]::new()
@@ -166,10 +169,11 @@ try {
 
     Assert ($source.IndexOf('Show-UpdateStatus -CurrentVersion $productVersion') -lt $start) 'Update must precede saved launch'
     Test-UpdateAction 'update skipped by Enter' @('') 'skip'
-    Test-UpdateAction 'explicit update still available' @('2') 'update'
+    Test-UpdateAction 'explicit update still available' @('1') 'update'
+    Test-UpdateAction 'three-day update reminder' @('3') 'snooze'
     Test-UpdateAction 'invalid update input reprompts' @('bad', '') 'skip'
-    function Show-EngineReleaseNotes { param($Release) [void]$script:Events.Add('release notes') }
-    Test-UpdateAction 'release notes then skip' @('1', '') 'skip'
+    function Open-EngineReleaseNotes { param($Release) [void]$script:Events.Add('release notes') }
+    Test-UpdateAction 'release notes then skip' @('R', '') 'skip'
 
     Test-Flow 'fresh chat defaults' -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'run') 'Expected chat'
@@ -652,7 +656,7 @@ try {
     $flashBundle = @($catalog | Where-Object { $_.Id -eq 'flashnext-427' })[0]
     $embeddingBundle = @($catalog | Where-Object { $_.Id -eq 'qwen3-embedding-06b-q8' })[0]
     Assert ($catalog.Count -eq 6 -and ($catalog.Kind -contains 'audio') -and ($catalog.Kind -contains 'speech') -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain main, vision, embedding and audio downloads'
-    Assert (@($flashBundle.Files).Count -eq 33 -and $flashBundle.Primary -match '00001-of-00033') 'FlashNext shard catalog is incomplete'
+    Assert (@($flashBundle.Files).Count -eq 3 -and $flashBundle.Primary -match '00001-of-00003') 'FlashNext shard catalog is incomplete'
     Assert ($embeddingBundle.Files[0].Url -match 'Qwen3-Embedding-0\.6B-Q8_0\.gguf') 'Embedding direct download URL is missing'
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS recommended download catalog'
@@ -775,6 +779,20 @@ try {
         $script:Passed++
         Microsoft.PowerShell.Utility\Write-Host "PASS $kind recommendation then path selection"
     }
+    Test-Flow -Name 'dashboard API handoff skips interviews and keeps key ephemeral' -Saved ([pscustomobject]@{launch_mode='server';setup_mode='aggressive';model=$model;server_parallel='8';server_auth=$true;server_addr='127.0.0.1:8080'}) -Inputs @() -Dashboard -DashboardKey 'DASHBOARD-EPHEMERAL-FIXTURE' -Check {
+        Assert ($nativeArgs[0] -eq 'serve' -and '8' -in $nativeArgs) 'Dashboard API settings lost'
+        Assert ($serverApiKey -eq 'DASHBOARD-EPHEMERAL-FIXTURE') 'Dashboard must use already entered key without another prompt'
+        Assert (($state|ConvertTo-Json -Depth 10) -notmatch 'DASHBOARD-EPHEMERAL-FIXTURE') 'Ephemeral key must not enter saved state'
+    }
+    Test-Flow -Name 'dashboard benchmark handoff keeps suite context and concurrency' -Saved ([pscustomobject]@{launch_mode='benchmark';setup_mode='conservative';model=$model;bench_kind='standard';bench_parallel='3';context='stale-not-used'}) -Inputs @() -Dashboard -Check {
+        Assert ($nativeArgs[0] -eq 'bench' -and '--suite' -in $nativeArgs -and '3' -in $nativeArgs) 'Dashboard benchmark plan lost'
+        Assert ('--ctx' -notin $nativeArgs) 'Dashboard benchmark must not inherit a general context window'
+    }
+    Test-Flow -Name 'dashboard audio-only handoff ignores LLM budgets' -Saved ([pscustomobject]@{launch_mode='server';server_llm_enabled=$false;server_embedding=$false;server_transcription=$true;transcription_model=$aux;model='missing-unused.gguf';device='Vulkan99';context='bad-unused';setup_mode='aggressive';server_addr='127.0.0.1:8080'}) -Inputs @() -Dashboard -Check {
+        Assert ($nativeArgs[0] -eq 'serve' -and '--transcription-model' -in $nativeArgs -and 'cpu' -in $nativeArgs) 'Audio-only dashboard server lost'
+        Assert ('--ctx' -notin $nativeArgs -and '--parallel' -notin $nativeArgs -and $nativeArgs -notcontains 'device.auto_profile=aggressive') 'Audio-only must not activate stale LLM allocation'
+    }
+    $script:DashboardAccepted=$false
     foreach ($scenario in @('dry', 'decline', 'reuse')) {
         $result = & powershell.exe -NoLogo -NoProfile -File $PSCommandPath -ChildFixture $scenario 2>&1 | Out-String
         $childExit = $LASTEXITCODE
