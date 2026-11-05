@@ -589,9 +589,14 @@ defaults() {
     DEFAULTS=(); for key in "${(@k)S[@]}"; do DEFAULTS[$key]=${S[$key]}; done
 }
 load_state() {
-    local key raw value state_path
+    local key raw value state_path source_state='' source_conf=''
     if [[ -f $STATE ]]; then
-        json_load "$STATE" || { fail "Invalid saved settings: $STATE"; return 1; }
+        source_state=$STATE
+    elif [[ -n ${LEGACY_STATE-} && -f $LEGACY_STATE ]]; then
+        source_state=$LEGACY_STATE
+    fi
+    if [[ -n $source_state ]]; then
+        json_load "$source_state" || { fail "Invalid saved settings: $source_state"; return 1; }
         [[ $JSON_KIND == object ]] || { fail 'Saved settings must be a JSON object.'; return 1; }
         for key in "${(@k)S[@]}"; do
             state_path="[\"$key\"]"; [[ -v "J[$state_path]" ]] || continue; raw=${J[$state_path]}
@@ -603,12 +608,19 @@ load_state() {
         done
         state_path='["configure_thinking"]'
         if [[ ! -v "J[$state_path]" && (${S[think_mode]} != default || ${S[reasoning_effort]} != default) ]]; then S[configure_thinking]=true; fi
-    elif [[ -f $CONFIG_DIR/wizard.conf ]]; then
+    else
+        if [[ -f $CONFIG_DIR/wizard.conf ]]; then
+            source_conf=$CONFIG_DIR/wizard.conf
+        elif [[ -n ${LEGACY_CONFIG_DIR-} && -f $LEGACY_CONFIG_DIR/wizard.conf ]]; then
+            source_conf=$LEGACY_CONFIG_DIR/wizard.conf
+        fi
+    fi
+    if [[ -n $source_conf ]]; then
         local -A names=([MODE]=launch_mode [MODEL]=model [PROFILE]=setup_mode [CTX]=context [UBATCH]=ubatch [KV_K]=kv_type_k [KV_V]=kv_type_v
             [RAM]=ram_budget [VRAM]=vram_budget [MTP]=mtp_model [MTP_K]=mtp_verify_tokens [ADDR]=server_addr [PARALLEL]=server_parallel [MMPROJ]=vision_projector [EMBEDDING]=embedding_model)
         while IFS= read -r value; do
             [[ $value == *=* ]] || continue; key=${value%%=*}; [[ ! -v "names[$key]" ]] || S[${names[$key]}]=${value#*=}
-        done < "$CONFIG_DIR/wizard.conf"
+        done < "$source_conf"
         [[ -z ${S[mtp_model]} ]] || S[mtp_enabled]=true
         [[ -z ${S[vision_projector]} ]] || S[server_vision]=true
         [[ -z ${S[embedding_model]} ]] || S[server_embedding]=true
@@ -623,6 +635,12 @@ reminder_interactive() {
     [[ ${INTERACTIVE-false} == true && ${DRY_RUN-false} == false && ${HEADLESS-false} == false &&
         -z ${CI-} ]]
 }
+reminder_state_file() {
+    REPLY="$CONFIG_DIR/private/$1"
+    if [[ ! -f $REPLY && -n ${LEGACY_CONFIG_DIR-} && -f $LEGACY_CONFIG_DIR/private/$1 ]]; then
+        REPLY="$LEGACY_CONFIG_DIR/private/$1"
+    fi
+}
 benchmark_installed_version() {
     local -h value
     REPLY=''
@@ -634,7 +652,8 @@ benchmark_installed_version() {
 benchmark_guide_read() {
     GUIDE_SUBMITTED=false; GUIDE_NEXT_REMIND_AT=0
     GUIDE_LAST_PROMPT_VERSION=''; GUIDE_LAST_SUBMITTED_VERSION=''; GUIDE_REMINDER_REASON=''
-    local -h file=$CONFIG_DIR/private/benchmark-first-submission.json raw
+    local -h file raw
+    reminder_state_file benchmark-first-submission.json; file=$REPLY
     [[ -f $file ]] || return 0
     json_load "$file" 2>/dev/null || return 0
     if json_get '["submitted"]' && [[ $REPLY == true ]]; then GUIDE_SUBMITTED=true; fi
@@ -707,19 +726,24 @@ benchmark_body_receipt_valid() {
 benchmark_startup_guide() {
     BENCHMARK_GUIDE_ACTIVE=false
     reminder_interactive || return 0
-    local -h receipt now answer current receipt_version history submitted_version reason delay changed=false
+    local -h receipt receipt_directory now answer current receipt_version history submitted_version reason delay changed=false
     benchmark_installed_version; current=$REPLY
     benchmark_guide_read
     history=$GUIDE_SUBMITTED; submitted_version=$GUIDE_LAST_SUBMITTED_VERSION
     # A legacy receipt proves history, never the current version unless its version is explicit.
-    if [[ -d $CONFIG_DIR/private/submission-receipts && ( -z $current || $submitted_version != "$current" ) ]]; then
-        while IFS= read -r receipt; do
-            if benchmark_body_receipt_valid "$receipt"; then
-                history=true; receipt_version=''
-                if json_get '["engine_version"]' && installed_version_valid "$REPLY"; then receipt_version=$REPLY; fi
-                if [[ -n $receipt_version && ( -z $submitted_version || $receipt_version == "$current" ) ]]; then submitted_version=$receipt_version; fi
-            fi
-        done < <(find "$CONFIG_DIR/private/submission-receipts/." ! -name . -prune -type f -name '*.private-receipt.json' -print 2>/dev/null)
+    if [[ -z $current || $submitted_version != "$current" ]]; then
+        local -a receipt_directories=("$CONFIG_DIR/private/submission-receipts")
+        [[ -z ${LEGACY_CONFIG_DIR-} || $LEGACY_CONFIG_DIR == "$CONFIG_DIR" ]] || receipt_directories+=("$LEGACY_CONFIG_DIR/private/submission-receipts")
+        for receipt_directory in "${receipt_directories[@]}"; do
+            [[ -d $receipt_directory ]] || continue
+            while IFS= read -r receipt; do
+                if benchmark_body_receipt_valid "$receipt"; then
+                    history=true; receipt_version=''
+                    if json_get '["engine_version"]' && installed_version_valid "$REPLY"; then receipt_version=$REPLY; fi
+                    if [[ -n $receipt_version && ( -z $submitted_version || $receipt_version == "$current" ) ]]; then submitted_version=$receipt_version; fi
+                fi
+            done < <(find "$receipt_directory/." ! -name . -prune -type f -name '*.private-receipt.json' -print 2>/dev/null)
+        done
     fi
     if [[ $history != "$GUIDE_SUBMITTED" || $submitted_version != "$GUIDE_LAST_SUBMITTED_VERSION" ]]; then
         benchmark_guide_write "$history" "$GUIDE_NEXT_REMIND_AT" "$GUIDE_LAST_PROMPT_VERSION" "$submitted_version" "$GUIDE_REMINDER_REASON" ||
@@ -2293,7 +2317,8 @@ download_update() (
 update_reminder_now() { date +%s; }
 update_reminder_read() {
     UPDATE_REMINDER_TAG=''; UPDATE_REMINDER_NEXT=0
-    local -h file=$CONFIG_DIR/private/update-reminder.json
+    local -h file
+    reminder_state_file update-reminder.json; file=$REPLY
     [[ -f $file ]] || return 0
     json_load "$file" 2>/dev/null || return 0
     if ! json_get '["schema_version"]' || [[ $REPLY != 1 ]]; then return 0; fi
@@ -2393,7 +2418,8 @@ main() {
         fi
     done
     [[ -d $ROOT ]] || { fail 'Installation root does not exist.'; return 1; }
-    CONFIG_DIR="$HOME/Library/Application Support/MoE4All"; STATE=$CONFIG_DIR/wizard-state.json
+    CONFIG_DIR="$ROOT/gui-data"; STATE=$CONFIG_DIR/wizard-state.json
+    LEGACY_CONFIG_DIR="$HOME/Library/Application Support/MoE4All"; LEGACY_STATE=$LEGACY_CONFIG_DIR/wizard-state.json
     need awk; defaults; load_state
     while (($#)); do
         flag=$1; shift

@@ -21,6 +21,7 @@ benchmark_guide_now() { printf '%s\n' "$test_now"; }
 update_reminder_now() { printf '%s\n' "$test_now"; }
 reset_case() {
     ROOT=$work/$1; CONFIG_DIR=$ROOT/gui-data; STATE=$CONFIG_DIR/wizard-state.json; BINARY=$ROOT/infr
+    LEGACY_CONFIG_DIR=''; LEGACY_STATE=''
     defaults
     INTERACTIVE=true; HEADLESS=false; DRY_RUN=false
     test_now=1800000000; test_release=1.4.0
@@ -134,6 +135,28 @@ for receipt_version in unknown 1.2.0 1.3.0; do
     fi
 done
 
+# Moving from the old user directory does not reset private history or cooldowns.
+reset_case legacy-reminder-directory
+LEGACY_CONFIG_DIR=$ROOT/legacy
+mkdir -p "$LEGACY_CONFIG_DIR/private"
+legacy_guide=$LEGACY_CONFIG_DIR/private/benchmark-first-submission.json
+printf '{"schema_version":2,"submitted":true,"next_remind_at":1800604800,"last_prompt_version":"1.3.0","last_submitted_version":"1.2.0","reminder_reason":"new_version"}\n' > "$legacy_guide"
+legacy_before=$(< "$legacy_guide")
+benchmark_startup_guide </dev/null > "$output"
+check '[[ ! -s $output && ! -e $guide && $(< "$legacy_guide") == "$legacy_before" ]]' 'Legacy private cooldown is a read-only fallback'
+benchmark_submission_succeeded benchmark 1.3.0
+benchmark_guide_read
+check '[[ -f $guide && $GUIDE_LAST_SUBMITTED_VERSION == 1.3.0 && $(< "$legacy_guide") == "$legacy_before" ]]' 'A normal successful upload saves local state without modifying legacy history'
+reset_case legacy-receipt-directory
+LEGACY_CONFIG_DIR=$ROOT/legacy
+mkdir -p "$LEGACY_CONFIG_DIR/private/submission-receipts"
+legacy_receipt=$LEGACY_CONFIG_DIR/private/submission-receipts/fixture.private-receipt.json
+printf '{"api_version":1,"kind":"benchmark","receipt_id":"rc_fixture","report_id":"fixture","file_sha256":"%s","payload_sha256":"%s","status":"forwarding","received_at":"2026-10-25T00:00:00Z","engine_version":"1.3.0"}\n' "$hash" "$hash" > "$legacy_receipt"
+legacy_before=$(< "$legacy_receipt")
+benchmark_startup_guide </dev/null > "$output"
+benchmark_guide_read
+check '[[ ! -s $output && $GUIDE_LAST_SUBMITTED_VERSION == 1.3.0 && $(< "$legacy_receipt") == "$legacy_before" ]]' 'Legacy receipts restore explicit current-version success without moving the receipt'
+
 # Only the release-list fetch is mocked: selection, notes, choices and state are real.
 fetch_url() {
     printf 'fetch\n' >> "$ROOT/network"
@@ -191,6 +214,19 @@ network_ok=true; updater_ok=false
 check_updates --automatic <<< update > "$output" 2>&1
 check 'grep -Fq "continuing startup" "$output"' 'Failed automatic update is nonfatal'
 updater_ok=true
+
+reset_case legacy-update-directory
+LEGACY_CONFIG_DIR=$ROOT/legacy
+mkdir -p "$LEGACY_CONFIG_DIR/private"
+legacy_update=$LEGACY_CONFIG_DIR/private/update-reminder.json
+printf '{"schema_version":1,"release_tag":"release-1.4.0","next_remind_at":1800259200}\n' > "$legacy_update"
+legacy_before=$(< "$legacy_update")
+check_updates --automatic </dev/null > "$output"
+check '[[ ! -s $output && ! -e $update_state && $(< "$legacy_update") == "$legacy_before" ]]' 'Legacy update snooze remains read-only and effective for the same tag'
+test_release=1.5.0
+check_updates --automatic <<< snooze > "$output"
+update_reminder_read
+check '[[ -f $update_state && $UPDATE_REMINDER_TAG == release-1.5.0 && $(< "$legacy_update") == "$legacy_before" ]]' 'A new tag saves local snooze without overwriting the legacy reminder'
 
 for mode in dry headless json ci noninteractive; do
     reset_case "guard-$mode"
