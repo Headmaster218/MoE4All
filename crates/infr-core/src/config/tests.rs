@@ -1450,6 +1450,10 @@ fn no_infr_env_reads_outside_the_config_layer() {
         "INFR_NO_MOE_SHARED_SLOT",
         "INFR_IMAGE_CODEC_DIR",
         "INFR_IMAGE_CODEC_FIXTURES",
+        // Ignored native Melo reference parity fixtures, not inference settings.
+        "INFR_MELO_MODEL",
+        "INFR_MELO_REFERENCE",
+        "INFR_MELO_NATIVE_OUTPUT",
     ];
 
     let Some(crates) = repo_crates_dir() else {

@@ -397,6 +397,18 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
         "test-only fixture directory for ignored native image decoder parity tests.",
     ),
     (
+        "INFR_MELO_MODEL",
+        "test-only model path for the ignored native Melo reference parity test.",
+    ),
+    (
+        "INFR_MELO_REFERENCE",
+        "test-only reference fixture path for the ignored native Melo parity test.",
+    ),
+    (
+        "INFR_MELO_NATIVE_OUTPUT",
+        "test-only optional output directory for the ignored native Melo parity test.",
+    ),
+    (
         "INFR_PROFILE",
         "build-time input: read by build.rs in core/cpu/gguf/llama/vulkan to set cfg(infr_profile). \
          A runtime Config cannot exist when it is read (§5.3).",

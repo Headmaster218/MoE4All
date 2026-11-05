@@ -456,6 +456,9 @@ impl SamplingOpts {
     }
 }
 
+// Parsed once at startup: keep clap's flattened options inline rather than allocating
+// boxes solely to shrink this bounded enum. It is not copied in the inference loop.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
