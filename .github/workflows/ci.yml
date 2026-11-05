@@ -154,7 +154,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run --workspace --locked
+      # Report all independent failures in one run; any failure still fails this job.
+      - run: cargo nextest run --workspace --locked --no-fail-fast
       - run: cargo test --doc --workspace --locked
       - if: always()
         run: sccache --show-stats

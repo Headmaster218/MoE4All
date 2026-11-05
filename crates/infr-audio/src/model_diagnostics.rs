@@ -1,4 +1,6 @@
 //! Opt-in test-only CPU diagnostics. No production timers, downloads or services.
+#![cfg(test)]
+
 use super::*;
 use std::{cell::RefCell, sync::Arc, time::Instant};
 

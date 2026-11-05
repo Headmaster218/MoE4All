@@ -14,9 +14,6 @@ mod submission;
 mod submission_validation;
 mod transcription;
 
-#[cfg(test)]
-mod module_composition_tests;
-
 #[derive(Parser)]
 #[command(
     name = "infr",
@@ -7534,6 +7531,11 @@ fn cmd_multi(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(infr_server::serve_multi(entries, sockaddr, hosted_cfg))
 }
+
+// Keep test-only modules after production items: the logging-policy source audit
+// scans the production prefix up to the first #[cfg(test)] module.
+#[cfg(test)]
+mod module_composition_tests;
 
 #[cfg(test)]
 mod tests {
