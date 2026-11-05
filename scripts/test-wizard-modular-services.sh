@@ -96,19 +96,21 @@ for l in false true; do for e in false true; do for a in false true; do
     [[ $(cat "$MODULAR_CAPTURE") == "$expected_capture" ]]; pass
 done; done; done
 
-# Real prompt/input path: all-off retries, three bools precede model/device prompts.
+# Real prompt/input path: all-off retries, four module bools precede model/device prompts.
 reset
 configure_api_modules > "$work/module-prompts" <<'INPUT'
 n
 n
 n
 n
+n
 y
 y
+n
 INPUT
 [[ ${S[server_llm_enabled]} == false && ${S[server_embedding]} == true && ${S[server_transcription]} == true ]]; pass
 grep -Fq 'Enable at least one API module.' "$work/module-prompts"; pass
-for expected_text in 'Enable the language model API?' 'Enable the Embedding API?' 'Enable the local transcription API?'; do
+for expected_text in 'Enable the language model API?' 'Enable the Embedding API?' 'Enable the local transcription API?' 'Enable the local speech synthesis API?'; do
     grep -Fq "$expected_text" "$work/module-prompts"; pass
 done
 
@@ -119,6 +121,7 @@ for aux in audio embedding both; do
     {
         printf '\nn\n'
         if [[ $aux == audio ]]; then printf 'n\ny\n'; else printf 'y\n'; [[ $aux != embedding ]] || printf 'n\n'; [[ $aux != both ]] || printf 'y\n'; fi
+        printf 'n\n' # Leave speech disabled in these existing module-isolation cases.
         if [[ $aux != audio ]]; then printf '%s\n\n' "$embedding"; fi
         if [[ $aux != embedding ]]; then printf '%s\n\n\n\n' "$audio"; fi
         if [[ $aux != audio && $platform == linux ]]; then printf '\n'; fi
@@ -170,7 +173,7 @@ download_bundle() {
     mkdir -p -- "$ROOT/models/SenseVoice-Small-Q8_0"
     touch "$ROOT/models/SenseVoice-Small-Q8_0/sense-voice-small-q8_0.gguf"
 }
-printf '\nn\nn\ny\nD\n1\n\n\n\n\n\n' > "$work/download-answers"
+printf '\nn\nn\ny\nn\nD\n1\n\n\n\n\n\n' > "$work/download-answers"
 configure < "$work/download-answers" > "$work/audio-download.log"
 [[ $downloads == 1 && ${S[model]} == '' ]]; build_command; has_arg --transcription-model; pass
 grep -Fq '4 threads by default; the loaded model uses about 300 MiB RAM.' "$work/audio-download.log"; pass

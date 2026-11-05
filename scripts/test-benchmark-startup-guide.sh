@@ -17,18 +17,20 @@ esac
 work=$(mktemp -d "$TMPDIR/guide-$platform.XXXXXX")
 unset CI
 benchmark_guide_now() { printf '%s\n' "$test_now"; }
-check() { if ! eval "$1"; then printf 'FAIL: %s\n' "$2" >&2; exit 1; fi; }
+benchmark_installed_version() { REPLY=$test_version; }
+checks=0
+check() { if ! eval "$1"; then printf 'FAIL: %s\n' "$2" >&2; exit 1; fi; checks=$((checks + 1)); }
 reset_case() {
     ROOT=$work/$1; CONFIG_DIR=$ROOT/gui-data; STATE=$CONFIG_DIR/wizard-state.json
     defaults
     INTERACTIVE=true; HEADLESS=false; DRY_RUN=false; BENCHMARK_GUIDE_ACTIVE=false
-    test_now=1800000000
+    test_now=1800000000; test_version=1.3.0
     guide_path=$CONFIG_DIR/private/benchmark-first-submission.json
 }
 receipt_fixture() {
     mkdir -p "$CONFIG_DIR/private/submission-receipts"
-    printf '{"api_version":1,"kind":"%s","receipt_id":"rc_fixture","report_id":"fixture","file_sha256":"%s","payload_sha256":"%s","status":"%s","received_at":"%s","receipt_token":"never-log-this-fixture-secret"}\n' \
-        "$1" "$hash_a" "$2" "$3" "$4" > "$CONFIG_DIR/private/submission-receipts/fixture.private-receipt.json"
+    printf '{"api_version":1,"kind":"%s","receipt_id":"rc_fixture","report_id":"fixture","file_sha256":"%s","payload_sha256":"%s","status":"%s","received_at":"%s","engine_version":"%s","receipt_token":"never-log-this-fixture-secret"}\n' \
+        "$1" "$hash_a" "$2" "$3" "$4" "${5-1.3.0}" > "$CONFIG_DIR/private/submission-receipts/fixture.private-receipt.json"
 }
 hash_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 hash_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -64,8 +66,10 @@ benchmark_guide_read; check '[[ $GUIDE_SUBMITTED == true ]]' 'Reminder rewrite m
 
 for mode in headless dry json noninteractive ci; do
     reset_case "$mode"
-    case $mode in headless) HEADLESS=true ;; dry) DRY_RUN=true ;; json) S[json_output]=true ;; noninteractive) INTERACTIVE=false ;; ci) CI=true ;; esac
+    case $mode in headless) HEADLESS=true ;; dry) DRY_RUN=true ;; json) INTERACTIVE=false; S[json_output]=true ;; noninteractive) INTERACTIVE=false ;; ci) CI=true ;; esac
     benchmark_startup_guide </dev/null > "$work/guard-$mode"
+    benchmark_submission_succeeded benchmark
+    benchmark_guide_write false 0
     check '[[ ! -e $CONFIG_DIR && ! -s $work/guard-$mode ]]' "$mode must not prompt or write"
     unset CI
 done
@@ -159,12 +163,14 @@ submission_api_request() {
             printf '{"api_version":1,"state":"ready","kind":"%s","report_id":"fixture","file_sha256":"%s","size_bytes":%s}' "$report_kind" "$report_hash" "$report_size" > "$output" ;;
     esac
 }
-for report_kind in benchmark error; do
-    reset_case "cloudflare-$report_kind"
+for scenario in benchmark-current benchmark-old benchmark-unknown error-current; do
+    report_kind=${scenario%%-*}; fixture_version=1.3.0
+    case $scenario in *-old) fixture_version=1.2.0 ;; *-unknown) fixture_version=unknown ;; esac
+    reset_case "cloudflare-$scenario"
     mkdir -p "$ROOT"; BINARY=/bin/true
     extension=m4b; [[ $report_kind != error ]] || extension=m4e
     report=$ROOT/fixture.$extension
-    printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture\n' "$report_kind" > "$report"
+    printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture\nengine: %s\n' "$report_kind" "$fixture_version" > "$report"
     file_sha256 "$report"; report_hash=$REPLY; report_size=$(wc -c < "$report"); trim "$report_size"; report_size=$REPLY
     body_ok=false
     if website_submission_upload "$report" "$report_kind" > "$work/authorization-only" 2>&1; then exit 1; fi
@@ -173,7 +179,16 @@ for report_kind in benchmark error; do
     website_submission_upload "$report" "$report_kind" > "$work/body-received"
     benchmark_guide_read
     if [[ $report_kind == benchmark ]]; then
-        check '[[ $GUIDE_SUBMITTED == true ]]' 'Valid body receipt must count immediately'
+        expected_version=$fixture_version; [[ $expected_version != unknown ]] || expected_version=''
+        check '[[ $GUIDE_SUBMITTED == true && $GUIDE_LAST_SUBMITTED_VERSION == "$expected_version" ]]' 'Body receipt must count its report version, never the running version'
+        json_load "$CONFIG_DIR/private/submission-receipts/rc_fixture.private-receipt.json"
+        json_get '["engine_version"]'; check '[[ $REPLY == "$expected_version" ]]' 'Receipt must retain only a known verified report version'
+        benchmark_startup_guide <<< 2 > "$work/post-upload-guide"
+        if [[ $expected_version == 1.3.0 ]]; then
+            check '[[ ! -s $work/post-upload-guide ]]' 'Uploading this version must suppress its invitation'
+        else
+            check '[[ -s $work/post-upload-guide ]]' 'An old/unknown pending upload must not suppress the current version'
+        fi
     else
         check '[[ $GUIDE_SUBMITTED == false && ! -e $guide_path ]]' 'Error body receipt must not count'
     fi
@@ -191,12 +206,14 @@ submission_gh() {
         *) return 0 ;;
     esac
 }
-for report_kind in benchmark error; do
+for scenario in benchmark-current benchmark-old benchmark-unknown error-current; do
+    report_kind=${scenario%%-*}; fixture_version=1.3.0
+    case $scenario in *-old) fixture_version=1.2.0 ;; *-unknown) fixture_version=unknown ;; esac
     for valid in false true; do
-        reset_case "github-$report_kind-$valid"
+        reset_case "github-$scenario-$valid"
         mkdir -p "$CONFIG_DIR"; BINARY=/bin/true
         report=$ROOT/fixture.m4b
-        printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture\ncreated-at: 2026-10-25T00:00:00Z\n' "$report_kind" > "$report"
+        printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture\ncreated-at: 2026-10-25T00:00:00Z\nengine: %s\n' "$report_kind" "$fixture_version" > "$report"
         pr_response=not-a-pr
         [[ $valid != true ]] || pr_response=https://github.com/Headmaster218/MoE4All/pull/123
         if gh_submission_upload "$report" "$report_kind" <<< y > "$work/github-response"; then
@@ -206,14 +223,21 @@ for report_kind in benchmark error; do
         fi
         benchmark_guide_read
         if [[ $valid == true && $report_kind == benchmark ]]; then
-            check '[[ $GUIDE_SUBMITTED == true ]]' 'Valid benchmark PR must count'
+            expected_version=$fixture_version; [[ $expected_version != unknown ]] || expected_version=''
+            check '[[ $GUIDE_SUBMITTED == true && $GUIDE_LAST_SUBMITTED_VERSION == "$expected_version" ]]' 'Valid PR must count its report version, never the running version'
+            benchmark_startup_guide <<< 2 > "$work/post-pr-guide"
+            if [[ $expected_version == 1.3.0 ]]; then
+                check '[[ ! -s $work/post-pr-guide ]]' 'A current-version PR suppresses the invitation'
+            else
+                check '[[ -s $work/post-pr-guide ]]' 'An old/unknown PR must keep the current invitation'
+            fi
         else
             check '[[ $GUIDE_SUBMITTED == false ]]' 'Invalid PR or error upload must not count'
         fi
     done
 done
 
-# Explicit browser self-confirmation in the real dispatcher counts; declining consent does not.
+# Browser self-confirmation is not a verified body receipt; declining consent also does not count.
 submission_gh() { return 1; }
 queue_pending_submission() { :; }
 open_github_submission() { :; }
@@ -225,10 +249,6 @@ for report_kind in benchmark error; do
     check '[[ ! -e $guide_path ]]' 'Declined upload consent must not mark success'
     offer_submission_upload "$ROOT/fixture.m4b" "$report_kind" <<< $'y\ny\n' > "$work/browser-sent"
     benchmark_guide_read
-    if [[ $report_kind == benchmark ]]; then
-        check '[[ $GUIDE_SUBMITTED == true ]]' 'Explicit browser sent must count for benchmark'
-    else
-        check '[[ $GUIDE_SUBMITTED == false ]]' 'Explicit error browser sent must not count'
-    fi
+    check '[[ $GUIDE_SUBMITTED == false && ! -e $guide_path ]]' 'Browser sent must not count without a real body receipt'
 done
-printf 'PASS %s benchmark startup guide: clocks, guards, backfill, explicit browser confirmation, preserved defaults and upload preferences, GitHub PR validation and Cloudflare body receipt\n' "$platform"
+printf 'PASS %s benchmark startup guide: %s checks (clocks, guards, backfill, browser non-proof, preserved defaults, GitHub PR validation and Cloudflare body receipt)\n' "$platform" "$checks"
