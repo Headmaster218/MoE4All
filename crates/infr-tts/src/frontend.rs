@@ -329,7 +329,8 @@ pub fn normalize_text(text: &str) -> Result<String> {
                         let year: u32 = tail[..4].parse()?;
                         let month: u32 = rest[..mlen].parse()?;
                         let day: u32 = day_part[..dlen].parse()?;
-                        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+                        let leap = year.is_multiple_of(4)
+                            && (!year.is_multiple_of(100) || year.is_multiple_of(400));
                         let days = match month {
                             2 => {
                                 if leap {

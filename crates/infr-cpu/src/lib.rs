@@ -354,7 +354,7 @@ impl CpuBackend {
         let pool = pool::SpinPool::new_bounded_min_spin(
             &self.cfg.kernels.cpu,
             self.dense_f32_threads,
-            self.cfg.kernels.cpu.spin.min(16_384).max(256),
+            self.cfg.kernels.cpu.spin.clamp(256, 16_384),
         )
         .map_err(|e| Error::backend(format!("create dense F32 CPU pool: {e}")))?;
         let _old = self.pool.take();

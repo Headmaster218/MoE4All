@@ -206,7 +206,8 @@ pub fn extract_features(samples: &[f32], cfg: &FrontendConfig) -> Result<Feature
             *x -= mean;
         }
         for i in (1..length).rev() {
-            frame[i] = frame[i] - 0.97 * frame[i - 1];
+            let previous = frame[i - 1];
+            frame[i] -= 0.97 * previous;
         }
         frame[0] = frame[0] - 0.97 * frame[0];
         real.fill(0.0);
@@ -290,7 +291,7 @@ fn mel_weights(num_mels: usize, fft_size: usize, sample_rate: u32) -> Result<Vec
 }
 
 fn stack_and_normalize(fbank: &[f32], frames: usize, cfg: &FrontendConfig) -> Result<Features> {
-    let rows = frames / cfg.lfr_n + usize::from(frames % cfg.lfr_n != 0);
+    let rows = frames / cfg.lfr_n + usize::from(!frames.is_multiple_of(cfg.lfr_n));
     let cols = cfg.num_mels * cfg.lfr_m;
     let mut data = float_buffer(rows.checked_mul(cols).context("LFR size overflow")?)?;
     let left_pad = (cfg.lfr_m - 1) / 2;
@@ -408,7 +409,7 @@ mod tests {
         // Broad-spectrum exact PCM values avoid measuring f32 cancellation in
         // almost-empty bins of a pure tone instead of the mathematical formula.
         let samples: Vec<f32> = (0..400)
-            .map(|i| (((i * 37 % 101) as i32 - 50) * 32 + 4096) as f32 / 32768.0)
+            .map(|i| ((i * 37 % 101 - 50) * 32 + 4096) as f32 / 32768.0)
             .collect();
         let actual = extract_features(&samples, &cfg).unwrap();
         // Independent slow DFT oracle, not a second call through FFT/window/mel helpers.
@@ -467,7 +468,7 @@ mod tests {
             } else {
                 1 + (length - 400) / 160
             };
-            assert_eq!(out.rows, (frames + 5) / 6);
+            assert_eq!(out.rows, frames.div_ceil(6));
             assert_eq!(out.cols, 560);
             assert!(out.data.iter().all(|&x| x == f32::EPSILON.ln()));
         }
@@ -516,8 +517,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_parameters_nonfinite_audio_and_cmvn() {
-        let mut cfg = FrontendConfig::default();
-        cfg.cmvn_add = vec![0.0; 80];
+        let mut cfg = FrontendConfig {
+            cmvn_add: vec![0.0; 80],
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
         cfg.cmvn_add.clear();
         cfg.frame_shift_ms = f32::NAN;

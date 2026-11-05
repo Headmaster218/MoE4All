@@ -595,7 +595,7 @@ impl MeloModel {
 }
 
 fn read_f32(bytes: &[u8]) -> Result<Vec<f32>> {
-    ensure!(bytes.len() % 4 == 0, "invalid F32 tensor length");
+    ensure!(bytes.len().is_multiple_of(4), "invalid F32 tensor length");
     let values = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -708,61 +708,63 @@ mod tests {
         }
         let _ = crate::math::take_conv_times();
         let mut last_trace = std::time::Instant::now();
-        let mut trace = |name: &str, x: &Signal| -> Result<()> {
-            let compute_ms = last_trace.elapsed().as_secs_f64() * 1000.;
-            let (conv_packing_ms, conv_linear_ms) = crate::math::take_conv_times();
-            let stage = stages
-                .iter()
-                .find(|s| s["name"].as_str() == Some(name))
-                .with_context(|| format!("missing fixture stage {name}"))?;
-            ensure!(
-                stage["t"].as_u64() == Some(x.t as u64) && stage["c"].as_u64() == Some(x.c as u64),
-                "{name} reference shape differs: native [{},{}], reference [{},{}]",
-                x.t,
-                x.c,
-                stage["t"],
-                stage["c"]
-            );
-            let expected = read_f32(&std::fs::read(
-                root.join(stage["file"].as_str().context("stage file")?),
-            )?)?;
-            ensure!(expected.len() == x.v.len(), "{name} element count differs");
-            let mut max_abs = 0f32;
-            let mut squared = 0f64;
-            let mut ref_squared = 0f64;
-            let mut max_ref = 0f32;
-            for (&a, &b) in x.v.iter().zip(&expected) {
-                max_abs = max_abs.max((a - b).abs());
-                max_ref = max_ref.max(b.abs());
-                squared += (a as f64 - b as f64).powi(2);
-                ref_squared += (b as f64).powi(2);
-            }
-            let relative_l2 = (squared / ref_squared.max(1e-20)).sqrt();
-            let report = serde_json::json!({"name":name,"t":x.t,"c":x.c,"max_abs":max_abs,"relative_l2":relative_l2,"compute_ms_since_previous_stage":compute_ms,"conv_packing_ms":conv_packing_ms,"conv_linear_ms":conv_linear_ms});
-            eprintln!("{report}");
-            reports.push(report);
-            seen += 1;
-            if let Some(dir) = &output {
-                std::fs::write(dir.join(format!("{name}.f32")), bytemuck::cast_slice(&x.v))?;
-            }
-            ensure!(
-                relative_l2 < 0.003 && max_abs < 0.03 * max_ref.max(1.),
-                "{name} reference tolerance failed: rel_l2={relative_l2}, max_abs={max_abs}"
-            );
-            last_trace = std::time::Instant::now();
-            Ok(())
+        let waveform = {
+            let mut trace = |name: &str, x: &Signal| -> Result<()> {
+                let compute_ms = last_trace.elapsed().as_secs_f64() * 1000.;
+                let (conv_packing_ms, conv_linear_ms) = crate::math::take_conv_times();
+                let stage = stages
+                    .iter()
+                    .find(|s| s["name"].as_str() == Some(name))
+                    .with_context(|| format!("missing fixture stage {name}"))?;
+                ensure!(
+                    stage["t"].as_u64() == Some(x.t as u64)
+                        && stage["c"].as_u64() == Some(x.c as u64),
+                    "{name} reference shape differs: native [{},{}], reference [{},{}]",
+                    x.t,
+                    x.c,
+                    stage["t"],
+                    stage["c"]
+                );
+                let expected = read_f32(&std::fs::read(
+                    root.join(stage["file"].as_str().context("stage file")?),
+                )?)?;
+                ensure!(expected.len() == x.v.len(), "{name} element count differs");
+                let mut max_abs = 0f32;
+                let mut squared = 0f64;
+                let mut ref_squared = 0f64;
+                let mut max_ref = 0f32;
+                for (&a, &b) in x.v.iter().zip(&expected) {
+                    max_abs = max_abs.max((a - b).abs());
+                    max_ref = max_ref.max(b.abs());
+                    squared += (a as f64 - b as f64).powi(2);
+                    ref_squared += (b as f64).powi(2);
+                }
+                let relative_l2 = (squared / ref_squared.max(1e-20)).sqrt();
+                let report = serde_json::json!({"name":name,"t":x.t,"c":x.c,"max_abs":max_abs,"relative_l2":relative_l2,"compute_ms_since_previous_stage":compute_ms,"conv_packing_ms":conv_packing_ms,"conv_linear_ms":conv_linear_ms});
+                eprintln!("{report}");
+                reports.push(report);
+                seen += 1;
+                if let Some(dir) = &output {
+                    std::fs::write(dir.join(format!("{name}.f32")), bytemuck::cast_slice(&x.v))?;
+                }
+                ensure!(
+                    relative_l2 < 0.003 && max_abs < 0.03 * max_ref.max(1.),
+                    "{name} reference tolerance failed: rel_l2={relative_l2}, max_abs={max_abs}"
+                );
+                last_trace = std::time::Instant::now();
+                Ok(())
+            };
+            model.infer_traced(
+                &tokens,
+                &SynthesisOptions {
+                    noise_scale: 0.,
+                    ..Default::default()
+                },
+                model.sample_rate as usize * 30,
+                &cancel,
+                &mut trace,
+            )?
         };
-        let waveform = model.infer_traced(
-            &tokens,
-            &SynthesisOptions {
-                noise_scale: 0.,
-                ..Default::default()
-            },
-            model.sample_rate as usize * 30,
-            &cancel,
-            &mut trace,
-        )?;
-        drop(trace);
         ensure!(seen == stages.len(), "not all reference stages compared");
         if let Some(dir) = &output {
             std::fs::write(

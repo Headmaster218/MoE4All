@@ -162,6 +162,8 @@ pub(crate) fn norm(x: &mut Signal, gamma: &[f32], beta: &[f32]) -> Result<()> {
 
 /// PyTorch Conv1d cross-correlation, zero padded, output time unchanged.
 /// Weight columns are packed [tap,channel] at load for contiguous im2col copies.
+// Keep the primitive's explicit tensor geometry, bias and cancellation inputs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conv(
     backend: &CpuBackend,
     x: &Signal,
@@ -174,15 +176,17 @@ pub(crate) fn conv(
 ) -> Result<Signal> {
     #[cfg(feature = "fused-conv")]
     {
-        return conv_fused(
+        conv_fused(
             backend, x, weight, output_c, kernel, dilation, bias, None, None, cancel,
-        );
+        )
     }
     #[cfg(not(feature = "fused-conv"))]
     conv_unfused(backend, x, weight, output_c, kernel, dilation, bias, cancel)
 }
 
 #[cfg(any(not(feature = "fused-conv"), test))]
+// Match the convolution primitive's arguments for the unfused reference path.
+#[allow(clippy::too_many_arguments)]
 fn conv_unfused(
     backend: &CpuBackend,
     x: &Signal,
@@ -259,6 +263,8 @@ fn conv_unfused(
 /// im2col window is overwritten/reused; SGEMM writes the final output slice.
 /// The elementwise order remains bias -> optional leaky -> optional residual.
 #[cfg(feature = "fused-conv")]
+// Fusion keeps the primitive geometry and each optional epilogue input explicit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn conv_fused(
     backend: &CpuBackend,
     x: &Signal,
@@ -369,6 +375,8 @@ pub(crate) fn conv_fused(
                             *value *= slope;
                         }
                     }
+                    // Preserve residual + output operand order, including NaN behavior.
+                    #[allow(clippy::assign_op_pattern)]
                     if let Some(r) = residual {
                         *value = r.v[(start + row) * output_c + channel] + *value;
                     }
@@ -381,6 +389,8 @@ pub(crate) fn conv_fused(
 
 /// Packed weight is [output_channels*kernel,input_channels]. Scatter implements
 /// ConvTranspose1d exactly; no inserted-zero tensor or runtime dependency.
+// Keep the primitive's explicit tensor geometry, bias and cancellation inputs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn transpose_conv(
     backend: &CpuBackend,
     x: &Signal,
@@ -394,7 +404,7 @@ pub(crate) fn transpose_conv(
     #[cfg(feature = "cpu-ab-profile")]
     let _phase = crate::cpu_profile::Timer::start(crate::cpu_profile::Phase::Transpose);
     ensure!(
-        stride > 0 && kernel >= stride && (kernel - stride) % 2 == 0,
+        stride > 0 && kernel >= stride && (kernel - stride).is_multiple_of(2),
         "invalid transpose convolution geometry"
     );
     let pad = (kernel - stride) / 2;
@@ -436,6 +446,8 @@ pub(crate) fn transpose_conv(
 
 /// Relative-key/value attention with a global mask and local relative window.
 /// Tiles query rows to bound scratch at O(T*TILE), rather than O(T^2).
+// Keep Q/K/V, relative-position geometry and cancellation explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention(
     backend: &CpuBackend,
     q: &Signal,
@@ -448,8 +460,11 @@ pub(crate) fn attention(
     window: usize,
     cancel: &AtomicBool,
 ) -> Result<Signal> {
+    // Retain the original remainder-by-zero panic if heads is zero.
+    #[allow(clippy::manual_is_multiple_of)]
+    let channels_match = q.c % heads == 0;
     ensure!(
-        q.c % heads == 0 && q.t == k.t && q.t == v.t && q.c == k.c && q.c == v.c,
+        channels_match && q.t == k.t && q.t == v.t && q.c == k.c && q.c == v.c,
         "attention shape mismatch"
     );
     let d = q.c / heads;
@@ -489,6 +504,8 @@ pub(crate) fn attention(
                     *a *= scale;
                 }
                 let i = start + r;
+                // Keep the indexed relative-window traversal and reduction order.
+                #[allow(clippy::needless_range_loop)]
                 for j in i.saturating_sub(window)..=(i + window).min(q.t - 1) {
                     let off = (rh * (2 * window + 1) + j + window - i) * d;
                     let mut score = 0.;

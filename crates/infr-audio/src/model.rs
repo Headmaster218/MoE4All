@@ -202,7 +202,7 @@ impl SenseVoiceModel {
         features: &Features,
         language: &str,
         use_itn: bool,
-        trace: &mut dyn FnMut(&str, usize, usize, &[f32]) -> Result<()>,
+        trace: &mut TraceCallback<'_>,
     ) -> Result<String> {
         self.infer_observed(
             features,
@@ -821,7 +821,7 @@ fn validate_weight(info: &TensorInfo, spec: &WeightSpec) -> Result<()> {
     );
     if info.dtype == DType::Q8_0 {
         ensure!(
-            info.shape[0] % 32 == 0,
+            info.shape[0].is_multiple_of(32),
             "{}: Q8_0 row width {} is not block aligned",
             info.name,
             info.shape[0]
@@ -858,7 +858,7 @@ fn floats_to_bytes(data: &[f32]) -> Vec<u8> {
 
 fn download_f32(backend: &dyn Backend, buffer: &dyn Buffer) -> Result<Vec<f32>> {
     ensure!(
-        buffer.len_bytes() % 4 == 0,
+        buffer.len_bytes().is_multiple_of(4),
         "F32 buffer byte length must be divisible by four"
     );
     let mut bytes = vec![0u8; buffer.len_bytes()];
@@ -906,7 +906,7 @@ fn prefix_ids(language: &str, use_itn: bool) -> Result<[usize; 4]> {
 
 fn sinusoidal_position(rows: usize, dim: usize) -> Result<Vec<f32>> {
     ensure!(
-        dim >= 4 && dim % 2 == 0,
+        dim >= 4 && dim.is_multiple_of(2),
         "position depth must be even and at least four"
     );
     let half = dim / 2;

@@ -777,7 +777,7 @@ mod tests {
                     assert!((x - 0.25).abs() < 1e-6);
                     emitted += 1;
                 }
-                assert_eq!(emitted, (count * 16_000 + rate as u64 - 1) / rate as u64);
+                assert_eq!(emitted, (count * 16_000).div_ceil(rate as u64));
             }
         }
     }
