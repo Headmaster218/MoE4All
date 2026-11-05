@@ -433,7 +433,7 @@ fn use_qsa_topk_scan(
 
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
-const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
+const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 300_000_000;
 const AGGRESSIVE_SUBMIT_EXPLORE_CAP: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
@@ -10573,6 +10573,19 @@ mod tests {
     }
 
     #[test]
+    fn submit_auto_profiles_use_reduced_time_budgets() {
+        use infr_core::config::AutoProfile;
+        assert_eq!(
+            SubmitAutoSettings::for_profile(AutoProfile::Conservative).budget_ns,
+            150_000_000
+        );
+        assert_eq!(
+            SubmitAutoSettings::for_profile(AutoProfile::Aggressive).budget_ns,
+            300_000_000
+        );
+    }
+
+    #[test]
     fn submit_auto_policy_samples_then_grows_geometrically() {
         let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
         let sample = submit_sample(16_000_000, 160); // 100 us/dispatch, far below budget
@@ -10617,11 +10630,16 @@ mod tests {
 
     #[test]
     fn submit_auto_policy_tightens_immediately_on_over_budget_submit() {
-        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
-        policy.cap = 64;
-        let done = policy.observe_round(submit_sample(500_000_000, 64), 1);
-        assert_eq!(done.cap, 32);
-        assert_eq!(done.stop, Some(SubmitTuneStop::Budget));
+        for profile in [
+            infr_core::config::AutoProfile::Conservative,
+            infr_core::config::AutoProfile::Aggressive,
+        ] {
+            let mut policy = submit_policy(profile);
+            policy.cap = 64;
+            let done = policy.observe_round(submit_sample(policy.settings.budget_ns * 2, 64), 1);
+            assert_eq!(done.cap, 32);
+            assert_eq!(done.stop, Some(SubmitTuneStop::Budget));
+        }
     }
 
     #[test]
