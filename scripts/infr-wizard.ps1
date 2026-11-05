@@ -477,9 +477,14 @@ function Get-VulkanDeviceOptions {
     $process = $script:VulkanDeviceProbe
     $script:VulkanDeviceProbe = $null
     try {
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(6000)) {
+            try { $process.Kill() } catch { }
+            throw '设备探测超过 6 秒；可手动选择设备。Device probe timed out; choose a device manually.'
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
     } catch {
         Write-Warning "无法枚举 Vulkan 设备，请检查显卡驱动：$($_.Exception.Message) / Could not enumerate Vulkan devices; check the GPU driver."
