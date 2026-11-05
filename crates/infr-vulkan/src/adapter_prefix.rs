@@ -794,7 +794,11 @@ pub(crate) fn supported(be_: &VulkanBackend) -> bool {
 }
 
 pub(crate) fn enabled(be_: &VulkanBackend) -> bool {
-    supported(be_) && !be_.shared.submit_tune_active.load(Ordering::Acquire)
+    // Ordinary token-row Decode uses its own stable submission boundaries. It does not
+    // contribute samples to automatic Prefill calibration, so waiting for that calibration
+    // can disable command-ahead indefinitely on short prompts. Prepared commands retain
+    // their own split boundaries and all existing geometry/resource validation below.
+    supported(be_)
 }
 
 pub(super) fn prefix_end(graph: &Graph) -> Option<usize> {

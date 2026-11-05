@@ -1325,6 +1325,31 @@ fn gpu_resident_ahead_prepares_and_recovers_without_repeating_frontends() {
 
 #[test]
 #[ignore = "requires an idle Vulkan GPU; model-free auto-copy/prepared transition"]
+fn gpu_resident_ahead_does_not_wait_for_prefill_calibration() {
+    let fixture = Fixture::new_with_copy_policy(1, true, Some(true));
+    // Simulate Prefill calibration still waiting for more real forwards. The fixture's
+    // explicit cap keeps submissions deterministic; only the pending marker is injected.
+    fixture
+        .backend
+        .shared
+        .submit_tune_active
+        .store(true, Ordering::Release);
+    for missing in [None, Some(0), Some(1)] {
+        // Checks that a real next-token packet is recorded/consumed, that hit/miss
+        // recovery preserves outputs, and that the frontend is never executed twice.
+        fixture.run_case(1, true, missing);
+        assert!(fixture
+            .backend
+            .shared
+            .submit_tune_active
+            .load(Ordering::Acquire));
+    }
+    fixture.binding_invalidation(1, true);
+    fixture.unsupported_next();
+}
+
+#[test]
+#[ignore = "requires an idle Vulkan GPU; model-free auto-copy/prepared transition"]
 fn gpu_resident_copy_prepared_prefix_preserves_owned_directory() {
     let fixture = Fixture::new_with_copy_policy(1, true, Some(true));
     for missing in [None, Some(0), Some(1), None] {
