@@ -47,6 +47,76 @@ if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     }
 }
 
+function Test-WizardOperationCancelled {
+    param([Exception]$Exception)
+    while ($null -ne $Exception) { if ($Exception.GetType().FullName -eq 'MoE4All.Launcher.NativePromptCanceledException') { return $true }; $Exception=$Exception.InnerException }
+    return $false
+}
+
+function Assert-WizardOperationActive {
+    if ($script:NativePromptsEnabled -and ('MoE4All.Launcher.NativePrompt' -as [type])) { [MoE4All.Launcher.NativePrompt]::CheckCancellation() }
+}
+
+function Wait-WizardOperation {
+    param([int]$Milliseconds)
+    if (-not $script:NativePromptsEnabled) { Start-Sleep -Milliseconds $Milliseconds; return }
+    for ($remaining=$Milliseconds; $remaining -gt 0; $remaining-=100) { Assert-WizardOperationActive; Start-Sleep -Milliseconds ([Math]::Min(100,$remaining)) }
+}
+
+function Invoke-Moe4AllSubmissionTransfer {
+    param(
+        [Parameter(Mandatory = $true)]$Client,
+        [Parameter(Mandatory = $true)]$Request,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
+        [int]$Attempt = 1,
+        [int]$TotalAttempts = 1
+    )
+
+    # Keep the deadline and cancellation checks in the wizard, independently of
+    # HttpClient's timer. ResponseContentRead includes the complete response body.
+    $cancellation = [System.Threading.CancellationTokenSource]::new()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $pending = $null
+    $completed = $false
+    $nextNotice = 5
+    try {
+        $cancellation.CancelAfter([TimeSpan]::FromSeconds($TimeoutSeconds))
+        $pending = $Client.SendAsync($Request, [System.Net.Http.HttpCompletionOption]::ResponseContentRead, $cancellation.Token)
+        while (-not $pending.IsCompleted) {
+            Assert-WizardOperationActive
+            if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                throw [System.TimeoutException]::new('提交服务请求超时；本地文件仍保留。Submission request timed out; the local file is preserved.')
+            }
+            if ($timer.Elapsed.TotalSeconds -ge $nextNotice) {
+                Write-Host ("正在等待上传服务：第 {0}/{1} 次，已等 {2} 秒，上限 {3} 秒。 / Waiting for submission service: attempt {0}/{1}, {2}s elapsed, {3}s limit." -f $Attempt, $TotalAttempts, [int]$timer.Elapsed.TotalSeconds, $TimeoutSeconds) -ForegroundColor DarkGray
+                $nextNotice += 5
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        Assert-WizardOperationActive
+        try {
+            $response = $pending.GetAwaiter().GetResult()
+        } catch {
+            if ($cancellation.IsCancellationRequested) {
+                throw [System.TimeoutException]::new('提交服务请求超时；本地文件仍保留。Submission request timed out; the local file is preserved.')
+            }
+            throw
+        }
+        $completed = $true
+        return $response
+    } finally {
+        if (-not $completed) {
+            $cancellation.Cancel()
+            # Also release a response that won the race with cancellation.
+            if ($null -ne $pending -and $pending.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion) {
+                $pending.GetAwaiter().GetResult().Dispose()
+            }
+        }
+        $timer.Stop()
+        $cancellation.Dispose()
+    }
+}
+
 function Get-SavedValue {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -1357,11 +1427,16 @@ function Invoke-NativeCommandResult {
     $previousErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
+        Assert-WizardOperationActive
         $nativeOutput = @(& $Executable @Arguments 2>&1)
         $nativeExitCode = $LASTEXITCODE
-        $textOutput = @($nativeOutput | ForEach-Object { [string]$_ })
-        return [pscustomobject]@{ ExitCode = $nativeExitCode; Output = [string[]]$textOutput }
+        $diagnosticOutput = @($nativeOutput | Where-Object { $_ -is [Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
+        # Successful machine-readable gh output must not include stderr warnings.
+        # On failure retain the combined diagnostic text used by existing callers.
+        $textOutput = @($nativeOutput | Where-Object { $nativeExitCode -ne 0 -or $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
+        return [pscustomobject]@{ ExitCode = $nativeExitCode; Output = [string[]]$textOutput; ErrorOutput=[string[]]$diagnosticOutput }
     } catch {
+        if (Test-WizardOperationCancelled $_.Exception) { throw }
         return [pscustomobject]@{ ExitCode = -1; Output = [string[]]@($_.Exception.Message) }
     } finally {
         $ErrorActionPreference = $previousErrorAction
@@ -1677,20 +1752,25 @@ function Invoke-Moe4AllSubmissionApi {
         [Parameter(Mandatory = $true)][Uri]$Uri,
         [AllowEmptyString()][string]$Token = '',
         $JsonBody = $null,
-        [byte[]]$FileBytes = $null
+        [byte[]]$FileBytes = $null,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
+        [ValidateRange(0, 3)][int]$MaximumRetries = 3
     )
 
     Add-Type -AssemblyName System.Net.Http
-    $maximumRetries = 3
-    for ($attempt = 0; $attempt -le $maximumRetries; $attempt++) {
+    for ($attempt = 0; $attempt -le $MaximumRetries; $attempt++) {
+        Assert-WizardOperationActive
         $handler = [System.Net.Http.HttpClientHandler]::new()
         $handler.AllowAutoRedirect = $false
         $proxy = Get-SubmissionProxy -ProbeUri $Uri
         if ($null -ne $proxy) { $handler.Proxy = $proxy }
         $client = [System.Net.Http.HttpClient]::new($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds(30)
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
+        $client.MaxResponseContentBufferSize = 1048576
         $request = $null
         $response = $null
+        $delaySeconds = 0
+        $retryReason = ''
         try {
             $httpMethod = if ($Method -eq 'GET') { [System.Net.Http.HttpMethod]::Get } else { [System.Net.Http.HttpMethod]::Post }
             $request = [System.Net.Http.HttpRequestMessage]::new($httpMethod, $Uri)
@@ -1704,18 +1784,18 @@ function Invoke-Moe4AllSubmissionApi {
                 $json = $JsonBody | ConvertTo-Json -Depth 8 -Compress
                 $request.Content = [System.Net.Http.StringContent]::new($json, [System.Text.Encoding]::UTF8, 'application/json')
             }
-            $response = $client.SendAsync($request).GetAwaiter().GetResult()
+            $response = Invoke-Moe4AllSubmissionTransfer -Client $client -Request $request -TimeoutSeconds $TimeoutSeconds -Attempt ($attempt + 1) -TotalAttempts ($MaximumRetries + 1)
             $status = [int]$response.StatusCode
             $bodyText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
             if ($bodyText.Length -gt 1048576) { throw [System.Exception]::new('提交服务响应超过 1 MiB，已拒绝处理。Submission service response exceeded 1 MiB.') }
             $value = $null
             if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
                 try { $value = $bodyText | ConvertFrom-Json } catch {
-                    if ($status -ge 200 -and $status -lt 300) { throw [System.Exception]::new('提交服务返回了无效 JSON。The submission service returned invalid JSON.') }
+                    if ($status -ge 200 -and $status -lt 300) { throw (New-Moe4AllSubmissionApiException -StatusCode $status -Code 'invalid_response' -Message '提交服务返回了无效 JSON。The submission service returned invalid JSON.') }
                 }
             }
             if ($status -ge 200 -and $status -lt 300) {
-                if ($null -eq $value) { throw [System.Exception]::new('提交服务返回了空响应。The submission service returned an empty response.') }
+                if ($null -eq $value) { throw (New-Moe4AllSubmissionApiException -StatusCode $status -Code 'invalid_response' -Message '提交服务返回了空响应。The submission service returned an empty response.') }
                 return [pscustomobject]@{ StatusCode = $status; Value = $value }
             }
 
@@ -1725,9 +1805,10 @@ function Invoke-Moe4AllSubmissionApi {
             if ($null -ne $value -and $null -ne $value.error) {
                 $code = [string]$value.error.code
                 $message = [string]$value.error.message
-                if ($value.error.PSObject.Properties.Name -contains 'retryable') { $retryable = $retryable -or [bool]$value.error.retryable }
+                # Format/privacy/conflict 4xx responses must never replay a POST.
+                if ($status -ge 500 -and $value.error.PSObject.Properties.Name -contains 'retryable') { $retryable = [bool]$value.error.retryable }
             }
-            if (-not $retryable -or $attempt -eq $maximumRetries) {
+            if (-not $retryable -or $attempt -eq $MaximumRetries) {
                 throw (New-Moe4AllSubmissionApiException -StatusCode $status -Code $code -Message $message)
             }
             $delaySeconds = [Math]::Pow(2, $attempt + 1)
@@ -1739,17 +1820,36 @@ function Invoke-Moe4AllSubmissionApi {
                 }
             }
             if ($delaySeconds -gt 120) { throw (New-Moe4AllSubmissionApiException -StatusCode $status -Code $code -Message '服务要求稍后重试；请保留报告。The service requested a longer wait; keep the report and retry later.') }
-            Start-Sleep -Milliseconds ([int]($delaySeconds * 1000 + (Get-Random -Minimum 0 -Maximum 501)))
+            $retryReason = "HTTP $status"
         } catch {
+            if (Test-WizardOperationCancelled $_.Exception) { throw }
             $statusData = $_.Exception.Data['StatusCode']
-            if ($null -ne $statusData -or $attempt -eq $maximumRetries) { throw }
-            Start-Sleep -Milliseconds ([int]([Math]::Pow(2, $attempt + 1) * 1000 + (Get-Random -Minimum 0 -Maximum 501)))
+            if ($null -ne $statusData) { throw }
+            $cause = $_.Exception
+            $transportFailure = $false
+            $timedOut = $false
+            while ($null -ne $cause) {
+                if ($cause -is [System.TimeoutException] -or $cause -is [System.OperationCanceledException]) { $timedOut = $true }
+                if ($cause -is [System.Net.Http.HttpRequestException] -or $cause -is [System.Net.WebException] -or $cause -is [System.IO.IOException] -or $cause -is [System.TimeoutException] -or $cause -is [System.OperationCanceledException]) { $transportFailure = $true }
+                $cause = $cause.InnerException
+            }
+            if (-not $transportFailure) { throw }
+            if ($attempt -eq $MaximumRetries) {
+                $failureCode = if ($timedOut) { 'request_timeout' } else { 'transport_error' }
+                throw (New-Moe4AllSubmissionApiException -StatusCode 0 -Code $failureCode -Message '上传服务请求失败，已停止自动重试；本地文件仍保留。Submission request failed; automatic retries stopped and the local file is preserved.')
+            }
+            $delaySeconds = [Math]::Pow(2, $attempt + 1)
+            $retryReason = if ($timedOut) { '请求超时 / Request timed out' } else { '连接失败 / Connection failed' }
         } finally {
             if ($null -ne $response) { $response.Dispose() }
             if ($null -ne $request) { $request.Dispose() }
             $client.Dispose()
             $handler.Dispose()
         }
+        # Dispose each attempt before waiting or starting the next connection.
+        $delayMilliseconds = [int]($delaySeconds * 1000 + (Get-Random -Minimum 0 -Maximum 501))
+        Write-Host ("{0}；{1:N1} 秒后重试（第 {2}/{3} 次）。 / Retrying in {1:N1}s (attempt {2}/{3})." -f $retryReason, ($delayMilliseconds / 1000.0), ($attempt + 2), ($MaximumRetries + 1)) -ForegroundColor Yellow
+        Wait-WizardOperation -Milliseconds $delayMilliseconds
     }
     throw '提交服务请求失败。Submission service request failed.'
 }
@@ -1870,6 +1970,7 @@ function Invoke-WebsiteSubmissionUpload {
     $sessionId = [Uri]::EscapeDataString([string]$session.session_id)
     $stateUri = [Uri]::new($config.ApiBase.AbsoluteUri.TrimEnd('/') + '/upload-sessions/' + $sessionId)
     while ($true) {
+        Assert-WizardOperationActive
         if ([DateTimeOffset]::UtcNow -ge $expires.ToUniversalTime()) { throw '上传会话已过期；本地文件仍完整保留。Upload session expired; the local file remains intact.' }
         $stateResult = Invoke-Moe4AllSubmissionApi -Method GET -Uri $stateUri -Token ([string]$session.session_token)
         if ([int]$stateResult.Value.api_version -ne 1 -or [string]$stateResult.Value.kind -ne $Kind -or [string]$stateResult.Value.report_id -ne $reportId -or [string]$stateResult.Value.file_sha256 -ne $fileHash -or [int64]$stateResult.Value.size_bytes -ne $bytes.Length) {
@@ -1883,7 +1984,7 @@ function Invoke-WebsiteSubmissionUpload {
         }
         if ($state -ne 'awaiting_verification') { throw "未知上传会话状态：$state / Unknown upload session state." }
         $pollSeconds = [Math]::Max(3, [Math]::Min(30, [int]$stateResult.Value.poll_after_seconds))
-        Start-Sleep -Seconds $pollSeconds
+        for ($pollTick=0; $pollTick -lt $pollSeconds*5; $pollTick++) { Assert-WizardOperationActive; Start-Sleep -Milliseconds 200 }
     }
 
     Write-Host '确认完成，正在上传原始提交文件... / Confirmed; uploading the original submission bytes...' -ForegroundColor Cyan

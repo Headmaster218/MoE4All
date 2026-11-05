@@ -556,6 +556,14 @@ try {
     Assert (($nativeFailure.Output -join "`n") -match 'not logged in') 'Native stderr was not captured for diagnostics'
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS native stderr does not terminate wizard'
+    $nativeSuccess = Invoke-NativeCommandResult -Executable (Join-Path $PSHOME 'powershell.exe') -Arguments @(
+        '-NoLogo','-NoProfile','-NonInteractive','-Command',
+        '[Console]::Out.WriteLine(''MACHINE_RESULT''); [Console]::Error.WriteLine(''fixture warning''); exit 0'
+    )
+    Assert ($nativeSuccess.ExitCode -eq 0 -and ($nativeSuccess.Output -join '') -eq 'MACHINE_RESULT') 'Successful machine output contains stderr diagnostics'
+    Assert (($nativeSuccess.ErrorOutput -join '') -match 'fixture warning') 'Successful stderr diagnostics were lost'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS machine-readable native output excludes stderr'
     function Offer-BenchmarkUpload { throw 'fixture upload failure' }
     $uploadFailureEscaped = $false
     try { Invoke-BenchmarkUploadSafely -Path $fixtureSubmissionPath } catch { $uploadFailureEscaped = $true }
