@@ -78,8 +78,9 @@ function Test-Modules {
     if ($null -ne $Saved -and (Test-SavedWizardModels)) { $script:answers.Enqueue($(if ($Reuse) { '' } else { 'n' })) }
     if (-not $Reuse) {
         $script:answers.Enqueue('2')
-        if ($RejectEmptyFirst) { foreach ($value in @('n', 'n', 'n')) { $script:answers.Enqueue($value) } }
+        if ($RejectEmptyFirst) { foreach ($value in @('n', 'n', 'n', 'n')) { $script:answers.Enqueue($value) } }
         foreach ($enabled in @($llm, $embedding, $audio)) { $script:answers.Enqueue($(if ($enabled) { 'y' } else { 'n' })) }
+        $script:answers.Enqueue('n') # Keep new optional speech synthesis disabled in legacy module fixtures.
         if ($llm) { $script:answers.Enqueue('n') } # Vision off.
         if ($embedding) { $script:answers.Enqueue($embeddingFile); $script:answers.Enqueue('17') }
         if ($audio) {
@@ -101,6 +102,7 @@ function Test-Modules {
     Check ($state.server_llm_enabled -is [bool] -and $state.server_llm_enabled -eq $llm) 'LLM bool state'
     Check ($state.server_embedding -is [bool] -and $state.server_embedding -eq $embedding) 'Embedding bool state'
     Check ($state.server_transcription -is [bool] -and $state.server_transcription -eq $audio) 'Transcription bool state'
+    Check ($state.server_speech -is [bool] -and -not $state.server_speech -and -not $nativeArgs.Contains('--speech-model')) 'Speech remains opt-in for legacy modules'
     Check (($nativeArgs.Contains('--embedding-model')) -eq $embedding) 'Embedding argv gate'
     Check (($nativeArgs.Contains('--transcription-model')) -eq $audio) 'Transcription argv gate'
     Check (($nativeArgs.Contains($llmFile)) -eq $llm) 'Positional LLM gate'
@@ -140,11 +142,11 @@ function Test-Modules {
     Check ($script:downloads -eq [int]$DownloadAudio.IsPresent) 'Download requires explicit D'
     if (-not $Reuse) {
         $switchPrompts = @($script:prompts | Where-Object { $_ -match 'Enable the .* API\?' })
-        $expectedCount = if ($RejectEmptyFirst) { 6 } else { 3 }
-        Check ($switchPrompts.Count -eq $expectedCount) 'Exactly three module switches before model prompts'
-        $ordered = @('Enable the language model API?', 'Enable the Embedding API?', 'Enable the local transcription API?')
+        $expectedCount = if ($RejectEmptyFirst) { 8 } else { 4 }
+        Check ($switchPrompts.Count -eq $expectedCount) 'Four independent module switches before model prompts'
+        $ordered = @('Enable the language model API?', 'Enable the Embedding API?', 'Enable the local transcription API?', 'Enable the local speech synthesis API?')
         for ($index = 0; $index -lt $expectedCount; $index++) {
-            Check ($switchPrompts[$index].Contains($ordered[$index % 3])) 'Module switch order'
+            Check ($switchPrompts[$index].Contains($ordered[$index % 4])) 'Module switch order'
         }
         if ($embedding) {
             Check (($script:output -join "`n").Contains('The Embedding model and backend load on the first request; the entire instance unloads after the idle timeout.')) 'Embedding lazy initialization explanation'
@@ -200,7 +202,8 @@ $script:Saved = [pscustomobject]@{ launch_mode = 'server'; server_llm_enabled = 
 Check (-not (Test-SavedWizardModels)) 'A disabled usable LLM must not hide a missing enabled embedding model'
 $script:Saved = $null
 $script:answers = [Collections.Generic.Queue[string]]::new()
-foreach ($answer in @('', '', '')) { $script:answers.Enqueue($answer) }
+foreach ($answer in @('', '', '', '')) { $script:answers.Enqueue($answer) }
 $defaults = Read-ServerModules -LlmEnabled $true -EmbeddingEnabled $false -TranscriptionEnabled $false
 Check ($defaults.Llm -and -not $defaults.Embedding -and -not $defaults.Transcription) 'Legacy/default Enter responses keep LLM enabled'
+Check (-not $defaults.Speech) 'Speech defaults to disabled on Enter'
 Write-Output "PASS: $script:checks Windows module checks; no engine, GPU, network download or production state used."

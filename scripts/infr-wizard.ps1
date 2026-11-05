@@ -117,6 +117,57 @@ function Invoke-Moe4AllSubmissionTransfer {
     }
 }
 
+function Get-SpeechSettings {
+    return [pscustomobject]@{
+        Enabled = ([string](Get-SavedValue 'server_speech' $false) -ieq 'true')
+        Model = [string](Get-SavedValue 'speech_model' '')
+        Lexicon = [string](Get-SavedValue 'speech_lexicon' '')
+        Threads = [string](Get-SavedValue 'speech_threads' '4')
+        IdleTimeout = [string](Get-SavedValue 'speech_idle_timeout' '300')
+        MaxOutputSeconds = [string](Get-SavedValue 'speech_max_output_seconds' '30')
+    }
+}
+
+function Read-SpeechSettings {
+    param($Settings)
+    if (-not $Settings.Enabled) { return }
+    Write-Host '语音合成使用独立 CPU 服务，首次请求加载，空闲后释放；需要支持 TTS 的引擎。/ Speech synthesis uses an independent lazy CPU service and requires a TTS-enabled build.' -ForegroundColor DarkGray
+    Write-Host '选择配套的原生 Melo GGUF 与资源目录。当前推荐目录暂无合成下载项。/ Select a matching native Melo GGUF and asset directory; no speech download is currently in the catalog.' -ForegroundColor DarkGray
+    Write-Host '输出 WAV/PCM 完整片段；音色、语速和格式由 API 请求指定。/ Returns complete WAV/PCM clips; voice, speed and format are set per API request.' -ForegroundColor DarkGray
+    while ($true) {
+        $Settings.Model = Read-TextValue -Label '合成 GGUF 文件 / Speech GGUF file' -Default $Settings.Model -Required
+        $Settings.Lexicon = Read-TextValue -Label '合成资源目录，含 lexicon.txt、tokens.txt、config.json / Speech asset directory' -Default $Settings.Lexicon -Required
+        $Settings.Threads = Read-IntegerValue -Label '合成 CPU 线程数 / Speech CPU threads' -Default $Settings.Threads -Minimum 1 -Maximum 256
+        $Settings.IdleTimeout = Read-TextValue -Label '合成空闲释放秒数，0 为常驻 / Speech idle seconds, 0 keeps resident' -Default $Settings.IdleTimeout -Required
+        $Settings.MaxOutputSeconds = Read-TextValue -Label '每段合成时长上限，1-120 秒 / Speech clip duration cap, 1-120 seconds' -Default $Settings.MaxOutputSeconds -Required
+        try { Add-SpeechArguments -Arguments ([Collections.Generic.List[string]]::new()) -Settings $Settings; return }
+        catch { Write-Host $_.Exception.Message -ForegroundColor Yellow }
+    }
+}
+
+function Add-SpeechArguments {
+    param([System.Collections.Generic.List[string]]$Arguments, $Settings)
+    if (-not $Settings.Enabled) { return }
+    foreach ($value in @($Settings.Model, $Settings.Lexicon)) {
+        if ([string]::IsNullOrWhiteSpace([string]$value) -or [string]$value -match '[\x00-\x1f\x7f]') { throw 'Speech requires a model file and asset directory without control characters.' }
+    }
+    $model = ConvertTo-FullPath $Settings.Model
+    $lexicon = ConvertTo-FullPath $Settings.Lexicon
+    if (-not (Test-Path -LiteralPath $model -PathType Leaf) -or [IO.Path]::GetExtension($model) -ine '.gguf') { throw 'Speech requires a native Melo GGUF file.' }
+    if (-not (Test-Path -LiteralPath $lexicon -PathType Container)) { throw 'Speech assets must be a directory containing lexicon.txt, tokens.txt and config.json.' }
+    foreach ($asset in @('lexicon.txt', 'tokens.txt', 'config.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $lexicon $asset) -PathType Leaf)) { throw "Speech asset directory is missing $asset" }
+    }
+    $threadCount = 0; $idleSeconds = [UInt64]0; $seconds = [single]0
+    if ([string]$Settings.Threads -notmatch '^\d+$' -or -not [int]::TryParse([string]$Settings.Threads, [ref]$threadCount) -or $threadCount -lt 1 -or $threadCount -gt 256) { throw 'Speech CPU threads must be in 1..256.' }
+    if ([string]$Settings.IdleTimeout -notmatch '^\d+$' -or -not [UInt64]::TryParse([string]$Settings.IdleTimeout, [ref]$idleSeconds)) { throw 'Speech idle timeout must be unsigned whole seconds; 0 keeps resident.' }
+    if (-not [single]::TryParse([string]$Settings.MaxOutputSeconds, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -or [single]::IsNaN($seconds) -or [single]::IsInfinity($seconds) -or $seconds -lt 1 -or $seconds -gt 120) { throw 'Speech output duration must be in 1..120 seconds.' }
+    $Settings.Model = $model; $Settings.Lexicon = $lexicon
+    foreach ($value in @('--speech-model', $model, '--speech-lexicon', $lexicon, '--speech-threads', [string]$threadCount,
+        '--speech-idle-timeout', $idleSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+        '--speech-max-output-seconds', $seconds.ToString('R', [Globalization.CultureInfo]::InvariantCulture))) { [void]$Arguments.Add($value) }
+}
+
 function Get-SavedValue {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -749,18 +800,46 @@ function Get-RecommendedModelCatalog {
                 RelativePath = 'SenseVoice-Small-Q8_0\sense-voice-small-q8_0.gguf'
             })
         }
+        [pscustomobject]@{
+            Id = 'melotts-chinese-native-f32'
+            Kind = 'speech'
+            Name = 'MeloTTS 中文原生 CPU / Chinese native CPU speech'
+            Downloadable = $false
+            UnavailableReason = '原生包已本地验证并备妥，等待公共下载托管；用户无需转换。Native package validated locally; public download hosting is pending. End users do not need conversion.'
+            LocalPackageReady = $true
+            PackageFileName = 'MeloTTS-Chinese-Native-F32-v1.zip'
+            PackageScript = 'scripts/package-native-speech.ps1'
+            ModelSha256 = '6d0d6fffe43cf6dea169f584c07bbb1a43756f37958ba9f9b78e27e8f9b32cc2'
+            ModelBytes = 164882176
+            SourceCommit = '66a4434a518a3b6d124756952977f0b10f0e9a76'
+            InfoUrl = 'https://huggingface.co/myshell-ai/MeloTTS-Chinese/tree/af5d207a364ea4208c6f589c89f57f88414bdd16'
+            # These are conversion inputs, deliberately not downloadable runtime files.
+            SourceUrls = @(
+                'https://huggingface.co/myshell-ai/MeloTTS-Chinese/tree/af5d207a364ea4208c6f589c89f57f88414bdd16'
+                'https://huggingface.co/csukuangfj/vits-melo-tts-zh_en/tree/a0d5c6a264c0ef92d70d8661d8cc502d79627cd6'
+            )
+            ConversionScript = 'scripts/convert_melotts_chinese.py'
+            RequiredAssets = @('lexicon.txt', 'tokens.txt', 'config.json')
+            RuntimeAssets = @('melotts-chinese-f32.gguf', 'lexicon.txt', 'tokens.txt', 'config.json', 'frontend.json', 'custom-lexicon.txt')
+            Primary = ''
+            Files = @()
+        }
     )
 }
 
 function Show-RecommendedModelDownloads {
-    param([ValidateSet('all', 'llm', 'vision', 'embedding', 'audio')][string]$Kind = 'all')
+    param([ValidateSet('all', 'llm', 'vision', 'embedding', 'audio', 'speech')][string]$Kind = 'all')
 
     Write-Host "`n官方推荐的模型 / Official recommended models" -ForegroundColor Cyan
-    foreach ($download in @(Get-RecommendedModelCatalog)) {
-        if ($Kind -ne 'all' -and $download.Kind -ne $Kind) { continue }
+    $matching = @(Get-RecommendedModelCatalog | Where-Object { $Kind -eq 'all' -or $_.Kind -eq $Kind })
+    foreach ($download in $matching) {
         Write-Host " $($download.Name)"
         Write-Host "   $($download.InfoUrl)" -ForegroundColor DarkGray
+        if ($download.PSObject.Properties['Downloadable'] -and -not $download.Downloadable) {
+            Write-Host "   $($download.UnavailableReason)" -ForegroundColor Yellow
+        }
     }
+    if (@($matching | Where-Object { -not $_.PSObject.Properties['Downloadable'] -or $_.Downloadable }).Count -eq 0) { return }
     Write-Host '在模型列表选择 D，可一次选择一个或多个项目下载到安装目录下的 models 文件夹。' -ForegroundColor DarkGray
     Write-Host 'Choose D in the model list to download one or more items into the models folder beside the launcher.' -ForegroundColor DarkGray
 }
@@ -932,7 +1011,13 @@ function Invoke-RecommendedModelDownload {
 }
 
 function Select-RecommendedDownloads {
-    $catalog = @(Get-RecommendedModelCatalog)
+    param([ValidateSet('all','llm','vision','embedding','audio','speech')][string]$Kind='all')
+    $matching = @(Get-RecommendedModelCatalog | Where-Object { $Kind -eq 'all' -or $_.Kind -eq $Kind })
+    $catalog = @($matching | Where-Object { -not $_.PSObject.Properties['Downloadable'] -or $_.Downloadable })
+    foreach ($unavailable in @($matching | Where-Object { $_.PSObject.Properties['Downloadable'] -and -not $_.Downloadable })) {
+        Write-Host (" {0}: {1}" -f $unavailable.Name, $unavailable.UnavailableReason) -ForegroundColor Yellow
+    }
+    if ($catalog.Count -eq 0) { return @() }
     while ($true) {
         Write-Host "`n下载模型与组件 / Download models and components" -ForegroundColor Cyan
         for ($i = 0; $i -lt $catalog.Count; $i++) {
@@ -2321,13 +2406,14 @@ function Select-EmbeddingModelPath {
 }
 
 function Read-ServerModules {
-    param([bool]$LlmEnabled, [bool]$EmbeddingEnabled, [bool]$TranscriptionEnabled)
+    param([bool]$LlmEnabled, [bool]$EmbeddingEnabled, [bool]$TranscriptionEnabled, [bool]$SpeechEnabled = $false)
     while ($true) {
         $LlmEnabled = Read-YesNo -Label '启用大语言模型 API？/ Enable the language model API?' -Default $LlmEnabled
         $EmbeddingEnabled = Read-YesNo -Label '启用 Embedding API？/ Enable the Embedding API?' -Default $EmbeddingEnabled
         $TranscriptionEnabled = Read-YesNo -Label '启用本地语音转录 API？/ Enable the local transcription API?' -Default $TranscriptionEnabled
-        if ($LlmEnabled -or $EmbeddingEnabled -or $TranscriptionEnabled) {
-            return [pscustomobject]@{ Llm = $LlmEnabled; Embedding = $EmbeddingEnabled; Transcription = $TranscriptionEnabled }
+        $SpeechEnabled = Read-YesNo -Label '启用本地语音合成 API？/ Enable the local speech synthesis API?' -Default $SpeechEnabled
+        if ($LlmEnabled -or $EmbeddingEnabled -or $TranscriptionEnabled -or $SpeechEnabled) {
+            return [pscustomobject]@{ Llm = $LlmEnabled; Embedding = $EmbeddingEnabled; Transcription = $TranscriptionEnabled; Speech = $SpeechEnabled }
         }
         Write-Host '请至少启用一个 API 模块。/ Enable at least one API module.' -ForegroundColor Yellow
     }
@@ -2342,6 +2428,10 @@ function Test-SavedWizardModels {
     if ($isServer) {
         if ([string](Get-SavedValue 'server_embedding' $false) -ieq 'true') { $paths += [string](Get-SavedValue 'embedding_model' '') }
         if ([string](Get-SavedValue 'server_transcription' $false) -ieq 'true') { $paths += [string](Get-SavedValue 'transcription_model' '') }
+        if ([string](Get-SavedValue 'server_speech' $false) -ieq 'true') {
+            try { Add-SpeechArguments -Arguments ([Collections.Generic.List[string]]::new()) -Settings (Get-SpeechSettings) } catch { return $false }
+            $paths += [string](Get-SavedValue 'speech_model' '')
+        }
     }
     if ($paths.Count -eq 0) { return $false }
     foreach ($path in $paths) {
@@ -2357,6 +2447,7 @@ function Restore-DisabledLlmState {
         'launch_mode', 'device', 'server_llm_enabled', 'server_addr', 'server_auth',
         'server_embedding', 'embedding_model', 'embedding_idle_timeout', 'server_transcription',
         'transcription_model', 'transcription_threads', 'transcription_idle_timeout', 'transcription_upload_dir',
+        'server_speech', 'speech_model', 'speech_lexicon', 'speech_threads', 'speech_idle_timeout', 'speech_max_output_seconds',
         'benchmark_upload', 'benchmark_upload_has_github', 'benchmark_upload_gh_auth', 'benchmark_upload_fallback',
         'submission_browser_action', 'submission_failure_action', 'submission_pending_retry', 'error_upload', 'last_command',
         'api_key', 'server_api_key'
@@ -3056,6 +3147,7 @@ $serverEmbedding = ([string](Get-SavedValue 'server_embedding' $false) -ieq 'tru
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
 $transcription = Get-TranscriptionSettings
+$speech = Get-SpeechSettings
 
 $configureThinking = [bool](Get-SavedValue 'configure_thinking' ($thinkMode -ne 'default' -or $reasoningEffort -ne 'default'))
 $cpuMissEnabled = [bool](Get-SavedValue 'cpu_miss_enabled' $false)
@@ -3080,10 +3172,11 @@ if (-not $reuseSavedSettings) {
         exit 0
     }
     if ($launchMode -eq 'server') {
-        $modules = Read-ServerModules -LlmEnabled $serverLlmEnabled -EmbeddingEnabled $serverEmbedding -TranscriptionEnabled $transcription.Enabled
+        $modules = Read-ServerModules -LlmEnabled $serverLlmEnabled -EmbeddingEnabled $serverEmbedding -TranscriptionEnabled $transcription.Enabled -SpeechEnabled $speech.Enabled
         $serverLlmEnabled = $modules.Llm
         $serverEmbedding = $modules.Embedding
         $transcription.Enabled = $modules.Transcription
+        $speech.Enabled = $modules.Speech
     }
     $llmEnabled = ($launchMode -ne 'server' -or $serverLlmEnabled)
     if ($llmEnabled -or $serverEmbedding) { Start-VulkanDeviceProbe }
@@ -3109,6 +3202,7 @@ if (-not $reuseSavedSettings) {
             $embeddingIdleTimeout = Read-IntegerValue -Label 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident' -Default $embeddingIdleTimeout -Minimum 0
         }
         Read-TranscriptionSettings -Settings $transcription
+        Read-SpeechSettings -Settings $speech
     }
 
     if ($llmEnabled -or $serverEmbedding) {
@@ -3365,7 +3459,7 @@ if ($launchMode -eq 'server') {
     }
 }
 
-if ($launchMode -eq 'server' -and -not ($serverLlmEnabled -or $serverEmbedding -or $transcription.Enabled)) {
+if ($launchMode -eq 'server' -and -not ($serverLlmEnabled -or $serverEmbedding -or $transcription.Enabled -or $speech.Enabled)) {
     throw '请至少启用一个 API 模块。/ Enable at least one API module.'
 }
 $nativeArgs = [System.Collections.Generic.List[string]]::new()
@@ -3518,6 +3612,7 @@ if ($launchMode -eq 'server') {
         [void]$nativeArgs.Add('--embedding-idle-timeout'); [void]$nativeArgs.Add($embeddingIdleTimeout)
     }
     Add-TranscriptionArguments -Arguments $nativeArgs -Settings $transcription
+    Add-SpeechArguments -Arguments $nativeArgs -Settings $speech
 }
 if ($llmEnabled) { [void]$nativeArgs.Add($modelPath) }
 
@@ -3568,6 +3663,8 @@ $state = [ordered]@{
     server_transcription = $transcription.Enabled; transcription_model = $transcription.Model
     transcription_threads = $transcription.Threads; transcription_idle_timeout = $transcription.IdleTimeout
     transcription_upload_dir = $transcription.UploadDir
+    server_speech = $speech.Enabled; speech_model = $speech.Model; speech_lexicon = $speech.Lexicon
+    speech_threads = $speech.Threads; speech_idle_timeout = $speech.IdleTimeout; speech_max_output_seconds = $speech.MaxOutputSeconds
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
     custom_sets = $customSets; last_command = $commandText
 }
@@ -3603,6 +3700,9 @@ if ($launchMode -eq 'server') {
     }
     if ($transcription.Enabled) {
         Write-Host "本地语音转录 API / Local transcription API: http://$clientAddress/v1/audio/transcriptions (WAV/PCM, CPU)" -ForegroundColor Cyan
+    }
+    if ($speech.Enabled) {
+        Write-Host "本地语音合成 API / Local speech synthesis API: http://$clientAddress/v1/audio/speech (WAV/PCM, CPU)" -ForegroundColor Cyan
     }
     if ($llmEnabled -and $serverVision) {
         Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
