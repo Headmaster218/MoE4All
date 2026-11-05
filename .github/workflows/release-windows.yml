@@ -120,6 +120,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardEntryPolicy.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardModelCatalog.ps1 -WorkDir (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\model-catalog')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardSpeech.ps1 -WorkDir (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\speech')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:MOE4ALL_WIZARD_TEST_TMP = Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\startup'
+          New-Item -ItemType Directory -Force -Path $env:MOE4ALL_WIZARD_TEST_TMP | Out-Null
+          $env:TEMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          $env:TMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardStartupPolicy.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-BenchmarkStartupGuide.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -STA -File .\scripts\Test-WizardStartupDialogs.ps1 -EvidenceDirectory $env:MOE4ALL_WIZARD_TEST_TMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --locked -p infr-hub --all-targets
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p infr-hub model_ref::tests::
@@ -127,7 +141,7 @@ jobs:
           cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build portable MoE4All engine (infr.exe)
-        run: cargo build --release --locked -p infr-cli
+        run: cargo build --release --locked -p infr-cli --features tts
       - name: Show sccache statistics
         if: always()
         run: sccache --show-stats

@@ -5,15 +5,15 @@
 Windows、Linux 免安装，约 17 MiB 即下即用；Apple Silicon 同步提供实验性 Metal 发行包。选择推荐的模型或自备模型，自动配置参数，即可立即开始聊天，
 或通过 OpenAI 兼容API接入现有客户端。显存、内存与 SSD 三级流动，协同加载权重运行。
 
-**1.0.0 性能参考**：Win 11 + RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，
+**1.2.0 性能参考**：Win 11 + RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，
 自动激进配置，Q8 K/V，关闭 MTP 与 CPU miss。速度单位均为 tok/s。
 
-| 模型 | 4K Decode 总均速 x1 / x2 / x3 | 30K 单路 Prefill | 30K Decode 总均速 x1 / x2 / x3 | 150K 单路 Prefill | 150K Decode 总均速 x1 / x2 / x3 |
+| 模型 | 6K Decode 总均速 x1 / x2 / x3 | 30K 单路 Prefill | 30K Decode 总均速 x1 / x2 / x3 | 150K 单路 Prefill | 150K Decode 总均速 x1 / x2 / x3 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Flash-Next 4.27bpw | — | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
-| Qwen3.6 35B Balanced | **120.98 / 164.64 / 201.28** | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
+| Qwen3.6 35B Balanced | **154.6 / 195.3 / 229.4** | **2,988.7** | **125.7 / 152.0 / 180.1** | **1,213.5** | **65.1 / 70.5 / 78.0** |
 
-<sub>Decode 为 1 / 2 / 3 路同时生成时的总平均吞吐；Prefill 为单路完整区间平均速度。完整条件见 [1.0.0 实测](#10030k--150k-平均性能2026-10-14)。</sub>
+<sub>Decode 为 1 / 2 / 3 路同时生成时的总平均吞吐；Prefill 为单路完整区间平均速度。完整条件见 [1.2.0 实测](#12030k--150k-平均性能2026-10-14)。</sub>
 
 **同机 Strata v0.1.44.1 参考**：使用其自动配置、不启用 MTP；`x2` 为两路总吞吐。
 
@@ -72,16 +72,16 @@ Windows 与 Linux 启动向导可从统一下载菜单选择下列主模型和�
 | 模型 / 组件 | 下载链接 | 文件与用途 |
 | --- | --- | --- |
 | **Qwen3.6 35B 本体** | [下载 APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`；35B 下载这一个文件即可 |
-| **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | 该目录下的 **33 个 GGUF 分片**，全部放在同一文件夹；启动时选择第一片 |
+| **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/f5b0b790eebb89033c48091c26abf74c1b385940) | 对应模型的 **3 个 GGUF 分片**，全部放在同一文件夹；启动时选择第一片 |
 | **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；API 图片理解时加载 |
 | **Qwen3 Embedding 0.6B** | [下载 Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`；提供 `/v1/embeddings` |
 
-Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。视觉文件会自动放到同一模型目录，便于向导发现。
+Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf`。视觉文件会自动放到同一模型目录，便于向导发现。
 
 
 ## 实测结果
 
-### 1.0.0：30K / 150K 平均性能（2026-10-14）
+### 1.2.0：30K / 150K 平均性能（2026-10-14）
 
 测试硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
 使用自动激进配置、Q8 K/V、`ctx=163840`，关闭 MTP 与 CPU miss。Decode 分别同时
@@ -91,9 +91,9 @@ Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Flash-Next 4.27bpw | 30K | **1,414.75** | **50.44** | **66.19** | **71.20** |
 | Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | **49.50** | **45.47** |
-| Qwen3.6 35B Balanced | 4K | **3,604.71** | **120.98** | **164.64** | **201.28** |
-| Qwen3.6 35B Balanced | 30K | **2,749.06** | **80.49** | **118.34** | **110.78** |
-| Qwen3.6 35B Balanced | 150K | **1,169.40** | **41.91** | **50.87** | **49.27** |
+| Qwen3.6 35B Balanced | 6K | **3,023.5** | **154.6** | **195.3** | **229.4** |
+| Qwen3.6 35B Balanced | 30K | **2,988.7** | **125.7** | **152.0** | **180.1** |
+| Qwen3.6 35B Balanced | 150K | **1,213.5** | **65.1** | **70.5** | **78.0** |
 
 ### Strata v0.1.44.1 同机对照（2026-10-15）
 

@@ -1,0 +1,17 @@
+#version 460
+// Widen one native Q8_0/BF16 weight slice per chunk. The base byte address may
+// belong to a resident tensor or a streamed arena slot; w_off is in elements.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; uint w_off; uint arena_lo; uint arena_hi; } pc;
+layout(binding = 1) writeonly buffer DB { float dst[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#include "native_decode.glsl"
+
+void main() {
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    dst[i] = dq(i + pc.w_off);
+}

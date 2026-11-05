@@ -8,16 +8,16 @@ Choose a recommended model or bring your own GGUF, select an automatic profile, 
 start terminal chat or an OpenAI-compatible API. Weights move across VRAM, system
 RAM, and SSD under one memory plan.
 
-**1.0.0 performance reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
+**1.2.0 performance reference:** RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB
 DDR4, automatic aggressive profile, Q8 K/V, with MTP and CPU miss offload disabled.
 All speeds are tok/s.
 
-| Model | 4K total Decode mean x1 / x2 / x3 | 30K single-stream Prefill | 30K total Decode mean x1 / x2 / x3 | 150K single-stream Prefill | 150K total Decode mean x1 / x2 / x3 |
+| Model | 6K total Decode mean x1 / x2 / x3 | 30K single-stream Prefill | 30K total Decode mean x1 / x2 / x3 | 150K single-stream Prefill | 150K total Decode mean x1 / x2 / x3 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Flash-Next 4.27bpw | — | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
-| Qwen3.6 35B Balanced | **120.98 / 164.64 / 201.28** | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
+| Qwen3.6 35B Balanced | **154.6 / 195.3 / 229.4** | **2,988.7** | **125.7 / 152.0 / 180.1** | **1,213.5** | **65.1 / 70.5 / 78.0** |
 
-<sub>Decode is aggregate mean throughput with 1 / 2 / 3 simultaneously active streams, not per-stream speed. Prefill is the full-interval single-stream mean. See the [1.0.0 measurements](#100-30k--150k-mean-performance-2026-10-14) for conditions.</sub>
+<sub>Decode is aggregate mean throughput with 1 / 2 / 3 simultaneously active streams, not per-stream speed. Prefill is the full-interval single-stream mean. See the [1.2.0 measurements](#120-30k--150k-mean-performance-2026-10-14) for conditions.</sub>
 
 **Same-host Strata v0.1.44.1 reference:** automatic configuration, without MTP;
 `x2` is aggregate throughput for two streams.
@@ -51,7 +51,7 @@ All speeds are tok/s.
 Open [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases) and
 download `MoE4All-Windows-x86_64-v*.zip` on Windows, the matching `.tar.gz`
 package on Linux x86_64, or the experimental `MoE4All-macOS-arm64-v*.tar.gz`
-package on Apple Silicon. This page covers **1.0.0**; the results below describe
+package on Apple Silicon. This page covers **1.2.0**; the results below describe
 the test conditions and provenance of the performance tables.
 
 ### 2. Extract it
@@ -100,12 +100,12 @@ beside the launcher.
 | Model / component | Download | File and purpose |
 | --- | --- | --- |
 | **Qwen3.6 35B model** | [Download APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`; this single file is sufficient for the 35B model |
-| **Flash-Next main model** | [Download all AD-4.27bpw-Q4_K_M-M64 shards](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | Download all **33 GGUF shards** into one folder and select the first shard at launch |
+| **Flash-Next main model** | [Download all AD-4.27bpw-Q4_K_M-M64 shards](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/f5b0b790eebb89033c48091c26abf74c1b385940) | Download all **3 GGUF shards** into one folder and select the first shard at launch |
 | **Flash-Next vision** | [Download the F16 vision projector](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`; loaded for API image understanding |
 | **Qwen3 Embedding 0.6B** | [Download the Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`; serves `/v1/embeddings` |
 
 The first Flash-Next shard is
-`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`. The automatic
+`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf`. The automatic
 Vision download is placed in the same model directory for discovery by the wizard.
 
 ## Build from source (Linux)
@@ -131,7 +131,7 @@ and platform details are in
 
 ## Measured results
 
-### 1.0.0: 30K / 150K mean performance (2026-10-14)
+### 1.2.0: 30K / 150K mean performance (2026-10-14)
 
 Hardware: RX 7900 XTX 24 GiB, Ryzen 5 5600X, 64 GiB DDR4, and Windows 11.
 Configuration: automatic aggressive, Q8 K/V, `ctx=163840`, with MTP and CPU miss
@@ -142,9 +142,9 @@ aggregate full-interval mean throughput. Prefill reports the single-stream mean.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Flash-Next 4.27bpw | 30K | **1,414.75** | **50.44** | **66.19** | **71.20** |
 | Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | **49.50** | **45.47** |
-| Qwen3.6 35B Balanced | 4K | **3,604.71** | **120.98** | **164.64** | **201.28** |
-| Qwen3.6 35B Balanced | 30K | **2,749.06** | **80.49** | **118.34** | **110.78** |
-| Qwen3.6 35B Balanced | 150K | **1,169.40** | **41.91** | **50.87** | **49.27** |
+| Qwen3.6 35B Balanced | 6K | **3,023.5** | **154.6** | **195.3** | **229.4** |
+| Qwen3.6 35B Balanced | 30K | **2,988.7** | **125.7** | **152.0** | **180.1** |
+| Qwen3.6 35B Balanced | 150K | **1,213.5** | **65.1** | **70.5** | **78.0** |
 
 ### Same-host Strata v0.1.44.1 comparison (2026-10-15)
 

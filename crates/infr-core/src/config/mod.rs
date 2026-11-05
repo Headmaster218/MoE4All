@@ -365,6 +365,9 @@ cfg_struct! {
 
         /// `INFR_NO_GEMM_WARP` (inverted).
         gemm_warp: bool = true,
+        /// `INFR_NO_NARROW_F32_GEMV` (inverted). Expand measured Q8_0/BF16 narrow
+        /// projections once per chunk, then use batched F32 GEMV on qualified Navi31.
+        narrow_f32_gemv: bool = true,
         /// `INFR_GEMM_WIDE_TILE`.
         gemm_wide_tile: bool = false,
         /// `INFR_GEMM_DIRECT_A` — fuse the store_f16 pass into the A_GLOBAL warp GEMM by
@@ -542,6 +545,15 @@ cfg_struct! {
         flash_dequant: bool = false,
         /// `INFR_NO_FLASH_WARP` (inverted).
         flash_warp: bool = true,
+        /// `INFR_AMDVLK_HD256_FLASH` — value-aware (empty or `0` turns it off). hd256 prefill on the AMD
+        /// proprietary driver (amdvlk / LLPC) uses the fused flash warp kernel. LLPC faults
+        /// (`0xc0000005` inside `vkCreateComputePipelines`, `amdvlk64.dll+0x2b65705`) when it
+        /// compiles that shader's FULLY-UNROLLED IR, so `attn_flash_warp_hd256.comp` now ships two
+        /// builds — the unrolled default and a `-DNO_UNROLL` twin — and the recorder gives amdvlk
+        /// the twin. Same math, same dispatch shape: the pick is only about which IR this compiler
+        /// can take. Set false to drop hd256 prefill back to the coopmat
+        /// `attn_qk`/`softmax`/`attn_pv` tier on a driver that still faults.
+        amdvlk_hd256_flash: bool = true,
         /// `INFR_NO_NC_FA` (inverted).
         nc_fa: bool = true,
         /// `INFR_NO_QK_WARP` (inverted).
@@ -602,7 +614,7 @@ cfg_struct! {
         iq4_pair_lut: bool = true,
         /// Packed Q3_K/Q6_K byte decode for measured BM32 expert MMQ shapes only.
         kquant_packed_decode: bool = true,
-        /// Six qualified Q8 BN128 Prefill tuples on measured Windows RX 7900 XTX.
+        /// Qualified Q8/Q6_K BN128 Prefill projections on measured Windows RX 7900 XTX.
         /// The original BM64 path remains the per-feature fallback.
         q8_prefill_bm128: bool = true,
         /// Exact chronological QSA Top-K collection on measured devices.

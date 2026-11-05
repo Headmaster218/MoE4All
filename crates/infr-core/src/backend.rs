@@ -273,10 +273,10 @@ pub fn integrated_ubatch_rows(cu: u32) -> usize {
 /// Target GPU time for ONE submit, in nanoseconds — the budget the submit splitter aims at.
 ///
 /// The surveyed iGPU kills a submit at ~2.06 s (measured: a job submitted at T is ring-reset at
-/// T+2.06 s, and its fence is force-signaled so the wait even returns "successfully"). 250 ms
-/// leaves an ~8x margin, which absorbs the run-to-run jitter that made the un-split 2.05 s forward
+/// T+2.06 s, and its fence is force-signaled so the wait even returns "successfully"). 150 ms
+/// leaves a ~13x margin, which absorbs the run-to-run jitter that made the un-split 2.05 s forward
 /// a coin flip against that budget.
-pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
+pub const SUBMIT_BUDGET_NS: u64 = 150_000_000;
 
 /// Stable fallback cap on DISPATCHES PER SUBMIT. `0` = unlimited (never split).
 ///
@@ -285,7 +285,8 @@ pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 /// which are recorded once and therefore cannot follow a cap that changes during calibration.
 ///
 /// 128 comes from the surveyed 2-CU part: 757 dispatches ≈ 2.05 s ⇒ ~2.7 ms/dispatch ⇒ 128
-/// dispatches ≈ 0.35 s, inside [`SUBMIT_BUDGET_NS`] with room to spare. It is deliberately NOT
+/// dispatches ≈ 0.35 s, well below the measured ~2 s watchdog timeout. This fixed fallback is
+/// independent of the tighter calibrated [`SUBMIT_BUDGET_NS`] target. It is deliberately NOT
 /// scaled by CU count: a bigger iGPU takes proportionally more rows (`integrated_ubatch_rows`), so
 /// its per-dispatch cost lands in the same place, and the same dispatch count lands in the same
 /// segment time.
@@ -1159,7 +1160,7 @@ mod tests {
     #[test]
     fn submit_cap_tracks_measured_dispatch_cost() {
         // The surveyed 2-CU iGPU: 757 dispatches, ~2.05 s ⇒ ~2.7 ms/dispatch. The cap it yields
-        // must hold a segment inside the 250 ms budget...
+        // must hold a segment inside the 150 ms budget...
         let cap = submit_cap_from_measurement(2_050_000_000, 757);
         assert!(cap > 0, "a 2 s forward must be split");
         let ns_per_dispatch = 2_050_000_000u64 / 757;

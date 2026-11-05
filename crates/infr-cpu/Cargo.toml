@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+f32-gemm = ["dep:matrixmultiply"]
+f32-gemm-profile = ["f32-gemm"]
+
 [dependencies]
 infr-prof.workspace = true
 infr-prof-rt.workspace = true
@@ -15,6 +20,7 @@ half.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+matrixmultiply = { version = "0.3.11", optional = true, default-features = false, features = ["std", "avx512"] }
 
 [dev-dependencies]
 # The shared backend decode-parity harness (`tests/decode_parity.rs`).

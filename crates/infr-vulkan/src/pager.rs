@@ -58,7 +58,7 @@ use crate::transfer::{
 };
 use crate::unified::{
     ExpertSlotId, UnifiedAllocationHandle, UnifiedClaimPlan, UnifiedRange, UnifiedVramClass,
-    UnifiedVramPool,
+    UnifiedVramPool, UnitAllocationRequest, UnitAllocationSpan,
 };
 
 const MIB_F64: f64 = (1u64 << 20) as f64;
@@ -1642,15 +1642,76 @@ enum MoeArenaMode {
     PrefillLayer,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PrefillPlacement {
-    /// Index into the session-owned global-corridor lease table. Prefill kernels add their identity
-    /// expert id times the role's expert stride to this allocation's physical base address; Decode
-    /// pool numbering is deliberately bypassed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrefillBankSpan {
     allocation: usize,
+    first_expert: usize,
+    experts: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrefillBankPayload {
+    allocation: usize,
+    first_expert: usize,
+    experts: usize,
+    source_offset: usize,
+    bytes: usize,
+}
+
+/// Pack a layer's actual expert stride into the lane's capacity spans. A lane can alternate
+/// quantization formats; its reserved unit is the largest expert, not the current layer's stride.
+/// Each expert remains contiguous, and unused capacity is at the end of each span.
+fn prefill_bank_payloads(
+    spans: &[PrefillBankSpan],
+    stride: usize,
+    experts: usize,
+) -> Result<Vec<PrefillBankPayload>> {
+    if stride == 0 || experts == 0 {
+        return Err(be("Prefill bank needs a nonzero expert stride and count"));
+    }
+    let mut next = 0usize;
+    let mut payloads = Vec::with_capacity(spans.len());
+    for span in spans {
+        if next == experts {
+            break;
+        }
+        if span.first_expert != next || span.experts == 0 {
+            return Err(be(
+                "Prefill bank spans do not cover consecutive whole experts",
+            ));
+        }
+        let count = span.experts.min(experts - next);
+        let source_offset = next
+            .checked_mul(stride)
+            .ok_or_else(|| be("Prefill bank source offset overflow"))?;
+        let bytes = count
+            .checked_mul(stride)
+            .ok_or_else(|| be("Prefill bank payload size overflow"))?;
+        payloads.push(PrefillBankPayload {
+            allocation: span.allocation,
+            first_expert: next,
+            experts: count,
+            source_offset,
+            bytes,
+        });
+        next = next
+            .checked_add(count)
+            .ok_or_else(|| be("Prefill bank expert count overflow"))?;
+    }
+    if next != experts {
+        return Err(be("Prefill bank spans cannot hold every expert"));
+    }
+    Ok(payloads)
+}
+
+#[derive(Clone, Debug)]
+struct PrefillPlacement {
+    /// Whole-expert runs in the session's lease table. The existing paged kernels read each
+    /// expert's absolute address from the LUT, so a bank need not share one physical base.
+    spans: Arc<[PrefillBankSpan]>,
     /// Dynamic whole-layer streaming lane. Every Prefill layer is streamed; there is no resident
-    /// subset competing with the ring. Physical arenas may be discontiguous, but one lane is a
-    /// complete contiguous per-pool range and this index is global across all pools.
+    /// subset competing with the ring. A complete lane may use several shards; this index is
+    /// global across all pools.
     lane: usize,
     layer_base: u32,
 }
@@ -1668,21 +1729,35 @@ pub(crate) struct PrefillCopyJob {
     buf_id: usize,
     transfer_plan: Arc<SessionTransferPlan>,
     copies: Vec<PrefillCopy>,
+    /// Keep ownership, not only the physical buffer, until every upload has completed. A phase
+    /// transition must not recycle these ranges while a detached producer still writes them.
+    _allocations: Vec<Arc<UnifiedAllocationHandle>>,
 }
 
 enum PrefillCopy {
     Memory {
+        bank: usize,
         src: usize,
         len: usize,
         target: DeviceTransferTarget,
+        _owner: Arc<AlignedHostBuffer>,
     },
     Tiered {
+        bank: usize,
         host: Arc<InclusiveHostCache>,
         block_base: BlockId,
         n_blocks: usize,
         block_bytes: usize,
         target: DeviceTransferTarget,
     },
+}
+
+impl PrefillCopy {
+    fn bank(&self) -> usize {
+        match self {
+            Self::Memory { bank, .. } | Self::Tiered { bank, .. } => *bank,
+        }
+    }
 }
 
 impl PrefillCopyJob {
@@ -1704,7 +1779,13 @@ impl PrefillCopyJob {
         }
         for copy in self.copies {
             match copy {
-                PrefillCopy::Memory { src, len, target } => {
+                PrefillCopy::Memory {
+                    src,
+                    len,
+                    target,
+                    _owner,
+                    ..
+                } => {
                     let src = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
                     self.transfer_plan.copy_on_host_worker(src, &target)?;
                 }
@@ -1714,6 +1795,7 @@ impl PrefillCopyJob {
                     n_blocks,
                     block_bytes,
                     target,
+                    ..
                 } => {
                     let len = n_blocks
                         .checked_mul(block_bytes)
@@ -1739,19 +1821,17 @@ impl PrefillCopyJob {
         executor: &BackgroundTransferExecutor,
     ) -> Result<Option<u64>> {
         let mut prepared = PreparedTransfer::default();
+        self.prepare_memory_copies(executor, &self.copies, &mut prepared)?;
         for copy in self.copies {
             match copy {
-                PrefillCopy::Memory { src, len, target } => {
-                    let src = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
-                    self.transfer_plan
-                        .prepare_upload(executor, src, &target, &mut prepared)?;
-                }
+                PrefillCopy::Memory { .. } => {}
                 PrefillCopy::Tiered {
                     host,
                     block_base,
                     n_blocks,
                     block_bytes,
                     target,
+                    ..
                 } => {
                     let len = n_blocks
                         .checked_mul(block_bytes)
@@ -1759,9 +1839,12 @@ impl PrefillCopyJob {
                     if len != target.len() {
                         return Err(be("moe pager: tiered Prefill target size mismatch"));
                     }
-                    self.transfer_plan.fill_on_host_worker(&target, |bytes| {
-                        host.materialize_stream(block_base, n_blocks, block_bytes, bytes)
-                    })?;
+                    self.transfer_plan.prepare_fill(
+                        executor,
+                        &target,
+                        |bytes| host.materialize_stream(block_base, n_blocks, block_bytes, bytes),
+                        &mut prepared,
+                    )?;
                 }
             }
         }
@@ -1773,32 +1856,62 @@ impl PrefillCopyJob {
     }
 
     pub(crate) fn execute<E: TransferExecutor>(self, executor: &E) -> Result<()> {
-        for copy in self.copies {
-            match copy {
-                PrefillCopy::Memory { src, len, target } => {
-                    let src = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
-                    self.transfer_plan.upload_now(executor, src, &target)?;
-                }
-                PrefillCopy::Tiered {
+        // Nonmapped devices stage at most one logical bank, as before segmentation. All of
+        // that bank's spans share one completion; fragmentation never adds a wait per span.
+        for copies in self
+            .copies
+            .chunk_by(|left, right| left.bank() == right.bank())
+        {
+            let mut prepared = PreparedTransfer::default();
+            self.prepare_memory_copies(executor, copies, &mut prepared)?;
+            for copy in copies {
+                if let PrefillCopy::Tiered {
                     host,
                     block_base,
                     n_blocks,
                     block_bytes,
                     target,
-                } => {
+                    ..
+                } = copy
+                {
                     let len = n_blocks
-                        .checked_mul(block_bytes)
+                        .checked_mul(*block_bytes)
                         .ok_or_else(|| be("moe pager: tiered Prefill bank byte size overflow"))?;
                     if len != target.len() {
                         return Err(be("moe pager: tiered Prefill target size mismatch"));
                     }
-                    self.transfer_plan.fill_now(executor, &target, |bytes| {
-                        host.materialize_stream(block_base, n_blocks, block_bytes, bytes)
-                    })?;
+                    self.transfer_plan.prepare_fill(
+                        executor,
+                        target,
+                        |bytes| {
+                            host.materialize_stream(*block_base, *n_blocks, *block_bytes, bytes)
+                        },
+                        &mut prepared,
+                    )?;
                 }
             }
+            prepared.complete_now(executor)?;
         }
         Ok(())
+    }
+
+    fn prepare_memory_copies<E: TransferExecutor>(
+        &self,
+        executor: &E,
+        copies: &[PrefillCopy],
+        prepared: &mut PreparedTransfer,
+    ) -> Result<()> {
+        let uploads = copies.iter().filter_map(|copy| match copy {
+            PrefillCopy::Memory {
+                src, len, target, ..
+            } => {
+                let bytes = unsafe { std::slice::from_raw_parts(*src as *const u8, *len) };
+                Some((bytes, target))
+            }
+            PrefillCopy::Tiered { .. } => None,
+        });
+        self.transfer_plan
+            .prepare_upload_batch(executor, uploads, prepared)
     }
 }
 
@@ -1942,8 +2055,8 @@ pub struct MoePagerSession {
     pub(crate) gpu_decode_owner: Option<Arc<GpuCopyBuffers>>,
     print_stats: bool,
     trace: Option<PagerTrace>,
-    /// Physical interpretation of every pool arena. Prefill owns slot 0..n_expert as one
-    /// contiguous layer bank; decode restores the ordinary expert-LRU interpretation.
+    /// Physical interpretation of every pool arena. Prefill owns complete layer banks addressed
+    /// by an expert LUT; Decode restores the ordinary expert-LRU interpretation.
     mode: MoeArenaMode,
     /// Complete layer currently occupying each dynamic Prefill lane. Layer-major Prefill invokes
     /// the same layer once per microbatch chunk; those later chunks reuse the first upload.
@@ -1960,8 +2073,8 @@ pub struct MoePagerSession {
     prefill_placement: HashMap<usize, PrefillPlacement>,
     prefill_layers: Vec<PrefillLayerPlacement>,
     prefill_loaded: HashSet<usize>,
-    /// Physical lane-bank leases in the frozen middle corridor. All registered layers assigned to
-    /// the same lane/bank share one entry; dropping this vector releases the whole Prefill phase.
+    /// Physical lane-bank span leases. All layers assigned to one lane/bank reuse its spans;
+    /// producer jobs retain the same leases until their uploads complete.
     prefill_allocations: Vec<Arc<UnifiedAllocationHandle>>,
 }
 
@@ -2932,6 +3045,51 @@ impl MoePagerSession {
         Ok(layers)
     }
 
+    /// Price reusable lane banks in whole-expert capacity units. A smaller-stride layer packs
+    /// its payload at the start of each span; it never inherits another layer's element stride.
+    fn prefill_unit_requests(
+        &self,
+        layers: &[PrefillLayer],
+        lanes: usize,
+    ) -> Result<(Vec<UnitAllocationRequest>, Vec<Vec<usize>>)> {
+        let mut capacities: Vec<Vec<(usize, usize)>> = vec![Vec::new(); lanes];
+        for (layer, (_, banks, _)) in layers.iter().enumerate() {
+            let lane = &mut capacities[layer % lanes];
+            lane.resize(lane.len().max(banks.len()), (0, 0));
+            for (bank, &(buf_id, _, _, _)) in banks.iter().enumerate() {
+                let source = &self
+                    .sources
+                    .get(&buf_id)
+                    .ok_or_else(|| be("Prefill capacity references an unregistered bank"))?
+                    .2;
+                if source.stride_bytes == 0
+                    || !source.bank_bytes.is_multiple_of(source.stride_bytes)
+                {
+                    return Err(be("Prefill bank is not a whole number of experts"));
+                }
+                lane[bank].0 = lane[bank].0.max(source.stride_bytes);
+                lane[bank].1 = lane[bank].1.max(source.bank_bytes / source.stride_bytes);
+            }
+        }
+        let mut requests = Vec::new();
+        let mut indices = Vec::with_capacity(lanes);
+        for lane in capacities {
+            let mut banks = Vec::with_capacity(lane.len());
+            for (unit_bytes, units) in lane {
+                if unit_bytes == 0 || units == 0 {
+                    return Err(be("Prefill lane contains an empty role bank"));
+                }
+                unit_bytes
+                    .checked_mul(units)
+                    .ok_or_else(|| be("Prefill lane capacity overflow"))?;
+                banks.push(requests.len());
+                requests.push(UnitAllocationRequest { unit_bytes, units });
+            }
+            indices.push(banks);
+        }
+        Ok((requests, indices))
+    }
+
     pub(crate) fn plan_prefill(&mut self, candidates: &[(usize, u64)]) -> Result<usize> {
         debug_assert!(candidates.windows(2).all(|pair| pair[0].0 >= pair[1].0));
         self.enter_decode();
@@ -2950,13 +3108,10 @@ impl MoePagerSession {
                 continue;
             }
             for lanes in (1..=self.prefill_target_lanes.min(layers.len()).max(1)).rev() {
-                let requested: Vec<_> = prefill_bank_sizes(&layers, lanes)
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let (requested, _) = self.prefill_unit_requests(&layers, lanes)?;
                 if self
                     .unified_pool
-                    .plan_owner_claim(&requested, UnifiedVramClass::Prefill, &[])
+                    .plan_unit_owner_claim(&requested, UnifiedVramClass::Prefill, &[])
                     .is_ok()
                 {
                     feasible.push((rows, lanes, reserve));
@@ -3012,8 +3167,8 @@ impl MoePagerSession {
         // Prefill addresses every bank directly, so its ring uses every phase-loanable range below
         // the runtime corridor rather than pretending each Decode size class is a separate
         // contiguous virtual arena. Live KV remains a blocker, but uncommitted future segmented-KV
-        // coordinates are available until their next growth boundary. Each bank stays inside one
-        // physical Vulkan shard; Gate/Up/Down may occupy unrelated shards.
+        // coordinates are available until their next growth boundary. Prefer the established
+        // contiguous layout, then let each role bank span physical gaps at expert boundaries.
         let requested_lanes = self.prefill_target_lanes.min(layers.len()).max(1);
         let mut chosen_layout = None;
         let mut last_error = None;
@@ -3021,8 +3176,11 @@ impl MoePagerSession {
         // and the empty exchange cells. `enter_decode` restores both before paging resumes.
         let protected_experts = Vec::new();
         for candidate_lanes in (1..=requested_lanes).rev() {
-            let lane_bank_bytes = prefill_bank_sizes(&layers, candidate_lanes);
-            let candidate_bytes = prefill_lane_bytes(&lane_bank_bytes);
+            let (requested, lane_bank_indices) =
+                self.prefill_unit_requests(&layers, candidate_lanes)?;
+            let candidate_bytes = requested.iter().try_fold(0u64, |sum, request| {
+                sum.checked_add(request.unit_bytes.checked_mul(request.units)? as u64)
+            });
             if candidate_bytes
                 .is_none_or(|bytes| bytes > self.unified_pool.prefill_loan_bytes() as u64)
             {
@@ -3036,15 +3194,7 @@ impl MoePagerSession {
                 continue;
             }
 
-            let mut requested = Vec::new();
-            let mut coordinates = Vec::new();
-            for (lane, banks) in lane_bank_bytes.iter().enumerate() {
-                for (bank, &bytes) in banks.iter().enumerate() {
-                    requested.push(bytes);
-                    coordinates.push((lane, bank));
-                }
-            }
-            let plan = match self.unified_pool.plan_owner_claim(
+            let plan = match self.unified_pool.plan_unit_owner_claim(
                 &requested,
                 UnifiedVramClass::Prefill,
                 &protected_experts,
@@ -3053,7 +3203,7 @@ impl MoePagerSession {
                 Err(error) => {
                     tracing::debug!(
                         candidate_lanes,
-                        requested_bytes = requested.iter().copied().sum::<usize>(),
+                        requested_bytes = ?candidate_bytes,
                         requested_ranges = requested.len(),
                         error = %error,
                         "[moe-prefill] candidate unified claim failed"
@@ -3062,13 +3212,27 @@ impl MoePagerSession {
                     continue;
                 }
             };
-            let retired = plan.victims().len();
-            let allocations = match self.commit_unified_claim(executor, plan) {
+            let retired = plan.claim.victims().len();
+            let mut bank_spans = vec![Vec::new(); requested.len()];
+            for UnitAllocationSpan {
+                request,
+                first_unit,
+                units,
+                allocation,
+            } in plan.spans
+            {
+                bank_spans[request].push(PrefillBankSpan {
+                    allocation,
+                    first_expert: first_unit,
+                    experts: units,
+                });
+            }
+            let allocations = match self.commit_unified_claim(executor, plan.claim) {
                 Ok(allocations) => allocations,
                 Err(error) => {
                     tracing::debug!(
                         candidate_lanes,
-                        requested_bytes = requested.iter().copied().sum::<usize>(),
+                        requested_bytes = ?candidate_bytes,
                         requested_ranges = requested.len(),
                         error = %error,
                         "[moe-prefill] candidate physical allocation failed"
@@ -3077,24 +3241,23 @@ impl MoePagerSession {
                     continue;
                 }
             };
-            debug_assert_eq!(allocations.len(), coordinates.len());
-            let mut lane_bank_allocations: Vec<Vec<usize>> = lane_bank_bytes
-                .iter()
-                .map(|banks| vec![usize::MAX; banks.len()])
+            let bank_spans: Vec<Arc<[PrefillBankSpan]>> = bank_spans
+                .into_iter()
+                .map(|mut spans| {
+                    spans.sort_unstable_by_key(|span| span.first_expert);
+                    Arc::from(spans)
+                })
                 .collect();
-            for (allocation, (lane, bank)) in coordinates.into_iter().enumerate() {
-                lane_bank_allocations[lane][bank] = allocation;
-            }
             chosen_layout = Some((
                 candidate_lanes,
-                lane_bank_allocations,
-                lane_bank_bytes,
+                lane_bank_indices,
+                bank_spans,
                 allocations,
                 retired,
             ));
             break;
         }
-        let (actual_lanes, lane_bank_allocations, lane_bank_bytes, allocations, retired_slots) =
+        let (actual_lanes, lane_bank_indices, bank_spans, allocations, retired_slots) =
             chosen_layout.ok_or_else(|| {
                 be(format!(
                     "moe pager: no complete Prefill streaming lane fits the fixed corridor{}",
@@ -3109,16 +3272,13 @@ impl MoePagerSession {
         for (layer_idx, (layer_base, banks, _)) in layers.into_iter().enumerate() {
             let lane = layer_idx % actual_lanes;
             let mut bank_ids = Vec::with_capacity(banks.len());
-            for (bank, (buf_id, _source_pool, _host_bank_offset, bank_bytes)) in
+            for (bank, (buf_id, _source_pool, _host_bank_offset, _bank_bytes)) in
                 banks.into_iter().enumerate()
             {
-                if bank_bytes > lane_bank_bytes[lane][bank] {
-                    return Err(be("moe pager: Prefill bank exceeds its dynamic lane"));
-                }
                 self.prefill_placement.insert(
                     buf_id,
                     PrefillPlacement {
-                        allocation: lane_bank_allocations[lane][bank],
+                        spans: Arc::clone(&bank_spans[lane_bank_indices[lane][bank]]),
                         lane,
                         layer_base,
                     },
@@ -3138,9 +3298,11 @@ impl MoePagerSession {
                 per_shard_ring_bytes[range.shard].saturating_add(range.len);
         }
         let ring_bytes: usize = per_shard_ring_bytes.iter().sum();
+        let fragmented_banks = bank_spans.iter().filter(|spans| spans.len() > 1).count();
+        let ring_spans = allocations.len();
         self.prefill_allocations = allocations;
         tracing::info!(
-            "[moe-prefill] target_lanes={} actual_lanes={} resident_layers=0/{} streamed_layer_max={} ring_bytes={} retired_expert_slots={} per_shard_ring_bytes={:?}",
+            "[moe-prefill] target_lanes={} actual_lanes={} resident_layers=0/{} streamed_layer_max={} ring_bytes={} retired_expert_slots={} per_shard_ring_bytes={:?} fragmented_banks={} ring_spans={}",
             requested_lanes,
             actual_lanes,
             self.prefill_layers.len(),
@@ -3148,6 +3310,8 @@ impl MoePagerSession {
             ring_bytes,
             retired_slots,
             per_shard_ring_bytes,
+            fragmented_banks,
+            ring_spans,
         );
         Ok(())
     }
@@ -3198,10 +3362,11 @@ impl MoePagerSession {
         if self.layer_bank_current(buf_id)? || self.layer_bank_pending(buf_id)? {
             return Ok(None);
         }
-        let placement = *self
+        let placement = self
             .prefill_placement
             .get(&buf_id)
-            .ok_or_else(|| be("moe pager: no prefill placement for registered buffer"))?;
+            .ok_or_else(|| be("moe pager: no prefill placement for registered buffer"))?
+            .clone();
         let banks = self
             .prefill_layers
             .iter()
@@ -3209,8 +3374,9 @@ impl MoePagerSession {
             .map(|layer| layer.banks.clone())
             .ok_or_else(|| be("moe pager: async layer missing from prefill layout"))?;
         let mut copies = Vec::with_capacity(banks.len());
+        let mut retained = Vec::new();
         for bank_id in banks {
-            let bank_placement = *self
+            let bank_placement = self
                 .prefill_placement
                 .get(&bank_id)
                 .ok_or_else(|| be("moe pager: async layer bank has no Prefill placement"))?;
@@ -3218,43 +3384,63 @@ impl MoePagerSession {
                 .sources
                 .get(&bank_id)
                 .ok_or_else(|| be("moe pager: async layer bank source disappeared"))?;
-            let allocation = self
-                .prefill_allocations
-                .get(bank_placement.allocation)
-                .ok_or_else(|| be("moe pager: Prefill bank allocation disappeared"))?;
-            let range = allocation.range();
-            if source.bank_bytes > range.len {
-                return Err(be("moe pager: Prefill bank exceeds its corridor lease"));
-            }
-            let target = DeviceTransferTarget::new(
-                allocation.buffer_arc(),
-                range.offset,
-                source.bank_bytes,
+            let payloads = prefill_bank_payloads(
+                &bank_placement.spans,
+                source.stride_bytes,
+                source.bank_bytes / source.stride_bytes,
             )?;
-            if let Some(host_chunk) = source.host_chunk {
-                let src = self.host_store[host_chunk]
-                    .range(source.host_offset, source.bank_bytes)
-                    .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
-                copies.push(PrefillCopy::Memory {
-                    src: src.as_ptr() as usize,
-                    len: src.len(),
-                    target,
-                });
-            } else {
-                // Prefill may pack this bank into a different GPU arena pool, but its block
-                // descriptors remain registered in the original size-class host pool.
-                let host = self.pools[*source_pool]
-                    .host
-                    .as_ref()
-                    .ok_or_else(|| be("moe pager: tiered Prefill bank has no host reader"))?;
-                let n_blocks = source.bank_bytes / source.stride_bytes;
-                copies.push(PrefillCopy::Tiered {
-                    host: Arc::clone(host),
-                    block_base: source.block_base,
-                    n_blocks,
-                    block_bytes: source.stride_bytes,
-                    target,
-                });
+            for payload in payloads {
+                let allocation = self
+                    .prefill_allocations
+                    .get(payload.allocation)
+                    .ok_or_else(|| be("moe pager: Prefill bank allocation disappeared"))?;
+                let range = allocation.range();
+                if payload.bytes > range.requested_len {
+                    return Err(be("moe pager: Prefill span exceeds its corridor lease"));
+                }
+                let target = DeviceTransferTarget::new(
+                    allocation.buffer_arc(),
+                    range.offset,
+                    payload.bytes,
+                )?;
+                retained.push(Arc::clone(allocation));
+                if let Some(host_chunk) = source.host_chunk {
+                    let offset = source
+                        .host_offset
+                        .checked_add(payload.source_offset)
+                        .ok_or_else(|| be("moe pager: Prefill host source offset overflow"))?;
+                    let src = self.host_store[host_chunk]
+                        .range(offset, payload.bytes)
+                        .ok_or_else(|| be("moe pager: async Prefill source range out of bounds"))?;
+                    copies.push(PrefillCopy::Memory {
+                        bank: bank_id,
+                        src: src.as_ptr() as usize,
+                        len: src.len(),
+                        target,
+                        _owner: Arc::clone(&self.host_store[host_chunk].bytes),
+                    });
+                } else {
+                    // Block ids stay in the source size-class store even when destination
+                    // spans live on unrelated shards or use a larger lane capacity stride.
+                    let host = self.pools[*source_pool]
+                        .host
+                        .as_ref()
+                        .ok_or_else(|| be("moe pager: tiered Prefill bank has no host reader"))?;
+                    let first = u32::try_from(payload.first_expert)
+                        .map_err(|_| be("moe pager: Prefill source expert id exceeds u32"))?;
+                    let block_base = source
+                        .block_base
+                        .checked_add(first)
+                        .ok_or_else(|| be("moe pager: Prefill source block id overflow"))?;
+                    copies.push(PrefillCopy::Tiered {
+                        bank: bank_id,
+                        host: Arc::clone(host),
+                        block_base,
+                        n_blocks: payload.experts,
+                        block_bytes: source.stride_bytes,
+                        target,
+                    });
+                }
             }
         }
 
@@ -3269,11 +3455,12 @@ impl MoePagerSession {
             buf_id,
             transfer_plan: Arc::clone(&self.transfer_plan),
             copies,
+            _allocations: retained,
         }))
     }
 
     pub(crate) fn complete_prefill_layer_cpu(&mut self, buf_id: usize) -> Result<()> {
-        let placement = *self
+        let placement = self
             .prefill_placement
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: completed layer has no Prefill placement"))?;
@@ -3288,8 +3475,43 @@ impl MoePagerSession {
         self.mark_layer_bank_current(buf_id)
     }
 
+    /// A drained producer failed before publishing the complete layer. Keep its leases, but
+    /// remove the pending marker so a later attempt can upload the entire lane again.
+    pub(crate) fn abort_prefill_layer_cpu(&mut self, buf_id: usize) {
+        let Some(placement) = self.prefill_placement.get(&buf_id) else {
+            return;
+        };
+        let lane = placement.lane;
+        if self.prefill_lane_layer[lane] != Some(placement.layer_base) {
+            return;
+        }
+        self.prefill_lane_layer[lane] = None;
+        self.prefill_loaded.retain(|id| {
+            self.prefill_placement
+                .get(id)
+                .is_none_or(|other| other.lane != lane)
+        });
+    }
+
+    /// Call only after the uploader is joined. Resolve cancelled/unreported pending jobs without
+    /// discarding any completely uploaded lane or returning leases still held by compute.
+    pub(crate) fn abort_pending_prefill_layers_cpu(&mut self) {
+        let pending: Vec<_> = self
+            .prefill_placement
+            .iter()
+            .filter_map(|(&id, placement)| {
+                (self.prefill_lane_layer[placement.lane] == Some(placement.layer_base)
+                    && !self.prefill_loaded.contains(&id))
+                .then_some(id)
+            })
+            .collect();
+        for id in pending {
+            self.abort_prefill_layer_cpu(id);
+        }
+    }
+
     pub fn mark_layer_bank_current(&mut self, buf_id: usize) -> Result<()> {
-        let placement = *self
+        let placement = self
             .prefill_placement
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: no prefill placement for registered buffer"))?;
@@ -3317,8 +3539,13 @@ impl MoePagerSession {
             .prefill_placement
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: no prefill placement for registered buffer"))?;
+        if placement.spans.len() != 1 {
+            return Err(be(
+                "fragmented Prefill bank has no single byte offset; use its LUT",
+            ));
+        }
         self.prefill_allocations
-            .get(placement.allocation)
+            .get(placement.spans[0].allocation)
             .map(|allocation| allocation.range().offset)
             .ok_or_else(|| be("moe pager: Prefill allocation index is stale"))
     }
@@ -4063,13 +4290,17 @@ impl MoePagerSession {
         let job = self
             .prepare_prefill_layer_cpu(executor, buf_id)?
             .ok_or_else(|| be("moe pager: failed to prepare synchronous Prefill layer"))?;
-        job.execute(executor)?;
+        if let Err(error) = job.execute(executor) {
+            self.abort_prefill_layer_cpu(buf_id);
+            return Err(error);
+        }
         self.complete_prefill_layer_cpu(buf_id)?;
         Ok(true)
     }
 
-    /// Freeze the identity mapping used by whole-layer prefill. The dispatch base address points
-    /// directly at this role bank, so local expert id is also its physical slot.
+    /// Freeze absolute expert addresses for whole-layer Prefill. Every expert is contiguous, but
+    /// successive experts may belong to different physical shards. The kernel LUT format stays
+    /// identical to Decode and to the original single-range Prefill path.
     pub fn layer_lut_window(
         &mut self,
         tape_cursor: &mut usize,
@@ -4090,21 +4321,33 @@ impl MoePagerSession {
             .prefill_placement
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: layer LUT has no Prefill placement"))?;
-        let allocation = self
-            .prefill_allocations
-            .get(placement.allocation)
-            .ok_or_else(|| be("moe pager: layer LUT allocation disappeared"))?;
-        let range = allocation.range();
-        if source.bank_bytes > range.len {
-            return Err(be("moe pager: Prefill LUT bank exceeds its corridor lease"));
+        if n_expert != source.bank_bytes / source.stride_bytes {
+            return Err(be(
+                "moe pager: Prefill LUT expert count differs from its source",
+            ));
         }
-        let bank_addr = allocation.base_addr() + range.offset as u64;
+        let payloads = prefill_bank_payloads(&placement.spans, source.stride_bytes, n_expert)?;
         let mut addresses = Vec::with_capacity(n_expert);
-        for expert in 0..n_expert {
-            let offset = expert
-                .checked_mul(source.stride_bytes)
-                .ok_or_else(|| be("moe pager: Prefill expert address overflow"))?;
-            addresses.push(bank_addr + offset as u64);
+        for payload in payloads {
+            let allocation = self
+                .prefill_allocations
+                .get(payload.allocation)
+                .ok_or_else(|| be("moe pager: layer LUT allocation disappeared"))?;
+            let range = allocation.range();
+            if payload.bytes > range.requested_len {
+                return Err(be("moe pager: Prefill LUT span exceeds its corridor lease"));
+            }
+            let bank_addr = allocation.base_addr() + range.offset as u64;
+            for expert in 0..payload.experts {
+                let offset = expert
+                    .checked_mul(source.stride_bytes)
+                    .ok_or_else(|| be("moe pager: Prefill expert address overflow"))?;
+                addresses.push(
+                    bank_addr
+                        .checked_add(offset as u64)
+                        .ok_or_else(|| be("moe pager: Prefill device address overflow"))?,
+                );
+            }
         }
         let base = as_vk_buf(self.tape.as_ref())?
             .mapped_ptr()
@@ -4341,8 +4584,8 @@ impl MoePagerSession {
         Ok(&self.pools[*pool])
     }
 
-    /// The arena buffer `buf_id`'s pool dispatches against (callers gate on [`Self::is_paged`]
-    /// first — this errors on an unregistered buffer).
+    /// Representative physical arena for compatibility with dispatch metadata. In Prefill it is
+    /// the first span's shard, not a contiguous view of the whole bank; actual reads use the LUT.
     pub fn arena(&self, buf_id: usize) -> Result<&dyn Buffer> {
         if self.mode == MoeArenaMode::PrefillLayer {
             let placement = self
@@ -4351,34 +4594,26 @@ impl MoePagerSession {
                 .ok_or_else(|| be("moe pager: no Prefill placement for arena buffer"))?;
             return self
                 .prefill_allocations
-                .get(placement.allocation)
+                .get(placement.spans[0].allocation)
                 .map(|allocation| allocation.buffer())
                 .ok_or_else(|| be("moe pager: Prefill arena allocation disappeared"));
         }
         Ok(self.pool_of(buf_id)?.pager.arena_buffer())
     }
 
-    /// `buf_id`'s pool arena's 64-bit `VkDeviceAddress` — the base the paged kernels scale the LUT
-    /// slot index onto (`arena_addr + slot * slot_bytes`). Passed to the shader as a push constant.
+    /// Representative arena address retained in the paged push-constant ABI. Expert weights are
+    /// addressed by absolute pointers in the LUT, including when a Prefill bank spans shards.
     pub fn arena_addr(&self, buf_id: usize) -> Result<u64> {
         if self.mode == MoeArenaMode::PrefillLayer {
             let placement = self
                 .prefill_placement
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: no Prefill placement for arena address"))?;
-            let source = &self
-                .sources
-                .get(&buf_id)
-                .ok_or_else(|| be("moe pager: no Prefill source for arena address"))?
-                .2;
             let allocation = self
                 .prefill_allocations
-                .get(placement.allocation)
+                .get(placement.spans[0].allocation)
                 .ok_or_else(|| be("moe pager: Prefill arena allocation disappeared"))?;
             let range = allocation.range();
-            if source.bank_bytes > range.len {
-                return Err(be("moe pager: Prefill arena exceeds its corridor lease"));
-            }
             return Ok(allocation.base_addr() + range.offset as u64);
         }
         Ok(self.pool_of(buf_id)?.pager.arena_addr())
@@ -4790,6 +5025,10 @@ impl DensePagerSession {
 
 /// `VulkanBackend::dense_pager`'s field type — same locking story as [`MoePagerCell`].
 pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
+
+#[cfg(test)]
+#[path = "pager_prefill_fragmented_tests.rs"]
+mod prefill_fragmented_tests;
 
 #[cfg(test)]
 mod tests {

@@ -245,6 +245,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.i8_dot = presence_inv(get, "INFR_NO_I8DOT");
 
     v.gemm_warp = presence_inv(get, "INFR_NO_GEMM_WARP");
+    v.narrow_f32_gemv = presence_inv(get, "INFR_NO_NARROW_F32_GEMV");
     v.gemm_wide_tile = presence(get, "INFR_GEMM_WIDE_TILE");
     v.gemm_direct_a = presence(get, "INFR_GEMM_DIRECT_A");
     v.small_bm = presence_inv(get, "INFR_NO_SMALL_BM");
@@ -276,6 +277,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.flash_stage = presence(get, "INFR_FLASH_STAGE");
     v.flash_dequant = presence(get, "INFR_FLASH_DEQUANT");
     v.flash_warp = presence_inv(get, "INFR_NO_FLASH_WARP");
+    v.amdvlk_hd256_flash = flag(get, "INFR_AMDVLK_HD256_FLASH");
     v.nc_fa = presence_inv(get, "INFR_NO_NC_FA");
     v.qk_warp = presence_inv(get, "INFR_NO_QK_WARP");
     v.pv_warp = presence_inv(get, "INFR_NO_PV_WARP");

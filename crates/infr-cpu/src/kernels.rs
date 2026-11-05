@@ -6548,14 +6548,24 @@ pub(crate) fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
     s
 }
 
-/// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
-/// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `mul_add`
-/// fuses each lane's multiply+add into one FMA (numerics policy: llama.cpp's f32 dots are FMA
-/// too) — this fn is attention's QK score and the F32-weight GEMM fallbacks (e.g. DG's router).
+/// F32 dot with eight accumulation lanes. Runtime AVX2/FMA dispatch also works
+/// in portable x86-64 builds; the baseline must not depend on native CPU flags.
+/// The SIMD implementation preserves the scalar lane and reduction order.
 #[inline]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "dot: a and b must have equal length");
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: both target features are runtime checked. The leaf checks the
+        // full load width against min(a.len(),b.len()), including short/tail inputs.
+        return unsafe { dot_f32_avx2(a, b) };
+    }
+    dot_f32_scalar(a, b)
+}
+
+#[inline]
+fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
     let chunks = n / 8;
     let mut acc = [0f32; 8];
@@ -6570,6 +6580,82 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
         s = a[i].mul_add(b[i], s);
     }
     s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let n = a.len().min(b.len());
+    let mut sum = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        // SAFETY: eight readable elements in both slices, unaligned loads.
+        let av = _mm256_loadu_ps(a.as_ptr().add(i));
+        let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+        sum = _mm256_fmadd_ps(av, bv, sum);
+        i += 8;
+    }
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    let mut total = lanes.iter().sum::<f32>();
+    for j in i..n {
+        total = a[j].mul_add(b[j], total);
+    }
+    total
+}
+
+/// A weight row against multiple activation rows. Eight independent queries
+/// hide FMA dependency latency and share each weight load. Each query retains
+/// the scalar eight-lane accumulation order, including the horizontal sum.
+pub(crate) fn dot_f32_batch(weight: &[f32], xs: &[f32], in_f: usize, out: &mut [f32]) {
+    assert_eq!(weight.len(), in_f);
+    assert_eq!(xs.len(), in_f * out.len());
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        // SAFETY: checked ISA, exact matrix lengths; leaf bounds full loads.
+        unsafe { dot_f32_batch_avx2(weight, xs, in_f, out) };
+        return;
+    }
+    for (r, value) in out.iter_mut().enumerate() {
+        *value = dot_f32_scalar(weight, &xs[r * in_f..(r + 1) * in_f]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_batch_avx2(weight: &[f32], xs: &[f32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::{
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let mut r = 0;
+    while r + 8 <= out.len() {
+        let mut accum = [_mm256_setzero_ps(); 8];
+        let mut k = 0;
+        while k + 8 <= in_f {
+            let w = _mm256_loadu_ps(weight.as_ptr().add(k));
+            for j in 0..8 {
+                let x = _mm256_loadu_ps(xs.as_ptr().add((r + j) * in_f + k));
+                accum[j] = _mm256_fmadd_ps(w, x, accum[j]);
+            }
+            k += 8;
+        }
+        for j in 0..8 {
+            let mut lanes = [0f32; 8];
+            _mm256_storeu_ps(lanes.as_mut_ptr(), accum[j]);
+            let mut value = lanes.iter().sum::<f32>();
+            for tail in k..in_f {
+                value = weight[tail].mul_add(xs[(r + j) * in_f + tail], value);
+            }
+            out[r + j] = value;
+        }
+        r += 8;
+    }
+    for j in r..out.len() {
+        out[j] = dot_f32_avx2(weight, &xs[j * in_f..(j + 1) * in_f]);
+    }
 }
 
 /// Gated-FFN activation applied to the gate value.
@@ -6607,6 +6693,50 @@ mod kernel_tests {
     use crate::repack::{q4k_gemm_group, q4k_pack, q6k_gemm_group, q6k_pack};
     use infr_core::tensor::DType;
     use infr_gguf::dequant::{dequant_block, dequant_codebook};
+
+    #[test]
+    fn f32_dot_runtime_simd_matches_scalar_with_tails_and_unaligned_inputs() {
+        let seed = 0x123456789abcdef;
+        for n in [
+            0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129, 192, 384,
+            1025, 5632,
+        ] {
+            let a = det_x(n + 1, seed);
+            let b = det_x(n + 1, seed ^ 0xa5a5a5a5);
+            let (a, b) = (&a[1..], &b[1..]);
+            let expected = dot_f32_scalar(a, b);
+            assert_eq!(
+                dot(a, b).to_bits(),
+                expected.to_bits(),
+                "portable dispatch n={n}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let actual = unsafe { dot_f32_avx2(a, b) };
+                assert_eq!(actual.to_bits(), expected.to_bits(), "SIMD n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn f32_batch_matches_scalar_for_query_and_dimension_tails() {
+        for n in [0, 1, 7, 8, 9, 31, 32, 33, 96, 192, 385, 2816] {
+            for rows in [0, 1, 2, 7, 8, 9, 15, 16, 17, 33, 128] {
+                let w = det_x(n + 1, 1234);
+                let x = det_x(n * rows + 1, 4567);
+                let (w, x) = (&w[1..], &x[1..]);
+                let mut out = vec![0.; rows];
+                dot_f32_batch(w, x, n, &mut out);
+                for r in 0..rows {
+                    assert_eq!(
+                        out[r].to_bits(),
+                        dot_f32_scalar(w, &x[r * n..(r + 1) * n]).to_bits(),
+                        "n={n}, rows={rows}, r={r}"
+                    );
+                }
+            }
+        }
+    }
 
     fn lcg(seed: &mut u64) -> u64 {
         *seed = seed

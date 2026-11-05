@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+tts = ["dep:infr-tts", "infr-server/tts"]
+
 [[bin]]
 name = "infr"
 path = "src/main.rs"
@@ -18,6 +22,8 @@ infr-engine.workspace = true
 infr-embedding.workspace = true
 infr-vision.workspace = true
 infr-server.workspace = true
+infr-audio = { path = "../infr-audio" }
+infr-tts = { path = "../infr-tts", optional = true }
 infr-llama = { path = "../infr-llama" }
 clap.workspace = true
 clap_complete.workspace = true

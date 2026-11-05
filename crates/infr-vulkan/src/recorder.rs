@@ -46,6 +46,9 @@ mod segmented_attention_contract;
 #[cfg(test)]
 #[path = "flash_pv_reuse_contract.rs"]
 mod flash_pv_reuse_contract;
+#[cfg(test)]
+#[path = "hd256_flash_ports_contract.rs"]
+mod hd256_flash_ports_contract;
 
 #[cfg(test)]
 #[path = "g01_cold_state_contract.rs"]
@@ -584,6 +587,31 @@ pub(crate) fn q8_prefill_bm128_applies(
                 | (2560, 10240, 1024)
                 | (2560, 12288, 1024)
         )
+}
+
+/// Extend the original six Q8 tuples only to measured large projection shapes.
+/// BM128 writes complete row tiles: ragged Prefill tails must retain BM64.
+/// Windows RX 7900 XTX qualification and the existing A_GLOBAL debug overrides
+/// are supplied by the caller. No expert MMQ, small-M or BF16 routing changes.
+pub(crate) fn dense_prefill_bm128_applies(
+    enabled: bool,
+    measured: bool,
+    default_ag: bool,
+    dtype: infr_core::DType,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
+    if q8_prefill_bm128_applies(enabled, measured, default_ag, dtype, m, k, n) {
+        return true;
+    }
+    let min_rows = match (dtype, k, n) {
+        (infr_core::DType::Q8_0, 2560, 10240 | 12288)
+        | (infr_core::DType::Q8_0, 2048, 4096 | 8192) => 1024,
+        (infr_core::DType::Q6K, 2048, 4096 | 8192) => 2048,
+        _ => return false,
+    };
+    enabled && measured && default_ag && (min_rows..=12288).contains(&m) && m.is_multiple_of(128)
 }
 
 fn kquant_packed_applies(
@@ -3103,6 +3131,35 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        self.linear_f32_inner(arena_addr, None, x, y, rows, in_f, out_f);
+    }
+
+    /// Track the BDA weight read so expansion writes and scratch reuse are ordered.
+    pub(crate) fn linear_f32_tracked(
+        &self,
+        weight: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let addr = weight
+            .device_addr()
+            .expect("narrow F32 scratch requires BDA");
+        self.linear_f32_inner(addr, Some(weight), x, y, rows, in_f, out_f);
+    }
+
+    fn linear_f32_inner(
+        &self,
+        arena_addr: u64,
+        weight_track: Option<&dyn Buffer>,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
         let use_mrow = rows > 1 && self.vk().f32_mrow;
         let use_v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
@@ -3146,10 +3203,42 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            &[
+                Self::vkb(weight_track.unwrap_or(x)),
+                Self::vkb(x),
+                Self::vkb(y),
+            ],
             1,
             &push,
             groups,
+        );
+    }
+
+    /// Widen a bounded native slice. For resident weights binding 0 tracks the
+    /// source; streamed callers use their existing arena RAW/WAR barriers.
+    pub(crate) fn dequant_weight_f32(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_off: usize,
+        source_track: &dyn Buffer,
+        dst: &dyn Buffer,
+        elems: usize,
+    ) {
+        let (name, spv) = crate::gemm::weight_f32_build_spv(dtype)
+            .expect("narrow F32 policy requires a widening build");
+        let kernel = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(elems as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(w_off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(source_track), Self::vkb(dst)],
+            1,
+            &push,
+            (elems as u32).div_ceil(64),
         );
     }
 
@@ -3634,7 +3723,7 @@ impl<'a> Recorder<'a> {
     /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
     /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged. The Q8_0
-    /// N64 variant also accepts `n%64==0 && n%128!=0`; all other variants still require n%128.
+    /// and BF16 N64 variants also accept `n%64==0 && n%128!=0`; other variants require n%128.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_f16a(
         &self,
@@ -3710,8 +3799,9 @@ impl<'a> Recorder<'a> {
                 64,
             )
         };
-        // All six tuples have M%128==0 and production splits==1. No padding or split policy change.
-        let (name, bn, bm) = if q8_prefill_bm128_applies(
+        // Qualified shapes have M%128==0 and reach this unsplit A_GLOBAL path;
+        // the existing split policy and 64-row scratch padding remain unchanged.
+        let (name, bn, bm) = if dense_prefill_bm128_applies(
             self.vk().q8_prefill_bm128,
             self.be.prefers_q8_prefill_bm128(),
             self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
@@ -3720,7 +3810,12 @@ impl<'a> Recorder<'a> {
             k,
             n,
         ) {
-            ("native_gemm_warp_q8_0_n128_ag_bm128", 128, 128)
+            (
+                crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype)
+                    .expect("qualified BM128 dtype"),
+                128,
+                128,
+            )
         } else {
             (name, bn, bm)
         };
@@ -7312,13 +7407,20 @@ impl<'a> Recorder<'a> {
         let n_splits =
             flash_split_count(self.vk().flash_splits, base_wg, kv_len, prefer_deep_splits);
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        let kp = self.be.kernel_sg(
-            "attn_flash_warp_hd256_bm16",
-            crate::gemm::attn_flash_warp_hd256_bm16_spv(),
-            6,
-            32,
-            32,
-        );
+        // LLPC (amdvlk) faults on this kernel's FULLY-UNROLLED IR; the `-DNO_UNROLL` twin compiles
+        // and runs there, while conforming drivers keep the unrolled build. Same math either way.
+        let (hd256_name, hd256_spv) = if self.be.is_amd_proprietary_driver() {
+            (
+                "attn_flash_warp_hd256_bm16_nounroll",
+                crate::gemm::attn_flash_warp_hd256_bm16_nounroll_spv(),
+            )
+        } else {
+            (
+                "attn_flash_warp_hd256_bm16",
+                crate::gemm::attn_flash_warp_hd256_bm16_spv(),
+            )
+        };
+        let kp = self.be.kernel_sg(hd256_name, hd256_spv, 6, 32, 32);
         let mut pp = [0u8; 32];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());

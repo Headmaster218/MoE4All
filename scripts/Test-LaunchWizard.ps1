@@ -91,13 +91,19 @@ function New-ModelFixture {
     } finally { $writer.Dispose() }
 }
 function Test-Flow {
-    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Check)
+    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Check, [switch]$Dashboard, [string]$DashboardKey = '')
     $script:Saved = $Saved
+    $script:DashboardAccepted = [bool]$Dashboard
+    $script:DashboardApiKey = $DashboardKey
+    $script:DashboardPendingPrompted = $false
     $script:Answers = [System.Collections.Generic.Queue[string]]::new()
     foreach ($value in $Inputs) { $script:Answers.Enqueue($value) }
     $script:Events = [System.Collections.Generic.List[string]]::new()
     $script:Output = [System.Collections.Generic.List[string]]::new()
     $repoRoot = $testRoot
+    $dataDir = Join-Path $testRoot 'gui-data'
+    $statePath = Join-Path $dataDir 'wizard-state.json'
+    $DryRun = $true
     $guiStatePath = Join-Path $testRoot 'no-gui-state.json'
     $infrPath = Join-Path $testRoot 'never-run.exe'
     $InitialModelPath = $InitialPath
@@ -163,10 +169,11 @@ try {
 
     Assert ($source.IndexOf('Show-UpdateStatus -CurrentVersion $productVersion') -lt $start) 'Update must precede saved launch'
     Test-UpdateAction 'update skipped by Enter' @('') 'skip'
-    Test-UpdateAction 'explicit update still available' @('2') 'update'
+    Test-UpdateAction 'explicit update still available' @('1') 'update'
+    Test-UpdateAction 'three-day update reminder' @('3') 'snooze'
     Test-UpdateAction 'invalid update input reprompts' @('bad', '') 'skip'
-    function Show-EngineReleaseNotes { param($Release) [void]$script:Events.Add('release notes') }
-    Test-UpdateAction 'release notes then skip' @('1', '') 'skip'
+    function Open-EngineReleaseNotes { param($Release) [void]$script:Events.Add('release notes') }
+    Test-UpdateAction 'release notes then skip' @('R', '') 'skip'
 
     Test-Flow 'fresh chat defaults' -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'run') 'Expected chat'
@@ -193,13 +200,13 @@ try {
         Assert ('kernels.vulkan.cpu_miss_max=2' -in $nativeArgs) 'Saved CPU miss limit lost'
     }
     $script:CpuTopology = [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true }
-    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', $model, '', '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', '', '', '', 'n', $model, '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'serve' -and 'device.auto_profile=aggressive' -in $nativeArgs) 'Expected aggressive API'
         Assert ($state.server_parallel -eq '3' -and $state.context -eq '100k') 'Parallel/context prompts shifted'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Cache must default to the install directory'
         Assert ('serve.api_key=' -in $nativeArgs) 'Explicit no-auth override lost'
     }
-    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', $model, '', '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', '', '', '', 'n', $model, '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
         Assert ($state.server_session_cache) 'Fresh API installs should enable SSD KV caching'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Default SSD KV cache path was not emitted'
     }
@@ -209,12 +216,12 @@ try {
         }
         Assert ($state.context -eq '20k') 'Manual context should be asked once at the common step'
     }
-    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', $model, 'y', $aux, 'y', $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '') -Check {
+    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', '', 'y', '', 'n', $model, 'y', $aux, $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '') -Check {
         foreach ($value in @('spec.mtp=false', '--mmproj', '--embedding-model')) {
             Assert ($value -in $nativeArgs) "Missing auxiliary setting $value"
         }
         Assert ($state.embedding_idle_timeout -eq '17') 'Auxiliary settings changed'
-        $order = @('Enable image understanding', 'Also serve the Embedding', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
+        $order = @('Enable the language model API', 'Enable the Embedding API', 'Enable the local transcription API', 'Enable image understanding', 'GGUF file or directory', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
         $previous = -1
         foreach ($pattern in $order) {
             $position = -1
@@ -553,6 +560,14 @@ try {
     Assert (($nativeFailure.Output -join "`n") -match 'not logged in') 'Native stderr was not captured for diagnostics'
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS native stderr does not terminate wizard'
+    $nativeSuccess = Invoke-NativeCommandResult -Executable (Join-Path $PSHOME 'powershell.exe') -Arguments @(
+        '-NoLogo','-NoProfile','-NonInteractive','-Command',
+        '[Console]::Out.WriteLine(''MACHINE_RESULT''); [Console]::Error.WriteLine(''fixture warning''); exit 0'
+    )
+    Assert ($nativeSuccess.ExitCode -eq 0 -and ($nativeSuccess.Output -join '') -eq 'MACHINE_RESULT') 'Successful machine output contains stderr diagnostics'
+    Assert (($nativeSuccess.ErrorOutput -join '') -match 'fixture warning') 'Successful stderr diagnostics were lost'
+    $script:Passed++
+    Microsoft.PowerShell.Utility\Write-Host 'PASS machine-readable native output excludes stderr'
     function Offer-BenchmarkUpload { throw 'fixture upload failure' }
     $uploadFailureEscaped = $false
     try { Invoke-BenchmarkUploadSafely -Path $fixtureSubmissionPath } catch { $uploadFailureEscaped = $true }
@@ -577,7 +592,7 @@ try {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model) 'Missing model should not launch directly'
         Assert (@($script:Events | Where-Object { $_ -match 'Start with the previous settings' }).Count -eq 0) 'Missing model should not offer direct launch'
     }
-    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', $model, 'y', $aux, 'n', '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', '', 'n', '', 'n', $model, 'y', $aux, '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
         Assert ($state.server_parallel -eq '1' -and $state.server_session_cache) 'Vision serving should keep SSD KV caching available'
     }
     $script:Saved = $null
@@ -640,8 +655,8 @@ try {
     $catalog = @(Get-RecommendedModelCatalog)
     $flashBundle = @($catalog | Where-Object { $_.Id -eq 'flashnext-427' })[0]
     $embeddingBundle = @($catalog | Where-Object { $_.Id -eq 'qwen3-embedding-06b-q8' })[0]
-    Assert ($catalog.Count -eq 4 -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain only main, vision and embedding downloads'
-    Assert (@($flashBundle.Files).Count -eq 33 -and $flashBundle.Primary -match '00001-of-00033') 'FlashNext shard catalog is incomplete'
+    Assert ($catalog.Count -eq 6 -and ($catalog.Kind -contains 'audio') -and ($catalog.Kind -contains 'speech') -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain main, vision, embedding and audio downloads'
+    Assert (@($flashBundle.Files).Count -eq 3 -and $flashBundle.Primary -match '00001-of-00003') 'FlashNext shard catalog is incomplete'
     Assert ($embeddingBundle.Files[0].Url -match 'Qwen3-Embedding-0\.6B-Q8_0\.gguf') 'Embedding direct download URL is missing'
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS recommended download catalog'
@@ -764,6 +779,20 @@ try {
         $script:Passed++
         Microsoft.PowerShell.Utility\Write-Host "PASS $kind recommendation then path selection"
     }
+    Test-Flow -Name 'dashboard API handoff skips interviews and keeps key ephemeral' -Saved ([pscustomobject]@{launch_mode='server';setup_mode='aggressive';model=$model;server_parallel='8';server_auth=$true;server_addr='127.0.0.1:8080'}) -Inputs @() -Dashboard -DashboardKey 'DASHBOARD-EPHEMERAL-FIXTURE' -Check {
+        Assert ($nativeArgs[0] -eq 'serve' -and '8' -in $nativeArgs) 'Dashboard API settings lost'
+        Assert ($serverApiKey -eq 'DASHBOARD-EPHEMERAL-FIXTURE') 'Dashboard must use already entered key without another prompt'
+        Assert (($state|ConvertTo-Json -Depth 10) -notmatch 'DASHBOARD-EPHEMERAL-FIXTURE') 'Ephemeral key must not enter saved state'
+    }
+    Test-Flow -Name 'dashboard benchmark handoff keeps suite context and concurrency' -Saved ([pscustomobject]@{launch_mode='benchmark';setup_mode='conservative';model=$model;bench_kind='standard';bench_parallel='3';context='stale-not-used'}) -Inputs @() -Dashboard -Check {
+        Assert ($nativeArgs[0] -eq 'bench' -and '--suite' -in $nativeArgs -and '3' -in $nativeArgs) 'Dashboard benchmark plan lost'
+        Assert ('--ctx' -notin $nativeArgs) 'Dashboard benchmark must not inherit a general context window'
+    }
+    Test-Flow -Name 'dashboard audio-only handoff ignores LLM budgets' -Saved ([pscustomobject]@{launch_mode='server';server_llm_enabled=$false;server_embedding=$false;server_transcription=$true;transcription_model=$aux;model='missing-unused.gguf';device='Vulkan99';context='bad-unused';setup_mode='aggressive';server_addr='127.0.0.1:8080'}) -Inputs @() -Dashboard -Check {
+        Assert ($nativeArgs[0] -eq 'serve' -and '--transcription-model' -in $nativeArgs -and 'cpu' -in $nativeArgs) 'Audio-only dashboard server lost'
+        Assert ('--ctx' -notin $nativeArgs -and '--parallel' -notin $nativeArgs -and $nativeArgs -notcontains 'device.auto_profile=aggressive') 'Audio-only must not activate stale LLM allocation'
+    }
+    $script:DashboardAccepted=$false
     foreach ($scenario in @('dry', 'decline', 'reuse')) {
         $result = & powershell.exe -NoLogo -NoProfile -File $PSCommandPath -ChildFixture $scenario 2>&1 | Out-String
         $childExit = $LASTEXITCODE

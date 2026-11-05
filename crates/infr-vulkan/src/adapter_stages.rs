@@ -200,6 +200,7 @@ fn linear_scratch_requests(
             m,
             in_f,
             out_f,
+            w_off,
             ..
         } = op
         else {
@@ -207,6 +208,10 @@ fn linear_scratch_requests(
         };
         let (m, k, n) = (*m as usize, *in_f as usize, *out_f as usize);
         let dt = graph.desc(*weight).dtype;
+        if let Some(bytes) = narrow_projection_scratch(be_, dt, m, k, n, *w_off as usize) {
+            record_scratch_max(requests, "lin_w32", bytes);
+            continue;
+        }
         if m == 0 || k == 0 || n == 0 || k % 32 != 0 {
             continue;
         }
@@ -304,10 +309,22 @@ fn linear_scratch_requests(
             add("mmq_sact", m * (k / 32) * 2);
         }
         let mpad = m.div_ceil(64) * 64;
-        if warp
+        // A_GLOBAL `a16` reservation — mirrors `native_warp_gemm`'s `use_ag` exactly: the
+        // wide/n128 ag tile for n%128==0, and the BN=64 ag tile for n%64-but-not-128 widths
+        // (Qwen3.8's 320-wide HC/recurrent projections; Q8_0 already dispatches it, so the
+        // reservation was previously missing those shapes' buffers).
+        let use_ag = coop
+            && cfg.gemm_warp
+            && k.is_multiple_of(32)
+            && if n.is_multiple_of(128) {
+                crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
+            } else {
+                n.is_multiple_of(64)
+                    && crate::gemm::native_gemm_warp_n64_ag_kernel_name(dt).is_some()
+            };
+        if use_ag
             && !(cfg.gemm_direct_a
                 && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some())
-            && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
         {
             add("lin_a16", mpad * k * 2);
         }
@@ -339,6 +356,7 @@ fn small_moe_scratch_requests(
     for (index, op) in graph.ops.iter().enumerate() {
         let Op::MoeFfn {
             x,
+            router,
             ne,
             n_ff_exp,
             n_expert,
@@ -380,6 +398,13 @@ fn small_moe_scratch_requests(
             staging,
             paged_mmq_scratch_requests(be_, graph, op).is_none(),
         );
+        // The same Router route also serves paged experts. Its whole-row C tile must be priced
+        // before freezing a staged workspace, rather than allocating an unplanned tail later.
+        let logits_rows = moe_router_logits_rows(
+            rows,
+            moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, experts),
+        );
+        record_scratch_max(requests, "moe_paged_logits", logits_rows * experts * 4);
     }
     Ok(())
 }

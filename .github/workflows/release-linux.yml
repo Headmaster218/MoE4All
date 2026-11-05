@@ -82,7 +82,7 @@ jobs:
           cargo test --locked -p infr-vision --lib
           cargo test --locked -p infr-vision bundled_codecs -- --ignored
       - name: Build portable engine
-        run: cargo build --release --locked -p infr-cli
+        run: cargo build --release --locked -p infr-cli --features tts
       - name: Show sccache statistics
         if: always()
         run: sccache --show-stats

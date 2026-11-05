@@ -192,8 +192,8 @@ reset; model_path llm model <<< 'models' > "$tmp/model-choice"; [[ ${S[model]} =
 
 # The package-local catalog supports multi-select and returns to model choice
 # instead of selecting one downloaded model on the user's behalf.
-catalog_load flashnext-427; [[ $CATALOG_KIND == llm && $CATALOG_COUNT == 33 && $CATALOG_PRIMARY == *00001-of-00033.gguf ]]; pass
-catalog_file flashnext-427 33; [[ $DOWNLOAD_RELATIVE == *00033-of-00033.gguf && $DOWNLOAD_URL == https://huggingface.co/*/resolve/* ]]; pass
+catalog_load flashnext-427; [[ $CATALOG_KIND == llm && $CATALOG_COUNT == 3 && $CATALOG_PRIMARY == *00001-of-00003.gguf && $CATALOG_BYTES == 94525391424 ]]; pass
+catalog_file flashnext-427 3; [[ $DOWNLOAD_RELATIVE == *00003-of-00003.gguf && $DOWNLOAD_URL == https://huggingface.co/*/resolve/f5b0b790eebb89033c48091c26abf74c1b385940/* ]]; pass
 catalog_load qwen3-embedding-06b-q8; [[ $CATALOG_KIND == embedding && $CATALOG_PRIMARY == *Qwen3-Embedding-0.6B-Q8_0.gguf ]]; pass
 (
     download_bundle() {
@@ -472,10 +472,13 @@ S[setup_mode]=aggressive; S[vision_projector]="$ROOT/models/mmproj-flash.gguf"
 S[embedding_model]="$ROOT/models/mtp-flash.gguf"; S[server_parallel]=2
 configure > "$tmp/interactive-combined" <<'INPUT'
 
+y
+y
+n
+n
 
 y
 
-y
 
 
 

@@ -5848,6 +5848,12 @@ impl MetalBackend {
                         .into(),
                 ));
             }
+            Op::Relu { .. } | Op::DepthwiseConv1d { .. } => {
+                return Err(Error::Unsupported(format!(
+                    "Metal Op::{} is CPU-only; select CPU in the caller",
+                    op.kind()
+                )));
+            }
             Op::Rope2D { .. }
             | Op::QkNormMrope { .. }
             | Op::Dsv4Compress { .. }

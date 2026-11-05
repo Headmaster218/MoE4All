@@ -10,6 +10,8 @@ members = [
     "crates/infr-chat",
     "crates/infr-engine",
     "crates/infr-embedding",
+    "crates/infr-audio",
+    "crates/infr-tts",
     "crates/infr-server",
     "crates/infr-llama",
     "crates/infr-cli",
@@ -20,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Headmaster218/MoE4All"
@@ -36,6 +38,8 @@ infr-cpu = { path = "crates/infr-cpu" }
 infr-chat = { path = "crates/infr-chat" }
 infr-engine = { path = "crates/infr-engine" }
 infr-embedding = { path = "crates/infr-embedding" }
+infr-audio = { path = "crates/infr-audio" }
+infr-tts = { path = "crates/infr-tts" }
 infr-server = { path = "crates/infr-server" }
 infr-prof = { path = "crates/infr-prof" }
 infr-prof-rt = { path = "crates/infr-prof-rt" }
