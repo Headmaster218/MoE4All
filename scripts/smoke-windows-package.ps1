@@ -2,6 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$PackageRoot,
     [string]$ExpectedVersion = '',
+    [ValidateSet('console', 'window', 'both')][string]$RelaunchEntry = 'both',
+    [string]$UpdateTestDirectory = '',
     [switch]$SkipDependencyCheck,
     [switch]$SkipInteractiveDeviceChecks
 )
@@ -24,6 +26,7 @@ $requiredPaths = @(
     $updateHelperPath
     $manifestPath
     $launcherPath
+    (Join-Path $PackageRoot 'MoE4All Engine.exe')
     (Join-Path $PackageRoot 'README.md')
     (Join-Path $PackageRoot 'README_EN.md')
     (Join-Path $PackageRoot 'LICENSE')
@@ -44,11 +47,28 @@ if ($ExpectedVersion -and [string]$manifest.version -ne $ExpectedVersion) {
 $requiredManagedPaths = @(
     'infr.exe'
     'Start-INFR-Wizard.cmd'
+    'MoE4All Engine.exe'
     'scripts/infr-wizard.ps1'
+    'scripts/infr-dashboard.ps1'
+    'scripts/infr-dashboard-state.ps1'
+    'scripts/wizard-console.cs'
+    'scripts/wizard-desktop.cs'
+    'scripts/wizard-theme.cs'
+    'scripts/wizard-prompts.cs'
+    'scripts/wizard-runtime.cs'
+    'scripts/wizard-downloads.cs'
+    'scripts/wizard-markdown.cs'
+    'scripts/wizard-workspaces.cs'
+    'scripts/wizard-api-status.cs'
+    'scripts/wizard-runtime-bridge.ps1'
     'scripts/moe4all-update-common.ps1'
     'scripts/apply-engine-update.ps1'
 )
 $managedPaths = @($manifest.files | ForEach-Object { [string]$_.path })
+if ('Start-INFR-Wizard.exe' -in $managedPaths -or
+    (Test-Path -LiteralPath (Join-Path $PackageRoot 'Start-INFR-Wizard.exe'))) {
+    throw 'New Windows packages must ship MoE4All Engine.exe as the sole window launcher.'
+}
 foreach ($requiredManagedPath in $requiredManagedPaths) {
     if ($requiredManagedPath -notin $managedPaths) {
         throw "Install manifest does not own required file: $requiredManagedPath"
@@ -91,7 +111,20 @@ if ($ExpectedVersion -and $versionOutput -notmatch [regex]::Escape("infr $Expect
     throw "Expected infr $ExpectedVersion, got: $($versionOutput.Trim())"
 }
 
-$updateTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("moe4all-update-smoke-" + [guid]::NewGuid().ToString('N'))
+$entriesToTest = if ($RelaunchEntry -eq 'both') { @('console', 'window') } else { @($RelaunchEntry) }
+if ([string]::IsNullOrWhiteSpace($UpdateTestDirectory)) {
+    $testId = [DateTime]::Now.ToString('yyyyMMdd-HHmmss') + '-package-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $workRoot = if ([string]::IsNullOrWhiteSpace($env:MOE4ALL_WORK_ROOT)) {
+        $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+        Join-Path $repoRoot 'local-work'
+    } else {
+        $env:MOE4ALL_WORK_ROOT
+    }
+    $UpdateTestDirectory = Join-Path (Join-Path $workRoot 'staging\moe4all') ($testId + '\ota')
+}
+$UpdateTestDirectory = [System.IO.Path]::GetFullPath($UpdateTestDirectory)
+foreach ($entryToTest in $entriesToTest) {
+$updateTestRoot = Join-Path $UpdateTestDirectory ($entryToTest + '-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $updateTestRoot -Force | Out-Null
     $legacyPath = Join-Path $updateTestRoot 'legacy-managed.txt'
@@ -120,6 +153,10 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'kv-sessions\keep.bin'), 'kv', [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'infr.toml'), 'custom = true', [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $updateTestRoot 'custom-user-file.txt'), 'keep me', [System.Text.UTF8Encoding]::new($false))
+    $preservedHashes = @{}
+    foreach ($relative in @('gui-data\wizard-state.json', 'kv-sessions\keep.bin', 'infr.toml', 'custom-user-file.txt')) {
+        $preservedHashes[$relative] = (Get-FileHash -LiteralPath (Join-Path $updateTestRoot $relative) -Algorithm SHA256).Hash
+    }
 
     $targetVersion = [string]$manifest.version
     $nativeArgs = @(
@@ -135,6 +172,8 @@ try {
         '-ExpectedVersion'
         $targetVersion
         '-RelaunchProbeOnly'
+        '-RelaunchEntry'
+        $entryToTest
     )
     $updateOutput = & powershell.exe @nativeArgs 2>&1 | Out-String
     $updateExitCode = $LASTEXITCODE
@@ -149,6 +188,9 @@ try {
     )) {
         if (-not (Test-Path -LiteralPath (Join-Path $updateTestRoot $preservedPath) -PathType Leaf)) {
             throw "Engine update did not preserve user-owned path: $preservedPath"
+        }
+        if ((Get-FileHash -LiteralPath (Join-Path $updateTestRoot $preservedPath) -Algorithm SHA256).Hash -ne $preservedHashes[$preservedPath]) {
+            throw "Engine update changed user-owned content: $preservedPath"
         }
     }
     if (Test-Path -LiteralPath $legacyPath) {
@@ -165,8 +207,13 @@ try {
     if ($backupFiles.Count -ne 0) { throw 'Engine update retained old-version files after the replacement and relaunch were verified.' }
 } finally {
     if (Test-Path -LiteralPath $updateTestRoot) {
+        $testPrefix = $UpdateTestDirectory.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+        if (-not ([System.IO.Path]::GetFullPath($updateTestRoot)).StartsWith($testPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing cleanup outside update test directory: $updateTestRoot"
+        }
         Remove-Item -LiteralPath $updateTestRoot -Recurse -Force
     }
+}
 }
 
 [void](Invoke-Infr @('--help'))

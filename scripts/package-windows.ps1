@@ -4,6 +4,7 @@ param(
     [string]$OutputDirectory = 'dist',
     [string]$Version = '',
     [string]$CodecDirectory = 'target\image-codecs',
+    [string]$LauncherBuildDirectory = '',
     [switch]$WithoutImageCodecs
 )
 
@@ -75,9 +76,36 @@ foreach ($file in $rootFiles) {
     }
     Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stagingPath $file)
 }
+
+# Build the inbox .NET window entry independently of the supplied Rust binary.
+# It must be present before hashing the managed-file allowlist for OTA.
+$launcherBuildScript = Join-Path $PSScriptRoot 'build-windows-launcher.ps1'
+if (-not (Test-Path -LiteralPath $launcherBuildScript -PathType Leaf)) {
+    throw "Required launcher build script is missing: $launcherBuildScript"
+}
+$windowLauncherPath = Join-Path $stagingPath 'MoE4All Engine.exe'
+$launcherBuildParameters = @{ OutputPath = $windowLauncherPath; Version = $Version }
+if ($LauncherBuildDirectory) { $launcherBuildParameters.BuildDirectory = Resolve-RepoPath $LauncherBuildDirectory }
+& $launcherBuildScript @launcherBuildParameters
+if (-not (Test-Path -LiteralPath $windowLauncherPath -PathType Leaf)) {
+    throw "Launcher build did not produce $windowLauncherPath"
+}
+
 $packagedScripts = @(
     'benchmark-hardware.ps1'
     'infr-wizard.ps1'
+    'infr-dashboard.ps1'
+    'infr-dashboard-state.ps1'
+    'wizard-console.cs'
+    'wizard-desktop.cs'
+    'wizard-theme.cs'
+    'wizard-prompts.cs'
+    'wizard-runtime.cs'
+    'wizard-downloads.cs'
+    'wizard-markdown.cs'
+    'wizard-workspaces.cs'
+    'wizard-api-status.cs'
+    'wizard-runtime-bridge.ps1'
     'moe4all-update-common.ps1'
     'apply-engine-update.ps1'
 )
