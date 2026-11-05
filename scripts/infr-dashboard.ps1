@@ -7,10 +7,13 @@ function Initialize-DashboardRuntime {
         $candidate=Join-Path $PSScriptRoot $name
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { $sources += $candidate }
     }
+    $icon = Join-Path $PSScriptRoot 'moe4all.ico'
+    if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) { throw 'Required launcher icon is missing: moe4all.ico' }
     $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
     try {
         $sourceBytes = [byte[]]@()
         foreach ($sourceFile in $sources) { $sourceBytes += [IO.File]::ReadAllBytes($sourceFile) }
+        $sourceBytes += [IO.File]::ReadAllBytes($icon)
         $identity = ([BitConverter]::ToString($hashAlgorithm.ComputeHash($sourceBytes))).Replace('-','').Substring(0,20).ToLowerInvariant()
     } finally { $hashAlgorithm.Dispose() }
     if ($env:MOE4ALL_LAUNCHER_CACHE) { $cache = $env:MOE4ALL_LAUNCHER_CACHE }
@@ -30,6 +33,7 @@ function Initialize-DashboardRuntime {
         $processInfo.FileName = $compiler
         $processInfo.Arguments = '/nologo /optimize+ /target:library /utf8output /r:System.Web.Extensions.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:"' + $temporary + '"'
         foreach ($sourceFile in $sources) { $processInfo.Arguments += ' "' + $sourceFile + '"' }
+        $processInfo.Arguments += ' /resource:"' + $icon + '",MoE4All.Icon'
         $processInfo.UseShellExecute = $false; $processInfo.CreateNoWindow = $true
         $processInfo.RedirectStandardOutput = $true; $processInfo.RedirectStandardError = $true
         $processInfo.EnvironmentVariables['TEMP'] = $cache

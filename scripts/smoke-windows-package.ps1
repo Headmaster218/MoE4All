@@ -48,6 +48,7 @@ $requiredManagedPaths = @(
     'infr.exe'
     'Start-INFR-Wizard.cmd'
     'MoE4All Engine.exe'
+    'scripts/moe4all.ico'
     'scripts/infr-wizard.ps1'
     'scripts/infr-dashboard.ps1'
     'scripts/infr-dashboard-state.ps1'

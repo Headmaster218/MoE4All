@@ -3,6 +3,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -204,6 +205,9 @@ namespace MoE4All.Launcher {
                 var edit=ButtonAt(T("调整一下","Edit"),w-116,28,96,36,false,delegate{screen="setup";Rebuild();});edit.Anchor=AnchorStyles.Top|AnchorStyles.Right;edit.Quiet=true;recent.Controls.Add(edit);content.Controls.Add(recent);
             }else content.Controls.Add(LabelAt(T("还没有模型？选好用途后，可以直接下载。","No model yet? Choose a task to browse recommended downloads."),2,365,w,40,smallFont,Muted));
             content.Height=HasSelection()?450:420;
+            var website=new LinkLabel{Name="WebsiteLink",Text=T("访问官网 · moe4all.com ↗","Website · moe4all.com ↗"),Left=2,Top=content.Height+12,Width=w,Height=32,Font=Font,LinkBehavior=LinkBehavior.AlwaysUnderline,Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right,AccessibleDescription=WizardBrand.Website};
+            website.LinkClicked+=delegate{try{Process.Start(new ProcessStartInfo(WizardBrand.Website){UseShellExecute=true});}catch{SetNotice(T("无法打开浏览器，请访问 https://moe4all.com/","Could not open your browser. Visit https://moe4all.com/"));}};
+            content.Controls.Add(website);content.Height=website.Bottom+8;
         }
         Panel Card(int top,int height,string title){var p=new SurfacePanel{Left=0,Top=top,Width=content.Width,Height=height,BackColor=WizardTheme.Current.Surface,Tag="WizardTheme.Surface",Anchor=AnchorStyles.Left|AnchorStyles.Right|AnchorStyles.Top};if(title.Length>0)p.Controls.Add(LabelAt(title,20,14,p.Width-40,30,sectionFont,Ink));content.Controls.Add(p);return p;}
         void CardAction(Panel card,string name,string title,Action action){var button=ButtonAt(title,card.Width-186,9,166,34,false,action);button.Name=name;button.Quiet=true;button.Anchor=AnchorStyles.Top|AnchorStyles.Right;foreach(Control c in card.Controls)if(c is Label&&c.Top==14)c.Width=Math.Max(80,card.Width-228);card.Controls.Add(button);button.BringToFront();}

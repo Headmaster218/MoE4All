@@ -14,6 +14,19 @@ using Microsoft.Win32;
 
 namespace MoE4All.Launcher
 {
+    public static class WizardBrand
+    {
+        public const string Website = "https://moe4all.com/";
+        [DllImport("shell32.dll", CharSet=CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+        internal static void Initialize(){try{SetCurrentProcessExplicitAppUserModelID("MoE4All.Engine");}catch(EntryPointNotFoundException){}}
+        public static Icon CreateIcon(int pixels){
+            using(var stream=typeof(WizardBrand).Assembly.GetManifestResourceStream("MoE4All.Icon")){
+                if(stream==null)throw new InvalidOperationException("The launcher icon resource is missing. Extract the complete package.");
+                using(var icon=new Icon(stream,new Size(pixels,pixels)))return (Icon)icon.Clone();
+            }
+        }
+    }
+
     // PowerShell is the GUI host. A bootstrap manifest cannot set its UI thread's
     // awareness. Call before constructing any controls (including ToolTips).
     public static class WizardDpi
@@ -516,6 +529,8 @@ private static string preference = "system";
         private bool windowButtons=true;
         private bool resizable=true;
         private WizardWheelRouter wheelRouter;
+        private Icon brandIcon;
+        private int brandIconSize;
 
         public Panel ContentHost { get { return contentHost; } }
         public Control CaptionBar { get { return caption; } }
@@ -524,10 +539,11 @@ private static string preference = "system";
         internal int LayoutDpi { get { return logicalDepth>0?96:contentDpi; } }
         protected bool DpiScaling { get { return dpiScaling; } }
         protected int LayoutPixels(int value) { return (int)Math.Round(value*LayoutDpi/96.0); }
-        static WizardWindow() { WizardDpi.Initialize(); }
+        static WizardWindow() { WizardDpi.Initialize(); WizardBrand.Initialize(); }
 
         public WizardWindow()
         {
+            ShowIcon=true;UpdateBrandIcon(96);
             AutoScaleDimensions = new SizeF(96F, 96F);
             // Explicit scaling also works in the inbox PowerShell .NET host,
             // whose WinForms app.config does not opt into dynamic DPI resizing.
@@ -591,6 +607,7 @@ private static string preference = "system";
         {
             if (disposing) Unsubscribe();
             base.Dispose(disposing);
+            if(disposing&&brandIcon!=null){brandIcon.Dispose();brandIcon=null;}
         }
 
         private void ThemeChanged(object sender, EventArgs e) { Dispatch(RefreshTheme); }
@@ -637,12 +654,14 @@ private static string preference = "system";
         private void ApplyWindowDpi(int next, Rectangle? suggested)
         {
             next=Math.Max(96,next);int previous=contentDpi;dpi=next;contentDpi=next;
+            UpdateBrandIcon(next);
             dpiScaling=true;SuspendLayout();Point location=Location;
             try { WizardDpi.ScaleTree(this,previous,next);if(suggested.HasValue&&WindowState==FormWindowState.Normal)Bounds=suggested.Value;else Location=location; }
             finally { dpiScaling=false;ResumeLayout(true); }
             OnDpiLayoutChanged(EventArgs.Empty);PerformLayout();Invalidate(true);
         }
         protected virtual void OnDpiLayoutChanged(EventArgs e) { }
+        private void UpdateBrandIcon(int dpi){int size=Math.Max(32,(int)Math.Round(32*dpi/96.0));if(size==brandIconSize)return;var next=WizardBrand.CreateIcon(size);var previous=brandIcon;brandIcon=next;brandIconSize=size;Icon=next;if(previous!=null)previous.Dispose();}
         internal IDisposable LogicalLayout(Control root) { return new LogicalScope(this,root); }
         // Existing page builders author 96-DPI lengths. Normalize only while
         // rebuilding, then scale once, including newly created controls/fonts.
@@ -912,7 +931,9 @@ private static string preference = "system";
             base.OnPaint(e);
             int right = Width;
             foreach (Control button in Controls) if (button.Visible) right = Math.Min(right, button.Left);
-            Rectangle title = new Rectangle(window.Pixels(16), 0, Math.Max(0, right - window.Pixels(28)), Height);
+            int left=window.Pixels(16);
+            if(window.ShowIcon&&window.Icon!=null){int size=window.Pixels(20);e.Graphics.DrawIcon(window.Icon,new Rectangle(left,(Height-size)/2,size,size));left+=size+window.Pixels(10);}
+            Rectangle title = new Rectangle(left, 0, Math.Max(0, right - left - window.Pixels(12)), Height);
             TextRenderer.DrawText(e.Graphics, window.Text, Font, title, WizardTheme.Current.Text,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis |
                 TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);

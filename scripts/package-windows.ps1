@@ -92,6 +92,7 @@ if (-not (Test-Path -LiteralPath $windowLauncherPath -PathType Leaf)) {
 }
 
 $packagedScripts = @(
+    'moe4all.ico'
     'benchmark-hardware.ps1'
     'infr-wizard.ps1'
     'infr-dashboard.ps1'

@@ -14,6 +14,8 @@ if (-not $Version) {
 if ($Version -notmatch '^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') { throw 'Invalid launcher version.' }
 $assemblyVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
 $source = Join-Path $PSScriptRoot 'wizard-entry.cs'
+$icon = Join-Path $PSScriptRoot 'moe4all.ico'
+if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) { throw 'Required launcher icon is missing: moe4all.ico' }
 if (-not $BuildDirectory) {
     $workRoot = if ($env:MOE4ALL_WORK_ROOT) { $env:MOE4ALL_WORK_ROOT } else { Join-Path $repoRoot 'local-work' }
     $BuildDirectory = Join-Path $workRoot 'build-cache\agent\wizard-entry-netfx'
@@ -23,7 +25,7 @@ $OutputPath = [IO.Path]::GetFullPath($OutputPath)
 [void][IO.Directory]::CreateDirectory($BuildDirectory)
 [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($OutputPath))
 $hash = [Security.Cryptography.SHA256]::Create()
-try { $identity = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText($source) + $Version + 'MoE4All Engine'))).Replace('-','').Substring(0,20) } finally { $hash.Dispose() }
+try { $identity = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText($source) + $Version + 'MoE4All Engine' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($icon))))).Replace('-','').Substring(0,20) } finally { $hash.Dispose() }
 $cached = Join-Path $BuildDirectory ("wizard-entry-$identity.exe")
 if (-not (Test-Path -LiteralPath $cached -PathType Leaf)) {
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -35,7 +37,7 @@ if (-not (Test-Path -LiteralPath $cached -PathType Leaf)) {
     [IO.File]::WriteAllText($attributes, ('[assembly:System.Reflection.AssemblyTitle("MoE4All Engine")]' + "`n" + '[assembly:System.Reflection.AssemblyVersion("'+$assemblyVersion+'")]' + "`n" + '[assembly:System.Reflection.AssemblyFileVersion("'+$assemblyVersion+'")]' + "`n" + '[assembly:System.Reflection.AssemblyInformationalVersion("'+$Version+'")]'), [Text.UTF8Encoding]::new($true))
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $compiler
-    $info.Arguments = '/nologo /optimize+ /target:winexe /platform:anycpu /utf8output /r:System.Windows.Forms.dll /out:"'+$temporary+'" "'+$source+'" "'+$attributes+'"'
+    $info.Arguments = '/nologo /optimize+ /target:winexe /platform:anycpu /utf8output /r:System.Windows.Forms.dll /win32icon:"'+$icon+'" /out:"'+$temporary+'" "'+$source+'" "'+$attributes+'"'
     $info.UseShellExecute=$false; $info.CreateNoWindow=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
     $info.EnvironmentVariables['TEMP']=$BuildDirectory; $info.EnvironmentVariables['TMP']=$BuildDirectory
     $process = [Diagnostics.Process]::new(); $process.StartInfo=$info
