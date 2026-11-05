@@ -1963,7 +1963,7 @@ configure() {
         choice bench_kind '测试方案 / Benchmark plan' \
             $'quick|自动快速 / Automatic quick|6K Prefill + 1024 Decode。单发，一次，可追加并发。\n6K Prefill + 1024 Decode. x1, one run; optional concurrency.' \
             $'standard|自动标准 / Automatic standard|6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。\n6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.' \
-            $'full|自动完整 / Automatic full|6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。\n6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.' \
+            $'full|自动完整 / Automatic full|6K、30K、150K Prefill + 1024 Decode；1-4 并发，各一次，共 12 次。\n6K, 30K, 150K Prefill + 1024 Decode; x1-x4, one run each, 12 runs. Shared KV, different questions.' \
             $'manual|手动测试 / Manual benchmark|按顺序添加 Prefill、Decode 和上下文深度。\nBuild one test step by step: Prefill, Decode and context depth.'
         if [[ ${S[bench_kind]} != manual ]]; then
             case ${S[bench_kind]} in quick) S[bench_parallel]=1 ;; standard) S[bench_parallel]=2 ;; full) S[bench_parallel]=4 ;; esac

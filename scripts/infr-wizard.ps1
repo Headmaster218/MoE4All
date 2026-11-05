@@ -3196,7 +3196,7 @@ if (-not $reuseSavedSettings) {
         $benchKind = Read-Choice -Label '测试方案 / Benchmark plan' -DefaultValue $benchKind -Options @(
             [pscustomobject]@{ Key = '1'; Value = 'quick'; Label = '自动快速 / Automatic quick'; Detail = @('6K Prefill + 1024 Decode。单发，一次，可追加并发。', '6K Prefill + 1024 Decode. x1, one run; optional concurrency.') }
             [pscustomobject]@{ Key = '2'; Value = 'standard'; Label = '自动标准 / Automatic standard'; Detail = @('6K、30K Prefill + 1024 Decode；1-2 并发，各一次，共 4 次。', '6K, 30K Prefill + 1024 Decode; x1-x2, one run each, 4 runs. Shared KV, different questions.') }
-            [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各三次，共 36 次。', '6K, 30K, 150K Prefill + 1024 Decode; x1-x4, three runs each, 36 runs. Shared KV, different questions.') }
+            [pscustomobject]@{ Key = '3'; Value = 'full'; Label = '自动完整 / Automatic full'; Detail = @('6K、30K、150K Prefill + 1024 Decode；1-4 并发，各一次，共 12 次。', '6K, 30K, 150K Prefill + 1024 Decode; x1-x4, one run each, 12 runs. Shared KV, different questions.') }
             [pscustomobject]@{ Key = '4'; Value = 'manual'; Label = '手动测试 / Manual benchmark'; Detail = @('按顺序添加 Prefill、Decode 和上下文深度。', 'Build one test step by step: Prefill, Decode and context depth.') }
         )
         }

@@ -152,7 +152,7 @@ impl BenchSuite {
         match self {
             Self::Quick => 1,
             Self::Standard => 1,
-            Self::Full => 3,
+            Self::Full => 1,
         }
     }
 
@@ -8323,7 +8323,7 @@ mod tests {
         assert_eq!(BenchSuite::Quick.decode_warmup_tokens(), 512);
         assert_eq!(BenchSuite::Quick.decode_reps(), 1);
         assert_eq!(BenchSuite::Standard.decode_reps(), 1);
-        assert_eq!(BenchSuite::Full.decode_reps(), 3);
+        assert_eq!(BenchSuite::Full.decode_reps(), 1);
         assert_eq!(BenchSuite::Quick.default_parallel(), 1);
         assert_eq!(BenchSuite::Standard.default_parallel(), 2);
         assert_eq!(BenchSuite::Full.default_parallel(), 4);
