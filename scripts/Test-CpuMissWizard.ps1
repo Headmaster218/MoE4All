@@ -22,6 +22,7 @@ Write-Host ("Live CPU topology: physical={0}, preferred={1}, detected={2}" -f $a
 
 function Get-CpuMissTopology { return $script:Topology }
 function Get-UpdatedModelHistory { param([string]$SelectedModel) return @() }
+function Get-ModelDownloadDirectory { return (Join-Path ([IO.Path]::GetTempPath()) 'cpu-miss-models') }
 function Read-Host {
     param([string]$Prompt)
     if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }
@@ -78,6 +79,7 @@ function Test-Case {
         )) { if ($setting -notin $sets) { throw "$Name missing $setting" } }
     }
     . $save
+    if ($state.download_dir -ne (Get-ModelDownloadDirectory)) { throw "$Name saved download directory mismatch" }
     if ($state.cpu_miss_enabled -ne ($ExpectedCores -gt 0)) { throw "$Name saved enable mismatch" }
     if ($ExpectedCores -gt 0 -and ([int]$state.cpu_miss_max -ne $ExpectedMax -or [int]$state.cpu_miss_cores -ne $ExpectedCores)) {
         throw "$Name saved limits mismatch"

@@ -655,7 +655,8 @@ try {
     $catalog = @(Get-RecommendedModelCatalog)
     $flashBundle = @($catalog | Where-Object { $_.Id -eq 'flashnext-427' })[0]
     $embeddingBundle = @($catalog | Where-Object { $_.Id -eq 'qwen3-embedding-06b-q8' })[0]
-    Assert ($catalog.Count -eq 6 -and ($catalog.Kind -contains 'audio') -and ($catalog.Kind -contains 'speech') -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain main, vision, embedding and audio downloads'
+    Assert ($catalog.Count -eq 7 -and ($catalog.Kind -contains 'audio') -and ($catalog.Kind -contains 'speech') -and -not ($catalog.Kind -contains 'mtp')) 'Recommended catalog should contain six downloads, including the 35B projector, plus the speech setup guide'
+    Assert (@($catalog | Where-Object { $_.Id -eq 'qwen35-vision' -and $_.Kind -eq 'vision' }).Count -eq 1) '35B vision projector is missing from the recommended catalog'
     Assert (@($flashBundle.Files).Count -eq 3 -and $flashBundle.Primary -match '00001-of-00003') 'FlashNext shard catalog is incomplete'
     Assert ($embeddingBundle.Files[0].Url -match 'Qwen3-Embedding-0\.6B-Q8_0\.gguf') 'Embedding direct download URL is missing'
     $script:Passed++
