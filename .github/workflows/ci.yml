@@ -114,12 +114,24 @@ jobs:
       - uses: actions/checkout@v7
       - name: Linux wizard smoke
         run: bash scripts/smoke-linux-wizard.sh
+      - name: Optional CPU module wizard regressions
+        env:
+          MOE4ALL_WORK_ROOT: ${{ runner.temp }}/moe4all-work
+        run: |
+          bash scripts/test-wizard-modular-services.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/modules" linux
+          bash scripts/test-wizard-transcription.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/transcription" linux
+          bash scripts/test-wizard-speech.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/speech" linux
+          mkdir -p "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          bash scripts/test-benchmark-startup-guide.sh linux "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          bash scripts/test-wizard-reminders.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/reminders" linux
       - name: Linux submission routes and receipt handoff
         env:
           TMPDIR: ${{ runner.temp }}
         run: bash scripts/test-submission-launchers.sh "$GITHUB_WORKSPACE"
       - name: Release promotion metadata tests
         run: python3 -m unittest discover -s scripts -p 'test_release_ci.py' -v
+      - name: Portable speech setup helper tests
+        run: python3 -m unittest discover -s scripts -p 'test_convert_melotts_chinese.py' -v
       - name: Submission protocol and PR classification tests
         run: python3 -m unittest discover -s scripts -p 'test_submission.py' -v
       - name: Benchmark PR review tables and hardware matching
