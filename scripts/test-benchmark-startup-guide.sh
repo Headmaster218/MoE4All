@@ -15,6 +15,9 @@ case $platform in
     *) exit 2 ;;
 esac
 work=$(mktemp -d "$TMPDIR/guide-$platform.XXXXXX")
+true_binary=$work/engine-success
+printf '#!/bin/sh\nexit 0\n' > "$true_binary"
+chmod +x "$true_binary"
 unset CI
 benchmark_guide_now() { printf '%s\n' "$test_now"; }
 benchmark_installed_version() { REPLY=$test_version; }
@@ -103,7 +106,7 @@ check '[[ $REPLY == later ]]' 'Enter must not confirm a different report'
 reset_case guided-flow
 mkdir -p "$CONFIG_DIR"
 S[launch_mode]=serve; S[bench_kind]=full; S[bench_parallel]=4; S[server_parallel]=3
-S[model]=$ROOT/model.gguf; BINARY=/bin/true
+S[model]=$ROOT/model.gguf; BINARY=$true_binary
 save_state
 # Unknown nested data must survive a preference-only merge as well.
 printf '{"launch_mode":"serve","bench_kind":"full","bench_parallel":"4","server_parallel":"3","unknown":{"list":[1,"preserved"]}}\n' > "$STATE"
@@ -167,7 +170,7 @@ for scenario in benchmark-current benchmark-old benchmark-unknown error-current;
     report_kind=${scenario%%-*}; fixture_version=1.3.0
     case $scenario in *-old) fixture_version=1.2.0 ;; *-unknown) fixture_version=unknown ;; esac
     reset_case "cloudflare-$scenario"
-    mkdir -p "$ROOT"; BINARY=/bin/true
+    mkdir -p "$ROOT"; BINARY=$true_binary
     extension=m4b; [[ $report_kind != error ]] || extension=m4e
     report=$ROOT/fixture.$extension
     printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture\nengine: %s\n' "$report_kind" "$fixture_version" > "$report"
@@ -211,7 +214,7 @@ for scenario in benchmark-current benchmark-old benchmark-unknown error-current;
     case $scenario in *-old) fixture_version=1.2.0 ;; *-unknown) fixture_version=unknown ;; esac
     for valid in false true; do
         reset_case "github-$scenario-$valid"
-        mkdir -p "$CONFIG_DIR"; BINARY=/bin/true
+        mkdir -p "$CONFIG_DIR"; BINARY=$true_binary
         report=$ROOT/fixture.m4b
         printf 'MOE4ALL-SUBMISSION/1\nkind: %s\nid: fixture\ncreated-at: 2026-10-25T00:00:00Z\nengine: %s\n' "$report_kind" "$fixture_version" > "$report"
         pr_response=not-a-pr
@@ -244,7 +247,7 @@ open_github_submission() { :; }
 submission_next_action() { REPLY=sent; }
 for report_kind in benchmark error; do
     reset_case "browser-sent-$report_kind"
-    BINARY=/bin/true
+    BINARY=$true_binary
     if offer_submission_upload "$ROOT/fixture.m4b" "$report_kind" <<< n > "$work/declined"; then exit 1; fi
     check '[[ ! -e $guide_path ]]' 'Declined upload consent must not mark success'
     offer_submission_upload "$ROOT/fixture.m4b" "$report_kind" <<< $'y\ny\n' > "$work/browser-sent"

@@ -186,7 +186,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native startup dialog checks failed.' }
           powershell.exe -NoProfile -STA -File .\scripts\Test-WizardBrand.ps1 -LauncherPath $launcher -EvidenceDirectory $evidence
           if ($LASTEXITCODE -ne 0) { throw 'Launcher icon checks failed.' }
-          .\scripts\Test-EngineUpdateDualEntry.ps1 -TaskId $task -WindowLauncherPath $launcher
+          powershell.exe -NoProfile -File .\scripts\Test-EngineUpdateDualEntry.ps1 -TaskId $task -WindowLauncherPath $launcher
+          if ($LASTEXITCODE -ne 0) { throw 'Dual-entry OTA checks failed.' }
       - name: Preserve updater diagnostics
         if: always()
         uses: actions/upload-artifact@v6
