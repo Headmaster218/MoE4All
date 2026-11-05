@@ -71,7 +71,10 @@ fn public_model_cpu_profile() -> Result<()> {
             },
         )?;
         let decode_seconds = started.elapsed().as_secs_f64();
-        ensure!(!segments.is_empty(), "diagnostic input has no audio samples");
+        ensure!(
+            !segments.is_empty(),
+            "diagnostic input has no audio samples"
+        );
         let mut duration = 0.;
         let mut frontend_seconds = 0.;
         let mut infer_seconds = 0.;
