@@ -76,7 +76,7 @@ Windows 与 Linux 启动向导可从统一下载菜单选择下列主模型和�
 | **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；API 图片理解时加载 |
 | **Qwen3 Embedding 0.6B** | [下载 Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`；提供 `/v1/embeddings` |
 
-Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。视觉文件会自动放到同一模型目录，便于向导发现。
+Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf`。视觉文件会自动放到同一模型目录，便于向导发现。
 
 
 ## 实测结果

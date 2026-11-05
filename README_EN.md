@@ -105,7 +105,7 @@ beside the launcher.
 | **Qwen3 Embedding 0.6B** | [Download the Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`; serves `/v1/embeddings` |
 
 The first Flash-Next shard is
-`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`. The automatic
+`Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf`. The automatic
 Vision download is placed in the same model directory for discovery by the wizard.
 
 ## Build from source (Linux)
