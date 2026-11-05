@@ -2,15 +2,16 @@
 """Reproducible, CPU-only Melo Chinese input acquisition and native GGUF conversion.
 
 Runtime has no Python dependency. Conversion needs an existing CPU-capable torch
-and numpy installation; it never installs packages. Downloads and derived data
-must stay in the explicitly selected INFR local-work root. Example (PowerShell):
-  python scripts/convert_melotts_chinese.py --task-id YYYYMMDD-HHMMSS-topic-id
+and numpy installation; it never installs packages. Inputs, logs and caches use
+--work-root; --output-dir selects the ready-to-use model directory. Example:
+  python convert_melotts_chinese.py --work-root ./voice-setup --output-dir ./models/MeloTTS-Chinese
 Use --download-only to acquire/verify original assets without importing torch.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 
 MODEL_REPO = "myshell-ai/MeloTTS-Chinese"
@@ -25,7 +27,7 @@ MODEL_REVISION = "af5d207a364ea4208c6f589c89f57f88414bdd16"
 FRONTEND_REPO = "csukuangfj/vits-melo-tts-zh_en"
 FRONTEND_REVISION = "a0d5c6a264c0ef92d70d8661d8cc502d79627cd6"
 CONVERSION = "native-f32-zero-bert-dp-v1"
-DEFAULT_ROOT = Path(r"D:\AIinfr\infr\local-work")
+DEFAULT_ROOT = Path(os.environ.get("MOE4ALL_WORK_ROOT", str(Path(__file__).resolve().parent.parent / "local-work")))
 EXPECTED_SHA256 = {
     "checkpoint.pth": "a74e9eadffff065c75eb6dfa040efa72cad23e72cfea70d39190bc174fb97093",
     "config.json": "d58b5acdab89ad2bbd65325affab309ae3cb964834b02f9a60587474e81c8bb9",
@@ -57,7 +59,10 @@ def download(url, destination):
     if destination.exists() and destination.stat().st_size:
         return
     part = destination.with_name(destination.name + ".part")
-    subprocess.run(["curl.exe" if os.name == "nt" else "curl", "--fail", "--location",
+    curl = shutil.which("curl.exe" if os.name == "nt" else "curl")
+    if not curl:
+        raise RuntimeError("curl is required for downloading the original voice assets; no software is installed automatically")
+    subprocess.run([curl, "--fail", "--location",
                     "--retry", "3", "--output", str(part), url], check=True)
     part.replace(destination)
 
@@ -236,16 +241,36 @@ def convert(inputs, output, source_manifest):
     return report
 
 
+def resolve_paths(args):
+    """Explicit output is portable; the legacy developer work layout remains supported."""
+    task_id = args.task_id or (datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-melo-setup-") + uuid.uuid4().hex[:8])
+    if not task_id or any(c in task_id for c in "/\\:") or ".." in task_id:
+        raise ValueError("task-id must be a single safe directory component")
+    root = args.work_root.resolve()
+    identity = "melotts-chinese-" + MODEL_REVISION[:12]
+    output = args.output_dir.resolve() if args.output_dir else inside(root, root / "test-cache" / "models" / (identity + "-" + CONVERSION))
+    return root, task_id, output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-root", type=Path, default=DEFAULT_ROOT)
-    parser.add_argument("--task-id", required=True)
+    parser.add_argument("--task-id", help="Optional unique name for setup logs and temporary files")
+    parser.add_argument("--output-dir", type=Path, help="Save the native GGUF and all voice assets in this folder")
     parser.add_argument("--download-only", action="store_true")
     args = parser.parse_args()
-    if not args.task_id or any(c in args.task_id for c in "/\\:") or ".." in args.task_id:
-        parser.error("task-id must be a single safe directory component")
-    root = args.work_root.resolve()
-    temp = inside(root, root / "tmp" / "infr" / args.task_id)
+    try:
+        root, task_id, output = resolve_paths(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if not args.download_only:
+        missing = [name for name in ("torch", "numpy") if importlib.util.find_spec(name) is None]
+        if missing:
+            parser.error("Conversion requires an existing Python environment with " + ", ".join(missing)
+                         + ". Follow the release-note setup steps; this script never installs dependencies.")
+        if (output / "melotts-chinese-f32.gguf").exists():
+            parser.error("Output model already exists; keep the existing model or choose a different --output-dir")
+    temp = inside(root, root / "tmp" / "infr" / task_id)
     temp.mkdir(parents=True, exist_ok=True)
     for key in ("TEMP", "TMP", "TMPDIR"):
         os.environ[key] = str(temp)
@@ -256,8 +281,7 @@ def main():
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     identity = "melotts-chinese-" + MODEL_REVISION[:12]
     inputs = inside(root, root / "inputs" / "models" / identity)
-    output = inside(root, root / "test-cache" / "models" / (identity + "-" + CONVERSION))
-    evidence = inside(root, root / "evidence" / "infr" / args.task_id)
+    evidence = inside(root, root / "evidence" / "infr" / task_id)
     evidence.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(root).free < 1024 ** 3:
         raise RuntimeError("Need at least 1GiB free for original and derived model assets")
