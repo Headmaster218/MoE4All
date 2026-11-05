@@ -478,6 +478,11 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.serve.response_store_entries = num::<u32>(get, "INFR_RESPONSE_STORE_ENTRIES");
     p.serve.response_store_path = opt_path(get, "INFR_RESPONSE_STORE_PATH");
 
+    // ── vision ───────────────────────────────────────────────────────────────
+    // `Flag`, not `presence`: the security ceiling is lifted by a value that says so, and `0` means
+    // "keep refusing private addresses" so a file layer that raised it can be turned back down.
+    p.vision.image_url_allow_private = flag(get, "INFR_IMAGE_URL_ALLOW_PRIVATE");
+
     // ── hub ──────────────────────────────────────────────────────────────────
     if let Some(endpoint) = get("INFR_HF_ENDPOINT") {
         p.hub.endpoint = Some(endpoint);

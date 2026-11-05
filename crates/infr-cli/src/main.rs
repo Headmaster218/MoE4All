@@ -524,7 +524,8 @@ enum Cmd {
     Serve {
         model: String,
         /// Optional Qwen3.8 vision projector GGUF. Image parts are accepted through the OpenAI
-        /// chat API as data URIs or base64 strings; projector weights are request-scoped.
+        /// chat API as data URIs, base64 strings, or http(s) URLs (public addresses only);
+        /// projector weights are request-scoped.
         #[arg(long, value_name = "PATH")]
         mmproj: Option<PathBuf>,
         /// Optional GGUF embedding model hosted natively at /v1/embeddings.
@@ -3032,6 +3033,10 @@ struct ParallelGenerator {
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
     default_presence_penalty: f32,
+    /// `vision.image_url_allow_private`: whether an `image_url` may address a non-public host.
+    /// Carried as a value because `cfg` is moved into the renderer below — and per R3 the fetch
+    /// policy comes from the resolved `Config`, never from the process environment at request time.
+    image_url_allow_private: bool,
 }
 
 struct EmbeddingGeneratorAdapter {
@@ -3058,6 +3063,7 @@ impl ParallelGenerator {
         Ok(Self {
             engine,
             vision,
+            image_url_allow_private: cfg.vision.image_url_allow_private,
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
             watch: infr_llama::WeightWatch::open(gguf_path)?,
             default_presence_penalty: model_default_presence_penalty(gguf_path),
@@ -3229,7 +3235,7 @@ impl GenBackend for ParallelGenerator {
             .context("this server was not started with --mmproj")?;
         let image_bytes = images
             .iter()
-            .map(|image| infr_vision::decode_image_input(image))
+            .map(|image| infr_vision::decode_image_input(image, self.image_url_allow_private))
             .collect::<anyhow::Result<Vec<_>>>()?;
         let embeddings = vision
             .encode_images(&image_bytes)?

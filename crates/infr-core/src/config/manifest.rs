@@ -384,6 +384,11 @@ knobs! {
     // Unset = memory-only store; the file is written only when the operator names one.
     "INFR_RESPONSE_STORE_PATH" => "serve.response_store_path", Path, Ignored, "responses.json", migrated;
 
+    // ── vision (§6.8 multimodal input) ───────────────────────────────────────
+    // The SSRF ceiling on `image_url` fetches. `Flag` so `0`/"" keep it closed and a config file
+    // that opened it can be overridden back down by the next layer.
+    "INFR_IMAGE_URL_ALLOW_PRIVATE" => "vision.image_url_allow_private", Flag, Ignored, "1", migrated;
+
     // ── hub (§6.9) ───────────────────────────────────────────────────────────
     "INFR_HF_ENDPOINT" => "hub.endpoint", Text, Ignored, "https://hf-mirror.com", migrated;
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",

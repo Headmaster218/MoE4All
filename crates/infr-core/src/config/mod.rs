@@ -1301,6 +1301,23 @@ cfg_struct! {
 }
 
 cfg_struct! {
+    /// Vision (`crates/infr-vision`): the multimodal input path.
+    VisionCfg / PartialVisionCfg {
+        /// `INFR_IMAGE_URL_ALLOW_PRIVATE`: let an `image_url` in a request address a NON-public
+        /// host — loopback, RFC1918, link-local (where the cloud metadata endpoints live), CGNAT.
+        ///
+        /// OFF by default. Fetching a URL is the one place the engine makes an outbound request on
+        /// a CALLER's behalf, and a caller can point it anywhere; with the answer ("public", "does
+        /// not resolve", "returned 404") plus the bytes themselves reportable back, an unrestricted
+        /// fetch is a port scanner into the private network the server usually sits inside. The
+        /// ceiling exists to be lifted deliberately, for the legitimate local target — a NAS, a LAN
+        /// camera, a local test server — where refusing the URL would only push callers back to
+        /// base64 for pictures they already have.
+        image_url_allow_private: bool = false,
+    }
+}
+
+cfg_struct! {
     /// The whole resolved configuration. Build it once (in `main()`, or by a library caller),
     /// wrap it in an `Arc`, and hand it to the backends and sessions. There is deliberately NO
     /// global (R4) and no interior mutability: a `Config` is a value.
@@ -1326,6 +1343,8 @@ cfg_struct! {
             prof: ProfCfg => PartialProfCfg,
             /// Server.
             serve: ServeCfg => PartialServeCfg,
+            /// Vision / multimodal input policy.
+            vision: VisionCfg => PartialVisionCfg,
             /// Model acquisition from the HuggingFace hub.
             hub: HubCfg => PartialHubCfg,
             /// Debug switches.

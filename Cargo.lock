@@ -1474,6 +1474,7 @@ dependencies = [
  "infr-vulkan",
  "libloading",
  "rayon",
+ "reqwest",
  "sha2",
  "tracing",
 ]

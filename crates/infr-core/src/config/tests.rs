@@ -557,6 +557,37 @@ vector = 'cvec.gguf'
     assert_eq!(cfg.uncensor.last_layer, 30);
 }
 
+/// The SSRF ceiling on `image_url` fetches ships CLOSED, and every layer that can lift it is
+/// exercised here: the lift is a deliberate operator decision, so a stale default or a `0` in some
+/// layer must never be able to open private addresses by accident.
+#[test]
+fn image_url_fetches_refuse_private_addresses_until_a_layer_opens_them() {
+    assert!(
+        !Config::default().vision.image_url_allow_private,
+        "no server fetches into the private network it sits inside unless it was told to"
+    );
+
+    for (value, want) in [("1", true), ("true", true), ("0", false), ("", false)] {
+        let cfg =
+            Config::load_from_layers(&[env_layer(&[("INFR_IMAGE_URL_ALLOW_PRIVATE", value)])]);
+        assert_eq!(
+            cfg.vision.image_url_allow_private, want,
+            "INFR_IMAGE_URL_ALLOW_PRIVATE={value:?}"
+        );
+    }
+
+    let from_file = Config::load_from_layers(&[file_layer(
+        "[vision]
+image_url_allow_private = true
+",
+    )]);
+    assert!(from_file.vision.image_url_allow_private);
+
+    let mut cfg = Config::default();
+    cli_layer(&["vision.image_url_allow_private=true"]).apply(&mut cfg);
+    assert!(cfg.vision.image_url_allow_private);
+}
+
 #[test]
 fn speculative_paths_preserve_explicit_runtime_ab_controls() {
     let defaults = Config::default();
@@ -2155,6 +2186,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_UNCENSOR_VECTOR",
         "INFR_UNCENSOR_FIRST_LAYER",
         "INFR_UNCENSOR_LAST_LAYER",
+        "INFR_IMAGE_URL_ALLOW_PRIVATE",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

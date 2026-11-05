@@ -67,7 +67,7 @@ Invoke-RestMethod -Uri "$base/v1/responses/$($first.id)/input_items" -Headers $h
 
 ## 图片与嵌入
 
-启用 Vision 并加载兼容的 mmproj 后，Chat Completions 的 `content` 可交错包含文本和 `image_url`。图片须为 data URI 或 base64；远程 HTTP URL 不受支持。以下示例读取本地 PNG：
+启用 Vision 并加载兼容的 mmproj 后，Chat Completions 的 `content` 可交错包含文本和 `image_url`。图片可为 data URI、裸 base64，或 http(s) URL；URL 由服务端抓取，上限 32 MiB、10 秒，且默认只允许公网可路由地址（要抓本机或局域网图片，设 `--set vision.image_url_allow_private=true`，或 `INFR_IMAGE_URL_ALLOW_PRIVATE=1`）。以下示例读取本地 PNG：
 
 支持 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO；带 `image-codecs/` 的 Windows/Linux
 发行包还支持 HEIC/HEIF（HEVC）和 AVIF。按文件内容识别，不依赖 MIME 或扩展名；
