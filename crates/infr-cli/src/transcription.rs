@@ -13,6 +13,7 @@ use std::{
 };
 
 #[derive(Args, Debug)]
+#[group(id = "TranscriptionServeOptions")]
 pub(crate) struct ServeOptions {
     /// Native transcription GGUF at /v1/audio/transcriptions (loaded on first request).
     /// File-audio API supports an OpenAI-compatible subset, using an independent CPU backend.
@@ -32,6 +33,7 @@ pub(crate) struct ServeOptions {
 }
 
 #[derive(Args, Debug)]
+#[group(id = "TranscriptionFileOptions")]
 pub(crate) struct FileOptions {
     #[arg(long, value_name = "WAV")]
     pub file: PathBuf,

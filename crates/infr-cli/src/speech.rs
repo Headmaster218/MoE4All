@@ -7,6 +7,7 @@ use infr_core::config::Config;
 use std::{path::PathBuf, sync::Arc};
 
 #[derive(Args, Debug)]
+#[group(id = "SpeechServeOptions")]
 pub(crate) struct ServeOptions {
     /// Optional native Melo GGUF at /v1/audio/speech (requires a tts-enabled build).
     #[arg(long, value_name = "GGUF", requires = "speech_lexicon")]
@@ -25,6 +26,7 @@ pub(crate) struct ServeOptions {
 }
 
 #[derive(Args, Debug)]
+#[group(id = "SpeechFileOptions")]
 pub(crate) struct FileOptions {
     #[arg(long, value_name = "DIR")]
     pub lexicon: PathBuf,
