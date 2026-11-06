@@ -289,12 +289,15 @@ try {
         }
         Assert ($state.context -eq '20k') 'Manual context should be asked once at the common step'
     }
-    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2',  $model,  'y',  $aux,  'y',  $aux,  '17',  '',  '',  '',  '',  '',  '',  '2',  '20k',  'y',  '',  '',  '',  '',  '') -Check {
+    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2',  $model,  'y',  $aux,  'y',  'y',  $aux,  '17',  '',  '',  '',  '',  '',  '',  '2',  '20k',  'y',  '',  '',  '',  '',  '') -Check {
         foreach ($value in @('spec.mtp=false', '--mmproj', '--embedding-model')) {
             Assert ($value -in $nativeArgs) "Missing auxiliary setting $value"
         }
         Assert ($state.embedding_idle_timeout -eq '17') 'Auxiliary settings changed'
-        $order = @('Enable image understanding', 'Also serve the Embedding', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
+        # The image_url policy is emitted both ways, so a No can also close what infr.toml opened.
+        Assert ('vision.image_url_allow_private=true' -in $nativeArgs) 'Private image URLs were not emitted'
+        Assert ($state.image_url_allow_private) 'Private image URLs were not saved'
+        $order = @('Enable image understanding', 'Allow image_url to fetch', 'Also serve the Embedding', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
         $previous = -1
         foreach ($pattern in $order) {
             $position = -1
@@ -694,8 +697,9 @@ try {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model) 'Missing model should not launch directly'
         Assert (@($script:Events | Where-Object { $_ -match 'Start with the previous settings' }).Count -eq 0) 'Missing model should not offer direct launch'
     }
-    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2',  $model,  'y',  $aux,  'n',  '',  '',  '',  '',  '',  '',  '1',  '100k',  'y',  '',  '',  '',  '',  '') -Check {
+    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2',  $model,  'y',  $aux,  '',  'n',  '',  '',  '',  '',  '',  '',  '1',  '100k',  'y',  '',  '',  '',  '',  '') -Check {
         Assert ($state.server_parallel -eq '1' -and $state.server_session_cache) 'Vision serving should keep SSD KV caching available'
+        Assert ('vision.image_url_allow_private=false' -in $nativeArgs) 'The default image_url policy should still be written down'
     }
     $script:Saved = $null
     $script:ReasoningProbeModel = ''

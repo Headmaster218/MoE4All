@@ -586,6 +586,22 @@ image_url_allow_private = true
     let mut cfg = Config::default();
     cli_layer(&["vision.image_url_allow_private=true"]).apply(&mut cfg);
     assert!(cfg.vision.image_url_allow_private);
+
+    // The wizard writes the answer BOTH ways, so `false` has to be a value and not a no-op: it is
+    // how a `No` closes a `[vision]` table or an environment that already opened the ceiling.
+    let mut opened = Config::default();
+    cli_layer(&["vision.image_url_allow_private=false"]).apply(&mut opened);
+    assert!(!opened.vision.image_url_allow_private);
+    let mut from_file = Config::load_from_layers(&[file_layer(
+        "[vision]
+image_url_allow_private = true
+",
+    )]);
+    cli_layer(&["vision.image_url_allow_private=false"]).apply(&mut from_file);
+    assert!(
+        !from_file.vision.image_url_allow_private,
+        "a CLI `false` must override a file that said true"
+    );
 }
 
 #[test]

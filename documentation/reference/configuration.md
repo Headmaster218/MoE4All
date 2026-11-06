@@ -244,7 +244,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 成功的非流式响应和流式响应的终止完成帧，均包含权威的 `usage` 及 llama.cpp 兼容的 `timings` 对象。`timings.context_n` 是完整提示词加补全深度，`context_limit` 是 KV 槽位容量，`cached_n` 将复用的提示词 token 与实际评估的 `prompt_n` token 区分开来。流式指标无条件输出，因此未发送 `stream_options.include_usage` 的客户端不会静默记录零 token。
 
-`POST /v1/responses` 复用相同的模型调度与请求上限；支持文本消息、重放的 function call/output、自定义 function tools，以及 `stream=true` 的 typed SSE。启用视觉模型及 projector 时，`input_image` 用 base64 `data:` URI。与存储无关、始终返回 400 的语义有：文件输入（`input_file`）、`file_id`、hosted tools、结构化输出模式、`truncation="auto"`、`background`、除 `reasoning.encrypted_content` 之外的 `include`，以及任何未被识别的请求字段。`parallel_tool_calls=false` 已被接受：解码器没有并行开关，模型仍可能给出多个调用，因此多余的调用会被丢掉，并在响应的 `warnings` 里说明丢掉了几个——静默少给调用会让 agent 循环永远等一个没人问过的结果。错误体的 `error.param` 指向客户端实际发送的那个字段；无法归到单一字段时记为 `request`（未识别字段），`GET`/`DELETE /v1/responses/{id}` 这类路径参数则记为 `response_id`。
+`POST /v1/responses` 复用相同的模型调度与请求上限；支持文本消息、重放的 function call/output、自定义 function tools，以及 `stream=true` 的 typed SSE。启用视觉模型及 projector 时，`input_image` 的 `image_url` 可以是 base64 `data:` URI、裸 base64，或 http(s) URL；URL 由服务端抓取，默认只允许公网可路由地址（见 `[vision]`）。与存储无关、始终返回 400 的语义有：文件输入（`input_file`）、`file_id`、hosted tools、结构化输出模式、`truncation="auto"`、`background`、除 `reasoning.encrypted_content` 之外的 `include`，以及任何未被识别的请求字段。`parallel_tool_calls=false` 已被接受：解码器没有并行开关，模型仍可能给出多个调用，因此多余的调用会被丢掉，并在响应的 `warnings` 里说明丢掉了几个——静默少给调用会让 agent 循环永远等一个没人问过的结果。错误体的 `error.param` 指向客户端实际发送的那个字段；无法归到单一字段时记为 `request`（未识别字段），`GET`/`DELETE /v1/responses/{id}` 这类路径参数则记为 `response_id`。
 
 链式请求上重发 `instructions` 是允许的，只要它与链上已经存储的系统前缀逐字相同（SDK 每轮都重发同一份提示词的形状）；改动过的、或者链上根本没有系统前缀却带来了新 `instructions` 的请求，会以 `param="instructions"` 报 400，而不是悄悄多插一个 system 轮次、把 KV 前缀打断。
 
@@ -258,7 +258,7 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 Responses API 只接受 plain text 与默认 `text.verbosity="medium"`；`low`/`high` 不支持。`reasoning.effort="minimal"` 在模板支持时近似映射为本地 `low`。本地 backend 没有独立的 hidden reasoning token 计量，因此 `reasoning_tokens` 为 0，外显思考内容计入 `output_tokens`。流式响应使用 `Cache-Control: no-store` 和 `X-Accel-Buffering: no`；生成在响应创建后失败时发出 typed `response.failed`。这些 HTTP 缓存头不会关闭模型 KV prefix cache。
 
-**`[vision]`** — `image_url_allow_private`（`INFR_IMAGE_URL_ALLOW_PRIVATE`，默认 `false`）决定服务端替客户端取 `image_url` 时可以连哪些地址。抓取本身已经锁了三条：单图最多 32 MiB、每一跳最多 10 秒（连接 5 秒）、以及只允许公网可路由地址——回环、RFC1918、链路本地（云元数据端点就住在 `169.254.169.254`）、CGNAT、组播和保留段全部拒绝；重定向由本项目自己逐跳跟，每一跳重过一遍地址规则，`file://` 这类 scheme 直接报错，不会当成非法 base64。设成 `true` 只抬掉地址这一条，给确实要抓本机图片的部署：NAS、局域网摄像头、跟服务器同在一只容器里的测试进程；字节和时间上界照旧。要明白抬掉代价是什么——"连上了但 404"和"连不上"是两种不同的回答，图片又能被模型描述回请求方，不设这条就等于让请求者拿这台机器探内网，所以默认关。
+**`[vision]`** — `image_url_allow_private`（`INFR_IMAGE_URL_ALLOW_PRIVATE`，默认 `false`）决定服务端替客户端取 `image_url` 时可以连哪些地址。抓取本身已经锁了三条：单图最多 32 MiB、每一跳最多 10 秒（连接 5 秒）、以及只允许公网可路由地址——回环、RFC1918、链路本地（云元数据端点就住在 `169.254.169.254`）、CGNAT、组播和保留段全部拒绝；重定向由本项目自己逐跳跟，每一跳重过一遍地址规则，`file://` 这类 scheme 直接报错，不会当成非法 base64。设成 `true` 只抬掉地址这一条，给确实要抓本机图片的部署：NAS、局域网摄像头、跟服务器同在一只容器里的测试进程；字节和时间上界照旧。要明白抬掉代价是什么——"连上了但 404"和"连不上"是两种不同的回答，图片又能被模型描述回请求方，不设这条就等于让请求者拿这台机器探内网，所以默认关。启动向导在"启用视觉图片理解"之后接着问这一条，答"否"也会把 `false` 写进命令行，盖掉配置文件或环境里已经抬开的值。
 
 **`[hub]`** — 模型获取（`infr pull`，以及模型缺失时 `infr run` / `infr serve` 执行的自动拉取）。`endpoint`（`INFR_HF_ENDPOINT`）选择 HuggingFace 兼容源：默认 `https://huggingface.co`，也可以是 `https://hf-mirror.com`。`pull_jobs`（`INFR_PULL_JOBS`，默认 `8`）表示单个模型下载可同时使用的连接数。慢的是连接而非链路：针对相同 CDN 对象测量，一个连接持续为 8.39 MiB/s，五个连接持续为 75.1 MiB/s，即每个连接 15.0 MiB/s，因此每连接速率不降反升。
 

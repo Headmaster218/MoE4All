@@ -2957,6 +2957,9 @@ $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
 $visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
+# A state file from before this key asked for nothing of the sort, and the engine default is the
+# closed one — so an absent key means private image URLs stay refused, never an accidental open.
+$imageUrlAllowPrivate = [bool](Get-SavedValue 'image_url_allow_private' $false)
 $serverEmbedding = [bool](Get-SavedValue 'server_embedding' $false)
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
 $embeddingIdleTimeout = [string](Get-SavedValue 'embedding_idle_timeout' '300')
@@ -2993,9 +2996,12 @@ if (-not $reuseSavedSettings) {
         }
         $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
         if ($serverVision) {
-            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
-            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片可用 data URI、裸 base64，或 http(s) URL。' -ForegroundColor DarkGray
+            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images may be data URIs, bare base64, or http(s) URLs.' -ForegroundColor DarkGray
             $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+            Write-Host '抓取 URL 是服务端替客户端出网，所以上了三层界：单图 32 MiB、每跳 10 秒、且只允许公网可路由地址——回环、RFC1918、链路本地（云元数据端点就在 169.254.169.254）、CGNAT 与保留段全部拒绝。打开它就是把这台机器所在内网交给请求方探测，默认关。' -ForegroundColor DarkGray
+            Write-Host 'A URL fetch is the server going out on the caller''s behalf, so it is capped at 32 MiB and 10 s per hop, and only publicly routable addresses are allowed. Opening this hands your local network to whoever can send a request.' -ForegroundColor DarkGray
+            $imageUrlAllowPrivate = Read-YesNo -Label '允许 image_url 抓取本机或局域网地址（NAS、网络摄像头）？/ Allow image_url to fetch loopback or LAN hosts?' -Default $imageUrlAllowPrivate
         }
         $serverEmbedding = Read-YesNo -Label '同时提供 Embedding API？/ Also serve the Embedding API?' -Default $serverEmbedding
         if ($serverEmbedding) {
@@ -3480,6 +3486,9 @@ if ($launchMode -eq 'server') {
     }
     if ($serverVision) {
         [void]$nativeArgs.Add('--mmproj'); [void]$nativeArgs.Add($visionProjectorPath)
+        # Always emitted, both ways: an answer of No must also be able to turn off a value the
+        # operator set in infr.toml or the environment, exactly like the other boolean switches.
+        Add-SetArgument $nativeArgs 'vision.image_url_allow_private' $imageUrlAllowPrivate.ToString().ToLowerInvariant()
     }
     if ($serverEmbedding) {
         [void]$nativeArgs.Add('--embedding-model'); [void]$nativeArgs.Add($embeddingModelPath)
@@ -3557,6 +3566,7 @@ $state = [ordered]@{
     kv_paged_cache_max = $kvPagedCacheMax; kv_paged_page_tokens = $kvPagedPageTokens
     kv_paged_tree = $kvPagedTree
     server_vision = $serverVision; vision_projector = $visionProjectorPath
+    image_url_allow_private = $imageUrlAllowPrivate
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout
     cpu_miss_enabled = $cpuMissEnabled; cpu_miss_max = $cpuMissMax; cpu_miss_cores = $cpuMissCores
@@ -3592,8 +3602,12 @@ if ($launchMode -eq 'server') {
         Write-Host "Embedding API: http://$clientAddress/v1/embeddings" -ForegroundColor Cyan
     }
     if ($serverVision) {
-        Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
-        Write-Host 'Vision chat enabled: send an image_url data URI in /v1/chat/completions content parts.' -ForegroundColor Cyan
+        Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url（data URI、裸 base64 或 http(s) URL）。' -ForegroundColor Cyan
+        Write-Host 'Vision chat enabled: send an image_url in /v1/chat/completions content parts — data URI, bare base64, or http(s) URL.' -ForegroundColor Cyan
+        if ($imageUrlAllowPrivate) {
+            Write-Host 'image_url 允许抓取本机与内网地址：这台服务器可以被请求指向私网。' -ForegroundColor Yellow
+            Write-Host 'image_url may address loopback and private hosts: a request can point this server into your network.' -ForegroundColor Yellow
+        }
     }
     Write-Host '按 Ctrl+C 停止服务器。Press Ctrl+C to stop the server.' -ForegroundColor Yellow
 } elseif ($launchMode -eq 'chat') {
