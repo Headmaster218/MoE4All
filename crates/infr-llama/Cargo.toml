@@ -15,6 +15,10 @@ infr-metal.workspace = true
 infr-gguf.workspace = true
 infr-cpu.workspace = true
 serde_json.workspace = true
+# The DeepSeek V4.1 engram table is a 202 GB MXFP8 file read a handful of rows at a time — see
+# `src/engram.rs`. std has no mmap, and `advise(Advice::Random)` is what stops readahead from
+# pulling in megabytes of rows nobody asked for.
+memmap2.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
 half.workspace = true
