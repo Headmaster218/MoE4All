@@ -77,6 +77,19 @@
 //! * **The hash map is data, not code.** `multipliers`/`primes`/`offsets`/`token_map` come from
 //!   `Config`, which is the load teammate's scope; [`EngramMap`] borrows plain slices so this side
 //!   has no dependency on *how* they were parsed.
+//! * **`ne[0]` is the ROW count here, not the column count.** The shipped table declares
+//!   `[384006168, 256]` codes and `[384006168, 8]` scales. Generic ggml would read that as 384 M
+//!   columns, but then the scale tensor would have to be `[8, 384006168]`; it is not. Independent
+//!   confirmation: `384006168 * 256 = 98_305_579_008` is exactly the byte gap between
+//!   `blk.1.engram_embd.weight` (offset 0) and `blk.1.engram_embd.scale`
+//!   (offset 98_305_579_008). Under the naive reading every gather addresses 384 M rows into a
+//!   256-row space. Do not "fix" this to the conventional order — the derivation is in
+//!   `index_engram_layers`.
+//! * **Type 34 is 1 byte per stored element, not 1 byte per 32 elements.** An E8M0 tensor's
+//!   `numel` is already the number of SCALES; the covering-the-blocks 32:1 ratio is baked into the
+//!   shape the converter wrote (`[rows, 8]` for a 256-wide key). Applying it a second time in the
+//!   byte-size formula shrinks the scale plane 32x and every valid row then fails its bounds
+//!   check.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
