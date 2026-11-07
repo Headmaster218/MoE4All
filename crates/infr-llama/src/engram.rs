@@ -735,12 +735,6 @@ impl<'a> Cursor<'a> {
         self.pos += n;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -1358,7 +1352,7 @@ mod tests {
     /// (type 32 / type 34), with a deterministic code pattern, and return its bytes.
     fn synth_engram_gguf(layer: u32, rows: u64, key_length: u64) -> Vec<u8> {
         let mut b: Vec<u8> = Vec::new();
-        let mut push_str = |b: &mut Vec<u8>, s: &str| {
+        let push_str = |b: &mut Vec<u8>, s: &str| {
             b.extend_from_slice(&(s.len() as u64).to_le_bytes());
             b.extend_from_slice(s.as_bytes());
         };
