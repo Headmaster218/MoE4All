@@ -1,0 +1,826 @@
+#version 460
+// Multi-row int8 dp4a GEMV: y[r] = x[r]·Wᵀ for r in 0..rows (1 <= rows <= 8, or up to 16 with
+// -DMRV=16) — `native_mmv.comp`'s integer-dot math on `native_gemv_mrow.comp`'s
+// weight-streamed-once multi-row shape. The m = 2..8 small-batch tier (spec-verify rows / a short
+// chat-turn suffix, e.g. the pp4-at-depth serve shape) previously rode the DEQUANT mrow kernel,
+// whose per-sub-block cost is dominated by the scalar byte-extract dequant-to-f32 + m·8 vec4 FMAs;
+// here the weight sub-block is unpacked ONCE into 8 packed-int8 words and each row costs just 8
+// dp4a + 8 L2-resident activation-word loads (activations pre-quantized per 32-block by
+// `quant_q8`: qa/dact/sact, layout [m, nblk]).
+//
+// rows = 1 (`-DUSE_RES` optionally set): THIS is also the m=1 DECODE kernel now — the single-row
+// case is not a separate code path, it is this shader with pc.rows=1 (see `Recorder::
+// linear_mmv_mrow`'s doc). A row's contribution depends only on its own qa/dact/sact slice, never
+// on `rows`, so decode (m=1) and verify (m=2..16) are bit-identical at the same weight/activation/
+// position by construction — same threads, same sub-block striding, same accumulation order, same
+// subgroupAdd width, whether `rows` is 1 or 16. This is the fix for the mmv_mw/mrow reassociation
+// gap README footnote 3 described (mmv_mw is retired from the AMD decode path for the dtypes that
+// need the symmetry guarantee; Intel keeps mmv_mw, untouched, see adapter.rs). `-DUSE_RES` fuses a
+// residual add (`y = residual + x·Wᵀ`) — only ever dispatched at rows=1 (the decode Linear+Add
+// fusion); the shader does not special-case this, it just adds `r_buf` unconditionally, which is
+// only reached by row 0 when rows=1.
+// Measured (E2B pp4@d4096, 7900 XTX): the GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s (the
+// adapter gates it to >= 8M-element non-vocab weights — see the Linear lowering's gate doc).
+// NUM_ROWS=2: one workgroup per 2 consecutive outputs (grid = ceil(out_f/2)), the activation
+// words read once for both outputs — same grid halving as `native_mmv.comp`.
+// Reduction: per-row subgroupAdd + one shared combine across waves (the mrow pattern — its 8-row
+// shared-tree replacement measured as the real cost there; see native_gemv_mrow.comp's header).
+// -DFMT_Q4K / -DFMT_Q5K / -DFMT_Q6K / -DFMT_Q2K / -DFMT_Q3K / -DFMT_IQ4XS, plus the legacy 32-block
+// set -DFMT_Q8_0 / -DFMT_Q4_0 / -DFMT_Q5_0 / -DFMT_Q4_1 / -DFMT_Q5_1 / -DFMT_IQ4NL, select the
+// weight format (the formats
+// with a symmetric-int8 tier on either the decode `mmv_mw` or the verify `mrow` side — see
+// adapter.rs's `mmv_mw_choice`/`mmv_gate` doc for the per-dtype policy table; others keep the
+// dequant mrow fallback). Q2_K/Q3_K's dequant math is a direct port of `native_mmv_mw.comp`'s
+// already host-reference-validated FMT_Q2K/FMT_Q3K `dpsub` (see
+// `mmv_mw_q2k_q3k_match_host_reference`) — weight-only unpack hoisted out of the per-row loop the
+// same way Q4_K/Q6_K already are here. FMT_Q5K mirrors FMT_Q4K's word-parallel wdec exactly (same
+// 6-bit packed scale/min layout, same f0/f1 accumulation shape), plus a second aligned-u32 load for
+// the 5th-bit `qh` plane — see the wdec doc below.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Same push layout as native_gemv/native_mmv (w_base = element offset for fused-QKV slices).
+// Streamed (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-tensor element-offset meaning.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+// int8 activations as uvec4 (in_f % 32 == 0 -> every sub-block is two aligned uvec4s): 2 wide
+// loads per (row, sub-block) instead of 8 scalar u32 ones - the inner loop is load-issue heavy
+// (8 qa loads + 8 dp4a per row per output).
+#ifdef FUSE_QUANT
+// Fused activation quantization: read f32 activations directly (binding 0), quantize per 32-block
+// inline — no separate `quant_q8` dispatch, no `dact`/`sact` scratch buffers. Binding 0 replaces
+// bindings 1-3; bindings 4+5 shift left (residual->1, y->2). The recorder passes the same buffer
+// for the unused slots so the binding count stays fixed.
+layout(binding = 0) readonly buffer ABuf { float a[]; }; // [m, k]
+#else
+layout(binding = 1) readonly buffer QA { uvec4 qa4[]; };        // int8 activations [m, in_f/16]
+layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [m, nblk]
+layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [m, nblk]
+#endif
+#ifdef USE_RES
+#ifdef FUSE_QUANT
+layout(binding = 1) readonly buffer RB2 { float r_buf[]; };     // residual [out_f] — rows=1 only
+layout(binding = 2) buffer YB { float y_buf[]; };
+#else
+layout(binding = 4) readonly buffer RB2 { float r_buf[]; };     // residual [out_f] — rows=1 only
+layout(binding = 5) buffer YB { float y_buf[]; };
+#endif
+#else
+#ifdef FUSE_QUANT
+layout(binding = 1) buffer YB { float y_buf[]; };
+#else
+layout(binding = 4) buffer YB { float y_buf[]; };
+#endif
+#endif
+
+// Row-tile cap: -DMRV=4 builds the rows<=4 specialization (half the dead per-sub-block row
+// iterations + acc registers at the pp4-at-depth serve shape); default 8 covers rows 5..8.
+#ifndef MRV
+#define MRV 8
+#endif
+const uint MR = uint(MRV);
+const uint MAX_SG = 8u;                  // 64 threads / min 8-wide subgroup
+#ifndef OUTS4
+// Only the 2-output (non-OUTS4) reduction uses this tree; the OUTS4 build reduces via part4, so
+// declaring `part` there just burned 512 B of LDS and cut occupancy on the small-in_f shape.
+shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgroup)
+#endif
+
+// Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
+// instead of inheriting native_decode.glsl's.
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+// Wide 4-word read: NW4 (b128, saddr) comes from native_weight_addr.glsl. The dp4a wdec loads then
+// issue one b128 instead of four b32 — the streamed-vs-resident decode gap. Same words —
+// bit-identical.
+#ifndef NW4
+#define NW4(wbase) uvec4(nw[(wbase)], nw[(wbase) + 1u], nw[(wbase) + 2u], nw[(wbase) + 3u])
+#endif
+
+uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+// Shared by Q6_K and Q3_K's wdec (both re-bias an unsigned scale byte to signed) — unconditional
+// since each SPV build activates exactly one FMT_* define, so there is never a redefinition.
+int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
+
+#if defined(FMT_Q3K) || defined(FMT_Q6K) || defined(FMT_Q8_0) || defined(FMT_Q4_0) \
+    || defined(FMT_Q5_0) || defined(FMT_IQ4NL)
+// Unaligned u32 via two word loads + funnel shift — same helper as native_mmv_mw.comp's FMT_Q3K.
+// Q3_K's 110-byte blocks are only 2-aligned. Q6_K's 210-byte blocks are ALSO only 2-aligned (210 %
+// 4 == 2), so every odd-indexed super-block's `bd` sits at a byte offset that is 2 mod 4, not 0 —
+// unlike Q4_K (144 % 4 == 0) and Q5_K (176 % 4 == 0), a single word-aligned `NW(byte >> 2)` load is
+// illegal here for anything computed as an offset from `bd` (ql/qh planes both inherit `bd`'s
+// parity). This funnel-shift load is what makes the FMT_Q6K word-parallel unpack below correct at
+// BOTH parities instead of silently misreading every other super-block. The legacy `_0`-family
+// strides are ALL odd-word too — Q8_0 34 B, Q5_0 22 B, Q4_0/IQ4_NL 18 B, every one `% 4 == 2` — so
+// they need it as well (their `_1` twins, Q4_1 20 B and Q5_1 24 B, are word-aligned and use plain
+// single-word `NW()` loads).
+uint ru32u(uint byte) {
+    uint w0 = NW(byte >> 2u);
+    uint sh = (byte & 3u) << 3u;
+    if (sh == 0u) { return w0; }
+    return (w0 >> sh) | (NW((byte >> 2u) + 1u) << (32u - sh));
+}
+#endif
+
+// Load four consecutive u32s starting at BYTE offset `bo` (any alignment) as a uvec4 —
+// == uvec4(ru32u(bo), ru32u(bo+4), ru32u(bo+8), ru32u(bo+12)), bit-identical. The four aligned
+// words come from ONE NW4 (fused global_load_b128, saddr base) instead of per-word scalar NW()
+// loads the vectorizer can't fuse — the same b128 shape Q4_K/Q5_K/Q6_K's wdec already uses,
+// extended to the odd-stride legacy formats. A +N-misaligned block funnels one tail word.
+uvec4 rw4(uint bo) {
+    uint wb = bo >> 2u; uint sh = (bo & 3u) << 3u;
+    uvec4 a = NW4(wb);
+    if (sh == 0u) { return a; }
+    uint t = NW(wb + 4u);
+    return uvec4((a.x >> sh) | (a.y << (32u - sh)), (a.y >> sh) | (a.z << (32u - sh)),
+                 (a.z >> sh) | (a.w << (32u - sh)), (a.w >> sh) | (t << (32u - sh)));
+}
+
+#if defined(FMT_Q4K) || defined(FMT_Q5K)
+// Q4_K/Q5_K share the same 6-bit scale/min packed layout for sub-block i from the 12-byte scales
+// field at sb.
+uvec2 k4(uint i, uint sb) {
+    if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
+    uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
+    uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
+    return uvec2(sc, mn);
+}
+#endif
+
+#ifdef FMT_Q4K
+#define ARM_SINGLE_DP
+// Unpack the 32-elem sub-block at element `gelem` into 8 packed-int8 words + its two scale
+// factors: f0 = d·sc (dot term), f1 = dmin·m (min term). Row r then contributes
+// f0·dact[r]·dp4a(qp, qa[r]) − f1·sact[r] — the same math as native_mmv.comp's dpsub.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 144u; // super-block byte base
+    uint sub = (gelem / 32u) & 7u;   // sub-block 0..7
+    float d = f16tof32(ru16(bd));
+    float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 km = k4(sub, bd + 4u);
+    f0 = d * float(km.x);
+    f1 = dmin * float(km.y);
+    // qbase is always word-aligned (bd = sb·144, 144 % 4 == 0; +16 +32·k) — load each 4-byte
+    // quant word ONCE and nibble-mask it packed (vs 4 rb() byte loads + shifts per word).
+    uint qword = (bd + 16u + (sub >> 1u) * 32u) >> 2u;
+    bool lo = (sub & 1u) == 0u;
+    uvec4 wA = NW4(qword); uvec4 wB = NW4(qword + 4u); // b128: qword 16B-aligned (144%16==0)
+    for (uint j = 0u; j < 8u; j++) {
+        uint w = (j < 4u) ? wA[j] : wB[j - 4u];
+        qp[j] = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
+    }
+}
+#endif
+
+#ifdef FMT_Q5K
+#define ARM_SINGLE_DP
+// Q5_K: [f16 d][f16 dmin][u8 scales[12]][u8 qh[32]][u8 qs[128]] = 176 bytes, 256 elements. Same
+// 6-bit packed scale/min layout as Q4_K (k4 above) and the same f0/f1 accumulation shape, but each
+// element is 5 bits: a 4-bit nibble from `qs` (identical low/high-nibble-per-half-of-64 addressing
+// to Q4_K) OR'd with a 5th bit from a `qh` bit-plane that is SHARED across all 8 sub-blocks (32
+// bytes covering all 256 elements; sub-block `sub` reads bit `sub` of each byte — this is exactly
+// llama.cpp's dequantize_row_q5_K u1/u2 shift-by-2-per-64-block sequence, reindexed: bit position
+// == sub because u1/u2 start at bits 0/1 and left-shift by 2 every 64-elem group).
+// Word-parallel unpack (mirrors Q4_K's wdec — NOT a byte-at-a-time loop, see the -5.8% Q4_K bug
+// this repo already fixed once): one aligned u32 load for the qs nibbles (same nibble-mask trick as
+// Q4_K) AND one aligned u32 load for the qh byte-plane, bit `sub` extracted from all 4 byte lanes
+// in a single shift+mask (shifting a u32 right by sub<8 moves bit `sub` of each byte to that byte's
+// bit 0 without cross-lane contamination, since the shift distance is smaller than a byte; masking
+// 0x01010101 then isolates exactly those four bits), then <<4 to merge as the nibble's 5th bit.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 176u; // super-block byte base
+    uint sub = (gelem / 32u) & 7u;   // sub-block 0..7 (== llama.cpp's `is`)
+    float d = f16tof32(ru16(bd));
+    float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 km = k4(sub, bd + 4u);
+    f0 = d * float(km.x);
+    f1 = dmin * float(km.y);
+    // qs base: bd+48 (d+dmin+scales=16 bytes, then qh=32 bytes -> qs at +48), word-aligned the same
+    // way Q4_K's qword is (bd, 48, 32·k, 4·j all multiples of 4).
+    uint qlword = (bd + 48u + (sub >> 1u) * 32u) >> 2u;
+    uint qhword = (bd + 16u) >> 2u; // qh base: right after scales, reused for every sub-block
+    bool lo = (sub & 1u) == 0u;
+    uvec4 lA = NW4(qlword); uvec4 lB = NW4(qlword + 4u); // 16B-aligned (176%16==0, +48)
+    uvec4 hA = NW4(qhword); uvec4 hB = NW4(qhword + 4u); // 16B-aligned (+16)
+    for (uint j = 0u; j < 8u; j++) {
+        uint wl = (j < 4u) ? lA[j] : lB[j - 4u];
+        uint wh = (j < 4u) ? hA[j] : hB[j - 4u];
+        uint nib = lo ? (wl & 0x0F0F0F0Fu) : ((wl >> 4u) & 0x0F0F0F0Fu);
+        uint bit5 = ((wh >> sub) & 0x01010101u) << 4u;
+        qp[j] = nib | bit5;
+    }
+}
+#endif
+
+#ifdef FMT_Q6K
+// Q6_K: [u8 ql[128]][u8 qh[64]][i8 scales[16]][f16 d] = 210 bytes, 256 elements. The i8 scale
+// covers 16 elements, so the 32-block splits into two dp4a groups (words 0..3 / 4..7): f0 = d·sc0,
+// f1 = d·sc1. The 6-bit q re-biases to signed (q−32) at pack time — no min/Σa term.
+//
+// Word-parallel unpack (was byte-at-a-time: 8 rb() loads for ql + 8 more for qh per 32-elem
+// sub-block — the dp4a-decode -25% AMD regression this rewrite targets). `ql`/`qh` are each loaded
+// as one aligned-OR-unaligned u32 per j (via `ru32u`, see its doc: bd is only 2-byte aligned on odd
+// super-blocks, so a plain `nw[]` word load would misread half of them) instead of 4 scalar byte
+// loads, then all 4 byte lanes are unpacked together with mask/shift, mirroring FMT_Q4K's nibble
+// trick and FMT_Q5K's qh-bit-plane trick:
+//   - nibble select: `qlw & 0x0F0F0F0F` (low) or `(qlw >> 4) & 0x0F0F0F0F` (high) — masking after
+//     the shift discards the cross-byte bits the `>>4` pulls in from the next lane, same as Q4_K.
+//   - 2-bit qh field: `((qhw >> qshift) & 0x03030303) << 4` — qshift < 8 so the mask likewise
+//     isolates each byte's own field before it's parked at bits [5:4], same shape as Q5_K's qh bit.
+//   - signed rebias (q−32, q ∈ 0..63, packed as a two's-complement byte): plain per-byte
+//     subtraction can't be done as one 32-bit op (borrow would propagate across byte lanes when a
+//     byte's code is < 32). SWAR-safe form: q ∈ [0,63] so q+96 ∈ [96,159] never over/underflows a
+//     byte lane, and `(x + 128) mod 256 == x xor 128` for any 8-bit x — so
+//     `(q + 0x60606060) ^ 0x80808080` == `(q − 32) mod 256` per byte lane, with zero cross-lane
+//     borrow, bit-identical to the old `(q - 32u) & 0xFFu` computed one byte at a time.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 210u;
+    uint p0 = gelem % 256u;
+    float d = f16tof32(ru16(bd + 208u));
+    uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
+    uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
+    bool high = og >= 2u; uint qshift = og * 2u;
+    uint qoff = bd + hf * 64u + (((og & 1u) == 1u) ? 32u : 0u); // ql half (qa/qb) once
+    uint qhbase = bd + 128u + qho;
+    // Hoist the 210-byte block's funnel out of the loop and b128 the quads. qoff/qhbase share a
+    // fixed alignment (bd%4 = 2*block-parity, all other terms 4-multiples => both aligned on even
+    // blocks, both +2 on odd). Even: read the two quads directly. Odd: slide a scalar tail word.
+    // Same funnel integers as ru32u — bit-identical.
+    uint qwb = qoff >> 2u; uint qsh = (qoff & 3u) << 3u;
+    uint hwb = qhbase >> 2u; uint hsh = (qhbase & 3u) << 3u;
+    uvec4 qA = NW4(qwb); uvec4 qB = NW4(qwb + 4u);
+    uvec4 hA = NW4(hwb); uvec4 hB = NW4(hwb + 4u);
+    if (qsh == 0u) {   // even block: word-aligned (qsh==0 <=> hsh==0), no funnel
+        for (uint j = 0u; j < 8u; j++) {
+            uint qlw = (j < 4u) ? qA[j] : qB[j - 4u];
+            uint qhw = (j < 4u) ? hA[j] : hB[j - 4u];
+            uint nib = high ? ((qlw >> 4u) & 0x0F0F0F0Fu) : (qlw & 0x0F0F0F0Fu);
+            uint bit2 = ((qhw >> qshift) & 0x03030303u) << 4u;
+            uint q = nib | bit2; // six-bit codes, one per byte lane, each in 0..63
+            qp[j] = (q + 0x60606060u) ^ 0x80808080u; // (q − 32) as two's-complement bytes, SWAR-safe
+        }
+    } else {           // odd block: +2 misaligned, funnel a sliding neighbor (word 8 is the tail)
+        uint qtail = NW(qwb + 8u); uint htail = NW(hwb + 8u);
+        for (uint j = 0u; j < 8u; j++) {
+            uint qcur = (j < 4u) ? qA[j] : qB[j - 4u];
+            uint hcur = (j < 4u) ? hA[j] : hB[j - 4u];
+            uint j1 = j + 1u;
+            uint qnxt = (j1 < 4u) ? qA[j1] : ((j1 < 8u) ? qB[j1 - 4u] : qtail);
+            uint hnxt = (j1 < 4u) ? hA[j1] : ((j1 < 8u) ? hB[j1 - 4u] : htail);
+            uint qlw = (qcur >> qsh) | (qnxt << (32u - qsh));
+            uint qhw = (hcur >> hsh) | (hnxt << (32u - hsh));
+            uint nib = high ? ((qlw >> 4u) & 0x0F0F0F0Fu) : (qlw & 0x0F0F0F0Fu);
+            uint bit2 = ((qhw >> qshift) & 0x03030303u) << 4u;
+            uint q = nib | bit2;
+            qp[j] = (q + 0x60606060u) ^ 0x80808080u;
+        }
+    }
+    f0 = d * float(sgn8(rb(scbase)));
+    f1 = d * float(sgn8(rb(scbase + 1u)));
+}
+#endif
+
+#ifdef FMT_Q3K
+// Q3_K: [u8 hmask[32]][u8 qs[64]][u8 scales_raw[12]][f16 d] = 110 bytes, 256 elements. The 6-bit
+// scale covers 16 elements → two dp4a groups per 32-block; q = (low2 | hbit<<2) − 4 is SYMMETRIC
+// (∈ −4..3, fits a signed byte) so there is no min/Σa term — same f0/f1 shape as Q6_K's wdec.
+// Bit math is a direct port of native_mmv_mw.comp's FMT_Q3K `dpsub` (host-reference-validated by
+// `mmv_mw_q2k_q3k_match_host_reference`), just hoisting the weight-only unpack out of the
+// per-row loop into a once-per-sub-block qp[8] + (f0,f1) pair, same shape as this file's Q4_K/Q6_K.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 110u;
+    uint p0 = gelem % 256u;
+    float d_all = f16tof32(ru16(bd + 108u));
+    uvec4 sc = rw4(bd + 96u); uint a0 = sc.x; uint a1 = sc.y; uint a2 = sc.z; // b128, same words
+    uint k1 = 0x03030303u; uint k2 = 0x0f0f0f0fu;
+    uint aux0 = (a0 & k2) | ((a2 & k1) << 4u);
+    uint aux1 = (a1 & k2) | (((a2 >> 2u) & k1) << 4u);
+    uint aux2 = ((a0 >> 4u) & k2) | (((a2 >> 4u) & k1) << 4u);
+    uint aux3 = ((a1 >> 4u) & k2) | (((a2 >> 6u) & k1) << 4u);
+    uint aux[4] = uint[4](aux0, aux1, aux2, aux3);
+    uint is0 = p0 / 16u;
+    uint sb0 = (aux[is0 >> 2u] >> ((is0 & 3u) * 8u)) & 0xFFu;
+    uint sb1 = (aux[(is0 + 1u) >> 2u] >> (((is0 + 1u) & 3u) * 8u)) & 0xFFu;
+    f0 = d_all * float(sgn8(sb0) - 32);
+    f1 = d_all * float(sgn8(sb1) - 32);
+    uint n = p0 / 128u;
+    uint jj = (p0 % 128u) / 32u;
+    uint shift = 2u * jj;
+    uint jg = 4u * n + jj;          // hmask bit index for this run
+    uint qb = bd + 32u + 32u * n;   // low-2-bit byte base for this run
+    // b128 the 8 low-2-bit words and the 8 hmask words as two rw4 quads each — same words as ru32u.
+    uvec4 qL0 = rw4(qb); uvec4 qL1 = rw4(qb + 16u);
+    uvec4 hM0 = rw4(bd); uvec4 hM1 = rw4(bd + 16u);
+    for (uint j = 0u; j < 8u; j++) {
+        uint qlo = (j < 4u) ? qL0[j] : qL1[j - 4u];
+        uint hbits = (j < 4u) ? hM0[j] : hM1[j - 4u];
+        uint q4 = ((qlo >> shift) & 0x03030303u)
+            | (((hbits >> jg) & 0x01010101u) << 2u);
+        uint w = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint q = (q4 >> (8u * b)) & 7u;
+            w |= ((q - 4u) & 0xFFu) << (8u * b); // two's-complement signed byte, q−4 ∈ −4..3
+        }
+        qp[j] = w;
+    }
+}
+#endif
+
+#ifdef FMT_IQ4XS
+#define ARM_SINGLE_DP
+// IQ4_XS: [f16 d][u16 scales_h][u8 scales_l[4]][u8 qs[128]] = 136 bytes, 256 elements, 8 sub-blocks.
+// Non-linear codebook (KV_IQ4NL, signed int8): gather codebook[code] -> int8, then row r dp4a's it
+// against qa[r]. One 6-bit scale dl per 32-elem sub-block (symmetric — no min term), so f0 = dl and
+// f1 = 0 and the Q4_K-style single-dp accumulation (`f0·dact·dp − f1·sact`) degenerates correctly.
+// Element order matches the activation aw[8]: qp[0..3] = KV of low nibbles (elems 0..15),
+// qp[4..7] = KV of high nibbles (elems 16..31). Same dl*KV product as the scalar dqblk decode.
+// Byte-packed LUT (see native_decode.glsl's kv_iq4nl): a 4-way dynamic index + bitfieldExtract
+// instead of a 16-way dynamic index — same values, bit-identical, cheaper ALU.
+const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+int kv_iq4nl(uint idx) {
+    return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
+}
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint p = gelem % 256u;
+    uint bd = (gelem / 256u) * 136u;
+    float d = f16tof32(ru16(bd));
+    uint scales_h = ru16(bd + 2u);
+    uint ib = p / 32u;
+    uint lo = (rb(bd + 4u + (ib >> 1u)) >> (4u * (ib & 1u))) & 0xFu;
+    uint hi = (scales_h >> (2u * ib)) & 3u;
+    f0 = d * float(int(lo | (hi << 4u)) - 32);
+    f1 = 0.0;
+    uint qw = (bd + 8u + 16u * ib) >> 2u; // 136%4==0: word-aligned, b128 the 4 qs words
+    uvec4 qv = NW4(qw);
+    for (uint j = 0u; j < 4u; j++) {
+        uint q = qv[j];                  // qs[4j..4j+3]
+        uint wl = 0u; uint wh = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint qbyte = (q >> (8u * b)) & 0xFFu;
+            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
+            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
+        }
+        qp[j] = wl;
+        qp[j + 4u] = wh;
+    }
+}
+#endif
+
+// ── Legacy 32-block ("_0"/"_1") formats + IQ4_NL ────────────────────────────────────────────────
+// One 32-element block == one activation quant block (BLK=32), so `wdec`'s 8 words ARE the whole
+// block: no super-block sub-indexing, one scale (+ one min for the `_1` twins) per wdec call.
+// Element order for every 4-bit member (llama.cpp `dequantize_row_q4_0`/`q5_0`/`q4_1`/`q5_1`/
+// `iq4_nl`): element j < 16 is the LOW nibble of `qs[j]`, element 16+j the HIGH nibble of the SAME
+// byte — so the four `qs` u32s give words 0..3 (low nibbles) and words 4..7 (high nibbles), the
+// identical wl/wh split FMT_IQ4XS already uses. Word-parallel throughout (mask/shift/SWAR on whole
+// u32s), never byte-at-a-time — that unpack shape is what cost Q4_K −5.8% and Q6_K −25% before.
+
+#if defined(FMT_Q5_0) || defined(FMT_Q5_1)
+// Spread 4 consecutive `qh` bits (starting at `base`) into the bit-0 of 4 byte lanes, word-parallel
+// — the `_5`-bit plane's answer to Q5_K's `(wh >> sub) & 0x01010101` trick (which can't be used
+// here: Q5_0/Q5_1's 5th bits for one word are 4 CONSECUTIVE bits of one u32, not the same bit of 4
+// bytes). v ∈ 0..15, and v * 0x00204081 places bit i of v at bit positions {i, i+7, i+14, i+21};
+// across i = 0..3 those 16 positions are all distinct, so the multiply carries nowhere. Masking
+// 0x01010101 then keeps exactly bit i of v in byte lane i's bit 0 (i → i+8i·… : 0→0, 1→8, 2→16,
+// 3→24). Caller shifts <<4 to park it as the code's 5th bit.
+uint qh_spread(uint qh, uint base) {
+    return (((qh >> base) & 0xFu) * 0x00204081u) & 0x01010101u;
+}
+#endif
+
+#ifdef FMT_Q8_0
+#define ARM_SINGLE_DP
+// Q8_0: [f16 d][i8 qs[32]] = 34 bytes, 32 elements. w = d·q8 with `q8` stored as a raw
+// two's-complement byte — the stored byte IS the dp4a operand, so there is NO unpack at all (no
+// nibble mask, no rebias, no codebook): 8 word loads and done. Symmetric, so no min term (f1 = 0)
+// and the shared f0·dact·dp − f1·sact arm degenerates to f0·dact·dp.
+// 34 % 4 == 2 → every odd block's `bd` is 2 mod 4; the qs words go through `ru32u` (see its doc).
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 32u) * 34u;
+    f0 = f16tof32(ru16(bd));
+    f1 = 0.0;
+    // b128 the 8 qs words as two rw4 quads (fused NW4 + funnel) — same words as ru32u per word.
+    uvec4 q0 = rw4(bd + 2u); uvec4 q1 = rw4(bd + 18u);
+    for (uint j = 0u; j < 8u; j++) { qp[j] = (j < 4u) ? q0[j] : q1[j - 4u]; }
+}
+#endif
+
+#ifdef FMT_Q4_0
+#define ARM_SINGLE_DP
+// Q4_0: [f16 d][u8 qs[16]] = 18 bytes, 32 elements. w = (q − 8)·d — one scale, SYMMETRIC
+// zero-point, so no min term (f1 = 0). 18 % 4 == 2 → `ru32u` loads.
+// SWAR-safe rebias (q − 8, q ∈ 0..15, one code per byte lane): a 32-bit `- 0x08080808` would
+// borrow ACROSS byte lanes for any code < 8. Q6_K's identity instead: q + 120 ∈ [120,135] never
+// overflows a lane, and (x + 128) mod 256 == x ^ 128 for any 8-bit x, so
+// `(q + 0x78787878) ^ 0x80808080` == (q − 8) mod 256 per lane, borrow-free (120 = 128 − 8).
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 32u) * 18u;
+    f0 = f16tof32(ru16(bd));
+    f1 = 0.0;
+    uvec4 qv = rw4(bd + 2u); // b128 the 4 qs words (same words as ru32u per word)
+    for (uint j = 0u; j < 4u; j++) {
+        uint w = qv[j];
+        qp[j] = ((w & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u;
+        qp[j + 4u] = (((w >> 4u) & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u;
+    }
+}
+#endif
+
+#ifdef FMT_Q5_0
+#define ARM_SINGLE_DP
+// Q5_0: [f16 d][u8 qh[4]][u8 qs[16]] = 22 bytes, 32 elements. w = (q5 − 16)·d, q5 = 4-bit nibble |
+// a 5th bit from the 32-bit `qh` plane: element j (< 16) takes bit j of qh, element 16+j takes bit
+// 16+j (llama.cpp's xh_0 = (qh >> j) << 4 & 0x10 / xh_1 = (qh >> (j+12)) & 0x10). Symmetric → no
+// min term. 22 % 4 == 2 → `ru32u` loads for BOTH qh and qs.
+// SWAR-safe rebias (q5 − 16, q5 ∈ 0..31): (q + 0x70707070) ^ 0x80808080 (112 = 128 − 16; q + 112 ≤
+// 143 never carries out of a lane) — same identity as Q4_0's 0x78 / Q6_K's 0x60.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 32u) * 22u;
+    f0 = f16tof32(ru16(bd));
+    f1 = 0.0;
+    uint qh = ru32u(bd + 2u);
+    uvec4 qv = rw4(bd + 6u); // b128 the 4 qs words (same words as ru32u per word)
+    for (uint j = 0u; j < 4u; j++) {
+        uint w = qv[j];
+        uint lo = (w & 0x0F0F0F0Fu) | (qh_spread(qh, j * 4u) << 4u);
+        uint hi = ((w >> 4u) & 0x0F0F0F0Fu) | (qh_spread(qh, 16u + j * 4u) << 4u);
+        qp[j] = (lo + 0x70707070u) ^ 0x80808080u;
+        qp[j + 4u] = (hi + 0x70707070u) ^ 0x80808080u;
+    }
+}
+#endif
+
+#ifdef FMT_Q4_1
+#define ARM_SINGLE_DP
+// Q4_1: [f16 d][f16 m][u8 qs[16]] = 20 bytes, 32 elements. w = q·d + m — the code stays UNSIGNED
+// (0..15, a valid positive int8 operand, no centering) and the additive min folds out of the dot
+// exactly like Q4_K's dmin·mn: Σ(q·d + m)·a = d·Σq·a + m·Σa, and Σa is `sact`. The shared arm
+// computes f0·dact·dp − f1·sact, so f1 = −m gives + m·Σa — IEEE-exact (negation and (−m)·sa are
+// both exact), no separate accumulation branch needed.
+// 20 % 4 == 0 → blocks ARE word-aligned (unlike Q4_0's 18); plain `nw[]` loads, and qs at bd+4 is
+// word-aligned too.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 32u) * 20u;
+    f0 = f16tof32(ru16(bd));
+    f1 = -f16tof32(ru16(bd + 2u));
+    uint qw = (bd + 4u) >> 2u; // 20%4==0: word-aligned, b128 the 4 qs words
+    uvec4 qv = NW4(qw);
+    for (uint j = 0u; j < 4u; j++) {
+        uint w = qv[j];
+        qp[j] = w & 0x0F0F0F0Fu;
+        qp[j + 4u] = (w >> 4u) & 0x0F0F0F0Fu;
+    }
+}
+#endif
+
+#ifdef FMT_Q5_1
+#define ARM_SINGLE_DP
+// Q5_1: [f16 d][f16 m][u8 qh[4]][u8 qs[16]] = 24 bytes, 32 elements. Q5_0's 5-bit code (same qh bit
+// layout, just 2 bytes later) with Q4_1's additive min instead of a zero-point: w = q5·d + m, q5 ∈
+// 0..31 stored raw (no centering — the top code 31 still fits a positive int8), min folded via
+// f1 = −m against `sact` exactly as in FMT_Q4_1 above.
+// 24 % 4 == 0 → word-aligned blocks; qh at bd+4 and qs at bd+8 are both word-aligned, plain `nw[]`.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 32u) * 24u;
+    f0 = f16tof32(ru16(bd));
+    f1 = -f16tof32(ru16(bd + 2u));
+    uint qh = NW((bd + 4u) >> 2u);
+    uint qw = (bd + 8u) >> 2u; // 24%4==0: word-aligned, b128 the 4 qs words
+    uvec4 qv = NW4(qw);
+    for (uint j = 0u; j < 4u; j++) {
+        uint w = qv[j];
+        qp[j] = (w & 0x0F0F0F0Fu) | (qh_spread(qh, j * 4u) << 4u);
+        qp[j + 4u] = ((w >> 4u) & 0x0F0F0F0Fu) | (qh_spread(qh, 16u + j * 4u) << 4u);
+    }
+}
+#endif
+
+#ifdef FMT_IQ4NL
+#define ARM_SINGLE_DP
+// IQ4_NL: [f16 d][u8 qs[16]] = 18 bytes, 32 elements — Q4_0's exact layout, but the 4-bit code is a
+// LUT index into the same signed 16-entry KV_IQ4NL codebook FMT_IQ4XS uses (already the correct
+// signed dp4a operand, no centering). One flat scale per 32-block, so f0 = d, f1 = 0 (IQ4_XS's
+// 6-bit per-sub-block scale collapses to this).
+// 18 % 4 == 2 → `ru32u` loads (IQ4_XS's 136-byte super-block is word-aligned and uses plain `nw[]`;
+// this is the one substantive difference between the two).
+// Byte-packed LUT (see native_decode.glsl's kv_iq4nl): a 4-way dynamic index + bitfieldExtract
+// instead of a 16-way dynamic index — same values, bit-identical, cheaper ALU.
+const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+int kv_iq4nl(uint idx) {
+    return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
+}
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 32u) * 18u;
+    f0 = f16tof32(ru16(bd));
+    f1 = 0.0;
+    uvec4 qv = rw4(bd + 2u); // b128 the 4 qs words (same words as ru32u per word)
+    for (uint j = 0u; j < 4u; j++) {
+        uint q = qv[j];
+        uint wl = 0u; uint wh = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint qbyte = (q >> (8u * b)) & 0xFFu;
+            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
+            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
+        }
+        qp[j] = wl;
+        qp[j + 4u] = wh;
+    }
+}
+#endif
+
+#ifdef FMT_Q2K
+// Q2_K: [u8 scales[16]][u8 qs[64]][f16 d][f16 dmin] = 84 bytes, 256 elements. Each 16-elem group
+// has its own 4-bit scale|min nibble pair — a Q4_K-shaped min term, but split per HALF of the
+// 32-block (dl0/ml0 for elems 0..15, dl1/ml1 for elems 16..31) rather than Q4_K's one pair per
+// whole 32-block. That doesn't fit the shared f0/f1 `wdec` interface above (needs 4 scalars, not
+// 2), so Q2_K gets its own `wdec2k` + a dedicated accumulation branch in main() below. Direct port
+// of native_mmv_mw.comp's FMT_Q2K `dpsub` (host-reference-validated), weight-only unpack hoisted
+// out of the per-row loop the same way. The min term needs PER-16 activation sums, which the
+// per-32-block `sact` can't split — same as the m=1 kernel, sub-sums are recomputed per row via
+// dp4a against packed ones (0x01010101).
+void wdec2k(uint gelem, out uint qp[8], out float dl0, out float ml0, out float dl1, out float ml1) {
+    uint bd = (gelem / 256u) * 84u;
+    uint p0 = gelem % 256u;
+    float d = f16tof32(ru16(bd + 80u));
+    float dmin = f16tof32(ru16(bd + 82u));
+    uint sb0 = rb(bd + p0 / 16u);        // scale|min nibbles for elems 0..15
+    uint sb1 = rb(bd + p0 / 16u + 1u);   // … and 16..31
+    dl0 = d * float(sb0 & 0xFu);  ml0 = dmin * float(sb0 >> 4u);
+    dl1 = d * float(sb1 & 0xFu);  ml1 = dmin * float(sb1 >> 4u);
+    uint shift = 2u * ((p0 % 128u) / 32u);
+    uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // aligned word base of this run's 2-bit codes
+    uvec4 qA = NW4(qw); uvec4 qB = NW4(qw + 4u); // b128 the 8 quant words
+    for (uint j = 0u; j < 8u; j++) {
+        uint w = (j < 4u) ? qA[j] : qB[j - 4u];
+        qp[j] = (w >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
+    }
+}
+#endif
+
+#ifdef FUSE_QUANT
+// Inline per-32-block symmetric int8 activation quantization: read 32 f32 elements, compute amax,
+// quantize to int8, output packed words aw[8] and per-block da/sa. Same numerics as quant_q8.comp
+// (amax/127 scale, round-to-nearest, clamp [−127,127], sa = Σ(d·q)). Shared by OUTS4 and non-OUTS4.
+void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
+    float amax = 0.0;
+    float vals[32];
+    for (uint i = 0u; i < 32u; i++) {
+        float v = a[row * pc.in_f + s * 32u + i];
+        vals[i] = v;
+        amax = max(amax, abs(v));
+    }
+    da = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / da : 0.0;
+    sa = 0.0;
+    for (uint j = 0u; j < 8u; j++) {
+        int packed = 0;
+        for (uint b = 0u; b < 4u; b++) {
+            int q = clamp(int(round(vals[j * 4u + b] * inv)), -127, 127);
+            packed |= (q & 0xFF) << (b * 8u);
+            sa += da * float(q);
+        }
+        aw[j] = packed;
+    }
+}
+#endif
+
+#ifdef OUTS4
+// (grid = ceil(out_f/4)). The 2-output layout leaves 64 − nsub lanes IDLE when nsub < 64 (E2B's
+// in_f=1536 gate_up: 48 sub-blocks → 25% of the wg dead, one loop iteration); splitting the wg
+// 4×16 keeps every lane on a sub-block. Reduction: shared tree over each output's 16 lanes.
+shared float part4[4u * MR * 16u];   // [out, row, lane]
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
+    // why no extra bounds check is needed here (the existing `live` guard below already covers a
+    // padding workgroup's out-of-range o0 for every lane).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint ot = t >> 4u;               // which of the 4 outputs this lane serves
+    uint sl = t & 15u;               // K sub-lane within the output's 16
+    uint nsub = pc.in_f / 32u;
+    uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
+    bool live = (o0 + ot) < pc.out_f; // per-output tail guard (out_f % 4)
+    uint wb = pc.w_base + (o0 + (live ? ot : 0u)) * pc.in_f;
+    float acc[MR];
+    for (uint r = 0u; r < MR; r++) { acc[r] = 0.0; }
+    for (uint s = sl; s < nsub; s += 16u) {
+#ifdef FMT_Q2K
+        uint qp[8]; float dl0; float ml0; float dl1; float ml1;
+        wdec2k(wb + s * 32u, qp, dl0, ml0, dl1, ml1);
+#else
+        uint qp[8]; float f0; float f1;
+        wdec(wb + s * 32u, qp, f0, f1);
+#endif
+        for (uint r = 0u; r < MR; r++) {
+            if (r < pc.rows) {
+#ifdef FUSE_QUANT
+                int aw[8]; float da; float sa;
+                fuse_quant(r, s, aw, da, sa);
+                uvec4 a0 = uvec4(uint(aw[0]), uint(aw[1]), uint(aw[2]), uint(aw[3]));
+                uvec4 a1 = uvec4(uint(aw[4]), uint(aw[5]), uint(aw[6]), uint(aw[7]));
+#else
+                float da = float(dact[r * nsub + s]);
+                float sa = float(sact[r * nsub + s]);
+                uint qb = r * in_fq + s * 2u;
+                uvec4 a0 = qa4[qb];
+                uvec4 a1 = qa4[qb + 1u];
+#endif
+#ifdef ARM_SINGLE_DP
+                int dp = 0;
+                dp = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[2]), int(a0.z), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[3]), int(a0.w), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[4]), int(a1.x), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[5]), int(a1.y), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dp);
+                acc[r] += f0 * da * float(dp) - f1 * sa;
+#elif defined(FMT_Q2K)
+                int dp0 = 0; int dp1 = 0; int s0 = 0; int s1 = 0;
+                dp0 = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dp0);
+                dp0 = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dp0);
+                dp0 = dotPacked4x8AccSatEXT(int(qp[2]), int(a0.z), dp0);
+                dp0 = dotPacked4x8AccSatEXT(int(qp[3]), int(a0.w), dp0);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[4]), int(a1.x), dp1);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[5]), int(a1.y), dp1);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dp1);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dp1);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.x), s0);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.y), s0);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.z), s0);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.w), s0);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.x), s1);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.y), s1);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.z), s1);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.w), s1);
+                acc[r] += da * (dl0 * float(dp0) + dl1 * float(dp1))
+                        - da * (ml0 * float(s0) + ml1 * float(s1));
+#else
+                // Q6_K/Q3_K: split dot per 16-elem scale group (uvec4 a0 / a1); no min term.
+                int dpa = 0; int dpb = 0;
+                dpa = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dpa);
+                dpa = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dpa);
+                dpa = dotPacked4x8AccSatEXT(int(qp[2]), int(a0.z), dpa);
+                dpa = dotPacked4x8AccSatEXT(int(qp[3]), int(a0.w), dpa);
+                dpb = dotPacked4x8AccSatEXT(int(qp[4]), int(a1.x), dpb);
+                dpb = dotPacked4x8AccSatEXT(int(qp[5]), int(a1.y), dpb);
+                dpb = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dpb);
+                dpb = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dpb);
+                acc[r] += da * (f0 * float(dpa) + f1 * float(dpb));
+#endif
+            }
+        }
+    }
+    for (uint r = 0u; r < MR; r++) {
+        if (r < pc.rows) { part4[(ot * MR + r) * 16u + sl] = acc[r]; }
+    }
+    barrier();
+    for (uint stride = 8u; stride > 0u; stride /= 2u) {
+        if (sl < stride) {
+            for (uint r = 0u; r < MR; r++) {
+                if (r < pc.rows) {
+                    part4[(ot * MR + r) * 16u + sl] += part4[(ot * MR + r) * 16u + sl + stride];
+                }
+            }
+        }
+        barrier();
+    }
+    if (sl < pc.rows && live) {
+#ifdef USE_RES
+        // USE_RES is only ever dispatched at pc.rows=1 (the decode Linear+Add fusion), so this
+        // branch is only reached by sl==0 — add the residual unconditionally rather than
+        // special-casing sl, keeping the code identical to the non-res path plus one term.
+        y_buf[sl * pc.out_f + o0 + ot] = r_buf[o0 + ot] + part4[(ot * MR + sl) * 16u];
+#else
+        y_buf[sl * pc.out_f + o0 + ot] = part4[(ot * MR + sl) * 16u];
+#endif
+    }
+}
+#else
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
+    // an explicit early return is needed here (the final `y_buf[t*pc.out_f + o0]` write below is
+    // unconditional on o0, unlike the OUTS4 variant above).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
+    if (o0 >= pc.out_f) { return; }
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint nsub = pc.in_f / 32u;
+    uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
+    uint wb0 = pc.w_base + o0 * pc.in_f;
+    bool has1 = (o0 + 1u) < pc.out_f; // workgroup-uniform tail guard (odd out_f)
+    float acc0[MR];
+    float acc1[MR];
+    for (uint r = 0u; r < MR; r++) { acc0[r] = 0.0; acc1[r] = 0.0; }
+    for (uint s = t; s < nsub; s += 64u) {
+#ifdef FMT_Q2K
+        uint qp0[8]; float dl00; float ml00; float dl10; float ml10;
+        wdec2k(wb0 + s * 32u, qp0, dl00, ml00, dl10, ml10);
+        uint qp1[8]; float dl01 = 0.0; float ml01 = 0.0; float dl11 = 0.0; float ml11 = 0.0;
+        if (has1) { wdec2k(wb0 + pc.in_f + s * 32u, qp1, dl01, ml01, dl11, ml11); }
+#else
+        uint qp0[8]; float a0; float b0;
+        wdec(wb0 + s * 32u, qp0, a0, b0);
+        uint qp1[8]; float a1 = 0.0; float b1 = 0.0;
+        if (has1) { wdec(wb0 + pc.in_f + s * 32u, qp1, a1, b1); }
+#endif
+        for (uint r = 0u; r < MR; r++) {
+            if (r < pc.rows) {
+#ifdef FUSE_QUANT
+                int aw[8]; float da; float sa;
+                fuse_quant(r, s, aw, da, sa);
+#else
+                float da = float(dact[r * nsub + s]);
+                float sa = float(sact[r * nsub + s]);
+                uint qb = r * in_fq + s * 2u;
+                uvec4 av0 = qa4[qb];
+                uvec4 av1 = qa4[qb + 1u];
+                int aw[8] = int[8](int(av0.x), int(av0.y), int(av0.z), int(av0.w),
+                                   int(av1.x), int(av1.y), int(av1.z), int(av1.w));
+#endif
+#ifdef ARM_SINGLE_DP
+                int dp0 = 0; int dp1 = 0;
+                for (uint j = 0u; j < 8u; j++) {
+                    dp0 = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0);
+                    if (has1) { dp1 = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1); }
+                }
+                acc0[r] += a0 * da * float(dp0) - b0 * sa;
+                if (has1) { acc1[r] += a1 * da * float(dp1) - b1 * sa; }
+#elif defined(FMT_Q2K)
+                int dp0a = 0; int dp0b = 0; int dp1a = 0; int dp1b = 0;
+                int s0a = 0; int s0b = 0;
+                for (uint j = 0u; j < 4u; j++) {
+                    dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0a);
+                    if (has1) { dp1a = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1a); }
+                    s0a = dotPacked4x8AccSatEXT(0x01010101, aw[j], s0a);
+                }
+                for (uint j = 4u; j < 8u; j++) {
+                    dp0b = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0b);
+                    if (has1) { dp1b = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1b); }
+                    s0b = dotPacked4x8AccSatEXT(0x01010101, aw[j], s0b);
+                }
+                acc0[r] += da * (dl00 * float(dp0a) + dl10 * float(dp0b))
+                         - da * (ml00 * float(s0a) + ml10 * float(s0b));
+                if (has1) {
+                    acc1[r] += da * (dl01 * float(dp1a) + dl11 * float(dp1b))
+                             - da * (ml01 * float(s0a) + ml11 * float(s0b));
+                }
+#else
+                // Q6_K/Q3_K: split dot per 16-elem scale group (words 0..3 / 4..7); no min term.
+                int dp0a = 0; int dp0b = 0; int dp1a = 0; int dp1b = 0;
+                for (uint j = 0u; j < 4u; j++) {
+                    dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0a);
+                    if (has1) { dp1a = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1a); }
+                }
+                for (uint j = 4u; j < 8u; j++) {
+                    dp0b = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0b);
+                    if (has1) { dp1b = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1b); }
+                }
+                acc0[r] += da * (a0 * float(dp0a) + b0 * float(dp0b));
+                if (has1) { acc1[r] += da * (a1 * float(dp1a) + b1 * float(dp1b)); }
+#endif
+            }
+        }
+    }
+    for (uint r = 0u; r < MR; r++) {
+        if (r < pc.rows) {
+            float s0 = subgroupAdd(acc0[r]);
+            float s1 = subgroupAdd(acc1[r]);
+            if (subgroupElect()) {
+                part[r * MAX_SG + gl_SubgroupID] = s0;
+                part[(MR + r) * MAX_SG + gl_SubgroupID] = s1;
+            }
+        }
+    }
+    barrier();
+    if (t < pc.rows) {
+        float t0 = 0.0;
+        float t1 = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) {
+            t0 += part[t * MAX_SG + s];
+            t1 += part[(MR + t) * MAX_SG + s];
+        }
+#ifdef USE_RES
+        // Same reasoning as the OUTS4 write above: USE_RES only ever dispatches at pc.rows=1, so
+        // this is only reached by t==0.
+        y_buf[t * pc.out_f + o0] = r_buf[o0] + t0;
+        if (has1) { y_buf[t * pc.out_f + o0 + 1u] = r_buf[o0 + 1u] + t1; }
+#else
+        y_buf[t * pc.out_f + o0] = t0;
+        if (has1) { y_buf[t * pc.out_f + o0 + 1u] = t1; }
+#endif
+    }
+}
+#endif

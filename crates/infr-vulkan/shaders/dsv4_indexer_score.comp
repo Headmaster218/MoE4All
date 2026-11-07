@@ -1,0 +1,57 @@
+#version 460
+// DeepSeek V4 ratio-4 lightning-indexer scores over official 68-byte MXFP4 rows. One workgroup
+// per compressed key; one lane per indexer head keeps all keys independently schedulable.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint cache_off;
+    uint kv_len;
+    uint n_head;
+    uint head_dim;
+    float scale;
+} pc;
+layout(binding = 0) readonly buffer QB { uint q[]; };
+layout(binding = 1) readonly buffer KB { uint k[]; };
+layout(binding = 2) readonly buffer WB { float weights[]; };
+layout(binding = 3) writeonly buffer SB { float scores[]; };
+
+shared float part[64];
+const float E2M1[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+
+uint byte_at_q(uint off) { return (q[off >> 2u] >> (8u * (off & 3u))) & 255u; }
+uint byte_at_k(uint off) { return (k[off >> 2u] >> (8u * (off & 3u))) & 255u; }
+float value(uint code) { return (code & 8u) != 0u ? -E2M1[code & 7u] : E2M1[code & 7u]; }
+
+float decode_q(uint row, uint d) {
+    uint base = row * 68u;
+    uint packed = byte_at_q(base + d / 2u);
+    uint code = (d & 1u) == 0u ? packed & 15u : packed >> 4u;
+    float scale = exp2(float(int(byte_at_q(base + 64u + d / 32u)) - 127));
+    return value(code) * scale;
+}
+float decode_k(uint row, uint d) {
+    uint base = pc.cache_off + row * 68u;
+    uint packed = byte_at_k(base + d / 2u);
+    uint code = (d & 1u) == 0u ? packed & 15u : packed >> 4u;
+    float scale = exp2(float(int(byte_at_k(base + 64u + d / 32u)) - 127));
+    return value(code) * scale;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= pc.kv_len) { return; }
+    uint h = gl_LocalInvocationID.x;
+    float dotv = 0.0;
+    if (h < pc.n_head) {
+        for (uint d = 0u; d < pc.head_dim; ++d) { dotv += decode_q(h, d) * decode_k(row, d); }
+        part[h] = weights[h] * pc.scale * max(dotv, 0.0);
+    } else {
+        part[h] = 0.0;
+    }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (h < stride) { part[h] += part[h + stride]; }
+        barrier();
+    }
+    if (h == 0u) { scores[row] = part[0]; }
+}

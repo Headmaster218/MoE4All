@@ -1,0 +1,89 @@
+#version 460
+// Projection GEMM for prefill: C[M,N] = A[M,K] · Wᵀ, where W is [N,K] (row-major [out,in], the
+// GGUF/our weight layout). A is f32 activations (converted to f16 in shared); W is f16, unpacked
+// from 2/uint during shared staging. Accumulate f32.
+// 64x64 output tile / 4 subgroups (2x2 coopmat 16x16 frags). 1D workgroup grid. M is padded to 64
+// (rows ≥ M load 0 from A → produce 0 in C, harmless if C is allocated ceil(M/64)*64 rows).
+// Requires requiredSubgroupSize=32, N%64==0, K%32==0.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+
+// Resident-BDA: the weight is read through a 64-bit buffer_reference into the resident arena
+// (base = arena_lo/arena_hi) instead of a bound SSBO — see linear_f32.comp's header for the
+// campaign rationale. Reads funnel through native_weight_addr.glsl's arena_word() (saddr scalar-base
+// global_load) rather than a divergent-index 64-bit deref — see that file's header.
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint arena_lo; uint arena_hi; } pc;
+layout(binding = 0) readonly buffer ABuf { float a[]; };       // [M, K] f32 activations
+layout(binding = 2) writeonly buffer CBuf { float c[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+shared float16_t As[BM * BK];
+shared float16_t Bs[BN * BK]; // [n][k] — staged k-inner so the global weight reads coalesce
+
+// f16 weight element g (global index into [N,K] = out*K + in)
+float wf(uint g) { return unpackHalf2x16(NW(g >> 1u))[g & 1u]; }
+
+void main() {
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address
+    uint tilesN = pc.n / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint sgid = gl_SubgroupID;
+    uint sgRow = (sgid / 2u) * 32u;
+    uint sgCol = (sgid % 2u) * 32u;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        for (uint idx = li; idx < BM * BK; idx += 128u) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[idx] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
+        }
+        for (uint idx = li; idx < BN * BK; idx += 128u) {
+            uint cc = idx / BK; // n within tile
+            uint kk = idx % BK; // k within tile (contiguous → coalesced weight reads)
+            Bs[cc * BK + kk] = float16_t(wf((wgCol + cc) * pc.k + (k0 + kk)));
+        }
+        barrier();
+
+        for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b1;
+            coopMatLoad(a0, As, (sgRow + 0u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, As, (sgRow + 16u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, Bs, (sgCol + 0u) * BK + kf, BK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, Bs, (sgCol + 16u) * BK + kf, BK, gl_CooperativeMatrixLayoutColumnMajor);
+            acc00 = coopMatMulAdd(a0, b0, acc00);
+            acc01 = coopMatMulAdd(a0, b1, acc01);
+            acc10 = coopMatMulAdd(a1, b0, acc10);
+            acc11 = coopMatMulAdd(a1, b1, acc11);
+        }
+        barrier();
+    }
+
+    uint cr = wgRow + sgRow;
+    uint ccol = wgCol + sgCol;
+    coopMatStore(acc00, c, (cr + 0u) * pc.n + (ccol + 0u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc01, c, (cr + 0u) * pc.n + (ccol + 16u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc10, c, (cr + 16u) * pc.n + (ccol + 0u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc11, c, (cr + 16u) * pc.n + (ccol + 16u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

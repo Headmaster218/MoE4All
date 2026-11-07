@@ -1,0 +1,102 @@
+#version 460
+#ifdef SUBGROUP_REDUCE
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+// Flash-decode combine: one workgroup per (head, hd-tile). Merges n_chunks partial softmax results
+// (per-chunk max pm, sum pl, weighted-V pacc) via the online-softmax rule. o = [nh, hd].
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint nh; uint hd; uint n_chunks; uint ntile; } pc;
+layout(binding = 0) readonly buffer PM { float pm[]; };     // [nh, n_chunks]
+layout(binding = 1) readonly buffer PL { float pl[]; };     // [nh, n_chunks]
+layout(binding = 2) readonly buffer PA { float pacc[]; };   // [nh, n_chunks, hd]
+#ifdef USE_LIVE
+// Live chunk count from the attn_live prologue (record-once replay: entries past `live` in
+// pm/pl/pacc are stale/uninitialized — never read them). Inserted BEFORE the output so the
+// recorder's reads|writes split stays output-last (same convention as the `_dyn` params SSBO).
+layout(binding = 3) readonly buffer LB { uint l_gx; uint l_gy; uint l_gz; uint l_live; };
+layout(binding = 4) buffer OB { float o[]; };               // [nh, hd]
+#else
+layout(binding = 3) buffer OB { float o[]; };               // [nh, hd]
+#endif
+
+shared float wexp[1024];
+
+void main() {
+    uint h = gl_WorkGroupID.x / pc.ntile;
+    uint tile = gl_WorkGroupID.x % pc.ntile;
+    uint hd = pc.hd;
+    uint t = gl_LocalInvocationID.x;
+    uint base = h * pc.n_chunks;
+#ifdef USE_LIVE
+    uint nch = l_live;
+#else
+    uint nch = pc.n_chunks;
+#endif
+#ifdef HYBRID_REDUCE
+    // Record-once replay cannot swap pipelines as KV grows. Keep the established four-tile serial
+    // combine while the live split count is small, then use all 16 tiles and wave32 reductions at
+    // deep context. Extra short-context workgroups return uniformly before touching shared state.
+    bool use_sg = nch >= 128u;
+    uint logical_ntile = use_sg ? pc.ntile : 4u;
+    if (!use_sg && tile >= logical_ntile) { return; }
+#else
+    uint logical_ntile = pc.ntile;
+#endif
+    uint hdt = hd / logical_ntile;
+    uint d0 = tile * hdt;
+    float mm;
+    float l;
+#if defined(SUBGROUP_REDUCE) && defined(HYBRID_REDUCE)
+    if (use_sg) {
+        float lane_m = -3.0e38;
+        for (uint c = t; c < nch; c += 32u) { lane_m = max(lane_m, pm[base + c]); }
+        mm = subgroupMax(lane_m);
+        float lane_l = 0.0;
+        for (uint c = t; c < nch; c += 32u) {
+            float w = exp(pm[base + c] - mm);
+            wexp[c] = w;
+            lane_l += pl[base + c] * w;
+        }
+        l = subgroupAdd(lane_l);
+        barrier();
+    } else {
+        mm = -3.0e38;
+        for (uint c = 0u; c < nch; c++) { mm = max(mm, pm[base + c]); }
+        for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
+        barrier();
+        l = 0.0;
+        for (uint c = 0u; c < nch; c++) { l += pl[base + c] * wexp[c]; }
+    }
+#elif defined(SUBGROUP_REDUCE)
+    float lane_m = -3.0e38;
+    for (uint c = t; c < nch; c += 32u) { lane_m = max(lane_m, pm[base + c]); }
+    mm = subgroupMax(lane_m);
+    float lane_l = 0.0;
+    for (uint c = t; c < nch; c += 32u) {
+        float w = exp(pm[base + c] - mm);
+        wexp[c] = w;
+        lane_l += pl[base + c] * w;
+    }
+    l = subgroupAdd(lane_l);
+    barrier();
+#else
+    mm = -3.0e38;
+    for (uint c = 0u; c < nch; c++) { mm = max(mm, pm[base + c]); }
+    for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
+    barrier();
+    l = 0.0;
+    for (uint c = 0u; c < nch; c++) { l += pl[base + c] * wexp[c]; }
+#endif
+    float inv = 1.0 / l;
+    for (uint d = d0 + t; d < d0 + hdt; d += 32u) {
+        float acc = 0.0;
+        // Skip zero-weight chunks: the self-chunking partial leaves pacc UNINITIALIZED for
+        // workgroups past the live kv range (0 × garbage could be NaN, so test the weight).
+        for (uint c = 0u; c < nch; c++) {
+            if (wexp[c] != 0.0) { acc += pacc[(base + c) * hd + d] * wexp[c]; }
+        }
+        o[h * hd + d] = acc * inv;
+    }
+}

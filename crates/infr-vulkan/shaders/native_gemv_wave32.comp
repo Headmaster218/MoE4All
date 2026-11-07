@@ -1,0 +1,92 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_control_flow_attributes : require
+// Bit-identical Wave32 form of native_gemv.comp for large-K Q8_0 Decode projections. Lane t
+// accumulates the old 64-thread tree's t and t+32 streams independently, performs the original
+// stride-32 add, then reproduces strides 16..1 with subgroup shuffle-down. This removes shared
+// memory and workgroup barriers without changing the floating-point addition tree.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef NR
+#define NR 1
+#endif
+
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, float xv[32]) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * xv[w]; }
+    return a;
+}
+
+void main() {
+    uint tile = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint tiles_per_row = (pc.out_f + uint(NR) - 1u) / uint(NR);
+    if (tile >= pc.rows * tiles_per_row) { return; }
+    uint r = tile / tiles_per_row;
+    uint o0 = (tile % tiles_per_row) * uint(NR);
+    uint lane = gl_SubgroupInvocationID;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+    uint xbase = r * pc.in_f;
+    uint nsub = pc.in_f / 32u;
+
+    float low[NR];
+    float high[NR];
+    [[unroll]] for (uint p = 0u; p < uint(NR); ++p) {
+        low[p] = 0.0;
+        high[p] = 0.0;
+    }
+    for (uint s = lane; s < nsub; s += 64u) {
+        float xv[32];
+        for (uint w = 0u; w < 32u; ++w) { xv[w] = x_buf[xbase + s * 32u + w]; }
+        [[unroll]] for (uint p = 0u; p < uint(NR); ++p) {
+            uint o = o0 + p;
+            if (o < pc.out_f) {
+                low[p] += dqsub(pc.w_base + o * pc.in_f + s * 32u, xv);
+            }
+        }
+    }
+    for (uint s = lane + 32u; s < nsub; s += 64u) {
+        float xv[32];
+        for (uint w = 0u; w < 32u; ++w) { xv[w] = x_buf[xbase + s * 32u + w]; }
+        [[unroll]] for (uint p = 0u; p < uint(NR); ++p) {
+            uint o = o0 + p;
+            if (o < pc.out_f) {
+                high[p] += dqsub(pc.w_base + o * pc.in_f + s * 32u, xv);
+            }
+        }
+    }
+
+    [[unroll]] for (uint p = 0u; p < uint(NR); ++p) {
+        float acc = low[p] + high[p];
+        for (uint stride = 16u; stride > 0u; stride /= 2u) {
+            float rhs = subgroupShuffleDown(acc, stride);
+            if (lane < stride) { acc += rhs; }
+        }
+        uint o = o0 + p;
+        if (lane == 0u && o < pc.out_f) {
+            uint unit = r * pc.out_f + o;
+#ifdef USE_RES
+            y_buf[unit] = r_buf[unit] + acc;
+#else
+            y_buf[unit] = acc;
+#endif
+        }
+    }
+}

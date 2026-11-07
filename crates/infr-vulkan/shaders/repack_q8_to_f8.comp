@@ -1,0 +1,79 @@
+#version 460
+// Prepack a Q8_0 weight tensor into E4M3 (`w8`), with the per-32-block scale BAKED IN — i.e. each
+// output element is the REAL dequantized weight value (`int8 * block_f16_scale`) cast straight to
+// `floate4m3_t`, computed with `dqblk` (native_decode.glsl, FMT_Q8_0 — decode-once-per-32-block,
+// the SAME math `native_gemm_f8cm_q8_0.comp`'s Bs staging already does every k-tile of every GEMM
+// dispatch). This is the ONE-TIME cost the `-DPREPACK` GEMM variant amortizes: once `w8` holds the
+// prescaled E4M3 weights, that GEMM's Bs staging reads `w8[]` directly (no dqblk, no per-dispatch
+// weight decode), landing the kernel in the WMMA-bound regime where fp8's 2x rate over f16 should
+// actually show up — the current dqblk path pays the SAME dequant-ALU cost f16 pays per dispatch,
+// which is why fp8-dqblk measured 0.73x f16 on RDNA4 (see native_gemm_f8cm_q8_0.comp's header).
+//
+// Gated by INFR_F8_COOPMAT=1 + INFR_F8_PREPACK=1 (adapter.rs `f8cm_ok`'s INFR_F8_PREPACK arm).
+// `w8` is `[n, k]` E4M3 (1 byte/elem), the SAME row-major [out,in] layout as the Q8_0 source, and
+// (per the adapter's pooled-scratch convention) is always written starting at element 0 — the
+// SOURCE `w_base` offset (fused-QKV slices / stacked-MoE expert offset) applies only to reads of
+// the Q8_0 input `nw[]`, matching every other native-GEMM kernel's w_base convention.
+//
+// One thread decodes one 32-element Q8_0 sub-block (32 elements = 32 output bytes), so `n*k/32`
+// threads cover the whole tensor; `local_size_x=256` threads/workgroup, wide-dispatch-split
+// (`gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x`, same convention as every other
+// flat-elementwise kernel here) since a large weight tensor (e.g. a 150k-vocab lm_head) can need
+// far more than the guaranteed-minimum 65535 single-dimension workgroup count.
+//
+// Repacked EVERY forward call in this measurement path (see adapter.rs) — a real deployment would
+// cache the repack once at load time, not redo it per Linear. Correctness UNVALIDATED on hardware
+// without fp8 coopmat (this dev box has none; compile-checked only).
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+// -DSTREAMED (resident-BDA): the Q8_0 SOURCE weight is read through a 64-bit buffer_reference into
+// the resident arena (base = arena_lo/arena_hi) instead of the bound binding-0 SSBO — same
+// convention as native_gemm_warp.comp's STREAMED doc (this file already includes native_decode.glsl,
+// so it rides the SAME native_weight_addr.glsl / NW() chokepoint, not an inline one). The E4M3 output
+// buffer (binding 1) is a derived scratch buffer the arena doesn't own, so it stays bound in both
+// builds. Additive: the non-STREAMED build is byte-identical.
+#ifdef STREAMED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// w_base: element offset into the Q8_0 SOURCE grid (fused-QKV slices / stacked-MoE expert offset).
+// `w8` is always written starting at element 0 (see header note).
+#ifdef STREAMED
+layout(push_constant) uniform PC { uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; } pc;
+#else
+layout(push_constant) uniform PC { uint n; uint k; uint w_base; } pc;
+#endif
+#ifndef STREAMED
+layout(binding = 0) readonly buffer WBuf { uint nw[]; };          // Q8_0 weight: raw GGUF blocks (native)
+#endif
+layout(binding = 1) writeonly buffer W8Buf { floate4m3_t w8[]; }; // [n, k] E4M3, block scale baked in
+
+#ifdef STREAMED
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#endif
+
+#define FMT_Q8_0
+#include "native_decode.glsl"
+
+void main() {
+#ifdef STREAMED
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address
+#endif
+    uint totalBlocks = (pc.n * pc.k) / 32u;
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint blk = wg * 256u + gl_LocalInvocationID.x;
+    if (blk >= totalBlocks) {
+        return;
+    }
+    float v[32];
+    dqblk(pc.w_base + blk * 32u, v);
+    uint outBase = blk * 32u;
+    [[unroll]] for (uint i = 0u; i < 32u; i++) {
+        w8[outBase + i] = floate4m3_t(v[i]);
+    }
+}

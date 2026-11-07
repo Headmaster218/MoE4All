@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU Decode miss 路径</title>
+<style>
+body{font:14px system-ui;margin:24px;color:#20252c;background:white}h1{font-size:24px}p,small{line-height:1.6;overflow-wrap:anywhere}label{display:inline-flex;gap:6px;align-items:center;margin:8px 14px 8px 0;max-width:100%}select{padding:6px;max-width:100%;min-width:0}button{width:34px;height:34px;border:1px solid #bbc4ca;border-radius:4px;background:#f4f6f7;font-size:22px;cursor:pointer}canvas{display:block;width:100%;height:360px;touch-action:none;border-bottom:1px solid #ddd}#hover{min-height:48px;overflow-wrap:anywhere;line-height:1.6}.wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;margin:16px 0}td,th{padding:7px 10px;border-bottom:1px solid #ddd;text-align:right;white-space:nowrap}td:first-child,th:first-child{text-align:left}.legend{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.legend span{border-left:12px solid;padding-left:6px}small{color:#58616b}@media(max-width:480px){body{margin:14px}h1{font-size:22px}}
+#timeline{height:420px}
+</style>
+<h1>GPU Decode miss 路径</h1>
+<small id="identity"></small>
+<p>FlashNext 4.27bpw，7900 XTX，2 槽 / 单路，30K 与 150K，各 12 个连续前向。仅 GPU 时间戳：CPU 阶段计时已关闭；保留前向起点、时钟校准、提交与依赖编号。此短窗口不作为持续吞吐跑分。</p>
+<p>命中掩码来自 GPU journal；条件跳过的 router notice 与 FFN 置灰。hit FFN 含 shared expert；miss resume 含缺失专家及累加收尾。BOTTOM 时间戳区间包含屏障和停顿，不是孤立 kernel 或 ALU busy 时间。CPU push 没有 DMA 时间戳；没有 DMA 的 miss 不推算其搬运耗时。Profiler Step 墙钟包含每个提交的 timestamp query、校准和回收成本，不能倒算无 profiler tok/s。</p>
+<p id="graph-scope"></p>
+<div class="wrap"><table><thead><tr><th>上下文</th><th>样本</th><th>Profiler Step P50 ms</th><th>主队列均值 ms</th><th>Miss / step</th><th>DMA / step ms</th><th>Hit→Miss gap / step ms</th><th>DMA 已完成后 gap / step ms</th></tr></thead><tbody id="summary"></tbody></table></div>
+<label>工况<select id="case"></select></label><label>样本<select id="step"></select></label><button id="reset" aria-label="恢复完整范围" title="恢复完整范围">↺</button>
+<div class="wrap"><table><thead><tr><th>边界</th><th>当前样本 ms</th><th>12 前向均值 ms</th><th>P50 ms</th></tr></thead><tbody id="boundaries"></tbody></table></div>
+<p>边界均由校准 GPU queue envelope 与前向起止墙钟计算：前段含首个提交前的准备与驱动启动；中段是独立 L0 图末尾至 L1 尾图首个 GPU 提交开始，不含 L1 自身计算；后段从最后主队列 GPU 工作（包含输出头 / GPU 采样）结束计至前向结束。空档包含 CPU、驱动与 profiler 收尾等未分解部分，不能据此断言是某个 CPU 操作或全部可消除。</p>
+<div id="detail"></div><div id="hover"></div>
+<div class="legend"><span style="border-color:#315f93">主队列</span><span style="border-color:#8865a6">执行 router notice</span><span style="border-color:#37a173">全 hit FFN</span><span style="border-color:#bb8c35">部分 hit FFN</span><span style="border-color:#c45b59">miss resume</span><span style="border-color:#238f8a">DMA</span><span style="border-color:#bdc4cc">条件跳过</span></div>
+<canvas id="timeline" aria-label="GPU 主队列、执行阶段、hit、DMA 与跳过阶段时间线"></canvas>
+<small>横轴为当前前向 CPU 起点后的校准墙钟时间；各轨并行，不能纵向求和。不是估算层边界。L0 起编号，只有 FFN 与 router notice 标注精确所属层；灰色 router notice 是 miss 后已编码但被 GPU 条件终止的下一层检查，不代表该层开始计算。其他跨层提交保留提交口径。</small>
+<div class="wrap"><table><thead><tr><th>Miss 层</th><th>Hit / 总数</th><th>路径</th><th>Hit ms</th><th>Miss ms</th><th>DMA MiB</th><th>DMA ms</th><th>Notice→DMA ms</th><th>DMA 覆盖 hit ms</th><th>Hit→Miss gap ms</th><th>未覆盖 DMA 尾部 ms</th><th>都 ready→Miss ms</th><th>Miss 后 GPU gap ms</th></tr></thead><tbody id="misses"></tbody></table></div>
+<script id="payload" type="application/octet-stream">__PAYLOAD__</script>
+<script>
+window.timelineReady=(async()=>{
+const bytes=Uint8Array.from(atob(document.getElementById('payload').textContent.trim()),c=>c.charCodeAt(0));
+const data=JSON.parse(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+const cs=document.getElementById('case'),ss=document.getElementById('step'),el=document.getElementById('timeline');
+const fmt=v=>v===null?'—':Number(v).toFixed(3),left=110,right=14,rowY=i=>48+i*60;
+let current,viewport={start:0,span:1},drag=null;
+document.getElementById('identity').textContent='2026-10-11 · GPU-only · SHA256 '+data[0].binaryHash;
+document.getElementById('summary').innerHTML=data.map(c=>'<tr>'+[c.depth/1000+'K',c.points.length,fmt(c.wall.median),fmt(c.main.mean),fmt(c.missCount/c.points.length),fmt(c.dma.mean),fmt(c.sumsPerStep.hitToResumeGapMs.mean),fmt(c.sumsPerStep.readyToResumeGapMs.mean)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');
+cs.innerHTML=data.map((c,i)=>'<option value="'+i+'">'+c.depth/1000+'K · 单路</option>').join('');
+function choose(){
+ const c=data[+cs.value],sorted=[...c.points].sort((a,b)=>a.wallMs-b.wallMs),p50=sorted.reduce((best,p)=>Math.abs(p.wallMs-c.wall.median)<Math.abs(best.wallMs-c.wall.median)?p:best,sorted[0]);
+ ss.innerHTML=c.points.map((p,i)=>'<option value="'+i+'">#'+p.id+(p===p50?' · P50':'')+' · '+fmt(p.wallMs)+' ms</option>').join('');ss.value=c.points.indexOf(p50);select();
+}
+function select(){const c=data[+cs.value];current=c.points[+ss.value];reset();document.getElementById('detail').textContent='Step #'+current.id+' · position '+current.positions.join(', ')+' · '+fmt(current.wallMs)+' ms · miss '+current.misses.length+' 层 · 跳过 '+current.skippedCount+' 个已编码 FFN';
+document.getElementById('graph-scope').textContent=current.rows[2].some(e=>e.layer===0)?'完整图模式：条件续跑与 hit/miss 分类覆盖 L0–L47。没有独立 L0 图与 L1 尾图之间的交接，因此该边界为不适用，而不是测得 0 ms。':'拆图模式：L0 为 PLE 重叠而独立执行普通图，GPU 时间仍在主队列 / stages 轨中；条件续跑与 hit/miss 分类统计对应 L1–L47，不把 L0 的普通 MoE 片段强行解释成 GPU journal 命中分类。';
+document.getElementById('boundaries').innerHTML=[['首个 GPU 工作之前','frontMs'],['L0 图 → L1 尾图','l0ToL1GapMs'],['最后 GPU 工作之后','tailMs']].map(([label,key])=>'<tr>'+[label,fmt(current.boundaries[key]),fmt(c.boundaryMetrics[key].mean),fmt(c.boundaryMetrics[key].median)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');
+document.getElementById('misses').innerHTML=current.misses.map(m=>'<tr>'+['L'+m.layer,m.hits+'/'+(m.hits+m.missing),m.route,fmt(m.hitMs),fmt(m.missMs),fmt(m.dmaBytes/1024**2),fmt(m.dmaMs),fmt(m.dmaStartAfterNoticeMs),fmt(m.dmaOverlapHitMs),fmt(m.hitToResumeGapMs),fmt(m.uncoveredDmaTailMs),fmt(m.readyToResumeGapMs),fmt(m.resumeToNextGpuGapMs)].map(v=>'<td>'+v+'</td>').join('')+'</tr>').join('');}
+function reset(){viewport={start:0,span:current.wallMs};draw();}
+function skippedNotice(e,row){return row===1&&e.name==='resident_router_notice'&&current.rows[5].some(s=>s.submit===e.submit&&s.layer===e.layer);}
+function color(e,row){if(row===0)return '#315f93';if(row===2)return e.status===1?'#37a173':'#bb8c35';if(row===3)return '#c45b59';if(row===4)return '#238f8a';if(row===5)return '#bdc4cc';if(e.name==='resident_router_notice')return skippedNotice(e,row)?'#bdc4cc':'#8865a6';if(e.name.includes('QSA'))return '#597bb0';if(e.name.includes('GDN'))return '#6ca58d';return '#7c8996';}
+function draw(){const w=el.clientWidth,r=devicePixelRatio||1;el.width=Math.round(w*r);el.height=Math.round(420*r);const x=el.getContext('2d');x.scale(r,r);x.clearRect(0,0,w,420);x.font='12px system-ui';const width=w-left-right,scale=width/viewport.span;
+ for(let i=0;i<=5;i++){const t=viewport.start+i*viewport.span/5,px=left+i*width/5;x.strokeStyle='#e0e5e9';x.beginPath();x.moveTo(px,30);x.lineTo(px,402);x.stroke();x.fillStyle='#54606b';x.textAlign=i===5?'right':'left';x.fillText(t.toFixed(2)+' ms',px,20);}x.textAlign='left';
+ ['Main queue','GPU stages','Hit FFN','Miss FFN','DMA','Skipped FFN'].forEach((s,i)=>{const y=rowY(i);x.fillStyle='#4b5560';x.fillText(s,2,y+16);x.save();x.beginPath();x.rect(left,y,width,26);x.clip();for(const e of current.rows[i]){const a=left+(e.start-viewport.start)*scale,b=left+(e.end-viewport.start)*scale;if(b<left||a>w-right)continue;x.fillStyle=color(e,i);x.fillRect(a,y,Math.max(1,b-a),26);if(b-a>34&&e.layer>=0){x.fillStyle=i===5?'#4b5560':'white';x.fillText('L'+e.layer,a+3,y+17);}}x.restore();});}
+function hover(event){const r=el.getBoundingClientRect(),px=event.clientX-r.left,py=event.clientY-r.top,t=viewport.start+(px-left)/(r.width-left-right)*viewport.span,row=Math.floor((py-48)/60),e=current.rows[row]?.findLast(e=>t>=e.start&&t<=e.end),skipped=e&&skippedNotice(e,row);document.getElementById('hover').textContent=e?e.name+' · '+(e.layer>=0?'L'+e.layer+' · ':'')+fmt(e.start)+'–'+fmt(e.end)+' ms · submit '+e.submit+' · wait '+e.wait+' · signal '+e.signal+' · '+e.bytes+' bytes'+(e.hits!==undefined?' · hit '+e.hits+'/'+e.count:'')+(skipped?' · speculative skipped':''):'';}
+function clamp(){viewport.span=Math.min(current.wallMs,Math.max(.02,viewport.span));viewport.start=Math.max(0,Math.min(current.wallMs-viewport.span,viewport.start));}
+el.addEventListener('wheel',event=>{event.preventDefault();const r=el.getBoundingClientRect(),f=Math.max(0,Math.min(1,(event.clientX-r.left-left)/(r.width-left-right))),anchor=viewport.start+f*viewport.span;viewport.span*=Math.exp(event.deltaY*.002);viewport.span=Math.min(current.wallMs,Math.max(.02,viewport.span));viewport.start=anchor-f*viewport.span;clamp();draw();},{passive:false});
+el.addEventListener('pointerdown',event=>{drag={x:event.clientX,start:viewport.start};el.setPointerCapture(event.pointerId);});
+el.addEventListener('pointermove',event=>{if(drag){viewport.start=drag.start-(event.clientX-drag.x)/(el.clientWidth-left-right)*viewport.span;clamp();draw();}else hover(event);});
+el.addEventListener('pointerup',()=>drag=null);el.addEventListener('pointercancel',()=>drag=null);
+cs.addEventListener('change',choose);ss.addEventListener('change',select);document.getElementById('reset').addEventListener('click',reset);window.addEventListener('resize',draw);choose();
+return{choose,select,getViewport:()=>({...viewport}),getRows:()=>current.rows,getCases:()=>data};
+})();
+</script>
+</html>

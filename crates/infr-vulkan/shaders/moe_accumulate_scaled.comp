@@ -1,0 +1,29 @@
+#version 460
+// Weighted accumulate of all selected experts' down outputs into hidden, with a per-EXPERT scale on
+// the down output (diffusion-gemma `ffn_down_exps.scale[n_expert]`, applied before the weighted
+// sum): hidden[i] += sum_slot wts[slot] * dscale[ids[slot]] * down[slot*ne + i]. `down` is
+// [n_used, ne]; `ids[slot]` is the expert id occupying that slot (same buffer `moe_topk` filled).
+// Twin of `moe_accumulate` (unscaled, qwen3moe) — kept separate so the common (no-scale) dispatch
+// stays branch-free.
+//
+// grid.y = `row` (MoE small-m fast path: `rows` independent tokens in one dispatch — `down`/`wts`/
+// `ids`/`hidden` become `[rows, n_used, ne]`/`[rows, n_used]`/`[rows, n_used]`/`[rows, ne]`;
+// `rows == 1` is the original single-token call, row always 0).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint ne; uint n_used; } pc;
+layout(binding = 0) readonly buffer DB { float down[]; };
+layout(binding = 1) readonly buffer WB { float wts[]; };
+layout(binding = 2) readonly buffer IB { uint ids[]; };
+layout(binding = 3) readonly buffer SB { float dscale[]; };
+layout(binding = 4) buffer HB { float hidden[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.ne) return;
+    uint row = gl_WorkGroupID.y;
+    uint obase = row * pc.n_used;
+    float acc = 0.0;
+    for (uint slot = 0u; slot < pc.n_used; slot++) {
+        acc += wts[obase + slot] * dscale[ids[obase + slot]] * down[(obase + slot) * pc.ne + i];
+    }
+    hidden[row * pc.ne + i] += acc;
+}

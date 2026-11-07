@@ -1,0 +1,20 @@
+[package]
+name = "infr-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-prof.workspace = true
+infr-prof-rt.workspace = true
+infr-core.workspace = true
+memmap2.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,12 @@
+#version 460
+// Indexed axpy: acc += wts[slot] * x. Like add_scaled but the scale is read from a GPU buffer
+// (the on-GPU router weights), so the weighted MoE expert accumulate needs no host-side scale.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; uint slot; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer WB { float wts[]; };
+layout(binding = 2) buffer AB { float acc[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) { acc[i] += wts[pc.slot] * x[i]; }
+}

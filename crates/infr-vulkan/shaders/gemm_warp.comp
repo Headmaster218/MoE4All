@@ -1,0 +1,101 @@
+#version 460
+// Coopmat GEMM in llama.cpp mul_mm style: 3-level tiling — workgroup tile (BM×BN) → warp tile
+// (WM×WN) → register-blocked coopmat fragments (CMS_M×CMS_N of 16×16 each). C[M,N] = A[M,K]·B[K,N],
+// f16 in, f32 out. Each warp (subgroup) owns a WM×WN sub-tile and keeps CMS_M×CMS_N accumulators in
+// registers across the K loop, so many independent coopMatMulAdds are in flight (high MAC pipeline
+// utilization) while reusing A/B tiles staged in shared. Tunable via the consts below.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef BM
+#define BM 128u
+#endif
+#ifndef BN
+#define BN 128u
+#endif
+#ifndef BK
+#define BK 16u
+#endif
+#ifndef WM
+#define WM 32u
+#endif
+#ifndef WN
+#define WN 64u
+#endif
+
+const uint WARPS_M = BM / WM;        // warps stacked in M
+const uint WARPS_N = BN / WN;        // warps stacked in N
+const uint NWARP = WARPS_M * WARPS_N;
+const uint CMS_M = WM / 16u;         // coopmat fragments per warp in M
+const uint CMS_N = WN / 16u;         // ... in N
+const uint THREADS = NWARP * 32u;
+const uint SAK = BK + 8u;            // shared strides (bank-conflict pad)
+const uint SBN = BN + 8u;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint n; uint k; } pc;
+layout(binding = 0) readonly buffer ABuf { float16_t a[]; };  // [M, K]
+layout(binding = 1) readonly buffer BBuf { float16_t b[]; };  // [K, N]
+layout(binding = 2) writeonly buffer CBuf { float c[]; };     // [M, N]
+
+shared float16_t As[BM * SAK];
+shared float16_t Bs[BK * SBN];
+
+void main() {
+    uint wgRow = gl_WorkGroupID.y * BM;
+    uint wgCol = gl_WorkGroupID.x * BN;
+    uint warp = gl_SubgroupID;          // 0..NWARP-1
+    uint warp_r = warp % WARPS_M;
+    uint warp_c = warp / WARPS_M;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            As[r * SAK + cc] = a[(wgRow + r) * pc.k + k0 + cc];
+        }
+        for (uint idx = li; idx < BK * BN; idx += THREADS) {
+            uint r = idx / BN;
+            uint cc = idx % BN;
+            Bs[r * SBN + cc] = b[(k0 + r) * pc.n + wgCol + cc];
+        }
+        barrier();
+        [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
+            [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                coopMatLoad(af[i], As, (warp_r * WM + i * 16u) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+                coopMatLoad(bf, Bs, kf * SBN + (warp_c * WN + j * 16u), SBN,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                    acc[i][j] = coopMatMulAdd(af[i], bf, acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            uint cr = wgRow + warp_r * WM + i * 16u;
+            uint cc = wgCol + warp_c * WN + j * 16u;
+            coopMatStore(acc[i][j], c, cr * pc.n + cc, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

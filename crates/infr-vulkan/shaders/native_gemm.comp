@@ -1,0 +1,97 @@
+#version 460
+// Native-block projection GEMM for prefill: C[M,N] = A[M,K] · Wᵀ, W = [N,K] raw GGUF blocks.
+// Mirrors gemm_proj (64x64 tile / 4 subgroups, 2x2 coopmat 16x16 frags) but dequantizes the weight
+// from native blocks during shared staging via dqblk() — so each weight element is decoded ONCE and
+// reused across all BM=64 activation rows (the row-amortization GEMV lacks). -DFMT_* selects the
+// format; build-compiled into one .spv per format. Requires requiredSubgroupSize=32, N%64, K%32.
+// Padded-C contract (same as gemm_proj.comp:6): A staging guards `gr<pc.m` (rows ≥ M load 0), but
+// the coopMatStore below writes the FULL 64-row tile unconditionally — so C MUST be allocated
+// ceil(M/64)*64 rows (padded rows receive 0, harmless). Every caller honors this (recorder.rs
+// `matmul_native_off`/`matmul_native` etc. all allocate the ceil(m/64)*64-row dst).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// Streamed (dense layer streaming, see pager.rs `DensePagerSession`): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — `w_base` keeps its element-offset
+// meaning (a fused-QKV slice offset), while `arena_lo`/`arena_hi` carry the resident slot's arena
+// base BYTE address (native_weight_addr.glsl). Mirrors native_gemv.comp's arm exactly: weight reads
+// funnel through native_decode's NW(i) chokepoint, so redefining NW to arena_word is the only
+// weight-source change.
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; } pc;
+layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+layout(binding = 2) writeonly buffer CBuf { float c[]; };
+
+shared float16_t As[BM * BK];
+shared float16_t Bs[BK * BN];
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+void main() {
+    GRID_INIT; // barrier inside — must run in uniform control flow before any dqblk()
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint tilesN = pc.n / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint sgid = gl_SubgroupID;
+    uint sgRow = (sgid / 2u) * 32u;
+    uint sgCol = (sgid % 2u) * 32u;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        for (uint idx = li; idx < BM * BK; idx += 128u) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[idx] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
+        }
+        // Each thread decodes one output column's BK=32 contiguous K elements as one sub-block
+        // (k0 % 32 == 0 ⇒ aligned), then scatters them column-major into Bs. Decode-once per column.
+        for (uint cc = li; cc < BN; cc += 128u) {
+            float v[32];
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0, v);
+            for (uint r = 0u; r < BK; r++) { Bs[r * BN + cc] = float16_t(v[r]); }
+        }
+        barrier();
+
+        for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b1;
+            coopMatLoad(a0, As, (sgRow + 0u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, As, (sgRow + 16u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, Bs, kf * BN + (sgCol + 0u), BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, Bs, kf * BN + (sgCol + 16u), BN, gl_CooperativeMatrixLayoutRowMajor);
+            acc00 = coopMatMulAdd(a0, b0, acc00);
+            acc01 = coopMatMulAdd(a0, b1, acc01);
+            acc10 = coopMatMulAdd(a1, b0, acc10);
+            acc11 = coopMatMulAdd(a1, b1, acc11);
+        }
+        barrier();
+    }
+
+    uint cr = wgRow + sgRow;
+    uint ccol = wgCol + sgCol;
+    coopMatStore(acc00, c, (cr + 0u) * pc.n + (ccol + 0u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc01, c, (cr + 0u) * pc.n + (ccol + 16u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc10, c, (cr + 16u) * pc.n + (ccol + 0u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc11, c, (cr + 16u) * pc.n + (ccol + 16u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

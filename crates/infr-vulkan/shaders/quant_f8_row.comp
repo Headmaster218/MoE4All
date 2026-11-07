@@ -1,0 +1,76 @@
+#version 460
+// Row-wise (whole-K) fp8 (E4M3) activation quantization — the activation-scaling pass for
+// `native_gemm_f8cm_q8_0.comp` (gated by INFR_F8_COOPMAT=1 + caps.f8_coopmat, see adapter.rs
+// `f8cm_ok`). Mirrors `quant_q8_row.comp`'s structure exactly (one workgroup per row, 256 threads
+// = 8 wave32 subgroups, two passes: amax reduce then quantize), but the QUANTITY being scaled into
+// is E4M3's float range, not int8's fixed-point range: E4M3's max normal magnitude is 448.0, and
+// unscaled LLM activations routinely exceed that (E4M3 has only 4 exponent bits — a ~1e38 f32
+// range collapses to +-448), which is the root cause of the garbage output `native_gemm_f8cm_q8_0`
+// produced on RDNA4 before this pass existed: casting f32 straight to floate4m3_t silently
+// saturates to +-inf/NaN on any activation whose magnitude exceeds 448. So the scale here is a pure
+// RANGE rescale (`amax / 448.0`), not a fixed-point quantization step size like quant_q8_row's
+// `amax / 127.0` — the elements written to `qa` are still ordinary (lossy, 3-mantissa-bit) floats,
+// just scaled to fit E4M3's dynamic range. `native_gemm_f8cm_q8_0.comp`'s epilogue multiplies the
+// f32 accumulator by `srow[row]` to undo this scale (`C[m,n] = C'[m,n] * scale_m`, since scaling
+// every element of a GEMM's row by `s` scales that whole output row by `s`).
+//
+// Q8_0 weight elements (dequantized to f32, then cast to floate4m3_t) are NOT scaled here: Q8_0's
+// int8 * per-block-f16-scale values are already small (bounded by the model's weight distribution,
+// typically well under 448) and fit E4M3 as-is — see `native_gemm_f8cm_q8_0.comp`'s weight staging,
+// unchanged by this pass. If that assumption turns out false on real weights, scaling weights too
+// would need a symmetric per-column (or per-block) scale threaded through the same epilogue
+// multiply, undone jointly with the row scale.
+//
+// requiredSubgroupSize=32 (so the 8-subgroup reduction below is exact, same requirement as
+// quant_q8_row.comp).
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint k; } pc;
+layout(binding = 0) readonly buffer ABuf { float a[]; };          // [m, k]
+layout(binding = 1) writeonly buffer QBuf { floate4m3_t qa[]; };  // [m, k]
+layout(binding = 2) writeonly buffer SBuf { float srow[]; };      // [m] — ONE scale per row
+
+shared float red[8]; // one subgroupMax partial per subgroup (256/32 = 8 subgroups)
+shared float rowMaxSh;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint base = row * pc.k;
+
+    float lmax = 0.0;
+    for (uint i = t; i < pc.k; i += 256u) {
+        lmax = max(lmax, abs(a[base + i]));
+    }
+    float sgmax = subgroupMax(lmax);
+    if (gl_SubgroupInvocationID == 0u) {
+        red[gl_SubgroupID] = sgmax;
+    }
+    barrier();
+    if (t == 0u) {
+        float rmax = red[0];
+        [[unroll]] for (uint s = 1u; s < 8u; s++) {
+            rmax = max(rmax, red[s]);
+        }
+        rowMaxSh = rmax;
+    }
+    barrier();
+
+    float amax = rowMaxSh;
+    // E4M3 max normal magnitude is 448.0 (4 exponent bits, bias 7: 2^8 * 1.75 = 448). Scale so the
+    // row's largest-magnitude activation lands exactly at that ceiling.
+    float scale = (amax > 0.0) ? (amax / 448.0) : 1.0;
+    float inv = (amax > 0.0) ? (448.0 / amax) : 0.0;
+    for (uint i = t; i < pc.k; i += 256u) {
+        qa[base + i] = floate4m3_t(a[base + i] * inv);
+    }
+    if (t == 0u) {
+        srow[row] = scale;
+    }
+}

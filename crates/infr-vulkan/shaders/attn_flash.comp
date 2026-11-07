@@ -1,0 +1,146 @@
+#version 460
+// Coopmat flash-attention for PREFILL — fused QK→softmax→PV, NO materialized S buffer (the non-FA
+// path's 81%-of-high-ctx bottleneck). One workgroup per (BM-row query tile, head). Online softmax
+// state (running max/sum + O accumulator) lives in shared; both matmuls use coopmat. K/V read once
+// per query tile instead of the full m×kv scores round-tripping HBM 4×. Q/K/V f16, O f32. Causal
+// mask via absolute positions. GQA: head h → kv head h/(nh/nkv). hd%16, hd<=128. sg32.
+// BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (needs a
+// 64 KiB device); BM=32 → 29056 B (fits NVIDIA 48 KiB / MoltenVK 32 KiB). The recorder picks the tile
+// from maxComputeSharedMemorySize; workgroup = (BM/16) subgroups of 32. (See attn_flash_warp.comp.)
+#ifndef BM_TILE
+#define BM_TILE 64
+#endif
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = (BM_TILE * 2), local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = BM_TILE; // query rows per tile ((BM/16) subgroups × 16)
+const uint BN = 64u; // kv columns per block
+
+layout(push_constant) uniform PC {
+    uint q_len;
+    uint kv_len;
+    uint nh;
+    uint nkv;
+    uint hd;
+    uint pos_offset;
+} pc;
+layout(binding = 0) readonly buffer QB { float16_t q[]; };  // [q_len, nh, hd]
+layout(binding = 1) readonly buffer KB { float16_t k[]; };  // [kv_len, nkv, hd]
+layout(binding = 2) readonly buffer VB { float16_t v[]; };  // [kv_len, nkv, hd]
+layout(binding = 3) writeonly buffer OB { float o[]; };     // [q_len, nh, hd]
+
+shared float Ss[BM * BN];      // raw scores then softmaxed (f32 for exp precision)
+shared float16_t Ps[BM * BN];  // probabilities f16 for P·V
+shared float Os[BM * 128u];    // O accumulator (hd <= 128)
+shared float mrow[BM];         // running row max
+shared float lrow[BM];         // running row sum
+shared float corr[BM];         // per-row rescale for the current block
+
+void main() {
+    uint qt = gl_WorkGroupID.x / pc.nh;
+    uint h = gl_WorkGroupID.x % pc.nh;
+    uint qr0 = qt * BM;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint li = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID; // 0..3 → rows [sg*16, +16)
+    uint hd = pc.hd;
+    float scale = 1.0 / sqrt(float(hd));
+
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] = 0.0; }
+    if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
+    barrier();
+
+    uint qmax = pc.pos_offset + qr0 + BM - 1u;
+    uint kvend = min(pc.kv_len, qmax + 1u);
+
+    for (uint kv0 = 0u; kv0 < kvend; kv0 += BN) {
+        // S = Q·Kᵀ (unscaled) → Ss. sg computes its 16 rows × all BN cols.
+        for (uint ctile = 0u; ctile < BN; ctile += 16u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint kf = 0u; kf < hd; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, q, (qr0 + sg * 16u) * pc.nh * hd + h * hd + kf,
+                            pc.nh * hd, gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global K read: the kv0 loop is NOT BN-rounded, so the last 64-wide column
+                // tile reads kv rows [kvend, ceil(kvend/BN)*BN) past kv_len. A direct coopMatLoad
+                // can't guard per-column (only the -DSTAGE arms can, via the shmem copy) — the
+                // over-read is bounded by the K/V ROW CAPACITY (recorder gates flash on
+                // kv_len.div_ceil(64)*64 <= att_cap_rows, so the padded tile stays inside the
+                // allocation) and the over-read columns are masked to -1e30 in the softmax below.
+                coopMatLoad(B, k, (kv0 + ctile) * pc.nkv * hd + kvh * hd + kf,
+                            pc.nkv * hd, gl_CooperativeMatrixLayoutColumnMajor);
+                acc = coopMatMulAdd(A, B, acc);
+            }
+            coopMatStore(acc, Ss, (sg * 16u) * BN + ctile, BN,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        // Online softmax for this block (one thread per row).
+        if (li < BM) {
+            uint r = li;
+            uint qpos = pc.pos_offset + qr0 + r;
+            float rmax = mrow[r];
+            for (uint j = 0u; j < BN; j++) {
+                uint kpos = kv0 + j;
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
+                Ss[r * BN + j] = s;
+                rmax = max(rmax, s);
+            }
+            float cf = exp(mrow[r] - rmax);
+            float rsum = 0.0;
+            for (uint j = 0u; j < BN; j++) {
+                float p = exp(Ss[r * BN + j] - rmax);
+                Ps[r * BN + j] = float16_t(p);
+                rsum += p;
+            }
+            lrow[r] = lrow[r] * cf + rsum;
+            mrow[r] = rmax;
+            corr[r] = cf;
+        }
+        barrier();
+
+        for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] *= corr[i / hd]; }
+        barrier();
+
+        // O += P·V (accumulator round-trips shared Os so the rescale carries across blocks).
+        for (uint ct = 0u; ct < hd; ct += 16u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+            coopMatLoad(acc, Os, (sg * 16u) * hd + ct, hd, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint kf = 0u; kf < BN; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, Ps, (sg * 16u) * BN + kf, BN,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global V read: same bounded over-read as the K load above (rows past kv_len
+                // stay inside the row-capacity allocation; their P weight is 0 → no contribution).
+                coopMatLoad(B, v, (kv0 + kf) * pc.nkv * hd + kvh * hd + ct,
+                            pc.nkv * hd, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(A, B, acc);
+            }
+            coopMatStore(acc, Os, (sg * 16u) * hd + ct, hd,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+    }
+
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) {
+        uint r = i / hd;
+        uint d = i % hd;
+        // PRECONDITION: `o`/`q` are allocated at the BM-aligned `mpad` row count (the recorder pads
+        // them), so every tile row `qr0+r` is in-bounds. The store therefore covers ALL BM rows —
+        // padding rows included — which keeps this kernel bit-identical to the staged/split-K paths
+        // (they also write every tile row). A future caller that sized `o`/`q` to a non-BM-aligned
+        // `q_len` would need a `qr0+r < pc.q_len` guard here (as attn_nc_fa.comp:228 has) AND the
+        // matching guard on the other flash kernels so the paths stay in agreement.
+        float l = lrow[r];
+        o[(qr0 + r) * pc.nh * hd + h * hd + d] = (l > 0.0) ? Os[i] / l : 0.0;
+    }
+}

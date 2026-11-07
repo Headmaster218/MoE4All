@@ -1,0 +1,107 @@
+#version 460
+// Non-FA prefill attention stage 1, 8-warp version: S[h,m,n] = scale·Q[m,h,:]·K[n,kvh,:]. Same as
+// attn_qk but mul_mm-style warp tiling (workgroup BM×BN → warp WM×WN → CMS_M×CMS_N register-blocked
+// 16×16 coopmat frags, 256 threads / 8 warps) — matches ollama's RADV mul_mm warptile, which the
+// 4-warp/2×2 attn_qk doesn't. K (hd) staged contiguous in Bs[n][k] (coalesced) then coopMatLoad
+// ColumnMajor → Kᵀ. Q is pre-scaled in As. Requires sg32, kv_pad % BN(256), hd % 16.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+
+const uint BM = 64u;
+const uint BN = 256u;
+const uint BK = 32u;
+const uint WM = 32u;
+const uint WN = 64u;
+const uint WARPS_M = BM / WM; // 2
+const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads
+const uint CMS_M = WM / 16u;  // 2
+const uint CMS_N = WN / 16u;  // 4
+const uint THREADS = WARPS_M * WARPS_N * 32u; // 256
+const uint SAK = BK + 8u;
+const uint SBK = BK + 8u; // Bs is [BN][BK]: hd contiguous → coalesced read, transposed at load
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint m;        // query rows (padded to BM)
+    uint kv_len;   // keys padded to BN (extra cols masked in softmax) — i.e. kv_pad
+    uint hd;
+    uint nh;
+    uint nkv;
+    float scale;
+} pc;
+layout(binding = 0) readonly buffer QB { float16_t q[]; };  // [m, nh, hd]
+layout(binding = 1) readonly buffer KB { float16_t k[]; };  // [kv, nkv, hd] (cache)
+layout(binding = 2) writeonly buffer SB { float16_t s[]; }; // [nh, m, kv_pad]
+
+shared float16_t As[BM * SAK];
+shared float16_t Bs[BN * SBK];
+
+void main() {
+    uint h = gl_WorkGroupID.z;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint hd = pc.hd;
+    uint tilesN = pc.kv_len / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint warp = gl_SubgroupID;
+    uint warp_r = warp % WARPS_M;
+    uint warp_c = warp / WARPS_M;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint k0 = 0u; k0 < hd; k0 += BK) {
+        // Q tile → As (scaled so S = scale·QKᵀ without a separate pass)
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            As[r * SAK + cc] =
+                float16_t(float(q[(wgRow + r) * pc.nh * hd + h * hd + k0 + cc]) * pc.scale);
+        }
+        // K tile → Bs[n][k], hd contiguous (coalesced); coopMatLoad ColumnMajor → Kᵀ.
+        for (uint idx = li; idx < BN * BK; idx += THREADS) {
+            uint cc = idx / BK; // n within tile
+            uint kk = idx % BK; // k within tile (contiguous)
+            Bs[cc * SBK + kk] = k[(wgCol + cc) * pc.nkv * hd + kvh * hd + k0 + kk];
+        }
+        barrier();
+        [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
+            [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                coopMatLoad(af[i], As, (warp_r * WM + i * 16u) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+                coopMatLoad(bf, Bs, (warp_c * WN + j * 16u) * SBK + kf, SBK,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                    acc[i][j] = coopMatMulAdd(af[i], bf, acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    uint sbase = h * pc.m * pc.kv_len;
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            uint cr = wgRow + warp_r * WM + i * 16u;
+            uint cc = wgCol + warp_c * WN + j * 16u;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> f =
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[i][j]);
+            coopMatStore(f, s, sbase + cr * pc.kv_len + cc, pc.kv_len,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

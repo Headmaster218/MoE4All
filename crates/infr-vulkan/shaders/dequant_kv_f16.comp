@@ -1,0 +1,31 @@
+#version 460
+// Dequant `n` elements of a standard-GGUF-block KV cache (-DFMT_*: Q4_0/Q4_1/Q5_0/Q5_1/IQ4NL) into a
+// contiguous f16 buffer, reusing the shared native_decode `dq()` per-element decode. Used to expand a
+// quantized KV prefix into an f16 scratch so the f16 flash / split / scalar attention can read it —
+// the persistent cache stays quantized (footprint preserved); the scratch is transient. 1 thread/elem.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// #74: read the GGUF-block KV cache by 64-bit device address instead of a bound SSBO, via
+// native_decode's NW/NW2/NW4 chokepoint redefined to kv_addr.glsl's kv_word*(k_addr,·) (same saddr
+// shape the paged-expert -DPAGED build uses) — this kernel is BDA-only (slice 5 deleted the bound-`nw`
+// twin). The `nw` binding disappears; the recorder keeps the cache BOUND at that read slot as an inert
+// descriptor so the store→dequant-read barrier survives (a BDA read is invisible to the descriptor
+// hazard tracker). See Recorder::dequant_kv_f16.
+layout(push_constant) uniform PC { uint n;
+    uint s_lo; uint s_hi;
+} pc;
+#include "kv_addr.glsl"
+#define NW(i) kv_word(k_addr, (i))
+#define NW2(wbase) kv_word2(k_addr, (wbase))
+#define NW4(wbase) kv_word4(k_addr, (wbase))
+#include "native_decode.glsl"
+layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
+
+void main() {
+    k_addr = kv_base(pc.s_lo, pc.s_hi);
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    dst[i] = float16_t(dq(i));
+}

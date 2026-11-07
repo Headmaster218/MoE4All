@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+source "$repo/Start-INFR-Wizard-Linux.sh"
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+ROOT=$tmp/package
+CONFIG_DIR=$tmp/config/infr
+STATE=$CONFIG_DIR/wizard-state.json
+LEGACY_CONFIG_DIR=$tmp/legacy-config/infr
+LEGACY_STATE=$LEGACY_CONFIG_DIR/wizard-state.json
+BINARY=$ROOT/infr
+mkdir -p "$ROOT" "$CONFIG_DIR"
+cp "$repo/Start-INFR-Wizard-Linux.sh" "$ROOT/"
+cat > "$BINARY" <<'ENGINE'
+#!/usr/bin/env bash
+case ${1-} in
+    --version) printf 'infr 0.10.0\n' ;;
+    devices) printf '%s\n' '  Vulkan0: Software [cpu, 0 MiB]' '  Vulkan1: Test GPU [discrete, 24 GiB] <- default' '  Vulkan2: Other GPU [integrated, 4 GiB]' ;;
+    bench) printf 'BENCH_ESTIMATE_MENU_V1|1|2|3|4|2|3|4|5|10|11|12|13\n' ;;
+    report) printf 'MOE4ALL_SUBMISSION_PATH=%s\n' "$ROOT/diagnostics/reports/fixture.m4e" ;;
+    *) printf 'STUB_LAUNCHED\n'; printf '<%s>\n' "$@"; printf 'KEY=%s\n' "${INFR_API_KEY-}" ;;
+esac
+ENGINE
+chmod +x "$BINARY"
+export XDG_CONFIG_HOME=$tmp/config
+unset INFR_API_KEY
+checks=0
+pass() { ((checks+=1)); }
+has_arg() { local arg; for arg in "${COMMAND[@]}"; do [[ $arg != "$1" ]] || return 0; done; return 1; }
+reject() { if "$@" > "$tmp/reject.log" 2>&1; then printf 'Unexpected success: %s\n' "$*" >&2; exit 1; fi; pass; }
+reset() { defaults; S[model]="$ROOT/model with spaces.gguf"; }
+
+bash -n "$repo/Start-INFR-Wizard-Linux.sh"; pass
+for version in 1.1.0 1.1.0-beta.1 1.1.0-rc.2 1.1.0+build.7; do installed_version_valid "$version"; pass; done
+version_newer 1.1.0 1.1.0-beta.1; pass
+version_newer 1.1.1 1.1.0-beta.1; pass
+reject version_valid 1.1.0-beta.1
+reject installed_version_valid '1.1.0-beta/1'
+reject version_newer 1.0.3 1.1.0-beta.1
+reject version_newer 1.1.0 1.1.0
+reject version_newer 1.1.0 1.1.0+build.7
+reject version_newer 1.1.0 1.1.0+build-with-hyphen
+reject version_newer 1.1.0-beta.2 1.1.0-beta.1
+for file in image-codecs/libheif.so.1 image-codecs/libde265.so.0 image-codecs/libdav1d.so.7 image-codecs/SOURCES.txt; do
+    managed "$file"; pass
+done
+reject managed image-codecs/evil.so
+for mode in run serve bench; do
+    output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --mode "$mode" --model 'model with spaces.gguf' --profile aggressive </dev/null)
+    [[ $output == *device.auto_profile=aggressive* && $output != *STUB_LAUNCHED* && $output != *kv.type_k=* && $output != *kv.type_v=* ]]; pass
+done
+[[ ! -f $STATE ]]; pass
+for profile in conservative aggressive; do
+    for mode in run serve bench; do
+        reset; S[setup_mode]=$profile; S[launch_mode]=$mode
+        S[kv_preset]=q8; S[kv_type_k]=q8_0; S[kv_type_v]=q8_0
+        build_command
+        ! has_arg kv.type_k=q8_0; ! has_arg kv.type_v=q8_0
+        [[ ${S[kv_preset]} == auto && -z ${S[kv_type_k]} && -z ${S[kv_type_v]} ]]; pass
+    done
+done
+for preset in q8 f16 custom auto; do
+    reset; S[setup_mode]=manual; S[kv_preset]=$preset; S[kv_type_k]=q8_0; S[kv_type_v]=f16
+    build_command
+    if [[ $preset == auto ]]; then ! has_arg kv.type_k=q8_0; ! has_arg kv.type_v=f16
+    else has_arg kv.type_k=q8_0; has_arg kv.type_v=f16; fi; pass
+done
+reset; S[launch_mode]=serve; S[server_parallel]=2; S[mtp_enabled]=true; S[mtp_model]=head.gguf; S[mtp_verify_tokens]=2
+choice mtp_verify_tokens 'MTP width' '4|4' '3|3' '2|2' <<< '' > "$tmp/numeric-choice"
+[[ ${S[mtp_verify_tokens]} == 2 ]]; pass
+choice mtp_verify_tokens 'MTP width' '4|4' '3|3' '2|2' <<< '2' > "$tmp/numeric-choice"
+[[ ${S[mtp_verify_tokens]} == 3 ]]; pass
+build_command; has_arg spec.k=4; has_arg --temp; pass
+S[server_parallel]=3; reject build_command
+reset; S[setup_mode]=manual; S[configure_memory]=true; S[vram_budget]=24g; S[ram_budget]=48g
+S[submit_mode]=fixed; S[submit_cap]=256; S[ubatch]=3072; S[kv_overflow]=true; S[kv_overflow_vram_mb]=100
+S[custom_sets]='paging.expert_prefetch=false; kernels.vulkan.cpu_miss_threads=99'
+build_command; has_arg device.vram_budget=24g; has_arg device.ram_budget=48g; has_arg device.submit_dispatches=256; has_arg kv.overflow_vram_mb=100
+has_arg kernels.vulkan.cpu_miss_threads=0; ! has_arg kernels.vulkan.cpu_miss_threads=99; pass
+S[custom_sets]='serve.api_key=secret'; reject build_command
+S[custom_sets]='malformed'; reject build_command
+reset; S[cpu_miss_enabled]=true; S[cpu_miss_cores]=4; S[cpu_miss_max]=3
+build_command; has_arg kernels.vulkan.cpu_miss_threads=4; has_arg kernels.vulkan.cpu_miss_max=3; pass
+S[cpu_miss_max]=4; reject build_command
+reset; S[launch_mode]=bench; S[bench_kind]=manual; S[manual_bench_kind]=mixed; S[depth_mode]=synthetic; S[depth_tokens]=30000; S[json_output]=true
+build_command; has_arg --pg; has_arg --synthetic-depth; has_arg --json; ! has_arg spec.mtp=false; pass
+reset; S[launch_mode]=bench; S[bench_kind]=standard; S[bench_parallel]=3
+build_command; has_arg --suite; has_arg standard; has_arg --parallel; has_arg 3; has_arg --result-dir; ! has_arg --synthetic-depth; pass
+grep -Fq '6K Prefill + 1024 Decode. x1, one run' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+grep -Fq 'Shared KV, different questions.' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+! grep -Fq '90s Decode' "$repo/Start-INFR-Wizard-Linux.sh"; pass
+reset; S[launch_mode]=bench; S[setup_mode]=aggressive; S[device]=Vulkan1
+start_benchmark_estimate_probe
+benchmark_estimate_detail quick 1; [[ $REPLY == '预计约 1 分钟。Estimated about 1 min.' ]]; pass
+benchmark_estimate_detail standard 3; [[ $REPLY == '预计约 4 分钟。Estimated about 4 min.' ]]; pass
+reset; S[error_upload]=false
+output=$(complete_error_report <<< $'first line\nsecond line\n.\n1\nn\n')
+[[ $output == *MOE4ALL_SUBMISSION_PATH=*fixture.m4e* && ${S[error_upload]} == false ]]; pass
+
+# The submission client is dependency-light: it uses the embedded JSON parser,
+# system curl, the engine verifier and a private receipt file.
+unset MOE4ALL_SUBMISSION_API_BASE MOE4ALL_SUBMISSION_SITE_ORIGIN
+submission_api_config; [[ $SUBMISSION_API_BASE == https://api.moe4all.com/v1 && $SUBMISSION_SITE_ORIGIN == https://moe4all.com ]]; pass
+MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1 submission_api_config
+[[ $SUBMISSION_SITE_ORIGIN == http://127.0.0.1:18765 ]]; pass
+if MOE4ALL_SUBMISSION_API_BASE=http://example.invalid/v1 submission_api_config > "$tmp/invalid-api" 2>&1; then exit 1; fi; pass
+mkdir -p "$tmp/submission-bin" "$ROOT/diagnostics/reports/v1/2026-10"
+report_id=20261019T010203.004Z-00112233445566778899aabbccddeeff
+report_path=$ROOT/diagnostics/reports/v1/2026-10/$report_id.m4e
+printf 'MOE4ALL-SUBMISSION/1\nkind: error\nid: %s\n' "$report_id" > "$report_path"
+fixture_hash=$(sha256sum "$report_path"); fixture_hash=${fixture_hash%% *}
+cat > "$tmp/submission-bin/curl" <<'CURL'
+#!/usr/bin/env bash
+output='' url='' method=GET
+while (($#)); do
+    case $1 in
+        --output) output=$2; shift 2 ;;
+        --request) method=$2; shift 2 ;;
+        --write-out|--header|--data-binary|--connect-timeout|--max-time) shift 2 ;;
+        --silent|--show-error) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+if [[ $url == */upload-sessions && $method == POST ]]; then
+    printf '{"api_version":1,"state":"awaiting_verification","session_id":"us_fixture","session_token":"st_fixture","verification_url":"http://127.0.0.1:18765/community/upload.html#session=fixture","max_upload_bytes":131072}' > "$output"
+    printf 201
+elif [[ $url == */upload-sessions/us_fixture && $method == GET ]]; then
+    printf '{"api_version":1,"state":"ready","kind":"error","report_id":"%s","file_sha256":"%s","size_bytes":%s}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" "$FIXTURE_SIZE" > "$output"
+    printf 200
+else
+    printf '{"api_version":1,"receipt_id":"rc_fixture","receipt_token":"rt_fixture","kind":"error","report_id":"%s","file_sha256":"%s","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"forwarding","duplicate":false,"received_at":"2026-10-19T01:02:03Z","public_url":null}' "$FIXTURE_REPORT_ID" "$FIXTURE_HASH" > "$output"
+    printf 202
+fi
+CURL
+cat > "$tmp/submission-bin/xdg-open" <<'OPEN'
+#!/usr/bin/env bash
+exit 0
+OPEN
+chmod +x "$tmp/submission-bin/curl" "$tmp/submission-bin/xdg-open"
+old_path=$PATH; PATH=$tmp/submission-bin:$PATH
+export FIXTURE_REPORT_ID=$report_id FIXTURE_HASH=$fixture_hash FIXTURE_SIZE=$(wc -c < "$report_path") MOE4ALL_SUBMISSION_API_BASE=http://127.0.0.1:18765/v1
+website_submission_upload "$report_path" error > "$tmp/submission-output"
+PATH=$old_path; unset FIXTURE_REPORT_ID FIXTURE_HASH FIXTURE_SIZE MOE4ALL_SUBMISSION_API_BASE
+[[ -f $CONFIG_DIR/private/submission-receipts/rc_fixture.private-receipt.json && $(< "$tmp/submission-output") == *'status: forwarding'* ]]; pass
+
+# Round-trip adversarial values as data, never as shell commands.
+reset; S[model]=$'model "quote" \\ space\nline\t.g g u f'; S[mtp_model]='$(touch SENTINEL)'; S[think_mode]=think; S[reasoning_effort]=medium
+save_state; original=${S[model]}; defaults; load_state
+[[ ${S[model]} == "$original" && ${S[mtp_model]} == '$(touch SENTINEL)' && ! -e $ROOT/SENTINEL ]]; pass
+# Ubuntu commonly provides mawk as /usr/bin/awk. Exercise it explicitly even
+# when the test host has selected gawk as its default alternative.
+mawk_path=$(command -v mawk) || { printf 'mawk is required for the Linux wizard test\n' >&2; exit 1; }
+(
+    awk() { command "$mawk_path" "$@"; }
+    defaults; S[model]='mawk model.gguf'; S[server_auth]=true; save_state
+    defaults; load_state
+    [[ ${S[model]} == 'mawk model.gguf' && ${S[server_auth]} == true ]]
+); pass
+printf '{"model":"\u4e2d\u6587 \ud83d\ude00.gguf", "unknown": [1,2]}' > "$STATE"
+defaults; load_state; [[ ${S[model]} != *'\u'* && ${S[model]} == *.gguf ]]; pass
+printf '{"model":"a", "model":"b"}' > "$STATE"; reject load_state
+printf '{}' > "$STATE"; defaults; load_state; [[ ${S[setup_mode]} == conservative ]]; pass
+printf '[]' > "$STATE"; reject load_state
+printf '{"model":"\u0000"}' > "$STATE"; reject load_state
+printf '{"model":123}' > "$STATE"; reject load_state
+printf '{"server_auth":"false"}' > "$STATE"; reject load_state
+printf '{"model":"broken"' > "$STATE"; reject load_state
+printf '{"think_mode":"think", "reasoning_effort":"medium"}' > "$STATE"
+defaults; load_state; [[ ${S[configure_thinking]} == true ]]; pass
+rm "$STATE"
+printf 'MODE=server\nMODEL=model.gguf\nPROFILE=aggressive\nUBATCH=3072\nMMPROJ=image.gguf\nEMBEDDING=emb.gguf\n' > "$CONFIG_DIR/wizard.conf"
+defaults; load_state; [[ ${S[launch_mode]} == serve && ${S[server_vision]} == true && ${S[auto_overrides]} == *ubatch* ]]; pass
+rm "$CONFIG_DIR/wizard.conf"
+
+# Package-local state wins. Old XDG state is a read-only fallback and migrates
+# naturally when the next normal save writes the package-local state.
+mkdir -p "$LEGACY_CONFIG_DIR"
+printf '{"model":"legacy-model.gguf","setup_mode":"aggressive"}\n' > "$LEGACY_STATE"
+defaults; load_state; [[ ${S[model]} == legacy-model.gguf && ${S[setup_mode]} == aggressive ]]; pass
+printf '{"model":"package-model.gguf","setup_mode":"conservative"}\n' > "$STATE"
+defaults; load_state; [[ ${S[model]} == package-model.gguf && ${S[setup_mode]} == conservative ]]; pass
+rm "$STATE"
+defaults; load_state; save_state
+[[ -f $STATE && -f $LEGACY_STATE && ${S[model]} == legacy-model.gguf ]]; pass
+
+mkdir "$ROOT/models"
+for name in flash-00001-of-00002.gguf flash-00002-of-00002.gguf mmproj-flash.gguf mtp-flash.gguf; do touch "$ROOT/models/$name"; done
+model_candidates "$ROOT/models" llm; [[ ${#CANDIDATES[@]} == 1 && ${CANDIDATES[0]} == *-00001-of-00002.gguf ]]; pass
+model_candidates "$ROOT/models" vision; [[ ${#CANDIDATES[@]} == 1 && ${CANDIDATES[0]} == *mmproj* ]]; pass
+reset; model_path llm model <<< 'models' > "$tmp/model-choice"; [[ ${S[model]} == *-00001-of-00002.gguf ]]; pass
+
+# The package-local catalog supports multi-select and returns to model choice
+# instead of selecting one downloaded model on the user's behalf.
+catalog_load flashnext-427; [[ $CATALOG_KIND == llm && $CATALOG_COUNT == 3 && $CATALOG_PRIMARY == *00001-of-00003.gguf && $CATALOG_BYTES == 94525391424 ]]; pass
+catalog_file flashnext-427 3; [[ $DOWNLOAD_RELATIVE == *00003-of-00003.gguf && $DOWNLOAD_URL == https://huggingface.co/*/resolve/f5b0b790eebb89033c48091c26abf74c1b385940/* ]]; pass
+catalog_load qwen3-embedding-06b-q8; [[ $CATALOG_KIND == embedding && $CATALOG_PRIMARY == *Qwen3-Embedding-0.6B-Q8_0.gguf ]]; pass
+(
+    download_bundle() {
+        printf '%s\n' "$1" >> "$tmp/download-ids"
+        catalog_load "$1"; mkdir -p -- "$ROOT/models/${CATALOG_PRIMARY%/*}"; printf fixture > "$ROOT/models/$CATALOG_PRIMARY"
+    }
+    download_menu <<< $'1,3,4\ny'
+) > "$tmp/download-menu"
+[[ $(tr '\n' ',' < "$tmp/download-ids") == 'qwen35-balanced,flashnext-vision,qwen3-embedding-06b-q8,' ]]; pass
+(
+    download_menu() {
+        catalog_load qwen35-balanced; mkdir -p -- "$ROOT/models/${CATALOG_PRIMARY%/*}"; printf fixture > "$ROOT/models/$CATALOG_PRIMARY"
+    }
+    reset; model_path llm model <<< $'D\nN\nmodels/flash-00001-of-00002.gguf'; printf '%s\n' "${S[model]}" > "$tmp/model-after-download"
+) > "$tmp/model-download-choice"
+[[ $(grep -c '^LLM 模型 / model$' "$tmp/model-download-choice") == 2 && $(< "$tmp/model-after-download") == *flash-00001-of-00002.gguf ]]; pass
+
+# Exercise the real download path without network access and reject arbitrary URLs.
+mkdir "$tmp/fake-downloader"
+cat > "$tmp/fake-downloader/curl" <<'CURL'
+#!/usr/bin/env bash
+while (($#)); do
+    if [[ $1 == --output ]]; then output=$2; shift 2; else shift; fi
+done
+printf fixture >> "$output"
+CURL
+chmod +x "$tmp/fake-downloader/curl"
+(
+    PATH="$tmp/fake-downloader:$PATH"; unset MODEL_DOWNLOADER
+    model_download_file 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' "$tmp/downloaded.gguf" fixture
+)
+[[ $(< "$tmp/downloaded.gguf") == fixture && ! -e $tmp/downloaded.gguf.part ]]; pass
+reject model_download_file 'https://example.invalid/model.gguf' "$tmp/rejected.gguf" rejected
+cat > "$tmp/fake-downloader/wget" <<'WGET'
+#!/usr/bin/env bash
+if [[ ${1-} == --help ]]; then printf 'minimal wget\n'; exit 0; fi
+while (($#)); do
+    if [[ $1 == -O ]]; then output=$2; shift 2; else shift; fi
+done
+printf wget-fixture >> "$output"
+WGET
+chmod +x "$tmp/fake-downloader/wget"
+(
+    command() {
+        if [[ ${1-} == -v && ${2-} == curl ]]; then return 1; fi
+        builtin command "$@"
+    }
+    PATH="$tmp/fake-downloader:$PATH"; unset MODEL_DOWNLOADER
+    model_download_file 'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' "$tmp/downloaded-wget.gguf" wget-fixture
+)
+[[ $(< "$tmp/downloaded-wget.gguf") == wget-fixture ]]; pass
+(
+    command() {
+        if [[ ${1-} == -v && (${2-} == curl || ${2-} == wget) ]]; then return 1; fi
+        builtin command "$@"
+    }
+    INTERACTIVE=false; HEADLESS=false; ! ensure_model_downloader
+); pass
+(
+    command() {
+        if [[ ${1-} == -v && (${2-} == curl || ${2-} == wget) ]]; then return 1; fi
+        builtin command "$@"
+    }
+    yes() { REPLY=true; }
+    install_curl() { return 1; }
+    INTERACTIVE=true; HEADLESS=false; ! ensure_model_downloader
+); pass
+
+reset; choose_device <<< '' > "$tmp/device-choice"; [[ ${S[device]} == Vulkan1 ]]; ! grep -q Software "$tmp/device-choice"; pass
+for address in 127.0.0.1:8080 localhost:8080 '[::1]:8080'; do valid_address "$address"; loopback "$address"; done; pass
+reject valid_address localhost.evil:8080
+reject valid_address 127.0.0.1:65536
+reject valid_address 300.1.1.1:8080
+reject valid_address '[::::]:8080'
+reject valid_address '[1:2:3:4:5:6:7]:8080'
+reject valid_address '[1:2:3:4:5:6:7:8::]:8080'
+for address in '[::]:8080' '[2001:db8::1]:8080' '[1:2:3:4:5:6:7:8]:8080'; do valid_address "$address"; done; pass
+! loopback localhost.evil:8080; pass
+
+# Saved settings and explicit CLI disable switches have identical precedence to Windows.
+reset; S[launch_mode]=serve; S[mtp_enabled]=true; S[mtp_model]=head.gguf; S[server_vision]=true; S[vision_projector]=image.gguf
+S[server_embedding]=true; S[embedding_model]=emb.gguf; S[ubatch]=2048; save_state
+before=$(sha256sum "$STATE")
+output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --ubatch 3072 --kv-k q8_0 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *3072* && $output == *kv.type_k=q8_0* && $output != *kv.type_v=* && $output != *fixture-secret* && $output != *spec.draft* && $output != *--mmproj* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --kv-v f16 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *kv.type_v=f16* && $output != *kv.type_k=* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --kv-k q8_0 --kv-v f16 --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *kv.type_k=q8_0* && $output == *kv.type_v=f16* && $(sha256sum "$STATE") == "$before" ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *spec.mtp=false* && $output != *spec.draft* ]]; pass
+output=$(bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model relative.gguf --mtp head.gguf --mtp-k 3 --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output == *spec.mtp=true* && $output == *spec.draft=*head.gguf* && $output == *spec.k=3* ]]; pass
+reject bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf --addr 0.0.0.0:8080 --no-api-key
+reject bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf
+output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf --yes --no-mtp --no-mmproj --no-embedding </dev/null)
+[[ $output == *KEY=fixture-secret* ]] && ! grep -q fixture-secret "$STATE"; pass
+output=$(INFR_API_KEY=fixture-secret bash "$ROOT/Start-INFR-Wizard-Linux.sh" --mode serve --model model.gguf --yes --no-api-key </dev/null)
+[[ $output == *KEY=* && $output != *fixture-secret* ]]; pass
+
+# Tiny real GGUF metadata, including a skipped array before the template.
+gguf_string() { local n=${#1}; printf '\\%03o' "$n" > /dev/null; printf '%b' "\\$(printf '%03o' "$n")\0\0\0\0\0\0\0"; printf '%s' "$1"; }
+{
+    printf 'GGUF\3\0\0\0\0\0\0\0\0\0\0\0\3\0\0\0\0\0\0\0'
+    gguf_string general.architecture; printf '\10\0\0\0'; gguf_string qwen4exp
+    gguf_string ignored.array; printf '\11\0\0\0\4\0\0\0\2\0\0\0\0\0\0\0\1\0\0\0\2\0\0\0'
+    gguf_string tokenizer.chat_template; printf '\10\0\0\0'; gguf_string reasoning_effort
+} > "$ROOT/tiny.gguf"
+[[ $(reasoning_efforts "$ROOT/tiny.gguf") == 'low medium xhigh' ]]; pass
+{
+    printf 'GGUF\3\0\0\0\0\0\0\0\0\0\0\0\2\0\0\0\0\0\0\0'
+    gguf_string general.architecture; printf '\10\0\0\0'; gguf_string qwen35moe
+    gguf_string tokenizer.chat_template; printf '\10\0\0\0'; gguf_string enable_thinking
+} > "$ROOT/tiny-qwen35.gguf"
+[[ $(reasoning_efforts "$ROOT/tiny-qwen35.gguf") == 'low medium high max' ]]; pass
+printf GGUF > "$ROOT/bad.gguf"; reject reasoning_efforts "$ROOT/bad.gguf"
+
+# The release fixture contains only runtime products, not developer Python files.
+make_package() {
+    local base=$1 version=$2 launcher=${3-} name hash size sep=''
+    mkdir -p "$base/documentation"
+    printf '#!/usr/bin/env bash\nprintf "infr %s\\n"\n' "$version" > "$base/infr"
+    if [[ -n $launcher ]]; then cp "$launcher" "$base/Start-INFR-Wizard-Linux.sh"
+    else cp "$repo/Start-INFR-Wizard-Linux.sh" "$base/"; fi
+    printf 'test guide\n' > "$base/documentation/README.md"
+    chmod +x "$base/infr" "$base/Start-INFR-Wizard-Linux.sh"
+    {
+        printf '{"schema_version":1,"updater_protocol":1,"product":"moe4all-engine","platform":"Linux-x86_64","version":"%s","files":[' "$version"
+        for name in infr Start-INFR-Wizard-Linux.sh documentation/README.md; do
+            hash=$(sha256sum "$base/$name"); hash=${hash%% *}; size=$(wc -c < "$base/$name")
+            printf '%s{"path":"%s","size":%s,"sha256":"%s"}' "$sep" "$name" "$size" "$hash"; sep=,
+        done
+        printf ']}\n'
+    } > "$base/install-manifest.json"
+}
+make_package "$tmp/installed" 0.10.0
+make_package "$tmp/stage" 1.0.0
+validate_package "$tmp/stage" 1.0.0; pass
+reject validate_package "$tmp/stage" 0.12.0
+touch "$tmp/stage/unlisted"; reject validate_package "$tmp/stage" 1.0.0; rm "$tmp/stage/unlisted"
+cp "$tmp/stage/infr" "$tmp/original-infr"; printf corrupt > "$tmp/stage/infr"; reject validate_package "$tmp/stage" 1.0.0; cp "$tmp/original-infr" "$tmp/stage/infr"
+prefix=MoE4All-Linux-x86_64-v1.0.0
+cp -r "$tmp/stage" "$tmp/$prefix"; tar -czf "$tmp/valid.tar.gz" -C "$tmp" "$prefix"
+extract_package "$tmp/valid.tar.gz" "$tmp/extracted" 1.0.0; pass
+printf private > "$tmp/installed/infr.toml"; mkdir "$tmp/installed/kv-sessions"; printf cache > "$tmp/installed/kv-sessions/private.infrkv"
+apply_update "$tmp/installed" "$tmp/extracted" 1.0.0
+[[ $("$tmp/installed/infr" --version) == 'infr 1.0.0' && $(< "$tmp/installed/infr.toml") == private && $(< "$tmp/installed/kv-sessions/private.infrkv") == cache ]]; pass
+reject apply_update "$tmp/installed" "$tmp/stage" 1.0.0
+make_package "$tmp/rollback-old" 0.10.0; make_package "$tmp/rollback-new" 1.0.0
+# Version mismatch is internally consistent with the manifest, but fails the final executable probe.
+printf '#!/usr/bin/env bash\nprintf "infr 9.9.9\\n"\n' > "$tmp/rollback-new/infr"
+hash=$(sha256sum "$tmp/rollback-new/infr"); hash=${hash%% *}; size=$(wc -c < "$tmp/rollback-new/infr")
+json_load "$tmp/rollback-new/install-manifest.json"; original_hash=${J['["files",0,"sha256"]']}; original_size=${J['["files",0,"size"]']}
+sed -i "s/${original_hash:1:64}/$hash/;s/\"size\":$original_size,/\"size\":$size,/" "$tmp/rollback-new/install-manifest.json"
+before=$(sha256sum "$tmp/rollback-old/infr" "$tmp/rollback-old/install-manifest.json")
+reject apply_update "$tmp/rollback-old" "$tmp/rollback-new" 1.0.0
+[[ $(sha256sum "$tmp/rollback-old/infr" "$tmp/rollback-old/install-manifest.json") == "$before" ]]; pass
+make_package "$tmp/bad-launcher-old" 0.10.0
+printf '#!/usr/bin/env bash\nif\n' > "$tmp/bad-launcher"
+make_package "$tmp/bad-launcher-new" 1.0.0 "$tmp/bad-launcher"
+before=$(sha256sum "$tmp/bad-launcher-old/infr" "$tmp/bad-launcher-old/install-manifest.json")
+reject apply_update "$tmp/bad-launcher-old" "$tmp/bad-launcher-new" 1.0.0
+[[ $(sha256sum "$tmp/bad-launcher-old/infr" "$tmp/bad-launcher-old/install-manifest.json") == "$before" ]]; pass
+reject fetch_url https://example.invalid/asset "$tmp/asset" 100
+
+# Shell updater guards (not just the separate developer Python fixtures).
+for name in 'documentation/../escape.md' 'documentation//escape.md' 'kv-sessions/private.infrkv' '/absolute' 'scripts/linux_wizard.py'; do reject managed "$name"; done
+make_package "$tmp/link-package" 1.0.0
+rm "$tmp/link-package/documentation/README.md"; ln -s /outside "$tmp/link-package/documentation/README.md"
+reject validate_package "$tmp/link-package" 1.0.0
+mkdir "$tmp/link-installed"; cp -r "$tmp/rollback-old/." "$tmp/link-installed/"
+mv "$tmp/link-installed/documentation" "$tmp/outside-docs"; ln -s "$tmp/outside-docs" "$tmp/link-installed/documentation"
+make_package "$tmp/link-stage" 1.0.0; reject apply_update "$tmp/link-installed" "$tmp/link-stage" 1.0.0
+make_package "$tmp/running-old" 0.10.0; make_package "$tmp/running-new" 1.0.0
+( engine_running() { return 0; }; reject apply_update "$tmp/running-old" "$tmp/running-new" 1.0.0 ); pass
+mkdir "$tmp/running-old/.git"; reject apply_update "$tmp/running-old" "$tmp/running-new" 1.0.0
+make_package "$tmp/mid-old" 0.10.0; make_package "$tmp/mid-new" 1.0.0
+before=$(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json")
+(
+    mv() { local arg; for arg in "$@"; do [[ $arg != *mid-new/Start-INFR-Wizard-Linux.sh ]] || return 1; done; command mv "$@"; }
+    reject apply_update "$tmp/mid-old" "$tmp/mid-new" 1.0.0
+)
+[[ $(sha256sum "$tmp/mid-old/infr" "$tmp/mid-old/install-manifest.json") == "$before" ]]; pass
+
+if [[ $(uname -s) == Linux ]]; then
+    make_package "$tmp/fifo" 1.0.0
+    if mkfifo "$tmp/fifo/unlisted-fifo" 2>/dev/null; then
+        reject validate_package "$tmp/fifo" 1.0.0
+    else
+        rm -rf -- "$tmp/fifo"
+    fi
+    mkdir -p "$tmp/archive-bad/$prefix"
+    ln -s /outside "$tmp/archive-bad/$prefix/infr"
+    tar -czf "$tmp/bad-link.tar.gz" -C "$tmp/archive-bad" "$prefix"
+    reject extract_package "$tmp/bad-link.tar.gz" "$tmp/link-extract" 1.0.0
+    rm "$tmp/archive-bad/$prefix/infr"; printf data > "$tmp/archive-bad/$prefix/infr"
+    tar -czf "$tmp/bad-duplicate.tar.gz" -C "$tmp/archive-bad" "$prefix/infr" "$prefix/infr"
+    reject extract_package "$tmp/bad-duplicate.tar.gz" "$tmp/duplicate-extract" 1.0.0
+    tar -czf "$tmp/bad-traversal.tar.gz" --transform='s@infr$@../escape@' -C "$tmp/archive-bad" "$prefix/infr"
+    reject extract_package "$tmp/bad-traversal.tar.gz" "$tmp/traversal-extract" 1.0.0
+
+    # Full Shell download/checksum/extract/replace chain, all network replaced by local fixtures.
+    make_package "$tmp/download-old" 0.10.0
+    hash=$(sha256sum "$tmp/valid.tar.gz"); hash=${hash%% *}
+    printf '%s  %s.tar.gz\n' "$hash" "$prefix" > "$tmp/download.sha256"
+    (
+        RELEASE_VERSION=1.0.0
+        RELEASE_ARCHIVE="https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/$prefix.tar.gz"
+        RELEASE_CHECKSUM="$RELEASE_ARCHIVE.sha256"
+        fetch_url() { if [[ $1 == *.sha256 ]]; then cp "$tmp/download.sha256" "$2"; else cp "$tmp/valid.tar.gz" "$2"; fi; }
+        download_update "$tmp/download-old" false
+    ) > "$tmp/download-output"
+    [[ $("$tmp/download-old/infr" --version) == 'infr 1.0.0' ]]; pass
+    make_package "$tmp/bad-download-old" 0.10.0
+    before=$(sha256sum "$tmp/bad-download-old/infr")
+    (
+        RELEASE_VERSION=1.0.0; RELEASE_ARCHIVE=archive; RELEASE_CHECKSUM=checksum
+        fetch_url() { if [[ $1 == checksum ]]; then printf '%064d  %s.tar.gz\n' 0 "$prefix" > "$2"; else cp "$tmp/valid.tar.gz" "$2"; fi; }
+        reject download_update "$tmp/bad-download-old"
+    )
+    [[ $(sha256sum "$tmp/bad-download-old/infr") == "$before" ]]; pass
+
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "$MOE4ALL_RELAUNCH_MARKER"\n' > "$tmp/relaunch-launcher"
+    make_package "$tmp/relaunch-old" 0.10.0
+    make_package "$tmp/relaunch-new" 1.0.0 "$tmp/relaunch-launcher"
+    rm -rf "$tmp/$prefix"; cp -r "$tmp/relaunch-new" "$tmp/$prefix"
+    tar -czf "$tmp/relaunch.tar.gz" -C "$tmp" "$prefix"
+    hash=$(sha256sum "$tmp/relaunch.tar.gz"); hash=${hash%% *}
+    printf '%s  %s.tar.gz\n' "$hash" "$prefix" > "$tmp/relaunch.sha256"
+    (
+        export MOE4ALL_RELAUNCH_MARKER="$tmp/relaunch-marker"
+        RELEASE_VERSION=1.0.0
+        RELEASE_ARCHIVE="https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/$prefix.tar.gz"
+        RELEASE_CHECKSUM="$RELEASE_ARCHIVE.sha256"
+        fetch_url() { if [[ $1 == *.sha256 ]]; then cp "$tmp/relaunch.sha256" "$2"; else cp "$tmp/relaunch.tar.gz" "$2"; fi; }
+        download_update "$tmp/relaunch-old"
+    ) > "$tmp/relaunch-output"
+    [[ $(< "$tmp/relaunch-marker") == --skip-update-check && $("$tmp/relaunch-old/infr" --version) == 'infr 1.0.0' ]]; pass
+fi
+
+# Exercise full interactive configuration with stub devices, no TTY or GPU needed.
+reset; S[model]="$ROOT/models/flash-00001-of-00002.gguf"
+configure > "$tmp/interactive-default" <<'INPUT'
+
+
+
+
+
+
+
+
+
+
+
+INPUT
+[[ ${S[launch_mode]} == run && ${S[setup_mode]} == conservative && ${S[device]} == Vulkan1 && ${S[max_new]} == 65536 ]]; pass
+
+# Device-driver failures after model selection stay explicit instead of looking
+# like a model-path failure. The top-level launcher keeps an interactive terminal
+# open; this sourced test verifies the actionable diagnostic without a GPU.
+cat > "$tmp/no-vulkan-infr" <<'ENGINE'
+#!/usr/bin/env bash
+if [[ ${1-} == devices ]]; then
+    printf '%s\n' 'MESA: warning: Driver does not support the 0x7d67 PCI ID.' >&2
+    printf '%s\n' 'no Vulkan physical devices found'
+fi
+ENGINE
+chmod +x "$tmp/no-vulkan-infr"
+BINARY=$tmp/no-vulkan-infr
+reject choose_device
+grep -q 'Mesa/Intel driver mismatch' "$tmp/reject.log"; pass
+BINARY=$ROOT/infr
+
+reset; S[launch_mode]=serve; S[model]="$ROOT/models/flash-00001-of-00002.gguf"
+S[setup_mode]=aggressive; S[vision_projector]="$ROOT/models/mmproj-flash.gguf"
+S[embedding_model]="$ROOT/models/mtp-flash.gguf"; S[server_parallel]=2
+configure > "$tmp/interactive-combined" <<'INPUT'
+
+y
+y
+n
+n
+
+y
+
+
+
+
+
+n
+
+n
+n
+
+150k
+y
+n
+
+n
+INPUT
+build_command; has_arg --mmproj; has_arg --embedding-model; has_arg spec.mtp=false; has_arg kv.session_idle_secs=120; has_arg 150k; pass
+
+version_newer 0.10.0 0.9.9; ! version_newer 0.10.0 0.10.0; ! version_newer 0.9.9 0.10.0; pass
+
+# A runtime package works with Python and jq deliberately made unusable.
+mkdir "$tmp/no-language-runtime"
+for name in python python3 jq; do printf '#!/bin/sh\nexit 91\n' > "$tmp/no-language-runtime/$name"; chmod +x "$tmp/no-language-runtime/$name"; done
+output=$(PATH="$tmp/no-language-runtime:$PATH" bash "$ROOT/Start-INFR-Wizard-Linux.sh" --dry-run --model model.gguf --no-mtp --no-mmproj --no-embedding --no-api-key </dev/null)
+[[ $output != *STUB_LAUNCHED* && $output == *spec.mtp=false* ]]; pass
+
+printf '[{"tag_name":"release-0.9.0","draft":false,"prerelease":false,"assets":[]},{"tag_name":"release-0.10.0","draft":false,"prerelease":false,"assets":[]},{"tag_name":"release-1.0.0","draft":false,"prerelease":true,"assets":[]},{"tag_name":"agent-9.0.0","draft":false,"prerelease":false,"assets":[]}]' > "$tmp/releases.json"
+json_load "$tmp/releases.json"; select_release; [[ $RELEASE_VERSION == 0.10.0 && -z $RELEASE_ARCHIVE ]]; pass
+
+printf '[{"tag_name":"release-1.0.0","draft":false,"prerelease":false,"assets":[{"name":"MoE4All-Linux-x86_64-v1.0.0.tar.gz","browser_download_url":"https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/MoE4All-Linux-x86_64-v1.0.0.tar.gz"},{"name":"MoE4All-Linux-x86_64-v1.0.0.tar.gz.sha256","browser_download_url":"https://github.com/Headmaster218/MoE4All/releases/download/release-1.0.0/MoE4All-Linux-x86_64-v1.0.0.tar.gz.sha256"}]}]' > "$tmp/update-check.json"
+(
+    touch "$ROOT/install-manifest.json"; INTERACTIVE=true; HEADLESS=false
+    fetch_url() { cp "$tmp/update-check.json" "$2"; }
+    download_update() { touch "$tmp/UNEXPECTED_UPDATE"; return 1; }
+    yes() { touch "$tmp/UNEXPECTED_PROMPT"; return 1; }
+    check_updates --check-update
+    [[ ! -f $tmp/UNEXPECTED_UPDATE && ! -f $tmp/UNEXPECTED_PROMPT ]]
+    HEADLESS=true; check_updates --update
+    [[ ! -f $tmp/UNEXPECTED_UPDATE && ! -f $tmp/UNEXPECTED_PROMPT ]]
+    HEADLESS=false; yes() { REPLY=false; }; check_updates --update
+    [[ ! -f $tmp/UNEXPECTED_UPDATE ]]
+) > "$tmp/check-only-output"
+pass
+printf 'test-linux-wizard: %s checks passed\n' "$checks"

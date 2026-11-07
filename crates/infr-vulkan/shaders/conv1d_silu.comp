@@ -1,0 +1,49 @@
+#version 460
+// Causal depthwise 1-D conv + SiLU, ONE token (qwen35/Qwen3.5 SSM input conv). One thread per channel:
+//   out[ch] = silu( Σ_{k<K-1} state[k][ch]·w[ch][k] + qkv[ch]·w[ch][K-1] )
+// then shift the per-channel history (drop oldest, append the raw qkv). `state` is [K-1, cc] row-major
+// (k outer), `w` is [cc, K] (per-channel kernel), matching the CPU reference layout.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA (STREAMED is the only weight build): the conv weight is read through a 64-bit
+// buffer_reference into the resident arena (base = arena_lo/arena_hi) instead of a bound SSBO —
+// see linear_f32.comp's header for the campaign rationale. No bound weight SSBO exists.
+layout(push_constant) uniform PC {
+    uint rows; uint cc; uint kconv; uint arena_lo; uint arena_hi;
+} pc;
+
+layout(binding = 0) readonly buffer XB { float qkv[]; };    // [rows, cc]
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { float v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 2) buffer SB { float cstate[]; };          // [(kconv-1)*cc] in/out
+layout(binding = 3) writeonly buffer OB { float outp[]; };  // [rows, cc]
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.cc) {
+        return;
+    }
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    uint km1 = pc.kconv - 1u;
+    // One thread per channel processes the `rows` tokens IN ORDER, carrying the per-channel history.
+    for (uint tk = 0u; tk < pc.rows; tk++) {
+        float acc = 0.0;
+        for (uint k = 0u; k < km1; k++) {
+            acc += cstate[k * pc.cc + ch] * WV(ch * pc.kconv + k);
+        }
+        float cur = qkv[tk * pc.cc + ch];
+        acc += cur * WV(ch * pc.kconv + km1);
+        outp[tk * pc.cc + ch] = acc / (1.0 + exp(-acc)); // SiLU
+
+        // shift history: state[k] = state[k+1] for k in 0..km1-1, then newest slot = cur.
+        for (uint k = 0u; k + 1u < km1; k++) {
+            cstate[k * pc.cc + ch] = cstate[(k + 1u) * pc.cc + ch];
+        }
+        if (km1 >= 1u) {
+            cstate[(km1 - 1u) * pc.cc + ch] = cur;
+        }
+    }
+}

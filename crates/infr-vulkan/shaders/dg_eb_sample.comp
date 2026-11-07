@@ -1,0 +1,157 @@
+#version 460
+// DiffusionGemma entropy-bound sampler reduction (perf slice 3, docs/diffusion-gemma.md): fuses
+// `diffusion.rs::denoise_block`'s per-canvas-row host closure (`per_pos`) into ONE GPU pass per
+// row, so the driver downloads `[rows]`-sized argmax/entropy/sampled arrays instead of the raw
+// `[rows, dim]` logits (dim = vocab, ~262144 — a >10000x smaller readback). One workgroup (256
+// threads) per canvas row; three passes over that row's `dim` logits, all VRAM-resident (never
+// crossing to host between passes) — cheap relative to the PCIe download it replaces.
+//
+// Mirrors the host closure EXACTLY (same math, same order), just spread across three passes
+// because a single row (up to 262144 f32 = 1 MiB) can't fit shared memory for a one-pass scan:
+//   1. argmax over z = raw*temp_inv (temp_inv > 0 never flips the argmax vs raw, but this keeps
+//      the value comparable across the module) — strict `>` keeps the LOWEST index on ties,
+//      exactly like the host's `if z > m`.
+//   2. entropy of softmax(z): h = ln(Z) - S/Z where Z = sum(e_i), S = sum(e_i*(z_i-m)), e_i =
+//      exp(z_i - m) — algebraically `-sum p_i*ln(p_i)` with p_i = e_i/Z (see the module doc for
+//      the derivation); an order-independent reduction (subgroup adds), unlike pass 3.
+//   3. ONE multinomial draw via forward (vocab-increasing) CDF inversion against the host-drawn
+//      uniform `u[row]`: target = u[row]*Z, first i (in increasing order) with cumsum(e) >=
+//      target. Order matters here (matches the host's serial i=0..dim walk), so this pass
+//      partitions `dim` into 256 CONTIGUOUS chunks (thread t owns [t*csz, min((t+1)*csz,dim))) —
+//      chunk sums taken in thread order reproduce the same cumulative walk as the host's serial
+//      loop. Thread 0 finds which chunk crosses `target` from the (cheap, 256-element) chunk-sum
+//      array, then ONLY that one thread re-scans its own (bounded) chunk to pin the exact index.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint dim; float temp_inv; } pc;
+layout(binding = 0) readonly buffer LB { float logits[]; };   // [rows, dim]
+layout(binding = 1) readonly buffer UB { float u[]; };        // [rows] host-drawn uniform in [0,1)
+layout(binding = 2) writeonly buffer AB { uint argmax_id[]; };  // [rows]
+layout(binding = 3) writeonly buffer EB { float entropy[]; };   // [rows]
+layout(binding = 4) writeonly buffer SB { uint sampled_id[]; }; // [rows]
+
+shared float sval[256];
+shared uint sidx[256];
+// Sized 256/MIN_SG (min subgroup 16) so a 16-lane subgroup can't overrun; the pipeline pins
+// requiredSubgroupSize=32 (kernel_sg(..., 32)), so only part[0..gl_NumSubgroups) (=8) is ever used.
+shared float part[16]; // one partial per subgroup (256 threads / sg; 8 waves @ sg32)
+shared float sh_m;
+shared float sh_zsum;
+shared uint sh_sel;
+shared float sh_local_target;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint dim = pc.dim;
+    uint base = row * dim;
+    float temp_inv = pc.temp_inv;
+
+    // ── Pass 1: argmax over z = raw*temp_inv (strided scan + shared-memory tree reduce, matching
+    // `argmax.comp`'s tie-break) ─────────────────────────────────────────────────────────────
+    float best = -1e30; // sentinel below any real logit (matches argmax.comp)
+    uint bi = 0u;
+    for (uint i = t; i < dim; i += 256u) {
+        float z = logits[base + i] * temp_inv;
+        if (z > best) { best = z; bi = i; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        // Lower-index-wins tie-break, matching argmax.comp + the host's first-maximum argmax.
+        if (t < s
+            && (sval[t + s] > sval[t] || (sval[t + s] == sval[t] && sidx[t + s] < sidx[t]))) {
+            sval[t] = sval[t + s];
+            sidx[t] = sidx[t + s];
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        sh_m = sval[0];
+        argmax_id[row] = sidx[0];
+    }
+    barrier();
+    float m = sh_m;
+
+    // ── Pass 2: Z = sum(e_i), S = sum(e_i*(z_i-m)) — order-independent, subgroup-reduced ──────
+    float sum_e = 0.0;
+    float sum_ez = 0.0;
+    for (uint i = t; i < dim; i += 256u) {
+        float z = logits[base + i] * temp_inv;
+        float e = exp(z - m);
+        sum_e += e;
+        sum_ez += e * (z - m);
+    }
+    sum_e = subgroupAdd(sum_e);
+    if (subgroupElect()) { part[gl_SubgroupID] = sum_e; }
+    barrier();
+    float tot_e = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) { tot_e += part[s]; }
+    barrier(); // every thread read part[] for tot_e before it's reused below
+
+    sum_ez = subgroupAdd(sum_ez);
+    if (subgroupElect()) { part[gl_SubgroupID] = sum_ez; }
+    barrier();
+    float tot_ez = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) { tot_ez += part[s]; }
+
+    if (t == 0u) {
+        sh_zsum = tot_e;
+        entropy[row] = log(tot_e) - tot_ez / tot_e;
+    }
+    barrier();
+    float zs = sh_zsum;
+
+    // ── Pass 3: forward CDF inversion in vocab order — target = u[row]*zs ─────────────────────
+    uint csz = (dim + 255u) / 256u;
+    uint c0 = min(t * csz, dim);
+    uint c1 = min(c0 + csz, dim);
+    float local_sum = 0.0;
+    for (uint i = c0; i < c1; i++) {
+        float z = logits[base + i] * temp_inv;
+        local_sum += exp(z - m);
+    }
+    sval[t] = local_sum; // reuse the shared array — pass 1's contents are long since consumed
+    barrier();
+
+    float target = u[row] * zs;
+    if (t == 0u) {
+        float running = 0.0;
+        uint sel = 255u; // fallback: last chunk (mirrors the host's `sampled = vocab-1` default)
+        float local_target = 1.0e30; // huge => the fallback chunk's scan never "finds" early
+        bool found = false;
+        for (uint b = 0u; b < 256u; b++) {
+            float nxt = running + sval[b];
+            if (!found && nxt >= target) {
+                sel = b;
+                local_target = target - running;
+                found = true;
+            }
+            running = nxt;
+        }
+        sh_sel = sel;
+        sh_local_target = local_target;
+    }
+    barrier();
+    uint sel = sh_sel;
+    float local_target = sh_local_target;
+
+    if (t == sel) {
+        float cum = 0.0;
+        uint chosen = dim - 1u; // same fallback as the host's initial `sampled` value
+        bool picked = false;
+        for (uint i = c0; i < c1; i++) {
+            float z = logits[base + i] * temp_inv;
+            float e = exp(z - m);
+            cum += e;
+            if (!picked && cum >= local_target) {
+                chosen = i;
+                picked = true;
+            }
+        }
+        sampled_id[row] = chosen;
+    }
+}

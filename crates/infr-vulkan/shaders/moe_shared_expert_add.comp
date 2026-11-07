@@ -1,0 +1,22 @@
+#version 460
+// qwen35moe Qwen2-MoE-style shared-expert combine: dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
+// shexp[r,c] — see `Op::MoeSharedExpertAdd`'s doc. One thread per (row, col) element
+// (`total = rows*n`); `gate` (one raw pre-sigmoid logit per row) broadcasts across each row's `n`
+// columns — the ROW-broadcast twin of `mul_vec`'s COLUMN broadcast.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; uint total; } pc;
+layout(binding = 0) readonly buffer MB { float moe_[]; };
+layout(binding = 1) readonly buffer SB { float shexp_[]; };
+layout(binding = 2) readonly buffer GB { float gate_[]; };
+layout(binding = 3) buffer DB { float dst[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) {
+        return;
+    }
+    uint r = i / pc.n;
+    float g = 1.0 / (1.0 + exp(-gate_[r]));
+    dst[i] = moe_[i] + g * shexp_[i];
+}

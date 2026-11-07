@@ -1,0 +1,55 @@
+#version 460
+// f16-weight GEMV y = x·Wᵀ — NO shaderFloat16 dependency. Fork of linear_f16.comp for devices
+// that lack VK_KHR_shader_float16/shaderFloat16 (which also implies no coopmat — f16 is a coopmat
+// prerequisite, see the caps.f16/caps.cooperative_matrix fallback ladder in adapter.rs). The f16
+// weight buffer is read as packed uint32 words (2 halves/word, the exact in-memory layout of a
+// tightly-packed f16 array) and unpacked via `unpackHalf2x16`, a CORE GLSL builtin requiring no
+// extension — instead of declaring a `float16_t` SSBO element (which needs the Float16 SPIR-V
+// capability). Same dispatch shape as linear_f16.comp (one workgroup per output element, 64
+// threads stride K, shared tree-reduce) and the same accumulation order, so results are bit- (or
+// near-bit-) identical to the f16 path modulo the dequant method. Correctness-first: no row-tiling
+// (unlike linear_f32's mrow variants) — this is the last-resort tier, not perf-tuned.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA: the weight is read through a 64-bit buffer_reference into the resident arena
+// (base = arena_lo/arena_hi) instead of a bound SSBO — see native_gemv.comp's header for the
+// campaign rationale.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint arena_lo; uint arena_hi;
+} pc;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { uint v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 1) readonly buffer XB { float x[]; };  // [rows, in]
+layout(binding = 2) buffer YB { float y[]; };            // [rows, out]
+
+shared float red[64];
+
+float w_at(uint idx) {
+    uint word = WV(idx >> 1);
+    vec2 h = unpackHalf2x16(word);
+    return (idx & 1u) == 0u ? h.x : h.y;
+}
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // = r * out_f + o
+    if (unit >= pc.rows * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += w_at(wbase + i) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}

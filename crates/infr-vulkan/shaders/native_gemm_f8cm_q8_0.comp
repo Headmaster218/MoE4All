@@ -1,0 +1,256 @@
+#version 460
+// fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — gated opt-in behind
+// INFR_F8_COOPMAT=1 + caps.f8_coopmat (see adapter.rs `f8cm_ok`). RDNA4 (Navi 44 / RX 9060 XT)
+// natively enumerates E4M3×E4M3 -> FLOAT32 cooperative-matrix configs at 16x16x16 (component raw
+// E4M3=1000491002, see lib.rs `CT_E4M3` / `has_f8_coopmat`). This kernel targets that config.
+//
+// LARGE WARPTILE (this revision): structurally the SAME 256-thread/8-warp warptile as the tuned
+// f16 GEMM (`native_gemm_warp.comp`) — BM=64 × BN=256, warp WM=32×WN=64, register-blocked
+// acc[CMS_M=2][CMS_N=4] of 16x16 coopmat frags, WARPS_M=2/WARPS_N=4 — instead of the original
+// naive BM=64×BN=64/4-subgroup single tile (which measured 0.64x the f16 warptile GEMM at pp512:
+// the wide 256-wide N tile amortizes each staged A-row / decoded W-column over 4x more math, and
+// the extra warps hide the Q8_0-weight dequant latency). `-DNARROW_N` halves the column tile
+// (BN 256->128) and doubles the k-stage (BK 32->64) for n%128 (not n%256) shapes — same 256
+// dequant calls/stage, 2x the workgroups; mirrors native_gemm_warp's NARROW_N variant exactly.
+// Bank-conflict padding (`SAK=SBK=BK+8`) is carried over from the f16 tile unchanged; fp8's 1-byte
+// element stride makes the LDS-bank arithmetic different from f16's 2-byte stride, so this padding
+// amount is UNVALIDATED for fp8 specifically (kept for structural parity, not re-derived) — a
+// follow-on tuning pass, not a correctness question.
+//
+// UNVALIDATED on RDNA3 (this dev box has no fp8 coopmat hardware — `caps.f8_coopmat` is false
+// here, so the gate never dispatches this kernel locally): compile-checked via glslc only, exercise
+// on RDNA4 for correctness/perf. fp8 (E4M3) is a FLOAT type, so fp8×fp8 -> f32 coopmat accumulate
+// is a DIRECT matmul: no per-block int scale/rescale round trip like `native_gemm_i8cm_q8_0.comp`'s
+// int8 path needs. BUT unlike f16, E4M3's dynamic range is tiny (4 exponent bits, max normal
+// magnitude 448.0) — casting raw f32 LLM activations straight to floate4m3_t overflows to inf/NaN
+// on any activation whose magnitude exceeds 448. The fix (unchanged from the naive kernel):
+// activations are pre-scaled into E4M3's range by a separate pass, `quant_f8_row.comp` (one
+// workgroup per row, whole-row amax -> `scale = amax/448`), BEFORE this kernel runs — see
+// `quant_f8_row` in recorder.rs / the `f8cm_ok` dispatch in adapter.rs, which calls it ahead of
+// this kernel. This kernel reads the pre-scaled `floate4m3_t` activations directly (binding 0,
+// `qa[]`) and stages them into `As` with NO numeric conversion (mirrors `native_gemm_warp`'s
+// A_GLOBAL idea of reading pre-converted activations verbatim, just still through an LDS stage
+// rather than coopMatLoad-from-global — see the "NOT CLEANLY PORTED" note below for why) — and
+// descales the OUTPUT at the end: `C[m,n] = C'[m,n] * srow[m]`, since scaling every activation in
+// row `m` by `1/srow[m]` before the matmul scales that whole output row by `1/srow[m]` too
+// (elementwise scaling of one GEMM operand's row/column factors linearly out of the dot product).
+// Q8_0 weights are dequantized to f32 then cast to floate4m3_t UNSCALED — their post-dequant
+// magnitude (int8 * per-32-block f16 scale) is bounded by the model's weight distribution and
+// expected to fit E4M3 as-is (see `dqblk` staging below); if a future run finds weight overflow
+// too, that needs a symmetric per-column/per-block weight scale undone jointly with `srow` in the
+// epilogue.
+//
+// NOT CLEANLY PORTED from native_gemm_warp: true A_GLOBAL (coopMatLoad straight from the `qa`
+// global buffer, skipping the As LDS stage entirely) needs `qa` padded to `ceil(m/64)*64` rows
+// (the f16 A_GLOBAL tile's `ABuf` doc: "[Mpad, K] f16 activations") — `quant_f8_row` currently
+// allocates/writes exactly `m` rows (its dispatch is `m` workgroups, one per real row, reading a
+// same-sized `m`-row source), so padding it would mean dispatching `mpad` workgroups and either
+// reading past the source activation buffer for the pad rows or adding a separate zero-fill pass.
+// That's a real change to `quant_f8_row` + its adapter.rs call site, not a shader-only tweak, and
+// this task is compile-check-only (no RDNA4 to validate the correctness of a new padding scheme
+// against) — so the As LDS stage is kept (same bounds-guarded copy the naive kernel already used),
+// and only the tiling/epilogue changed. Left as a follow-on once RDNA4 confirms this revision is
+// correct. SPLIT-K (narrow-n deep-k occupancy) and the BM128/BM32 row-tile variants are likewise
+// not ported — `native_gemm_warp`'s comment block flags those as separate tuning experiments on
+// top of the base warptile, not part of "the same warptile structure", and adding them here would
+// multiply the untested-on-fp8-hardware surface for no shape this task's caller currently needs.
+//
+// The whole K dimension accumulates straight into ONE persistent f32 coopmat accumulator per
+// 16x16 sub-tile (register-blocked, `acc[CMS_M][CMS_N]`, CMS_M=WM/16, CMS_N=WN/16). The epilogue
+// can't just `coopMatStore` straight to `c` (the per-row descale needs to know which output row
+// each stored element lands on, and coopMatStore's internal fragment-to-thread mapping is
+// driver/hardware defined — not something to assume). So each 16x16 tile is first `coopMatStore`d
+// to a SHARED float scratch array (RowMajor layout, so `tile16[tbase + r*16+c]` is unambiguously
+// element `(r,c)` — a KNOWN layout with no fragment-mapping assumption), then every lane in the
+// subgroup reads back its share of that KNOWN layout and writes `c` scaled by that element's row's
+// `srow[]` — same store-then-scale epilogue shape as the naive kernel's `storeScaledTile`, just
+// called once per register-blocked accumulator tile (CMS_M*CMS_N times) instead of 4 fixed calls.
+// BM=64 matches the `mpad = ceil(m/64)*64` padding convention every GEMM tier in adapter.rs already
+// allocates for `c`; the epilogue's `if (gr < pc.m)` guard means padding rows are simply skipped
+// (not written), so `c`'s padded rows stay whatever the allocator initialized them to.
+//
+// Q8_0 weight elements are dequantized to f32 during shared staging via `dqblk()`
+// (native_decode.glsl, FMT_Q8_0 — decode-once-per-32-block, reused across the BM=64 row tile) and
+// converted to `floate4m3_t`; staged column-major into `Bs` (`Bs[col*SBK+k]`) exactly like
+// `native_gemm_warp`'s Q8_0 weight staging, so `coopMatLoad(..., ColumnMajor)` picks it up the
+// same way.
+//
+// E4M3 precision tradeoff: 3 mantissa bits (vs f16's 10) — expected to be lossy even with correct
+// range scaling. Whether prefill output stays coherent under this precision (and under this wider
+// tile's different accumulation order vs the naive kernel) is the open question an RDNA4 run
+// answers.
+//
+// Requires n%256==0,k%32==0 (default) or n%128==0,k%64==0 (-DNARROW_N). requiredSubgroupSize=32
+// (set at pipeline-creation time, `kernel_sg`). Weight format: Q8_0 only (raw signed int8 +
+// per-32-block f16 scale, native_decode.glsl FMT_Q8_0).
+//
+// -DPREPACK (measurement variant, see recorder.rs `matmul_f8cm_q8_0_prepacked` / adapter.rs
+// `f8cm_ok`'s INFR_F8_PREPACK arm): binding 1 becomes a PRE-PACKED E4M3 weight buffer
+// (`repack_q8_to_f8.comp` bakes the Q8_0 block scale in ONCE ahead of this dispatch), and the Bs
+// staging below reads it DIRECTLY — no dqblk, no per-dispatch Q8_0 decode. Everything else
+// (activations, srow epilogue, warptile, NARROW_N) is UNCHANGED. This tests whether removing the
+// in-shader dequant (the SAME cost f16 pays, which the base variant above still pays) lets fp8's
+// 2x WMMA rate actually win, instead of the dequant-ALU bottleneck the base variant measured
+// (0.73x f16 on RDNA4).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint THREADS = 256u;
+const uint BM = 64u;
+const uint WM = 32u;
+// -DNARROW_N halves the column tile (BN 256->128) and doubles the k-stage (BK 32->64): the SAME
+// 256 dequant calls per stage (128 cols x 2 k-blocks), for n%128 (not n%256) shapes — mirrors
+// native_gemm_warp's NARROW_N variant exactly (see its header doc for the occupancy rationale).
+#ifdef NARROW_N
+const uint BN = 128u;
+const uint BK = 64u;
+const uint WN = 32u;
+#else
+const uint BN = 256u;
+const uint BK = 32u;
+const uint WN = 64u;
+#endif
+const uint WARPS_M = BM / WM; // 2
+const uint WARPS_N = BN / WN; // 4 -> 8 warps / 256 threads
+const uint CMS_M = WM / 16u;  // 2
+const uint CMS_N = WN / 16u;  // 4 (wide) or 2 (narrow)
+const uint SAK = BK + 8u;     // As is [BM][SAK] — bank-conflict padding (see header note)
+const uint SBK = BK + 8u;     // Bs is [BN][SBK]
+
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// Unused under -DPREPACK (the prepacked `w8` buffer is always its own base — see header note).
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+layout(binding = 0) readonly buffer QABuf { floate4m3_t qa[]; }; // [M, K] pre-scaled fp8 acts
+#ifdef PREPACK
+layout(binding = 1) readonly buffer WBuf { floate4m3_t w8[]; }; // [N, K] prepacked E4M3, scale baked in
+#else
+layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // Q8_0 weight: raw GGUF blocks (native)
+#endif
+layout(binding = 2) readonly buffer SBuf { float srow[]; }; // [M] per-row activation descale
+layout(binding = 3) writeonly buffer CBuf { float c[]; };
+
+shared floate4m3_t As[BM * SAK];
+shared floate4m3_t Bs[BN * SBK];
+// Epilogue scratch: one 16x16 f32 tile per subgroup (WARPS_M*WARPS_N=8 subgroups @ 256 threads),
+// reused sequentially across each subgroup's CMS_M*CMS_N accumulator tiles (barrier() between each
+// store+scale round, in `storeScaledTile`).
+shared float tile16[WARPS_M * WARPS_N * 256u];
+
+#ifndef PREPACK
+#define FMT_Q8_0
+#include "native_decode.glsl"
+#endif
+
+// Store one 16x16 f32 accumulator tile to `tile16` (KNOWN RowMajor layout: element (r,c) at
+// tile16[tbase + r*16+c]), then scale-and-write it into `c` at (rowOff+r, colOff+c), guarded by
+// pc.m (padding rows are skipped, not written). `barrier()` calls are workgroup-uniform (every
+// invocation in every subgroup reaches them the same number of times, since every warp's
+// register-blocked epilogue loop runs CMS_M*CMS_N times), so this is safe to call from all
+// WARPS_M*WARPS_N subgroups even though each subgroup only touches its own `tile16` slice.
+void storeScaledTile(coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> t,
+                      uint rowOff, uint colOff) {
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint tbase = sg * 256u;
+    coopMatStore(t, tile16, tbase, 16, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint e = 0u; e < 8u; e++) {
+        uint idx = lane + e * 32u;
+        uint r = idx / 16u;
+        uint col = idx % 16u;
+        uint gr = rowOff + r;
+        uint gc = colOff + col;
+        if (gr < pc.m) {
+            c[gr * pc.n + gc] = tile16[tbase + idx] * srow[gr];
+        }
+    }
+    barrier();
+}
+
+void main() {
+    uint tilesN = pc.n / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint warp = gl_SubgroupID;
+    uint warp_r = warp % WARPS_M;
+    uint warp_c = warp / WARPS_M;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        // Stage BM=64 rows x BK activations, read directly from the pre-scaled fp8 buffer (no
+        // conversion — the f32->fp8 cast already happened in `quant_f8_row.comp`). Zero-padded
+        // past pc.m (padding rows are never read back downstream).
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[r * SAK + cc] = (gr < pc.m) ? qa[gr * pc.k + k0 + cc] : floate4m3_t(0.0);
+        }
+        // One thread per (column, 32-elem k-block) per iteration — BN*(BK/32) slots per stage,
+        // striped across THREADS (exactly one iteration for both the wide and narrow tile:
+        // 256*1 = 128*2 = 256). Column-major stage into Bs, matching native_gemm_warp's Q8_0
+        // weight staging. Under -DPREPACK the weight is ALREADY E4M3 (scale baked in by
+        // repack_q8_to_f8.comp) — read it straight from `w8[]`, no dqblk / no per-dispatch decode.
+        for (uint slot = li; slot < BN * (BK / 32u); slot += THREADS) {
+            uint cc = slot % BN;
+            uint kb = (slot / BN) * 32u;
+#ifdef PREPACK
+            uint base = (wgCol + cc) * pc.k + k0 + kb;
+            [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
+                Bs[cc * SBK + kb + kk] = w8[base + kk];
+            }
+#else
+            float v[32];
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
+            [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
+                Bs[cc * SBK + kb + kk] = floate4m3_t(v[kk]);
+            }
+#endif
+        }
+        barrier();
+        [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
+            [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                coopMatLoad(af[i], As, (warp_r * WM + i * 16u) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+                coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+                coopMatLoad(bf, Bs, (warp_c * WN + j * 16u) * SBK + kf, SBK,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                    // Direct fp8 matmul — no per-block rescale: this accumulator carries the
+                    // running sum across the WHOLE k dimension (every k0 iteration), unlike the
+                    // int8 kernel's csub (which is reset every Q8_0 block because its raw int32
+                    // dot still needs a per-block float scale applied before it can be summed).
+                    acc[i][j] = coopMatMulAdd(af[i], bf, acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // Descale epilogue: each accumulator tile holds C'[m,n] = sum_k (qa[m,k]*inv[m]) * w8[k,n],
+    // i.e. the true C[m,n] scaled by 1/srow[m] (srow[m] = amax[m]/448, so qa was scaled by
+    // 448/amax[m] going in). Multiplying by srow[gr] in storeScaledTile restores C[m,n].
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            uint cr = wgRow + warp_r * WM + i * 16u;
+            uint cc = wgCol + warp_c * WN + j * 16u;
+            storeScaledTile(acc[i][j], cr, cc);
+        }
+    }
+}

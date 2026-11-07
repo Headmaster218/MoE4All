@@ -1,0 +1,83 @@
+#version 460
+// Decode the live raw-SWA ring and selected compressed V4 rows from mixed FP8 into one packed-f16
+// K=V list. The following ordinary Attention op owns the single shared softmax and sink.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint comp_off;
+    uint pos;
+    uint selected;
+    uint head_dim;
+    uint raw_window;
+    uint has_indices;
+    uint total_pairs;
+} pc;
+layout(binding = 0) readonly buffer RB { uint raw[]; };
+layout(binding = 1) readonly buffer CB { uint comp[]; };
+layout(binding = 2) readonly buffer IB { uint indices[]; };
+layout(binding = 3) writeonly buffer DB { uint dst[]; };
+
+uint byte_raw(uint off) { return (raw[off >> 2u] >> (8u * (off & 3u))) & 255u; }
+uint byte_comp(uint off) { return (comp[off >> 2u] >> (8u * (off & 3u))) & 255u; }
+
+float e4m3(uint code) {
+    float sign = (code & 0x80u) != 0u ? -1.0 : 1.0;
+    uint mag = code & 0x7fu;
+    uint expv = mag >> 3u;
+    uint mant = mag & 7u;
+    float v = expv == 0u
+        ? float(mant) * exp2(-9.0)
+        : (1.0 + float(mant) * 0.125) * exp2(float(int(expv) - 7));
+    return sign * v;
+}
+
+float decode_raw(uint row, uint d) {
+    uint page = row / 64u;
+    uint in_page = row % 64u;
+    uint page_base = page * 37376u;
+    uint data = page_base + in_page * 576u;
+    uint scales = page_base + 64u * 576u + in_page * 8u;
+    if (d < 448u) {
+        return e4m3(byte_raw(data + d)) * exp2(float(int(byte_raw(scales + d / 64u)) - 127));
+    }
+    uint off = data + 448u + 2u * (d - 448u);
+    uint bits = byte_raw(off) | (byte_raw(off + 1u) << 8u);
+    return uintBitsToFloat(bits << 16u);
+}
+
+float decode_comp(uint row, uint d) {
+    uint page = row / 64u;
+    uint in_page = row % 64u;
+    uint page_base = pc.comp_off + page * 37376u;
+    uint data = page_base + in_page * 576u;
+    uint scales = page_base + 64u * 576u + in_page * 8u;
+    if (d < 448u) {
+        return e4m3(byte_comp(data + d)) * exp2(float(int(byte_comp(scales + d / 64u)) - 127));
+    }
+    uint off = data + 448u + 2u * (d - 448u);
+    uint bits = byte_comp(off) | (byte_comp(off + 1u) << 8u);
+    return uintBitsToFloat(bits << 16u);
+}
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    if (pair >= pc.total_pairs) { return; }
+    uint pairs_per_row = pc.head_dim / 2u;
+    uint out_row = pair / pairs_per_row;
+    uint d = 2u * (pair % pairs_per_row);
+    uint raw_live = min(pc.pos + 1u, pc.raw_window);
+    float a;
+    float b;
+    if (out_row < raw_live) {
+        uint first = pc.pos + 1u - raw_live;
+        uint row = (first + out_row) % pc.raw_window;
+        a = decode_raw(row, d);
+        b = decode_raw(row, d + 1u);
+    } else {
+        uint i = out_row - raw_live;
+        uint row = pc.has_indices != 0u ? indices[i] : i;
+        a = decode_comp(row, d);
+        b = decode_comp(row, d + 1u);
+    }
+    dst[pair] = packHalf2x16(vec2(a, b));
+}

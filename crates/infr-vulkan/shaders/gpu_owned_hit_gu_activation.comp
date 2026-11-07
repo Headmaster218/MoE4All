@@ -1,0 +1,178 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Test-only complete H producer: native 64-lane K tree, fused GU+SiLU,
+// one compact ACT write. No Down work and no cross-workgroup synchronization.
+// Build FMT_Q5K/IQ2S/IQ3S, LOCAL=64|128|256, NR=1|2|4|8, MAX_NFF=1024.
+// IQ formats require USE_GRID/generated native_grids.glsl or the matching
+// IQ2_GRID_BUFFER/IQ3_GRID_BUFFER native_decode buffer codebook (no LDS init).
+// Buffer mode prepends Grid at 0, shifting X/Ids/Tape/Output to 1/2/3/4.
+// SHARED_Q8 adds the always-H slot using the existing 64-byte shared ABI.
+// Host pins Fixed32/full subgroups. Dispatch rows*physical_used*ceil(nff/outputs).
+#ifndef LOCAL
+#define LOCAL 64
+#endif
+#ifndef NR
+#define NR 2
+#endif
+#ifndef MAX_NFF
+#define MAX_NFF 1024
+#endif
+#if LOCAL != 64 && LOCAL != 128 && LOCAL != 256
+#error LOCAL_must_be_64_128_or_256
+#endif
+#if NR != 1 && NR != 2 && NR != 4 && NR != 8
+#error NR_must_be_1_2_4_or_8
+#endif
+#if (defined(FMT_Q5K) + defined(FMT_IQ2S) + defined(FMT_IQ3S)) != 1
+#error Select_one_supported_Gate_Up_format
+#endif
+#if (defined(FMT_IQ2S) || defined(FMT_IQ3S)) && !defined(USE_GRID) && !defined(IQ2_GRID_BUFFER) && !defined(IQ3_GRID_BUFFER)
+#error IQ_formats_require_a_codebook
+#endif
+#if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
+#if (defined(IQ2_GRID_BUFFER) && !defined(FMT_IQ2S)) || (defined(IQ3_GRID_BUFFER) && !defined(FMT_IQ3S))
+#error Buffer_grid_must_match_format
+#endif
+#ifdef USE_GRID
+#error Select_either_buffer_or_LDS_grid
+#endif
+#define HIT_BINDING_OFFSET 1
+#else
+#define HIT_BINDING_OFFSET 0
+#endif
+
+layout(local_size_x = LOCAL) in;
+layout(std430, binding = 0 + HIT_BINDING_OFFSET) readonly buffer Input { float x[]; };
+layout(std430, binding = 1 + HIT_BINDING_OFFSET) readonly buffer Ids { uint ids[]; };
+layout(std430, binding = 2 + HIT_BINDING_OFFSET) readonly buffer Tape { uvec2 tape[]; };
+layout(std430, binding = 3 + HIT_BINDING_OFFSET) writeonly buffer Output { float output_values[]; };
+layout(push_constant) uniform Params {
+    uint ne; uint nff; uint rows; uint used; uint experts; uint physical_used;
+    uint gate_base; uint up_base; uint down_base; uint down_tiles;
+#ifdef SHARED_Q8
+    layout(offset = 40) uvec2 shared_gate;
+    layout(offset = 48) uvec2 shared_up;
+    layout(offset = 56) uvec2 shared_down;
+#endif
+} p;
+
+#include "native_weight_addr.glsl"
+#define NW(index) arena_word(index)
+#ifndef STREAMED
+#define STREAMED
+#endif
+#include "native_decode.glsl"
+#ifdef SHARED_Q8
+#include "gpu_owned_hit_ffn_shared_q8.glsl"
+#endif
+
+shared float gate_part[NR][LOCAL / 32];
+shared float up_part[NR][LOCAL / 32];
+
+bool fits(uint base, uint count, uint length) {
+    return base <= length && count <= length - base;
+}
+bool valid_address(uvec2 a) {
+    return any(notEqual(a, uvec2(0u)))
+        && !all(equal(a, uvec2(0xffffffffu))) && (a.x & 3u) == 0u;
+}
+float hit_dqsub(uint start, uint xoff, bool shared_slot) {
+    float v[32];
+#ifdef SHARED_Q8
+    if (shared_slot) owned_shared_q8_dqblk32(start, v);
+    else
+#endif
+    dqblk(start, v);
+    float a = 0.0;
+    // Keep the native rolled dot: unrolling this loop breaks numerical parity.
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x[xoff + w]; }
+    return a;
+}
+
+void main() {
+    // Every rejection before GRID_INIT is workgroup-uniform under immutable IDs.
+    if (p.rows == 0u || p.rows > 8u || p.used == 0u || p.used > 16u
+        || p.experts == 0u || p.ne == 0u || p.ne > 65536u
+        || p.nff == 0u || p.nff > uint(MAX_NFF)
+        || (p.ne & 255u) != 0u || (p.nff & 31u) != 0u) return;
+#ifdef SHARED_Q8
+    if (p.physical_used != p.used + 1u) return;
+#else
+    if (p.physical_used != p.used) return;
+#endif
+    if (gl_SubgroupSize != 32u || gl_NumSubgroups != uint(LOCAL / 32)) return;
+#if defined(IQ2_GRID_BUFFER)
+    if (uint(G_IQ2S.length()) < 2048u) return;
+#elif defined(IQ3_GRID_BUFFER)
+    if (uint(G_IQ3S.length()) < 512u) return;
+#endif
+    uint assignments = p.rows * p.used;
+    if (uint(ids.length()) < assignments + p.rows
+        || uint(x.length()) < p.rows * p.ne
+        || uint(output_values.length()) < p.rows * p.physical_used * p.nff
+        || !fits(p.gate_base, p.experts, uint(tape.length()))
+        || !fits(p.up_base, p.experts, uint(tape.length()))) return;
+    if (gl_WorkGroupID.z != 0u) return;
+    const uint outputs = uint(LOCAL / 64 * NR);
+    uint tiles = (p.nff + outputs - 1u) / outputs;
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= p.rows * p.physical_used * tiles) return;
+    uint assignment = unit / tiles, tile = unit % tiles;
+    uint row = assignment / p.physical_used, slot = assignment % p.physical_used;
+    bool shared_slot = slot == p.used;
+    uvec2 gate, up;
+#ifdef SHARED_Q8
+    if (shared_slot) {
+        gate = p.shared_gate;
+        up = p.shared_up;
+    } else
+#endif
+    {
+        if ((ids[assignments + row] & (1u << slot)) == 0u) return;
+        uint expert = ids[row * p.used + slot];
+        if (expert >= p.experts) return;
+        gate = tape[p.gate_base + expert];
+        up = tape[p.up_base + expert];
+    }
+    if (!valid_address(gate) || !valid_address(up)) return;
+    GRID_INIT;
+    uint wave = gl_SubgroupID, group = wave / 2u;
+    uint t = (wave & 1u) * 32u + gl_SubgroupInvocationID;
+    uint o0 = tile * outputs + group * uint(NR), xbase = row * p.ne;
+    uint64_t ga = arena_base(gate.x, gate.y), ua = arena_base(up.x, up.y);
+    float gacc[NR], uacc[NR];
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); ++rr) { gacc[rr] = 0.0; uacc[rr] = 0.0; }
+    // Match native_gemv_id_multi's block/rr nesting and fresh 32-value partial.
+    for (uint s = t; s < p.ne / 32u; s += 64u) {
+        [[unroll]] for (uint rr = 0u; rr < uint(NR); ++rr) {
+            uint o = o0 + rr;
+            if (o >= p.nff) continue;
+            w_addr = ga;
+            gacc[rr] += hit_dqsub(o * p.ne + s * 32u, xbase + s * 32u, shared_slot);
+            w_addr = ua;
+            uacc[rr] += hit_dqsub(o * p.ne + s * 32u, xbase + s * 32u, shared_slot);
+        }
+    }
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); ++rr) {
+        float g = subgroupAdd(gacc[rr]), u = subgroupAdd(uacc[rr]);
+        if (subgroupElect()) { gate_part[rr][wave] = g; up_part[rr][wave] = u; }
+    }
+    barrier();
+    if (t == 0u) {
+        [[unroll]] for (uint rr = 0u; rr < uint(NR); ++rr) {
+            uint o = o0 + rr;
+            if (o >= p.nff) continue;
+            float g = 0.0, u = 0.0;
+            for (uint s = 0u; s < 2u; ++s) {
+                g += gate_part[rr][group * 2u + s];
+                u += up_part[rr][group * 2u + s];
+            }
+            output_values[(row * p.physical_used + slot) * p.nff + o] =
+                (g / (1.0 + exp(-g))) * u;
+        }
+    }
+}

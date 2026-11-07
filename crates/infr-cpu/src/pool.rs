@@ -1,0 +1,738 @@
+//! Persistent spin-pool for the CPU op interpreter (threadpool restructure phase 2).
+//!
+//! Rayon's fork-join costs a wake/steal/sleep cycle per parallel op; between the ~400 ops of one
+//! DiffusionGemma denoise graph that latency (and the deque/epoch plumbing measured at ~6% of
+//! thread-time) is pure overhead. This pool keeps `N-1` workers alive across the whole graph:
+//! a job is handed off by bumping a generation counter the workers spin on (~1µs handoff while
+//! hot), tasks are claimed dynamically with a `fetch_add` cursor (straggler-proof), and workers
+//! park after a short spin budget so an idle pool costs nothing (the host self-conditioning gap
+//! between denoise steps, rayon-side MoeFfn work, and plain idle all put them to sleep).
+//!
+//! Scheduling only — every converted call site runs the exact same per-row math in the same
+//! order as its rayon predecessor, so outputs are bit-identical.
+//!
+//! Clearing `kernels.cpu.spinpool` routes `run` through rayon instead
+//! (A/B + escape hatch).
+
+use infr_core::config::CpuCfg;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// One in-flight job: an index-space of `n_tasks`, claimed dynamically by all threads.
+type Job = &'static (dyn Fn(usize) + Sync);
+
+struct Shared {
+    min_spin: u32,
+    force_park: AtomicBool,
+    park_idle: AtomicBool,
+    /// The current job's closure, valid from the `seq` bump until every worker has checked in
+    /// (`done == workers`) — `run` does not return (and the borrowed closure cannot die) before
+    /// that, so a worker can never observe a stale/torn slot: it only reads `job` after seeing a
+    /// NEW `seq`, and no new `seq` can be published while any worker is still on the old job.
+    job: UnsafeCell<Option<Job>>,
+    /// Generation counter: bumped once per job; workers spin on it changing.
+    seq: AtomicUsize,
+    /// Dynamic task cursor (`fetch_add` claim), reset per job.
+    cursor: AtomicUsize,
+    n_tasks: AtomicUsize,
+    /// Workers that finished the current job (drained the cursor).
+    done: AtomicUsize,
+    /// A task panicked (caught per-task so `done` still advances; `run` re-panics).
+    panicked: AtomicBool,
+    shutdown: AtomicBool,
+    /// Ceiling for the adaptive spin budget (constant `SpinPool::spin_limit` since phase 3 removed
+    /// the last rayon section from the interpreter; kept a field for future per-graph tuning).
+    budget_cap: AtomicU32,
+    /// Per-worker "I am parked" flags — see the park handshake in `worker_loop`.
+    sleeping: Vec<AtomicBool>,
+}
+
+// SAFETY: `job` is only written by `run` while no worker is between jobs' check-ins (see the
+// field doc), and only read by workers after an Acquire load of `seq` that the write
+// happens-before (SeqCst bump).
+unsafe impl Sync for Shared {}
+
+pub(crate) struct SpinPool {
+    shared: Arc<Shared>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Worker thread count (callers participate too, so parallelism = workers + 1).
+    workers: usize,
+    /// `!kernels.cpu.spinpool`: run jobs through rayon instead.
+    rayon_fallback: bool,
+    /// CEILING for the adaptive per-worker spin budget, and the caller-side wait loop's
+    /// yield threshold — `kernels.cpu.spin`, read ONCE at construction.
+    ///
+    /// Two measured failure modes bound the budget: too LONG and the spinning workers' SMT
+    /// siblings throttle the op loop's SERIAL bookkeeping between pool ops (per-op profile:
+    /// RmsNorm/Add more than DOUBLED; DG exec 2.87 → 3.18s at a fixed 32k) — rayon's MoeFfn itself
+    /// was unharmed once a pause mechanism parked waiters for it (both since removed with the rayon
+    /// sections themselves — phase 3 staged MoeFfn onto this pool). Too SHORT and dense prefill pays
+    /// a worker wake per op (qwen3 pp512 404 → 356 t/s at a fixed 1k). The adaptive budget collapses
+    /// after a park and regrows on jobs arriving mid-spin, so the ceiling can be generous.
+    ///
+    /// A FIELD, not a `OnceLock` memo (`docs/config-plan.md` §10.6): the value comes off the
+    /// backend's `Config`, so a per-call read would be a `getenv`-shaped cost on the wait loop and
+    /// a memo would pin the first pool's value process-wide.
+    spin_limit: u32,
+    /// Serializes `run` — the pool holds ONE job; concurrent dispatch is a caller bug
+    /// (converted call sites are all reached from the single-threaded `execute` op loop).
+    in_run: AtomicBool,
+    private_idle: bool,
+    /// An explicitly isolated backend may not spill work into the process-global pool.
+    bounded_rayon: Option<rayon::ThreadPool>,
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn worker_loop<const PRIVATE_IDLE: bool>(me: usize, shared: Arc<Shared>) {
+    // Baseline generation is the CONSTRUCTION-time value (0), not a fresh load: a worker whose
+    // OS thread starts late — after the first `run()` already bumped `seq` — must still join
+    // that in-flight job (its check-in is what `run` is blocked on). Loading `seq` here instead
+    // would make the late worker treat the live job as already-seen and deadlock the caller.
+    let mut seen = 0usize;
+    // ADAPTIVE spin budget, per worker: spinning is only worth its SMT-sibling tax (it throttles
+    // the op loop's serial sections running on the paired hyperthread) when the next job arrives
+    // before the budget runs out. Jobs arriving mid-spin → inter-op gaps are short (dense
+    // prefill) → grow toward `SpinPool::spin_limit`. Having to park → gaps are long (decode's serial
+    // stretches, MoE's rayon section) → collapse to a near-immediate park. Measured: fixed
+    // budgets force a 3-way tradeoff (qwen3 pp 416 vs tg 44 vs DG 2.87s — each best at a
+    // DIFFERENT value); the gap history picks the right regime per phase automatically.
+    let min_spin = shared.min_spin;
+    let mut budget = min_spin;
+    loop {
+        // ── Wait for a new generation ────────────────────────────────────────────────
+        let mut spins = 0u32;
+        let mut parked = false;
+        loop {
+            let s = shared.seq.load(Ordering::Acquire);
+            if s != seen {
+                seen = s;
+                break;
+            }
+            if shared.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            spins += 1;
+            if spins < budget && (!PRIVATE_IDLE || !shared.park_idle.load(Ordering::Relaxed)) {
+                std::hint::spin_loop();
+            } else {
+                // Park handshake: publish the flag, RE-CHECK seq/shutdown (SeqCst on both sides
+                // orders flag-publish vs. the dispatcher's seq-bump-then-read-flag), then park.
+                // A wake that slips in between the re-check and `park()` is absorbed by park's
+                // token semantics (`unpark` before `park` makes `park` return immediately).
+                shared.sleeping[me].store(true, Ordering::SeqCst);
+                if shared.seq.load(Ordering::SeqCst) != seen
+                    || shared.shutdown.load(Ordering::SeqCst)
+                {
+                    shared.sleeping[me].store(false, Ordering::SeqCst);
+                    continue;
+                }
+                std::thread::park();
+                shared.sleeping[me].store(false, Ordering::SeqCst);
+                spins = 0;
+                parked = true;
+            }
+        }
+        budget = if shared.force_park.load(Ordering::Acquire) {
+            0
+        } else if parked {
+            min_spin
+        } else {
+            (budget * 4).min(shared.budget_cap.load(Ordering::Relaxed))
+        };
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        // ── Drain the task cursor ────────────────────────────────────────────────────
+        // SAFETY: `job` was written before the observed `seq` bump and stays alive until this
+        // worker (and all others) increment `done` — see `Shared::job`'s doc.
+        let job = unsafe { (*shared.job.get()).expect("spin-pool: seq bumped without a job") };
+        let n = shared.n_tasks.load(Ordering::Acquire);
+        loop {
+            let t = shared.cursor.fetch_add(1, Ordering::Relaxed);
+            if t >= n {
+                break;
+            }
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(t))).is_err() {
+                shared.panicked.store(true, Ordering::Release);
+            }
+        }
+        shared.done.fetch_add(1, Ordering::Release);
+    }
+}
+
+struct CollectGuard<'a, T> {
+    slots: *mut std::mem::MaybeUninit<T>,
+    initialized: &'a [AtomicBool],
+}
+
+impl<T> Drop for CollectGuard<'_, T> {
+    fn drop(&mut self) {
+        for (i, initialized) in self.initialized.iter().enumerate() {
+            if initialized.load(Ordering::Acquire) {
+                // SAFETY: each true flag is published only after its corresponding slot has been
+                // initialized, and `run` waits for all tasks before propagating a panic.
+                unsafe { std::ptr::drop_in_place(self.slots.add(i).cast::<T>()) };
+            }
+        }
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl SpinPool {
+    /// Thread count follows rayon's (`RAYON_NUM_THREADS` / available parallelism) so `-t` pins
+    /// both pools identically. Both knobs (`spin`, `spinpool`) are read out of `cfg` HERE and
+    /// never again — see [`SpinPool::spin_limit`].
+    pub(crate) fn new(cfg: &CpuCfg) -> Self {
+        let n_threads = rayon::current_num_threads().max(1);
+        Self::new_sized(cfg, n_threads)
+    }
+
+    pub(crate) fn new_sized(cfg: &CpuCfg, n_threads: usize) -> Self {
+        Self::new_sized_min_spin(cfg, n_threads, 256)
+    }
+
+    pub(crate) fn new_bounded(
+        cfg: &CpuCfg,
+        n_threads: usize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        Self::new_bounded_min_spin(cfg, n_threads, 256)
+    }
+
+    pub(crate) fn new_bounded_min_spin(
+        cfg: &CpuCfg,
+        n_threads: usize,
+        min_spin: u32,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        let fallback = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_threads.max(1))
+            .thread_name(|i| format!("infr-cpu-fallback-{i}"))
+            .build()?;
+        let mut pool = Self::new_sized_min_spin(cfg, n_threads, min_spin);
+        pool.bounded_rayon = Some(fallback);
+        Ok(pool)
+    }
+
+    pub(crate) fn new_sized_min_spin(cfg: &CpuCfg, n_threads: usize, min_spin: u32) -> Self {
+        Self::new_sized_impl(cfg, n_threads, min_spin, false)
+    }
+
+    pub(crate) fn new_private_min_spin(cfg: &CpuCfg, n_threads: usize, min_spin: u32) -> Self {
+        Self::new_sized_impl(cfg, n_threads, min_spin, true)
+    }
+
+    fn new_sized_impl(cfg: &CpuCfg, n_threads: usize, min_spin: u32, private_idle: bool) -> Self {
+        let n_threads = n_threads.max(1);
+        let workers = n_threads - 1;
+        let rayon_fallback = !cfg.spinpool;
+        let spin_limit = cfg.spin;
+        let shared = Arc::new(Shared {
+            min_spin: min_spin.max(1),
+            force_park: AtomicBool::new(false),
+            park_idle: AtomicBool::new(false),
+            job: UnsafeCell::new(None),
+            seq: AtomicUsize::new(0),
+            cursor: AtomicUsize::new(0),
+            n_tasks: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            budget_cap: AtomicU32::new(spin_limit),
+            sleeping: (0..workers).map(|_| AtomicBool::new(false)).collect(),
+        });
+        let handles = (0..workers)
+            .map(|me| {
+                let sh = shared.clone();
+                std::thread::Builder::new()
+                    .name(format!("infr-spin-{me}"))
+                    .spawn(move || {
+                        if private_idle {
+                            worker_loop::<true>(me, sh);
+                        } else {
+                            worker_loop::<false>(me, sh);
+                        }
+                    })
+                    .expect("spin-pool: spawn failed")
+            })
+            .collect();
+        SpinPool {
+            shared,
+            handles,
+            workers,
+            rayon_fallback,
+            spin_limit,
+            in_run: AtomicBool::new(false),
+            private_idle,
+            bounded_rayon: None,
+        }
+    }
+
+    /// End an explicit short burst without spinning across unrelated GPU/control work. The
+    /// check-in makes every worker observe the parking request before restoring the next burst.
+    pub(crate) fn park_workers(&self) {
+        self.shared.force_park.store(true, Ordering::Release);
+        self.run(self.workers + 1, &|_| {});
+        self.shared.force_park.store(false, Ordering::Release);
+    }
+
+    /// Park idle helpers without publishing another generation or waiting for a check-in.
+    /// Running tasks still drain normally; the next real job clears this request before waking.
+    pub(crate) fn park_idle_workers(&self) {
+        debug_assert!(self.private_idle);
+        self.shared.park_idle.store(true, Ordering::Release);
+    }
+
+    /// Run `f(0..n_tasks)` across the pool (caller participates). Dynamic task claim; returns
+    /// once every task ran AND every worker checked in (the check-in is what makes the borrowed
+    /// closure's lifetime sound — see `Shared::job`).
+    pub(crate) fn run(&self, n_tasks: usize, f: &(dyn Fn(usize) + Sync)) {
+        if n_tasks == 0 {
+            return;
+        }
+        // Single-task jobs and worker-less pools short-circuit: no handoff, no wake.
+        if n_tasks == 1 || self.workers == 0 {
+            for t in 0..n_tasks {
+                f(t);
+            }
+            return;
+        }
+        // Busy pool (a second graph executing concurrently on this backend — e.g. parallel
+        // serve sessions) or explicit fallback: route through rayon, which handles concurrent
+        // callers natively. The pool itself holds ONE job at a time.
+        if self.rayon_fallback
+            || self
+                .in_run
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            use rayon::prelude::*;
+            if let Some(pool) = &self.bounded_rayon {
+                pool.install(|| (0..n_tasks).into_par_iter().for_each(f));
+            } else {
+                (0..n_tasks).into_par_iter().for_each(f);
+            }
+            return;
+        }
+        let sh = &self.shared;
+        if self.private_idle {
+            sh.park_idle.store(false, Ordering::Release);
+        }
+        // SAFETY: lifetime erasure of `f` — sound because this function does not return until
+        // every worker has incremented `done`, after which no worker touches the slot again.
+        unsafe {
+            *sh.job.get() = Some(std::mem::transmute::<&(dyn Fn(usize) + Sync), Job>(f));
+        }
+        sh.cursor.store(0, Ordering::Relaxed);
+        sh.n_tasks.store(n_tasks, Ordering::Release);
+        sh.done.store(0, Ordering::Relaxed);
+        sh.seq.fetch_add(1, Ordering::SeqCst);
+        for (i, flag) in sh.sleeping.iter().enumerate() {
+            if flag.load(Ordering::SeqCst) {
+                self.handles[i].thread().unpark();
+            }
+        }
+        // Participate.
+        loop {
+            let t = sh.cursor.fetch_add(1, Ordering::Relaxed);
+            if t >= n_tasks {
+                break;
+            }
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(t))).is_err() {
+                sh.panicked.store(true, Ordering::Release);
+            }
+        }
+        // Wait for every worker's check-in (they may still be draining the cursor's tail).
+        // Periodic yield: under thread oversubscription (tests spawning several pools, a busy
+        // rayon pool alongside) a pure spin here can starve the very workers it waits on.
+        let mut spins = 0u32;
+        while sh.done.load(Ordering::Acquire) < self.workers {
+            spins += 1;
+            if spins < self.spin_limit {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        unsafe {
+            *sh.job.get() = None;
+        }
+        // Consume `panicked` BEFORE releasing the job slot, and release it either way.
+        //
+        // The flag is pool-GLOBAL (it lives on `Shared`, written by this caller and by every
+        // `worker_loop`), while `in_run` is what makes the pool single-job. Releasing first opens a
+        // window in which another caller's `compare_exchange` succeeds, its task panics and sets
+        // the flag, and THIS caller's swap then consumes it: we would panic for their failure and
+        // they would return normally with incomplete task state (backlog B25).
+        //
+        // Reading it while still holding `in_run` closes that window — no second job can have
+        // started, so the flag can only be ours. The store must still happen before the `panic!`,
+        // or an unwinding caller would leave `in_run` latched `true` and every later `run` would
+        // silently take the rayon fallback for the life of the process.
+        let panicked = sh.panicked.swap(false, Ordering::AcqRel);
+        self.in_run.store(false, Ordering::Release);
+        if panicked {
+            panic!("spin-pool: a task panicked (caught per-task; state may be incomplete)");
+        }
+    }
+
+    /// Chunk `data` into `chunk`-sized pieces and run `f(chunk_index, piece)` across the pool,
+    /// `grain` consecutive chunks per claimed task (coarsening for huge chunk counts). The
+    /// last piece may be shorter (`data.len() % chunk`). Bit-identity: pure scheduling — each
+    /// piece is processed by exactly one thread with unchanged math.
+    pub(crate) fn for_chunks_mut<T: Send>(
+        &self,
+        data: &mut [T],
+        chunk: usize,
+        grain: usize,
+        f: &(dyn Fn(usize, &mut [T]) + Sync),
+    ) {
+        let len = data.len();
+        if len == 0 {
+            return;
+        }
+        let n_chunks = len.div_ceil(chunk);
+        let grain = grain.max(1);
+        let n_tasks = n_chunks.div_ceil(grain);
+        let base = SendPtr(data.as_mut_ptr());
+        self.run(n_tasks, &move |task| {
+            let c0 = task * grain;
+            let c1 = (c0 + grain).min(n_chunks);
+            for c in c0..c1 {
+                let start = c * chunk;
+                let end = (start + chunk).min(len);
+                // SAFETY: chunk ranges are disjoint across tasks and in-bounds by construction.
+                let piece =
+                    unsafe { std::slice::from_raw_parts_mut(base.get().add(start), end - start) };
+                f(c, piece);
+            }
+        });
+    }
+
+    /// `(0..n).map(f).collect()` across the pool, order-preserving.
+    pub(crate) fn collect<T: Send>(&self, n: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+        let mut out: Vec<std::mem::MaybeUninit<T>> = Vec::with_capacity(n);
+        // SAFETY: every index 0..n is written exactly once below before assume-init.
+        unsafe { out.set_len(n) };
+        let initialized: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+        // ONE `as_mut_ptr` feeds both the tasks' writes and the unwind guard's drops. Calling it
+        // twice would reborrow `out` mutably a second time, popping the first pointer's tag off
+        // the borrow stack — so the guard, which runs only while unwinding and therefore only
+        // AFTER the second pointer exists, would be dropping through a pointer the aliasing model
+        // already considers dead. Same address either way, so nothing observable changes today;
+        // it is UB by the model, not by the codegen.
+        let base = SendPtr(out.as_mut_ptr());
+        let guard = CollectGuard {
+            slots: base.get(),
+            initialized: &initialized,
+        };
+        self.run(n, &|i| {
+            // SAFETY: each task writes only its own slot.
+            unsafe { base.get().add(i).write(std::mem::MaybeUninit::new(f(i))) };
+            initialized[i].store(true, Ordering::Release);
+        });
+        // Every slot is initialized after a successful `run`; disable the unwind-only destructor.
+        std::mem::forget(guard);
+
+        // The rebuild is done via `from_raw_parts` rather than
+        // `transmute::<Vec<MaybeUninit<T>>, Vec<T>>`: `Vec` is not `repr(C)`, so transmuting
+        // between two instantiations of it is not a language guarantee even though
+        // `MaybeUninit<T>` and `T` have identical layout — the compiler is free to lay out
+        // `Vec<A>` and `Vec<B>` differently. Taking the pointer/len/capacity apart and handing
+        // them back to `Vec::from_raw_parts` is the sanctioned form and relies only on the
+        // documented `MaybeUninit<T>`-to-`T` layout equivalence. (`Vec::into_raw_parts` is still
+        // unstable, hence the manual `forget`.)
+        let (ptr, len, cap) = (out.as_mut_ptr(), out.len(), out.capacity());
+        std::mem::forget(out);
+        // SAFETY: `ptr`/`len`/`cap` come straight from a `Vec<MaybeUninit<T>>` that we have
+        // `forget`ten (so it will not also free the allocation), `MaybeUninit<T>` has the same
+        // size and alignment as `T`, and all `len` elements are initialized per the argument
+        // above — so the allocation is valid to reinterpret as a `Vec<T>` of the same capacity.
+        unsafe { Vec::from_raw_parts(ptr as *mut T, len, cap) }
+    }
+}
+
+/// Raw base pointer that may cross thread boundaries; safety is argued at each use site
+/// (disjoint index ranges per task). Accessed via [`SendPtr::get`], NOT the field — edition-2021
+/// closures capture individual FIELDS, and a captured bare `*mut T` loses these unsafe impls.
+pub(crate) struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+// not instrumented: per-task pointer accessors in the dispatch hot loop, too small to probe
+impl<T> SendPtr<T> {
+    pub(crate) fn new(p: *mut T) -> Self {
+        SendPtr(p)
+    }
+    pub(crate) fn get(&self) -> *mut T {
+        self.0
+    }
+}
+// not instrumented: trivial Copy-clone in hot loops; a span here would be pure overhead
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SendPtr<T> {}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Drop for SpinPool {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        self.shared.seq.fetch_add(1, Ordering::SeqCst);
+        for h in &self.handles {
+            h.thread().unpark();
+        }
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nonblocking_idle_parking_does_not_publish_a_job_and_remains_reusable() {
+        use super::*;
+        let pool = SpinPool::new_private_min_spin(&CpuCfg::default(), 4, 262144);
+        for round in 0..128 {
+            let count = AtomicUsize::new(0);
+            pool.run(64, &|_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(count.load(Ordering::Relaxed), 64);
+            let seq = pool.shared.seq.load(Ordering::Acquire);
+            pool.park_idle_workers();
+            assert_eq!(pool.shared.seq.load(Ordering::Acquire), seq);
+            if round % 16 == 0 {
+                let deadline = std::time::Instant::now();
+                while !pool
+                    .shared
+                    .sleeping
+                    .iter()
+                    .all(|s| s.load(Ordering::SeqCst))
+                {
+                    assert!(deadline.elapsed() < std::time::Duration::from_secs(2));
+                    std::thread::yield_now();
+                }
+            }
+        }
+        pool.run(0, &|_| panic!("zero tasks"));
+        pool.run(1, &|_| {});
+        pool.run(64, &|_| {});
+        assert!(!pool.shared.park_idle.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn explicit_burst_parking_is_reusable() {
+        use super::*;
+        let pool = SpinPool::new_sized_min_spin(&CpuCfg::default(), 4, 16384);
+        for _ in 0..128 {
+            let count = AtomicUsize::new(0);
+            pool.run(64, &|_| {
+                count.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(count.load(Ordering::Relaxed), 64);
+            pool.park_workers();
+            assert!(!pool.shared.force_park.load(Ordering::Relaxed));
+            let deadline = std::time::Instant::now();
+            while !pool
+                .shared
+                .sleeping
+                .iter()
+                .all(|s| s.load(Ordering::SeqCst))
+            {
+                assert!(deadline.elapsed() < std::time::Duration::from_secs(2));
+                std::thread::yield_now();
+            }
+        }
+    }
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn spin_pool_runs_every_task_once() {
+        let pool = SpinPool::new(&CpuCfg::default());
+        for &n in &[1usize, 2, 7, 64, 1000, 10007] {
+            let hits: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+            pool.run(n, &|t| {
+                hits[t].fetch_add(1, Ordering::Relaxed);
+            });
+            assert!(
+                hits.iter().all(|h| h.load(Ordering::Relaxed) == 1),
+                "n={n}: some task ran zero or multiple times"
+            );
+        }
+    }
+
+    /// B25's observable consequence: after a panicking job the pool must still be a POOL.
+    ///
+    /// The race itself — a second caller slipping into the window between `in_run.store(false)` and
+    /// the `panicked` swap — is not deterministically reproducible without pausing a thread
+    /// mid-teardown, so this pins the property the reorder must not break instead: the panic
+    /// propagates, `in_run` is released, and the next job neither inherits the flag nor gets
+    /// silently demoted to the rayon fallback.
+    #[test]
+    fn a_panicking_job_leaves_the_pool_reusable_and_does_not_leak_its_flag() {
+        let pool = SpinPool::new(&CpuCfg::default());
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(64, &|t| {
+                if t == 17 {
+                    panic!("task boom");
+                }
+            });
+        }));
+        std::panic::set_hook(prev);
+        assert!(caught.is_err(), "a task panic must propagate to the caller");
+        assert!(
+            !pool.in_run.load(Ordering::Acquire),
+            "the job slot must be released even when run() unwinds, or every later run() \
+             silently falls back to rayon for the life of the process"
+        );
+        assert!(
+            !pool.shared.panicked.load(Ordering::Acquire),
+            "the panic flag must have been consumed, not left for the next job to inherit"
+        );
+
+        // The next job runs normally: it must not re-panic on a stale flag, and it must still be
+        // the spin pool doing the work (every task exactly once).
+        let hits: Vec<AtomicU64> = (0..256).map(|_| AtomicU64::new(0)).collect();
+        pool.run(256, &|t| {
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn collect_drops_completed_values_when_another_task_panics() {
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let pool = SpinPool::new(&CpuCfg::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.collect(2, &|i| {
+                if i == 1 {
+                    panic!("task boom");
+                }
+                DropCounter(Arc::clone(&drops))
+            });
+        }));
+        std::panic::set_hook(prev);
+
+        assert!(caught.is_err(), "the task panic must propagate");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "the value completed before the panic must be dropped"
+        );
+    }
+
+    #[test]
+    fn spin_pool_chunks_and_collect() {
+        let pool = SpinPool::new(&CpuCfg::default());
+        let mut v = vec![0u32; 1000];
+        pool.for_chunks_mut(&mut v, 16, 3, &|c, piece| {
+            for (i, x) in piece.iter_mut().enumerate() {
+                *x = (c * 16 + i) as u32;
+            }
+        });
+        assert!(v.iter().enumerate().all(|(i, &x)| x == i as u32));
+        let got = pool.collect(257, &|i| i * 2);
+        assert!(got.iter().enumerate().all(|(i, &x)| x == i * 2));
+    }
+
+    #[test]
+    fn spin_pool_reusable_across_many_jobs() {
+        let pool = SpinPool::new(&CpuCfg::default());
+        let acc = AtomicU64::new(0);
+        for _ in 0..200 {
+            pool.run(32, &|_| {
+                acc.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        assert_eq!(acc.load(Ordering::Relaxed), 200 * 32);
+    }
+
+    /// `kernels.cpu.spin` reaches the two places it is used — the workers' adaptive-budget ceiling
+    /// and the caller-side wait loop's yield threshold — from the `CpuCfg` the pool was built with,
+    /// and the SHIPPED default is still `1 << 15`. Before S3 this was a process-wide `OnceLock`
+    /// memo of the knob's env spelling, so a second pool could not see a different value at all
+    /// (§10.6); two pools with different budgets in one test is what could not be written before.
+    #[test]
+    fn spin_budget_comes_off_the_config_per_pool() {
+        assert_eq!(CpuCfg::default().spin, 1 << 15);
+        let dflt = SpinPool::new(&CpuCfg::default());
+        assert_eq!(dflt.spin_limit, 1 << 15);
+        assert_eq!(dflt.shared.budget_cap.load(Ordering::Relaxed), 1 << 15);
+
+        let tight = SpinPool::new(&CpuCfg {
+            spin: 4,
+            ..CpuCfg::default()
+        });
+        assert_eq!(tight.spin_limit, 4);
+        assert_eq!(tight.shared.budget_cap.load(Ordering::Relaxed), 4);
+        // Scheduling-only knob: a near-zero budget parks workers immediately but must still run
+        // every task exactly once.
+        let hits: Vec<AtomicU64> = (0..777).map(|_| AtomicU64::new(0)).collect();
+        tight.run(777, &|t| {
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    /// `kernels.cpu.spinpool` cleared routes `run` through rayon —
+    /// scheduling only, so the observable contract is unchanged: every task still runs once.
+    #[test]
+    fn cleared_spinpool_falls_back_to_rayon() {
+        assert!(CpuCfg::default().spinpool);
+        assert!(!SpinPool::new(&CpuCfg::default()).rayon_fallback);
+
+        let pool = SpinPool::new(&CpuCfg {
+            spinpool: false,
+            ..CpuCfg::default()
+        });
+        assert!(pool.rayon_fallback);
+        let hits: Vec<AtomicU64> = (0..1000).map(|_| AtomicU64::new(0)).collect();
+        pool.run(1000, &|t| {
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn bounded_cpu_capability_uses_its_own_thread_budget() {
+        for threads in [1, 2, 4] {
+            for spinpool in [true, false] {
+                let cfg = CpuCfg {
+                    spinpool,
+                    ..CpuCfg::default()
+                };
+                let pool = SpinPool::new_bounded(&cfg, threads).unwrap();
+                assert_eq!(pool.workers + 1, threads);
+                assert_eq!(
+                    pool.bounded_rayon.as_ref().unwrap().current_num_threads(),
+                    threads
+                );
+                let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+                let hits = AtomicU64::new(0);
+                pool.run(128, &|_| {
+                    seen.lock().unwrap().insert(std::thread::current().id());
+                    if !spinpool && threads > 1 {
+                        assert_eq!(rayon::current_num_threads(), threads);
+                    }
+                    hits.fetch_add(1, Ordering::Relaxed);
+                });
+                assert_eq!(hits.load(Ordering::Relaxed), 128);
+                assert!(seen.into_inner().unwrap().len() <= threads);
+            }
+        }
+    }
+}

@@ -1,0 +1,113 @@
+#version 460
+// RoPE over x laid out [t, n_heads, hd]. One thread per (t, head).
+// Variants: -DOUT_F16 writes f16 (the llama q/KV-cache write: `out_base` shifts the output row —
+// 0 for the Q scratch, `pos` for the fused K cache write); -DUSE_PARAMS additionally reads the
+// per-token pos from the params SSBO so the record-once decode can replay (`pc.pos_offset` is
+// then the 0/1 out_base multiplier, like qk_norm_rope_dyn's `out_base`);
+// -DNEOX pairs (i, i + rope_dim/2) instead of the default interleaved (2i, 2i+1) — llama.cpp's
+// ROPE_TYPE_NEOX vs ROPE_TYPE_NORM (see `Op::Rope::neox`). Only the STATIC f32 builds carry it
+// (`rope_neox`, `rope_ff_neox`); its one caller is deepseek32's lightning indexer, which ropes an
+// f32 scratch in place, and the adapter refuses neox on the f16/dyn paths rather than drop it.
+// -DBACKWARD negates `sin` and leaves `cos` alone — llama.cpp's `ggml_rope_ext_back` is literally
+// this kernel with `sin_sign = -1` (see `Op::Rope::backward`); deepseek4 de-ropes its attention
+// OUTPUT before the grouped output projection. Same static-f32-only rule as NEOX (`rope_back`,
+// `rope_ff_back`).
+#ifdef OUT_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset; uint out_base;
+#ifdef KV_BDA
+    // -DKV_BDA (#74 slice 3, OUT_F16 only): write the f16 K cache by device address (kv_addr.glsl
+    // `k_addr`, d_lo/d_hi); the `y` binding disappears, cache stays bound inert for the barrier —
+    // see Recorder::rope_f16_at.
+    uint d_lo; uint d_hi;
+#endif
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+#ifdef FREQ_FACTORS
+// YaRN per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by
+// ff[pair] (deepseek2 k_pe — see `rope_ff` build in build.rs). Binds at 1; y shifts to 2 —
+// the hazard tracker treats the TRAILING binding as the write, and the recorder binds
+// [x, ff, y], so the output must come last for the store→read barrier. (FREQ_FACTORS is only
+// built WITHOUT OUT_F16/USE_PARAMS — the adapter rejects ff on the f16/dyn paths.)
+layout(binding = 1) readonly buffer FB { float ff[]; };
+#endif
+#ifdef USE_PARAMS
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifndef KV_BDA
+layout(binding = 2) buffer YB { float16_t y[]; };
+#endif
+#elif defined(OUT_F16)
+#ifndef KV_BDA
+layout(binding = 1) buffer YB { float16_t y[]; };
+#endif
+#else
+#ifdef FREQ_FACTORS
+layout(binding = 2) buffer YB { float y[]; };
+#else
+layout(binding = 1) buffer YB { float y[]; };
+#endif
+#endif
+#if defined(OUT_F16) && defined(KV_BDA)
+#include "kv_addr.glsl"
+#define KVWH(idx, val) kv_store_half(k_addr, (idx), (val))
+#else
+#define KVWH(idx, val) y[idx] = float16_t(val)
+#endif
+
+void main() {
+#if defined(OUT_F16) && defined(KV_BDA)
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+#endif
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.t * pc.nheads) { return; }
+#ifdef USE_PARAMS
+    uint pos = p_pos + idx / pc.nheads;
+    uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
+#else
+    uint pos = pc.pos_offset + idx / pc.nheads;
+    uint out_base = pc.out_base;
+#endif
+    uint base = idx * pc.hd;
+    uint obase = out_base * pc.nheads * pc.hd + base;
+    // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
+    // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
+    // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).
+#ifdef OUT_F16
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
+#else
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
+#endif
+    uint hf = pc.rope_dim / 2u;
+    for (uint i = 0u; i < hf; i++) {
+        float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
+        float ang = float(pos) * freq;
+#ifdef FREQ_FACTORS
+        ang /= ff[i];
+#endif
+#ifdef BACKWARD
+        float s = -sin(ang);
+#else
+        float s = sin(ang);
+#endif
+        float co = cos(ang);
+#ifdef NEOX
+        uint i0 = i, i1 = i + hf;
+#else
+        uint i0 = 2u * i, i1 = i0 + 1u;
+#endif
+        float a = x[base + i0];
+        float b = x[base + i1];
+#ifdef OUT_F16
+        KVWH(obase + i0, a * co - b * s);
+        KVWH(obase + i1, a * s + b * co);
+#else
+        y[obase + i0] = a * co - b * s;
+        y[obase + i1] = a * s + b * co;
+#endif
+    }
+}

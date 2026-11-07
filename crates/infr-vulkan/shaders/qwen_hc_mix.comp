@@ -1,0 +1,21 @@
+#version 460
+// Qwen3.8 low-rank gated residual collapse. One lane computes one output feature and sums the
+// small, fixed residual-stream axis in reference order.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint hc; uint n_embd; uint total; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer GB { float gate[]; };
+layout(binding = 2) writeonly buffer DB { float dst[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) { return; }
+    uint r = i / pc.n_embd;
+    uint d = i - r * pc.n_embd;
+    float acc = 0.0;
+    for (uint h = 0u; h < pc.hc; ++h) {
+        uint j = (r * pc.hc + h) * pc.n_embd + d;
+        float s = 1.0 / (1.0 + exp(-gate[j]));
+        acc += x[j] * s;
+    }
+    dst[i] = acc / float(pc.hc);
+}

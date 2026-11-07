@@ -1,0 +1,373 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Opt JS-based actions into Node 24 ahead of the GH default flip (June 2026)
+  # to surface upstream incompatibility early. Mirrors the krypt / tikr baseline.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# Mostly Linux: infr is a Vulkan-first engine. `glslc` (shaderc) compiles the
+# compute shaders at build time, and the dp4a shaders need a recent glslc
+# (GL_EXT_integer_dot_product) — Ubuntu 24.04 ships shaderc 2023.8 which is too
+# old, so we pin ubuntu-26.04 (shaderc 2025+). The GPU integration tests are
+# #[ignore]'d (they need a real Vulkan device); CI builds + runs the CPU suite.
+# ash loads Vulkan at runtime via dlopen, so no libvulkan is needed to build.
+# The `test-macos` job additionally builds on Apple Silicon and runs the
+# reference Metal backend's parity suite against a real Metal device.
+
+jobs:
+  classify:
+    name: classify PR
+    runs-on: ubuntu-26.04
+    outputs:
+      submission_only: ${{ steps.diff.outputs.submission_only }}
+      submission_kind: ${{ steps.diff.outputs.submission_kind }}
+      submission_path: ${{ steps.diff.outputs.submission_path }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          submission_only=false
+          submission_kind=
+          submission_path=
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            python3 scripts/classify-submission-pr.py "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "submission_only=$submission_only" >> "$GITHUB_OUTPUT"
+          echo "submission_kind=$submission_kind" >> "$GITHUB_OUTPUT"
+          echo "submission_path=$submission_path" >> "$GITHUB_OUTPUT"
+
+  submission-data:
+    name: community submission
+    needs: classify
+    if: needs.classify.outputs.submission_only == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate the one immutable submission
+        env:
+          SUBMISSION_KIND: ${{ needs.classify.outputs.submission_kind }}
+          SUBMISSION_PATH: ${{ needs.classify.outputs.submission_path }}
+        run: |
+          if [[ "$SUBMISSION_KIND" == benchmark ]]; then
+            python3 scripts/validate-benchmark-submission.py "$SUBMISSION_PATH"
+          elif [[ "$SUBMISSION_KIND" == error ]]; then
+            python3 scripts/validate-error-submission.py "$SUBMISSION_PATH"
+          else
+            echo "unknown submission kind: $SUBMISSION_KIND" >&2
+            exit 1
+          fi
+
+  fmt:
+    name: cargo fmt --check
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: always()
+        run: sccache --show-stats
+
+  test:
+    name: cargo test
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux wizard smoke
+        run: bash scripts/smoke-linux-wizard.sh
+      - name: Optional CPU module wizard regressions
+        env:
+          MOE4ALL_WORK_ROOT: ${{ runner.temp }}/moe4all-work
+        run: |
+          bash scripts/test-wizard-modular-services.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/modules" linux
+          bash scripts/test-wizard-transcription.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/transcription" linux
+          bash scripts/test-wizard-speech.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/speech" linux
+          mkdir -p "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          bash scripts/test-benchmark-startup-guide.sh linux "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          bash scripts/test-wizard-reminders.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/reminders" linux
+      - name: Linux submission routes and receipt handoff
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/test-submission-launchers.sh "$GITHUB_WORKSPACE"
+      - name: Release promotion metadata tests
+        run: python3 -m unittest discover -s scripts -p 'test_release_ci.py' -v
+      - name: Portable speech setup helper tests
+        run: python3 -m unittest discover -s scripts -p 'test_convert_melotts_chinese.py' -v
+      - name: Submission protocol and PR classification tests
+        run: python3 -m unittest discover -s scripts -p 'test_submission.py' -v
+      - name: Benchmark PR review tables and hardware matching
+        run: python3 -m unittest discover -s scripts -p 'test_benchmark_pr_summary.py' -v
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Compact benchmark index tests
+        run: node --test scripts/test-benchmark-index.mjs scripts/test-benchmark-main.mjs
+      - name: Trusted benchmark summary comment tests
+        run: node --test scripts/test-benchmark-summary-comment.mjs
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      # Report all independent failures in one run; any failure still fails this job.
+      - run: cargo nextest run --workspace --locked --no-fail-fast
+      - run: cargo test --doc --workspace --locked
+      - if: always()
+        run: sccache --show-stats
+
+  launcher-windows:
+    name: Windows launcher and updater
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify both Windows entries without loading models
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:MOE4ALL_WORK_ROOT = Join-Path $env:RUNNER_TEMP 'moe4all-work'
+          $task = '20261106-020000-launcher-ci'
+          $env:MOE4ALL_WIZARD_TEST_TMP = Join-Path $env:MOE4ALL_WORK_ROOT "tmp\moe4all\$task"
+          New-Item -ItemType Directory -Force -Path $env:MOE4ALL_WIZARD_TEST_TMP | Out-Null
+          $env:TEMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          $env:TMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          $launcher = Join-Path $env:MOE4ALL_WIZARD_TEST_TMP 'MoE4All Engine.exe'
+          $evidence = Join-Path $env:MOE4ALL_WORK_ROOT "evidence\moe4all\$task"
+          .\scripts\build-windows-launcher.ps1 -OutputPath $launcher
+          .\scripts\Test-WizardStartupPolicy.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          .\scripts\Test-BenchmarkStartupGuide.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          powershell.exe -NoProfile -STA -File .\scripts\Test-WizardStartupDialogs.ps1 -EvidenceDirectory $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Native startup dialog checks failed.' }
+          powershell.exe -NoProfile -STA -File .\scripts\Test-WizardBrand.ps1 -LauncherPath $launcher -EvidenceDirectory $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher icon checks failed.' }
+          powershell.exe -NoProfile -File .\scripts\Test-EngineUpdateDualEntry.ps1 -TaskId $task -WindowLauncherPath $launcher
+          if ($LASTEXITCODE -ne 0) { throw 'Dual-entry OTA checks failed.' }
+      - name: Preserve updater diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-launcher-checks
+          path: ${{ runner.temp }}/moe4all-work/evidence/moe4all/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # CPU generation goldens against REAL models. The `cpu_golden_*` /
+  # `cpu_kv_*` tests in `infr-llama/tests/cpu_backend.rs` self-skip when the
+  # GGUF isn't in the HF cache (see the `need_model!` macro), so on a bare
+  # runner they always no-op — which is exactly how a real arch-correctness bug
+  # (the Q8_0 sub-256 truncation that changed gemma-3-1b's output) slipped past
+  # CI. This job downloads a SMALL representative set of goldens into the
+  # standard HuggingFace hub cache (`~/.cache/huggingface/hub/models--<org>--
+  # <repo>/snapshots/<commit>/<file>` — the exact layout `find_gguf` reads),
+  # caches them across runs, and runs the CPU suite so those goldens actually
+  # execute and their hashes are asserted. Runs in parallel with the other jobs.
+  #
+  # Model set (Q4_K_M, ~1.58 GiB total) — one per distinct architecture family
+  # with a CPU golden, deliberately excluding the multi-GiB MoE / big models:
+  #   unsloth/gemma-3-1b-it-GGUF  (733 MiB) — dense SWA/GeGLU, hd=256; the
+  #                                          non-256-in_f arch that caught Q8_0
+  #   unsloth/Qwen3-0.6B-GGUF     (361 MiB) — dense; also drives the cpu_kv_*
+  #                                          coherence + quant-sweep tests
+  # Qwen3.5-0.8B (gated-DeltaNet) is intentionally NOT downloaded: its longer
+  # greedy generation is FP-sensitive, so the exact-token golden hash is not
+  # portable across CPU microarchitectures (coherent but different tokens on the
+  # runner vs the dev box). gemma3/qwen3 are short + stable enough to reproduce
+  # bit-for-bit; with the model absent, cpu_golden_qwen35 self-skips (need_model!).
+  cpu-goldens:
+    name: cargo test (CPU goldens, real models)
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      # Cache the downloaded GGUFs across runs. The key encodes the exact model
+      # set + quant, so it only re-downloads when that list changes (bump the
+      # `-v1` suffix if you change the models below).
+      - name: Cache golden model GGUFs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b-q4km-v2
+      - name: Download golden GGUFs (single file per repo)
+        run: |
+          pipx install huggingface_hub
+          hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
+          hf download unsloth/Qwen3-0.6B-GGUF   Qwen3-0.6B-Q4_K_M.gguf
+      # Release build: these run real CPU inference (the f32 reference backend),
+      # which is far too slow to time out in debug. Single-threaded because the
+      # goldens mutate process-global generation env under a shared lock.
+      - run: cargo test --release -p infr-llama --test cpu_backend --locked -- --test-threads=1
+      - if: always()
+        run: sccache --show-stats
+
+  build:
+    name: cargo build --release
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: cargo build --release --workspace --locked
+      - if: always()
+        run: sccache --show-stats
+
+  # Cheap Linux guard for the macOS-only `infr-metal` crate: `cargo check`
+  # cross-compiled to aarch64-apple-darwin doesn't link, so no macOS SDK is
+  # needed — it just typechecks the match arms/tests that the Linux clippy/test
+  # jobs skip (they never build `infr-metal`). Catches Op-signature drift before
+  # the expensive `test-macos` runner. Drop this job if it ever proves flaky.
+  metal-check:
+    name: cargo check (infr-metal, Apple target)
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-apple-darwin
+          cache: false
+      - run: rustup target add aarch64-apple-darwin
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin
+      - if: always()
+        run: sccache --show-stats
+
+  # macOS / Metal: the Linux jobs above never build `infr-metal` (it is
+  # `#![cfg(target_os = "macos")]`). This job builds the workspace on an
+  # Apple-Silicon runner — which has a real Metal device — and runs the
+  # infr-metal parity suite. Those tests are `#[ignore]`d like the Vulkan GPU
+  # tests, so they need an explicit `--include-ignored`.
+  #
+  # `--nocapture` is load-bearing, not debug noise: `tests/pcache.rs` prints the
+  # cold-vs-warm pipeline-cache breakdown (MSL front end, which is NOT cached,
+  # versus PSO creation, which is), and this log is the ONLY place that
+  # measurement exists — no one on this project has a Metal device.
+  test-macos:
+    name: cargo test (macOS / Metal)
+    needs: classify
+    if: needs.classify.outputs.submission_only != 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: brew install shaderc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          cache-write: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: cargo build --workspace --locked
+      - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
+      - name: macOS launch wizard and package smoke tests
+        run: /bin/zsh scripts/smoke-macos-wizard.zsh
+      - name: macOS automatic update and benchmark reminders
+        env:
+          MOE4ALL_WORK_ROOT: ${{ runner.temp }}/moe4all-work
+        run: |
+          mkdir -p "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          /bin/zsh scripts/test-benchmark-startup-guide.sh macos "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/startup-guide"
+          /bin/zsh scripts/test-wizard-reminders.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/ci/reminders" macos
+      - name: macOS submission routes and receipt handoff
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: /bin/zsh scripts/test-submission-launchers.sh "$GITHUB_WORKSPACE"
+      - if: always()
+        run: sccache --show-stats
+
+  gate:
+    name: PR gate
+    if: always()
+    needs: [classify, submission-data, fmt, clippy, test, launcher-windows, cpu-goldens, build, metal-check, test-macos]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Require the applicable checks
+        env:
+          CLASSIFY: ${{ needs.classify.result }}
+          SUBMISSION_ONLY: ${{ needs.classify.outputs.submission_only }}
+          SUBMISSION_DATA: ${{ needs.submission-data.result }}
+          FMT: ${{ needs.fmt.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          TEST: ${{ needs.test.result }}
+          CPU_GOLDENS: ${{ needs.cpu-goldens.result }}
+          BUILD: ${{ needs.build.result }}
+          METAL_CHECK: ${{ needs.metal-check.result }}
+          TEST_MACOS: ${{ needs.test-macos.result }}
+          LAUNCHER_WINDOWS: ${{ needs.launcher-windows.result }}
+        run: |
+          [[ "$CLASSIFY" == success ]]
+          if [[ "$SUBMISSION_ONLY" == true ]]; then
+            [[ "$SUBMISSION_DATA" == success ]]
+          else
+            for result in "$FMT" "$CLIPPY" "$TEST" "$CPU_GOLDENS" "$BUILD" "$METAL_CHECK" "$TEST_MACOS" "$LAUNCHER_WINDOWS"; do
+              [[ "$result" == success ]]
+            done
+          fi

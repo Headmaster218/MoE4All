@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Logits { float logits[]; };
+layout(binding = 1) buffer Counts { float counts[]; };
+layout(binding = 2) readonly buffer Control { uvec4 control[]; };
+layout(push_constant) uniform Params { uint n; uint rows; } p;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= p.n * p.rows) return;
+    uint row = index / p.n;
+    uint token = index % p.n;
+    uvec4 c = control[row];
+    uint address = c.w * p.n + token;
+    float count = counts[address];
+    if (token == c.z) {
+        count += 1.0;
+        counts[address] = count;
+    }
+    if (count > 0.0) {
+        precise float frequency = uintBitsToFloat(c.y) * count;
+        precise float penalty = uintBitsToFloat(c.x) + frequency;
+        logits[index] -= penalty;
+    }
+}

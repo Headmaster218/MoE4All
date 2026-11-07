@@ -1,0 +1,233 @@
+#version 460
+// Non-coopmat shared-memory fma flash-attention for PREFILL (the "nc_fa" tier, adapter.rs
+// `nc_fa_ok`): fused tile QK^T → online softmax → PV accumulate, NO materialized [m,kv] scores.
+// This is the attention companion of native_gemm_fma.comp — R1 un-gated the prefill GEMMs for
+// devices without a usable 16x16x16 f16 coopmat (Intel Arc/ANV), which left the scalar per-row
+// `attention_kv` as their ONLY full-tile prefill attention (31% of knob pp512 on Qwen3-14B, worse
+// at depth). Every flash/nonfa prefill kernel here is coopmat SPIR-V, so before this kernel a
+// non-coopmat device ran ALL prefill attention rows one at a time.
+//
+// Design constraints (Intel Arc audit; tuned blind on RADV under INFR_NO_COOPMAT=1):
+//  • NO subgroup ops anywhere — accumulation is per-thread registers + shared staging, and no
+//    layout depends on gl_SubgroupSize (Arc enumerates 8-32; ANV may pick any).
+//  • SMALL row tile: BM=32 (16 for the hd=512 build) × BN=64 kv block, 256 threads — Alchemist
+//    SIMD8 EUs spill easily and prefer more, smaller workgroups. Registers stay modest: the QK
+//    phase holds E=BN·BM/256 score accumulators (8/4), the PV phase 32/TPR partial sums (≤4).
+//  • Shared ≤64 KiB: Qs+KVs BK-chunk staging (the native_gemm_fma warptile pattern) + Ss score
+//    tile + Os accumulator = 37.6 KiB (hd≤128) / 54.0 KiB (hd≤256) / 47.6 KiB (hd=512, BM=16).
+//  • Barriers AFTER all shared reads of an iteration (the mmq race lesson) — a fast thread must
+//    never restage Qs/KVs/Ss while a slow one still reads the previous block's values.
+//
+// Semantics mirror attn_partial.comp exactly (the kernel this tier replaces at rows≥64):
+//  • causal: row r (absolute position pos+qr0+r) attends keys ≤ its own position;
+//  • sliding window (window>0): keys ≥ pos_r+1−window; the block loop starts at ROW 0's window
+//    base — later rows' bases are ≤ BM−1 positions higher, always inside the first BN block;
+//  • ring KV (SWA caches sized below ctx): position j lives at cache row j % (cap/(nkv·hd)) —
+//    the same `cap` push-constant mapping as attn_partial's RROW (identity on full-ctx caches).
+//    The ring only recycles rows the window mask already excludes, so a recycled row's (real,
+//    newer) K value is always masked to −1e30 before softmax;
+//  • scale: caller-supplied (gemma4 pushes 1.0); 0 → the 1/√hd default;
+//  • GQA: head h reads kv head h/(nh/nkv).
+// Q/K/V f16, O f32. hd%4 (vec4 loads), hd ≤ HD_MAX. q/dst rows NOT required padded: q rows ≥
+// q_len stage as zeros and dst pad rows are never written (no Internal-buffer requirement).
+// KV dtype scope: f16 only — at prefill rows>1 the adapter already dequants q8/block-quant KV
+// sides to the f16 ring-layout scratch, so `k_q8_eff`/`v_q8_eff` are false by construction
+// there; the gate keeps them excluded explicitly (no native-q8 read variant of this kernel).
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef HD_MAX
+#define HD_MAX 128
+#endif
+#if HD_MAX > 256
+#define BM 16u // hd=512: halve the row tile so Os stays 32 KiB
+#else
+#define BM 32u
+#endif
+
+const uint BN = 64u; // kv positions per block
+const uint BK = 32u; // staged dims per QK chunk (= staged dims per PV chunk)
+const uint THREADS = 256u;
+const uint SK = BK + 1u; // +1 pad de-conflicts strided column reads
+const uint TPR = THREADS / BM; // threads cooperating on one query row (8 / 16)
+const uint E = BN / TPR; // score columns per thread (8 / 4)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint q_len; // actual query rows (NOT padded)
+    uint kv_len; // this layer's live kv length (positions)
+    uint nh;
+    uint nkv;
+    uint hd;
+    uint pos; // absolute position of query row 0
+    uint window; // sliding-window size (0 = full causal)
+    float scale; // 0 → 1/√hd
+    uint cap; // total cache ELEMENTS (ring row mapping); matches attn_partial's push
+} pc;
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; }; // [q_len, nh, hd]
+layout(binding = 1) readonly buffer KB { f16vec4 k4[]; }; // [rcap, nkv, hd] (ring rows)
+layout(binding = 2) readonly buffer VB { f16vec4 v4[]; }; // [rcap, nkv, hd]
+layout(binding = 3) writeonly buffer OB { float o[]; };   // [q_len, nh, hd]
+
+shared float Qs[BM * SK];      // BK-dim chunk of the query tile
+shared float KVs[BN * SK];     // BK-dim chunk of the K block, then 32-dim chunks of V
+shared float Ss[BM * BN];      // raw scores, then probabilities
+shared float Os[BM * HD_MAX];  // O accumulator (rescaled online)
+shared float mrow[BM];         // running row max
+shared float lrow[BM];         // running row sum
+shared float corr[BM];         // per-row rescale for the current block
+
+void main() {
+    uint qt = gl_WorkGroupID.x / pc.nh;
+    uint h = gl_WorkGroupID.x % pc.nh;
+    uint qr0 = qt * BM;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint li = gl_LocalInvocationIndex;
+    uint hd = pc.hd;
+    uint hd4 = hd >> 2u;
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
+    // Ring row capacity (attn_partial's RROW): position j lives at cache row j % rcap. Identity
+    // on a full-context cache (every live j < kv_len <= rcap).
+    uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
+#define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
+
+    for (uint i = li; i < BM * hd; i += THREADS) { Os[i] = 0.0; }
+    if (li < BM) {
+        mrow[li] = -1e30;
+        lrow[li] = 0.0;
+    }
+    barrier();
+
+    // This thread's fixed score coordinates: query row `tr`, columns tj0*E .. +E.
+    uint tr = li / TPR;
+    uint tj0 = li % TPR;
+    uint qpos = pc.pos + qr0 + tr;
+    uint lo_r = (pc.window > 0u && qpos + 1u > pc.window) ? qpos + 1u - pc.window : 0u;
+
+    // kv block range: [row 0's window base, last row's causal end). Later rows' window bases are
+    // at most BM-1 > 0 positions above the base — always inside the first block (BM <= 32 < BN).
+    uint lo_tile = (pc.window > 0u && pc.pos + qr0 + 1u > pc.window)
+                       ? pc.pos + qr0 + 1u - pc.window
+                       : 0u;
+    uint kvend = min(pc.kv_len, pc.pos + qr0 + BM);
+
+    for (uint b0 = lo_tile; b0 < kvend; b0 += BN) {
+        // ── S = Q·Kᵀ over BK-dim chunks (native_gemm_fma's staging pattern) ──
+        float accs[E];
+        [[unroll]] for (uint e = 0u; e < E; e++) accs[e] = 0.0;
+        for (uint k0 = 0u; k0 < hd; k0 += BK) {
+            // stage Qs: BM rows × BK dims as vec4s (one per thread for BM=32; rows >= q_len and
+            // dims >= hd stage zeros — q is sized q_len rows, NOT tile-padded)
+            for (uint idx = li; idx < BM * (BK / 4u); idx += THREADS) {
+                uint r = idx / (BK / 4u);
+                uint c4 = idx % (BK / 4u);
+                uint gr = qr0 + r;
+                uint d = k0 + c4 * 4u;
+                vec4 qv = (gr < pc.q_len && d < hd)
+                              ? vec4(q4[(gr * pc.nh + h) * hd4 + (d >> 2u)])
+                              : vec4(0.0);
+                uint b = r * SK + c4 * 4u;
+                Qs[b] = qv.x;
+                Qs[b + 1u] = qv.y;
+                Qs[b + 2u] = qv.z;
+                Qs[b + 3u] = qv.w;
+            }
+            // stage KVs: BN keys × BK dims (positions >= kv_len stage zeros; ring rows via RROW)
+            for (uint idx = li; idx < BN * (BK / 4u); idx += THREADS) {
+                uint j = idx / (BK / 4u);
+                uint c4 = idx % (BK / 4u);
+                uint kpos = b0 + j;
+                uint d = k0 + c4 * 4u;
+                vec4 kv = (kpos < pc.kv_len && d < hd)
+                              ? vec4(k4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                              : vec4(0.0);
+                uint b = j * SK + c4 * 4u;
+                KVs[b] = kv.x;
+                KVs[b + 1u] = kv.y;
+                KVs[b + 2u] = kv.z;
+                KVs[b + 3u] = kv.w;
+            }
+            barrier();
+            for (uint kk = 0u; kk < BK; kk++) {
+                float av = Qs[tr * SK + kk];
+                [[unroll]] for (uint e = 0u; e < E; e++) {
+                    accs[e] += av * KVs[(tj0 * E + e) * SK + kk];
+                }
+            }
+            // AFTER all shared reads of this chunk (mmq race lesson).
+            barrier();
+        }
+        // mask (causal end, window base, kv end) and publish this block's scores
+        [[unroll]] for (uint e = 0u; e < E; e++) {
+            uint j = tj0 * E + e;
+            uint kpos = b0 + j;
+            bool dead = kpos >= pc.kv_len || kpos > qpos || kpos < lo_r;
+            Ss[tr * BN + j] = dead ? -1e30 : accs[e] * scale;
+        }
+        barrier();
+
+        // ── online softmax for this block (one thread per row) ──
+        if (li < BM) {
+            float rmax = mrow[li];
+            for (uint j = 0u; j < BN; j++) { rmax = max(rmax, Ss[li * BN + j]); }
+            float cf = exp(mrow[li] - rmax);
+            float rsum = 0.0;
+            for (uint j = 0u; j < BN; j++) {
+                float s = Ss[li * BN + j];
+                // dead scores stay EXACTLY zero even in an all-dead block (where rmax would be
+                // -1e30 and exp(s - rmax) = exp(0) = 1 — pad rows / window edges hit this).
+                float p = (s > -1e29) ? exp(s - rmax) : 0.0;
+                Ss[li * BN + j] = p;
+                rsum += p;
+            }
+            lrow[li] = lrow[li] * cf + rsum;
+            mrow[li] = rmax;
+            corr[li] = cf;
+        }
+        barrier();
+
+        // rescale the accumulator by this block's correction factor
+        for (uint i = li; i < BM * hd; i += THREADS) { Os[i] *= corr[i / hd]; }
+        barrier();
+
+        // ── O += P·V over 32-dim chunks of V (KVs restaged per chunk) ──
+        for (uint d0 = 0u; d0 < hd; d0 += 32u) {
+            for (uint idx = li; idx < BN * 8u; idx += THREADS) {
+                uint j = idx / 8u;
+                uint c4 = idx % 8u;
+                uint kpos = b0 + j;
+                uint d = d0 + c4 * 4u;
+                vec4 vv = (kpos < pc.kv_len && d < hd)
+                              ? vec4(v4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                              : vec4(0.0);
+                uint b = j * SK + c4 * 4u;
+                KVs[b] = vv.x;
+                KVs[b + 1u] = vv.y;
+                KVs[b + 2u] = vv.z;
+                KVs[b + 3u] = vv.w;
+            }
+            barrier();
+            // row tr, dims d0 + tj0 + TPR·u — fixed disjoint ownership, no atomics needed
+            [[unroll]] for (uint u = 0u; u < 32u / TPR; u++) {
+                uint dl = tj0 + TPR * u;
+                if (d0 + dl < hd) {
+                    float s = 0.0;
+                    for (uint j = 0u; j < BN; j++) { s += Ss[tr * BN + j] * KVs[j * SK + dl]; }
+                    Os[tr * hd + d0 + dl] += s;
+                }
+            }
+            barrier();
+        }
+    }
+
+    for (uint i = li; i < BM * hd; i += THREADS) {
+        uint r = i / hd;
+        uint gr = qr0 + r;
+        if (gr < pc.q_len) {
+            float l = lrow[r];
+            o[(gr * pc.nh + h) * hd + (i % hd)] = (l > 0.0) ? Os[i] / l : 0.0;
+        }
+    }
+}

@@ -1,0 +1,184 @@
+#version 460
+// Exact score-desc/index-asc top-k, followed by an index-ascending bitonic sort. The latter
+// reproduces scatter-to-mask attention order: selected tokens are consumed chronologically.
+//
+// Select the k-th score with a 4-pass 8-bit radix search, then resolve the lower-index tie break
+// with one parallel count and one collection pass. This preserves the original total order while
+// scanning the score vector 6 times instead of 17 (16 radix + collection). Qwen3.8 selects 512
+// of up to 65536 blocks, so avoiding twelve full index-radix scans matters at long context.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint max_blocks;
+    uint top_k;
+    uint rows;
+    uint kv_len;
+    uint ratio;
+} pc;
+layout(binding = 0) readonly buffer SB { float scores[]; };
+layout(binding = 1) writeonly buffer DB { uint dst[]; };
+
+#define INVALID 0xffffffffu
+shared uint bucket[256];
+shared uint selected_digit;
+shared uint remaining_rank;
+#ifndef ORDERED_COLLECT
+shared uint selected_count;
+shared uint tie_prefix[256];
+shared uint chosen[512];
+#endif
+#ifdef PARALLEL_SCAN
+#include "qsa_prefix_scan.glsl"
+#endif
+
+uint ordered_float(float x) {
+    uint bits = floatBitsToUint(x);
+    return (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
+}
+
+#ifdef ORDERED_COLLECT
+#include "qsa_topk_ordered_collect.glsl"
+#endif
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+#ifdef PARALLEL_SCAN
+    t = scan_thread();
+#endif
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) { return; }
+    uint blocks = (pc.kv_len - pc.rows + row + 1u) / pc.ratio;
+    uint score_base = row * pc.max_blocks;
+    uint dst_base = row * pc.top_k;
+
+    // A batch may straddle QSA's dense-to-sparse boundary. Before that boundary every
+    // complete block is retained, so preserve chronological order directly and skip a radix
+    // selection whose requested rank would exceed the number of candidates.
+    if (blocks <= pc.top_k) {
+        for (uint j = t; j < blocks; j += 256u) {
+            dst[dst_base + j] = j;
+        }
+        return;
+    }
+
+    uint prefix_score = 0u;
+    uint rank = pc.top_k;
+
+    for (uint level = 0u; level < 4u; ++level) {
+        bucket[t] = 0u;
+        barrier();
+
+        for (uint j = t; j < blocks; j += 256u) {
+            uint score_key = ordered_float(scores[score_base + j]);
+            uint done = level * 8u;
+            uint mask = done == 0u ? 0u : 0xffffffffu << (32u - done);
+            if ((score_key & mask) != (prefix_score & mask)) { continue; }
+            uint digit = (score_key >> (24u - done)) & 0xffu;
+            atomicAdd(bucket[digit], 1u);
+        }
+        barrier();
+
+#ifdef PARALLEL_SCAN
+        uint count = bucket[255u - t];
+        uint above = exclusive_count_prefix(count);
+        if (above < rank && above + count >= rank) {
+            selected_digit = 255u - t;
+            remaining_rank = rank - above;
+        }
+#else
+        if (t == 0u) {
+            uint above = 0u;
+            uint digit = 0u;
+            uint next_rank = rank;
+            for (int b = 255; b >= 0; --b) {
+                uint count = bucket[uint(b)];
+                if (above + count >= rank) {
+                    digit = uint(b);
+                    next_rank = rank - above;
+                    break;
+                }
+                above += count;
+            }
+            selected_digit = digit;
+            remaining_rank = next_rank;
+        }
+#endif
+        barrier();
+
+        prefix_score |= selected_digit << (24u - level * 8u);
+        rank = remaining_rank;
+        barrier();
+    }
+
+#ifdef ORDERED_COLLECT
+    collect_ordered(t, blocks, score_base, dst_base, prefix_score, rank);
+#else
+    // `rank` is now the number of entries equal to the threshold score that must be retained.
+    // Give each lane a contiguous index range, count its ties, and have lane 0 prefix those 256
+    // tiny counts. A later lane can then decide locally whether each equal-score index is among
+    // the first `rank`, preserving the exact lower-index tie break without radix-scanning index.
+    uint begin = blocks * t / 256u;
+    uint end = blocks * (t + 1u) / 256u;
+    uint local_ties = 0u;
+    for (uint j = begin; j < end; ++j) {
+        local_ties += uint(ordered_float(scores[score_base + j]) == prefix_score);
+    }
+#ifdef PARALLEL_SCAN
+    uint tie_ordinal = exclusive_count_prefix(local_ties);
+#else
+    tie_prefix[t] = local_ties;
+    barrier();
+    if (t == 0u) {
+        uint prefix = 0u;
+        for (uint lane = 0u; lane < 256u; ++lane) {
+            uint count = tie_prefix[lane];
+            tie_prefix[lane] = prefix;
+            prefix += count;
+        }
+    }
+    barrier();
+#endif
+
+    if (t == 0u) { selected_count = 0u; }
+    barrier();
+#ifndef PARALLEL_SCAN
+    uint tie_ordinal = tie_prefix[t];
+#endif
+    for (uint j = begin; j < end; ++j) {
+        uint score_key = ordered_float(scores[score_base + j]);
+        bool equal = score_key == prefix_score;
+        if (score_key > prefix_score || (equal && tie_ordinal < rank)) {
+            uint slot = atomicAdd(selected_count, 1u);
+            if (slot < pc.top_k) { chosen[slot] = j; }
+        }
+        tie_ordinal += uint(equal);
+    }
+    barrier();
+
+    uint i0 = t;
+    uint i1 = t + 256u;
+    if (i0 >= pc.top_k) { chosen[i0] = INVALID; }
+    if (i1 >= pc.top_k) { chosen[i1] = INVALID; }
+    barrier();
+    for (uint width = 2u; width <= 512u; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint pass = 0u; pass < 2u; ++pass) {
+                uint i = t + pass * 256u;
+                uint j = i ^ stride;
+                if (j > i) {
+                    bool ascending = (i & width) == 0u;
+                    uint a = chosen[i];
+                    uint b = chosen[j];
+                    if ((ascending && a > b) || (!ascending && a < b)) {
+                        chosen[i] = b;
+                        chosen[j] = a;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    if (i0 < pc.top_k) { dst[dst_base + i0] = chosen[i0]; }
+    if (i1 < pc.top_k) { dst[dst_base + i1] = chosen[i1]; }
+#endif
+}

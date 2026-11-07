@@ -1,0 +1,46 @@
+#version 460
+// Causal GQA attention (online softmax). q [t,nh,hd], k/v [t,nkv,hd] -> o [t,nh,hd]. One thread per
+// (t, head). hd <= 128.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint t; uint nh; uint nkv; uint hd; } pc;
+layout(binding = 0) readonly buffer QB { float q[]; };
+layout(binding = 1) readonly buffer KB { float k[]; };
+layout(binding = 2) readonly buffer VB { float v[]; };
+layout(binding = 3) buffer OB { float o[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.t * pc.nh) { return; }
+    uint ti = idx / pc.nh;
+    uint h = idx % pc.nh;
+    uint grp = pc.nh / pc.nkv;
+    uint kvh = h / grp;
+    uint hd = pc.hd;
+    float scale = 1.0 / sqrt(float(hd));
+    uint qbase = (ti * pc.nh + h) * hd;
+
+    float acc[128];
+    for (uint d = 0u; d < hd; d++) { acc[d] = 0.0; }
+    float m = -3.0e38;
+    float l = 0.0;
+
+    for (uint j = 0u; j <= ti; j++) {
+        uint kbase = (j * pc.nkv + kvh) * hd;
+        float dotv = 0.0;
+        for (uint d = 0u; d < hd; d++) { dotv += q[qbase + d] * k[kbase + d]; }
+        float s = dotv * scale;
+        if (s > m) {
+            float corr = exp(m - s);
+            l *= corr;
+            for (uint d = 0u; d < hd; d++) { acc[d] *= corr; }
+            m = s;
+        }
+        float p = exp(s - m);
+        l += p;
+        uint vbase = (j * pc.nkv + kvh) * hd;
+        for (uint d = 0u; d < hd; d++) { acc[d] += p * v[vbase + d]; }
+    }
+    uint obase = (ti * pc.nh + h) * hd;
+    for (uint d = 0u; d < hd; d++) { o[obase + d] = acc[d] / l; }
+}

@@ -1,0 +1,104 @@
+#version 460
+// Register-resident sequential DeltaNet scan with full recurrent-state snapshots for the leading
+// trace_rows tokens. This is the MTP VERIFY twin of deltanet_seq.comp.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define RPL 4u
+#ifndef NCOL
+#define NCOL 2u
+#endif
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint trace_rows;
+    uint nv;
+    uint nk;
+    uint kd;
+    uint vd;
+} pc;
+
+layout(binding = 0) readonly buffer KN { float kng[]; };
+layout(binding = 1) readonly buffer QN { float qng[]; };
+layout(binding = 2) readonly buffer VB { float v[]; };
+layout(binding = 3) readonly buffer BG { float bet[]; };
+layout(binding = 4) readonly buffer DG { float dec[]; };
+layout(binding = 5) buffer SB { float state[]; };
+layout(binding = 6) writeonly buffer OB { float outp[]; };
+layout(binding = 7) writeonly buffer TB { float trace[]; };
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint nblk = pc.vd / NCOL;
+    uint h = gl_WorkGroupID.x / nblk;
+    uint d0 = (gl_WorkGroupID.x % nblk) * NCOL;
+    uint khid = h % pc.nk;
+    uint kd = pc.kd;
+    uint sbase = h * kd * pc.vd;
+    uint state_elems = pc.nv * kd * pc.vd;
+
+    float s[NCOL][RPL];
+    [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[c][r] = state[sbase + (r * 32u + lane) * pc.vd + d0 + c];
+        }
+    }
+
+    for (uint tk = 0u; tk < pc.rows; tk++) {
+        uint nbase = tk * pc.nk * kd + khid * kd;
+        float kr[RPL], qr[RPL];
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            uint i = r * 32u + lane;
+            kr[r] = kng[nbase + i];
+            qr[r] = qng[nbase + i];
+        }
+
+        uint ga = tk * pc.nv + h;
+        float decay = dec[ga];
+        float beta = bet[ga];
+        uint ob = tk * pc.nv * pc.vd + h * pc.vd + d0;
+
+        float kvp[NCOL];
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            float acc = 0.0;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                s[c][r] *= decay;
+                acc += kr[r] * s[c][r];
+            }
+            kvp[c] = acc;
+        }
+        float dl[NCOL];
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            dl[c] = (v[ob + c] - subgroupAdd(kvp[c])) * beta;
+        }
+
+        float op[NCOL];
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            float acc = 0.0;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                s[c][r] += kr[r] * dl[c];
+                acc += qr[r] * s[c][r];
+                uint si = sbase + (r * 32u + lane) * pc.vd + d0 + c;
+                if (tk < pc.trace_rows) {
+                    trace[tk * state_elems + si] = s[c][r];
+                }
+            }
+            op[c] = acc;
+        }
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            float o = subgroupAdd(op[c]);
+            if (lane == c) {
+                outp[ob + c] = o;
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            state[sbase + (r * 32u + lane) * pc.vd + d0 + c] = s[c][r];
+        }
+    }
+}

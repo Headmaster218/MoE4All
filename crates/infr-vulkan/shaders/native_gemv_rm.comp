@@ -1,0 +1,87 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+// Multi-output-row decode GEMV (m=1 activation): one workgroup computes RM CONSECUTIVE output rows
+// instead of 1. Each thread carries RM independent weight-load/accumulate streams over the shared
+// activation run — RM× the in-flight memory requests per wave, so the low-out_f projection GEMVs
+// (q/o/down: only out_f≈4096 workgroups, memory-latency-starved) get the MLP that lets them
+// saturate DRAM like the big lm_head/gate+up GEMVs already do. Per-row math (thread sub-block
+// assignment + shared tree-reduce) is byte-for-byte the RM=1 native_gemv path → BIT-IDENTICAL
+// output; only the workgroup packing changes. -DRM=N sets rows/wg; -DUSE_RES fuses a residual.
+// Decode-only (activation rows==1); the tiled GEMM / plain GEMV still serve rows>1.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-slot element-offset meaning. The ONLY weight build (the bound-SSBO
+// resident twin died with the eager `Recorder::linear_native_rm` caller, its sole consumer).
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+#ifndef RM
+#define RM 2
+#endif
+
+shared float red[64];
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+// Dot one 32-elem sub-block of weights (decoded once) against the matching activation run.
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid (host splits into (x,y) when
+    // ceil(out_f/RM) exceeds maxComputeWorkGroupCount[0] — see Recorder::dispatch_wide); reduces to
+    // gl_WorkGroupID.x when 1-D. A padding workgroup from an uneven split gets o0 >= out_f, which
+    // the existing per-row `o < pc.out_f` guards below already turn into a no-op (no OOB write) —
+    // no extra bounds check needed here, only the index recovery.
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(RM);
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint nsub = pc.in_f / 32u;
+    float acc[RM];
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) { acc[rr] = 0.0; }
+    for (uint s = t; s < nsub; s += 64u) {
+        uint xoff = s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                acc[rr] += dqsub(pc.w_base + o * pc.in_f + s * 32u, xoff);
+            }
+        }
+    }
+    // One shared tree-reduce per output row (identical order to the RM=1 kernel), red[] reused.
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+        red[t] = acc[rr];
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] += red[t + stride]; }
+            barrier();
+        }
+        uint o = o0 + rr;
+        if (t == 0u && o < pc.out_f) {
+#ifdef USE_RES
+            y_buf[o] = r_buf[o] + red[0];
+#else
+            y_buf[o] = red[0];
+#endif
+        }
+        barrier(); // red[] must be free before the next row reuses it
+    }
+}

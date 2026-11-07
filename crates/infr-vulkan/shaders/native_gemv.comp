@@ -1,0 +1,80 @@
+#version 460
+// Native-block dequant GEMV y = x·Wᵀ (raw GGUF blocks read through a resident-BDA arena pointer,
+// padded to u32). Cooperative-over-K: one workgroup per output, 64 threads each own whole 32-elem
+// sub-blocks (decode scale ONCE via dqblk, amortized over the sub-block), shared tree-reduce.
+// Per-format decode comes from the shared native_decode.glsl (also used by native_gemm). -DFMT_*
+// selects the format; -DUSE_RES fuses a residual. Build-compiled by build.rs into one .spv per
+// (format, residual) — the STREAMED weight read below is the ONLY weight build (the bound-SSBO
+// resident twin died with the eager `VulkanBackend::linear_native`/`Recorder::linear_native_{sg,rm,
+// rm_v2}` callers that were its sole consumers; see build.rs's `keep_resident`).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// Dense layer streaming (see pager.rs `DensePagerSession`): the weight is read from the arena pool
+// by 64-bit device address instead of a bound SSBO — `w_base` keeps its within-slot element-offset
+// meaning (the op's own fused-QKV slice offset), while `arena_lo`/`arena_hi` carry the resident
+// slot's arena base BYTE address (see native_weight_addr.glsl). This lifts the ~4 GiB
+// maxStorageBufferRange cap a bound SSBO arena has.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+shared float red[64];
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+// Dot one 32-elem sub-block of weights (decoded once) against the matching activation run.
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint wbase = pc.w_base + o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    uint nsub = pc.in_f / 32u;
+    float acc = 0.0;
+    for (uint s = t; s < nsub; s += 64u) {
+        acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+    }
+#if defined(FMT_F16) || defined(FMT_BF16)
+    // Dense F16/BF16 projections can have a ragged K (Qwen3.8 Vision uses 4304 = 134*32 + 16).
+    // Quantized formats remain block-aligned and never compile this scalar tail.
+    uint tail = nsub * 32u;
+    for (uint i = tail + t; i < pc.in_f; i += 64u) {
+        acc += dq(wbase + i) * x_buf[xbase + i];
+    }
+#endif
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+#ifdef USE_RES
+    if (t == 0u) { y_buf[unit] = r_buf[unit] + red[0]; }
+#else
+    if (t == 0u) { y_buf[unit] = red[0]; }
+#endif
+}

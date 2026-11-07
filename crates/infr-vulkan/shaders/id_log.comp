@@ -1,0 +1,10 @@
+#version 460
+// Chained-decode id ring log: ring[params[0] & 63] = id[0]. Recorded LAST in the decode replay
+// (params[0] = the position this iteration just decoded, already advanced; id[0] = the token its
+// Argmax/Sample just wrote) — after one n-replay submission the host reads the n ids from the
+// ring in one go instead of syncing per token. Ring size 64 caps the chain length.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer PB { uint params[]; };
+layout(binding = 1) readonly buffer IB { uint id[]; };
+layout(binding = 2) writeonly buffer RB { uint ring[]; };
+void main() { ring[params[0] & 63u] = id[0]; }

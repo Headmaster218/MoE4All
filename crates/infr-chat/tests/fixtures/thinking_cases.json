@@ -1,0 +1,447 @@
+[
+  {
+    "name": "default_0",
+    "options": {},
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "set to xhigh"
+    ],
+    "excludes": [
+      "set to low"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "default_1",
+    "options": {
+      "enable_thinking": true
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "set to xhigh"
+    ],
+    "excludes": [
+      "set to low"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "low",
+    "options": {
+      "reasoning_effort": "low"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "set to low"
+    ],
+    "excludes": [
+      "set to xhigh"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "medium",
+    "options": {
+      "reasoning_effort": "medium"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [],
+    "excludes": [
+      "set to low",
+      "set to xhigh"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "xhigh",
+    "options": {
+      "reasoning_effort": "xhigh"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "set to xhigh"
+    ],
+    "excludes": [
+      "set to low"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "off",
+    "options": {
+      "enable_thinking": false
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [],
+    "excludes": [
+      "Reasoning effort is set"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "name": "off_ignores_effort",
+    "options": {
+      "enable_thinking": false,
+      "reasoning_effort": "low"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [],
+    "excludes": [
+      "Reasoning effort is set"
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "name": "invalid_high",
+    "options": {
+      "reasoning_effort": "high"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [],
+    "excludes": [],
+    "error": "Unexpected reasoning effort high"
+  },
+  {
+    "name": "invalid_max",
+    "options": {
+      "reasoning_effort": "max"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [],
+    "excludes": [],
+    "error": "Unexpected reasoning effort max"
+  },
+  {
+    "name": "system_low",
+    "options": {
+      "reasoning_effort": "low"
+    },
+    "messages": [
+      {
+        "role": "system",
+        "content": "User system instruction"
+      },
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "User system instruction"
+    ],
+    "excludes": [],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "tools_low",
+    "options": {
+      "reasoning_effort": "low"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "# Tools",
+      "get_weather"
+    ],
+    "excludes": [],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "system_medium",
+    "options": {
+      "reasoning_effort": "medium"
+    },
+    "messages": [
+      {
+        "role": "system",
+        "content": "User system instruction"
+      },
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "User system instruction"
+    ],
+    "excludes": [],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "tools_medium",
+    "options": {
+      "reasoning_effort": "medium"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "# Tools",
+      "get_weather"
+    ],
+    "excludes": [],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "system_xhigh",
+    "options": {
+      "reasoning_effort": "xhigh"
+    },
+    "messages": [
+      {
+        "role": "system",
+        "content": "User system instruction"
+      },
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "User system instruction"
+    ],
+    "excludes": [],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "tools_xhigh",
+    "options": {
+      "reasoning_effort": "xhigh"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "# Tools",
+      "get_weather"
+    ],
+    "excludes": [],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    ],
+    "suffix": "<|im_start|>assistant\n<think>\n"
+  },
+  {
+    "name": "preserve_default",
+    "options": {},
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer",
+        "reasoning_content": "old private calculation"
+      },
+      {
+        "role": "user",
+        "content": "Next question"
+      }
+    ],
+    "contains": [
+      "old private calculation",
+      "Answer"
+    ],
+    "excludes": []
+  },
+  {
+    "name": "preserve_on",
+    "options": {
+      "preserve_thinking": true
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer",
+        "reasoning_content": "old private calculation"
+      },
+      {
+        "role": "user",
+        "content": "Next question"
+      }
+    ],
+    "contains": [
+      "old private calculation",
+      "Answer"
+    ],
+    "excludes": []
+  },
+  {
+    "name": "preserve_off",
+    "options": {
+      "preserve_thinking": false
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer",
+        "reasoning_content": "old private calculation"
+      },
+      {
+        "role": "user",
+        "content": "Next question"
+      }
+    ],
+    "contains": [
+      "Answer"
+    ],
+    "excludes": [
+      "old private calculation"
+    ]
+  },
+  {
+    "name": "preserve_off_keeps_current_tool_turn",
+    "options": {
+      "preserve_thinking": false
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "active tool calculation",
+        "tool_calls": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": {
+                "city": "Tokyo"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "sunny"
+      }
+    ],
+    "contains": [
+      "active tool calculation",
+      "<function=get_weather>",
+      "Tokyo",
+      "<tool_response>"
+    ],
+    "excludes": []
+  },
+  {
+    "name": "stable_prefix",
+    "options": {
+      "reasoning_effort": "low"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      }
+    ],
+    "contains": [
+      "set to low"
+    ],
+    "excludes": [
+      "<|im_start|>assistant"
+    ],
+    "generation": false
+  }
+]

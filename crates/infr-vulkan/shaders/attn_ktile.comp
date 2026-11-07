@@ -1,0 +1,215 @@
+#version 460
+// PROBE (B7 slice 1) — LDS-staged K-TILE flash-decoding pass 1. Nothing in production dispatches
+// this; the only caller is tests/attn_ktile_probe.rs. See docs/backlog.md B7.
+//
+// WHY: `attn_partial.comp` gives each 32-lane wave ONE key and reduces that key's 128-dim dot with
+// a cross-lane `subgroupAdd`, so per key a wave issues ~4 VALU of real dot + ~6 VALU of reduction
+// — the reduction ALU scales with keys x heads and is 59% of decode GPU time at d32768. Here each
+// THREAD owns a whole key and computes its entire 128-dim dot from LDS, so the per-key cross-lane
+// reduction disappears completely. The price is that K must first be transposed through LDS: a
+// thread-per-key read straight from global is hopelessly uncoalesced (consecutive keys are
+// nkv*hd*2 = 1 KiB apart), so a KBK-key tile is staged with CONTIGUOUS per-thread global reads and
+// re-read per-thread out of LDS. Note the LDS gives ZERO data reuse (each staged key row is read
+// by exactly one thread) — it exists purely as the coalescing transpose.
+//
+// SPECIALIZED HARD (the fallback for everything else is attn_partial): hd == 128, rows == 1
+// (decode), f16 K and V read by device address (-DKV_BDA shape, always on here), causal,
+// window == 0, no canvas, no Q8/mainline-quant KV, no ring cache (cap must be 0 → RROW identity).
+//
+// OUTPUT LAYOUT is byte-for-byte `attn_partial.comp`'s so pass 2 (`attn_combine`) is reused
+// unchanged: pm/pl = [nh, n_chunks], pacc = [nh, n_chunks, hd], and an EMPTY chunk writes
+// m = -3e38, l = 0, pacc = 0 (the combine's `wexp != 0` test skips it).
+//
+// ── LDS BANK CONFLICTS (the main trap) ─────────────────────────────────────────────────────────
+// The K tile is `[KBK][KDW+KPAD]` u32 words, read one uvec4 (4 words) at a time by thread `t` from
+// row `t`. With KPAD = 0 the row stride is 64 words = 2x32 banks, so for a fixed word index every
+// thread lands on the SAME 4 banks → 32-way serialization. KPAD = 4 words makes the stride 68, so
+// thread t starts at bank (68t) % 32 = (4t) % 32: the 32 lanes' 4-word spans cover each of the 32
+// banks exactly 4 times, which is the 4-cycle floor for a wave32 b128 read (32 lanes x 16 B = 512 B
+// over 128 B/clk) — i.e. perfectly balanced, no penalty. PADDING IN WORDS, not halfs, and a
+// multiple of 4 so every row stays 16-byte aligned for ds_read_b128. The `-DKPAD=0` build exists
+// only to MEASURE that this is real (see the probe test's nopad config).
+//
+// q is workgroup-uniform (one head, 128 halfs). It is unpacked to f32 ONCE into `qf4` and read
+// back by every thread at the SAME address — an LDS broadcast, which costs one cycle and, unlike
+// holding q in registers, does not spend 64-128 VGPRs per thread.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef KWG
+#define KWG 64 // workgroup threads == keys per tile (one full dot per thread per tile)
+#endif
+#ifndef KPAD
+#define KPAD 4 // LDS row padding in u32 WORDS (must be a multiple of 4; 0 = conflict A/B build)
+#endif
+#ifndef KDW
+#define KDW 64 // head-dim u32 WORDS staged per pass (64 = the whole hd=128 row; 32 = half, halves LDS)
+#endif
+
+#define KBK KWG                // keys per tile
+#define KROWW (KDW + KPAD)     // LDS row stride, words
+#define KROWV4 (KROWW / 4)     // LDS row stride, uvec4
+#define KPERROW (KDW / 4)      // uvec4 staged per key row per pass
+#define KNDP (64 / KDW)        // dim passes per tile
+#define SC_MAX 512             // max supported `chunk` (the shipped ATTN_SPLIT.max_chunk)
+
+layout(local_size_x = KWG, local_size_y = 1, local_size_z = 1) in;
+
+const uint WGSZ = uint(KWG);
+const uint BKEYS = uint(KBK);
+const uint ROWV4 = uint(KROWV4);
+const uint PERROW = uint(KPERROW);
+const uint NDP = uint(KNDP);
+const uint DWORDS = uint(KDW);
+const uint HDW = 64u; // u32 words in one hd=128 f16 key row
+
+// Push layout is EXACTLY attn_partial.comp's -DKV_BDA block (60 B) so the recorder's existing
+// packing is reused verbatim. `cap` / `pos` / `rows` / `window` are read only to assert the
+// specialization on the host side; this shader ignores window/rows/cap and uses pos for qpos1.
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;
+    uint pos; uint rows;
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+} pc;
+#include "kv_addr.glsl"
+
+layout(binding = 0) readonly buffer QB { uint qw[]; };  // q as raw u32 words: [nh, hd] f16
+layout(binding = 1) readonly buffer KB { uint ku_inert[]; }; // INERT (hazard edge only, never read)
+layout(binding = 2) readonly buffer VB { uint vu_inert[]; }; // INERT
+layout(binding = 3) buffer PM { float pm[]; };          // [nh, n_chunks]
+layout(binding = 4) buffer PL { float pl[]; };          // [nh, n_chunks]
+layout(binding = 5) buffer PACC { float pacc[]; };      // [nh, n_chunks, hd]
+
+shared uvec4 ksh[KBK * KROWV4]; // staged K tile, f16 packed, padded row stride
+shared vec4 qf4[32];            // this head's q, unpacked to f32 once (hd=128 → 32 vec4)
+shared float sc[SC_MAX];        // per-key score then exp weight
+shared float red[KWG];          // workgroup max / sum tree
+shared vec4 vsh[KWG];           // P·V partials, [KWG/32 key-groups][32 dim-vec4s]
+
+vec4 vread4(uint i4) {
+    uvec2 w = KV2(v_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(128.0);
+
+    // Same workgroup → (query head, chunk) decomposition as attn_partial (the g heads sharing a
+    // kv-head/chunk stay CONSECUTIVE so their K/V re-read hits L2), so the grid is identical.
+    uint g = pc.nh / pc.nkv;
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
+    uint qpos1 = pc.pos + 1u;             // rows == 1: the single query row's causal end
+    uint j0 = c * pc.chunk;               // window == 0, no canvas → chunk grid base is 0
+    uint j1 = min(j0 + pc.chunk, qpos1);
+
+    // q → f32 in LDS, once. (Broadcast-read in the dot loop; see the header.)
+    uint qbase = h * HDW;
+    for (uint i = t; i < 32u; i += WGSZ) {
+        qf4[i] = vec4(unpackHalf2x16(qw[qbase + 2u * i]), unpackHalf2x16(qw[qbase + 2u * i + 1u]));
+    }
+
+    float lmax = -3.0e38;
+    for (uint jt = j0; jt < j1; jt += BKEYS) {
+        float acc = 0.0;
+        for (uint dp = 0u; dp < NDP; dp++) {
+            barrier(); // previous pass's ksh reads complete before restaging
+            // ── COALESCED stage: thread `t` takes uvec4 slot (key = idx/KPERROW, u = idx%KPERROW),
+            // so the KPERROW threads of one key row read CONSECUTIVE 16-byte chunks of that row's
+            // 256 contiguous bytes. A wave32 instruction therefore touches 32/KPERROW whole key
+            // rows back to back — vs the naive thread-per-key global read, where one instruction
+            // scatters 32 x 16 B over 32 KiB (the ~25x amplification attn_partial's header cites).
+            for (uint idx = t; idx < BKEYS * PERROW; idx += WGSZ) {
+                uint key = idx / PERROW;
+                uint u = idx % PERROW;
+                uvec4 val = uvec4(0u);
+                uint jj = jt + key;
+                if (jj < j1) {
+                    val = KV4(k_addr, (jj * pc.nkv + kvh) * HDW + dp * DWORDS + u * 4u);
+                }
+                ksh[key * ROWV4 + u] = val;
+            }
+            barrier();
+            if (jt + t < j1) {
+                // ONE thread, ONE key, the WHOLE dot — no cross-lane reduction anywhere.
+                uint rowb = t * ROWV4;
+                for (uint u = 0u; u < PERROW; u++) {
+                    uvec4 kw = ksh[rowb + u];
+                    uint qi = (dp * DWORDS + u * 4u) >> 1u; // qf4 index of this uvec4's 8 halfs
+                    vec4 a0 = vec4(unpackHalf2x16(kw.x), unpackHalf2x16(kw.y));
+                    vec4 a1 = vec4(unpackHalf2x16(kw.z), unpackHalf2x16(kw.w));
+                    acc += dot(a0, qf4[qi]) + dot(a1, qf4[qi + 1u]);
+                }
+            }
+        }
+        if (jt + t < j1) {
+            float s = acc * scale;
+            sc[jt + t - j0] = s;
+            lmax = max(lmax, s);
+        }
+    }
+
+    red[t] = lmax;
+    barrier();
+    for (uint s = WGSZ / 2u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] = max(red[t], red[t + s]); }
+        barrier();
+    }
+    float m = red[0];
+    barrier();
+
+    float lsum = 0.0;
+    for (uint j = j0 + t; j < j1; j += WGSZ) {
+        float p = exp(sc[j - j0] - m);
+        sc[j - j0] = p;
+        lsum += p;
+    }
+    red[t] = lsum;
+    barrier();
+    for (uint s = WGSZ / 2u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    float l = red[0];
+
+    // P·V unchanged in STRUCTURE from attn_partial: each lane owns one output dim-vec4 and reads V
+    // with a wide coalesced load — that pattern already has no cross-lane reduction, so there was
+    // nothing for the K-tile idea to fix. Only the key→group split generalizes to KWG/32 groups.
+    uint dim = t & 31u;
+    uint grp = t >> 5u;
+    uint ngrp = WGSZ / 32u;
+    uint vbase = kvh * 32u + dim;
+    uint vstride = pc.nkv * 32u;
+    vec4 acc = vec4(0.0);
+    uint jv = j0 + grp;
+    for (; jv + ngrp < j1; jv += 2u * ngrp) {
+        vec4 b0 = vread4(jv * vstride + vbase);
+        vec4 b1 = vread4((jv + ngrp) * vstride + vbase);
+        acc += sc[jv - j0] * b0;
+        acc += sc[jv + ngrp - j0] * b1;
+    }
+    for (; jv < j1; jv += ngrp) {
+        acc += sc[jv - j0] * vread4(jv * vstride + vbase);
+    }
+    vsh[t] = acc;
+    barrier();
+    if (grp == 0u) {
+        for (uint gg = 1u; gg < ngrp; gg++) { acc += vsh[gg * 32u + dim]; }
+        uint pbase = (h * pc.n_chunks + c) * 128u;
+        pacc[pbase + 4u * dim] = acc.x;
+        pacc[pbase + 4u * dim + 1u] = acc.y;
+        pacc[pbase + 4u * dim + 2u] = acc.z;
+        pacc[pbase + 4u * dim + 3u] = acc.w;
+    }
+    if (t == 0u) {
+        pm[h * pc.n_chunks + c] = m;
+        pl[h * pc.n_chunks + c] = l;
+    }
+}

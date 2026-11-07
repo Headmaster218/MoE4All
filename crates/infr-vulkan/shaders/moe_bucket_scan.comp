@@ -1,0 +1,17 @@
+#version 460
+// MoE bucketing pass 2 — exclusive prefix sum of `counts[n_expert]` → `offsets[n_expert]` (the start
+// of each expert's contiguous run in the bucket arrays). One workgroup, serial scan (n_expert ≤ 128 —
+// trivial vs the GEMMs). The scatter's `fill[n_expert]` counters are zeroed by a separate parallel
+// clear (`rec.zero`) that overlaps the count/scan instead of riding this 1-lane serial pass — the
+// zero doesn't depend on `counts`, so folding it in here needlessly gated the scatter on the scan.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n_expert; } pc;
+layout(binding = 0) readonly buffer CB { uint counts[]; };
+layout(binding = 1) writeonly buffer OB { uint offsets[]; };
+void main() {
+    uint acc = 0u;
+    for (uint e = 0u; e < pc.n_expert; e++) {
+        offsets[e] = acc;
+        acc += counts[e];
+    }
+}

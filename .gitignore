@@ -1,0 +1,34 @@
+# Rust
+/target
+/Start-INFR-Wizard.exe
+/MoE4All Engine.exe
+/dist/
+/test-kv-cache/
+/scripts/__pycache__/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Compiled shaders
+*.spv
+
+# Models / weights (never commit)
+*.gguf
+models/
+*.safetensors
+
+# Editor / OS
+.DS_Store
+*.swp
+/ref/
+target-prof/
+/gui-data/
+/kv-sessions/
+/.update/
+/benchmark-data/
+/diagnostics/
+/upstream-research/
+# Preserve local data from the retired resource-matrix harness.
+/artifacts/context-resource-matrix/
+/tests/context-resource/matrix.local.json
+bili_report_work/*
+followtasks.txt

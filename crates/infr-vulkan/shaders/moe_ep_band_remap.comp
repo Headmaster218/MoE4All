@@ -1,0 +1,37 @@
+#version 460
+// Expert-parallel (multi-GPU EP) band remap — the ONLY per-MoE-layer kernel Expert Parallelism
+// adds. After the (replicated) router `moe_topk` produces GLOBAL top-k expert ids in `ids` and
+// their normalized weights in `wts` (identical on every rank — full router, full n_expert), this
+// rewrites them so THIS rank computes only the experts in its contiguous band [lo, hi):
+//
+//   * id in [lo, hi)  → ids := id - lo   (index into this rank's LOCAL expert shard [0, hi-lo)),
+//                        wts unchanged.
+//   * id out of band  → ids := 0, wts := 0  (a valid in-bounds LOCAL slot the GEMV reads harmlessly,
+//                        then the weighted combine multiplies by 0 → contributes nothing).
+//
+// Every rank runs the SAME router/top-k, so the set of (token, slot) assignments and their weights
+// are identical everywhere; each rank keeps exactly the assignments whose expert it owns. Summing
+// every rank's resulting MoE output (the all-reduce) reproduces the single-device weighted top-k
+// sum: for each slot exactly one rank has a non-zero weight (the band that owns that expert), and
+// the other ranks contribute a hard 0. Zeros are exact in f32, so no rank's partial gains spurious
+// terms — the cross-rank sum differs from the single-device accumulate only by reassociation
+// (token-identical, exactly like the TP all-reduce).
+//
+// `n` = rows * n_used (the packed (token, slot) assignment count). Both buffers are read-modify-
+// write; binding order follows the recorder's inputs-first/outputs-LAST dispatch convention (both
+// are writes).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; uint lo; uint hi; } pc;
+layout(binding = 0) buffer IDS { uint ids[]; };
+layout(binding = 1) buffer WTS { float wts[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint id = ids[i];
+    if (id >= pc.lo && id < pc.hi) {
+        ids[i] = id - pc.lo;
+    } else {
+        ids[i] = 0u;
+        wts[i] = 0.0;
+    }
+}

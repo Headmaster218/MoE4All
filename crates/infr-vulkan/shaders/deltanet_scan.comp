@@ -1,0 +1,166 @@
+#version 460
+// Chunked gated-DeltaNet, pass 3/3 (SCAN — the only sequential part): per chunk, using the
+// precomputed normalized k̂/q̂ (global), dot matrices D/Dq, and gates β/G:
+//   A[j][l] = β_j e^{G_j−G_l} D[j][l]              (build in LDS from global D)
+//   R_j     = β_j v_j − β_j e^{G_j} (k̂_jᵀ S₀)
+//   Δ = (I+A)⁻¹ R                                   (forward substitution)
+//   o_j     = e^{G_j} (q̂_jᵀ S₀) + Σ_{l≤j} e^{G_j−G_l} Dq[j][l] Δ_l
+//   S ← e^{G_{c−1}} S₀ + Σ_j e^{G_{c−1}−G_j} k̂_j ⊗ Δ_j
+// One workgroup per (value head, COLS-column block). With the shared work hoisted into the prep
+// pass, the per-block work here is purely state-coupled (no duplication), so small blocks are
+// cheap occupancy: vd=128 / COLS=16 → nv·8 workgroups. LDS is tiny (~7 KiB) — many wgs per CU.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define C 32u
+#define COLS 8u
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nv;
+    uint nk;
+    uint kd;   // ≤ 128
+    uint vd;
+} pc;
+
+layout(binding = 0) readonly buffer VB { float v[]; };       // [rows, nv*vd]
+layout(binding = 1) readonly buffer KN { float kng[]; };     // [rows, nk*kd] normalized k̂
+layout(binding = 2) readonly buffer QN { float qng[]; };     // [rows, nk*kd] normalized q̂
+layout(binding = 3) readonly buffer DK { float dk[]; };      // [nchunk, nk, C, C]
+layout(binding = 4) readonly buffer DQ { float dq[]; };      // [nchunk, nk, C, C]
+layout(binding = 5) readonly buffer BG { float betag[]; };   // [nchunk, nv, C]
+layout(binding = 6) readonly buffer GG { float gg[]; };      // [nchunk, nv, C]
+layout(binding = 7) buffer SB { float state[]; };            // [nv*kd*vd] in/out
+layout(binding = 8) buffer OB { float outp[]; };             // [rows, nv*vd]
+
+shared float ss[128u * COLS]; // this block's state columns [kd, COLS], LDS-resident across chunks
+shared float aa[C * C];      // A (solve), then Wq (output)
+shared float dl[C * COLS];   // R → Δ for this column block
+shared float bb[C];          // β
+shared float gs[C];          // G
+shared float wj[C];          // e^{G_{c−1}−G_j}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint nblk = (pc.vd + COLS - 1u) / COLS;
+    uint h = gl_WorkGroupID.x / nblk;
+    uint blk = gl_WorkGroupID.x % nblk;
+    uint d0 = blk * COLS;
+    uint khid = h % pc.nk;
+    uint sbase = h * pc.kd * pc.vd;
+    uint kd = pc.kd;
+
+    // Load this block's state columns into LDS ONCE — the whole scan runs against LDS state
+    // (the monolithic kernel's resident-state trick), stored back once at the end.
+    for (uint p = t; p < kd * COLS; p += 256u) {
+        uint kk = p / COLS;
+        uint d = d0 + p % COLS;
+        ss[p] = (d < pc.vd) ? state[sbase + kk * pc.vd + d] : 0.0;
+    }
+    barrier();
+
+    for (uint base = 0u; base < pc.rows; base += C) {
+        uint chunk = base / C;
+        uint c = min(C, pc.rows - base);
+        uint gbase = (chunk * pc.nv + h) * C;
+        uint mbase = (chunk * pc.nk + khid) * C * C;
+
+        if (t < c) {
+            bb[t] = betag[gbase + t];
+            gs[t] = gg[gbase + t];
+        }
+        barrier();
+        // A[j][l] = β_j e^{G_j−G_l} D[j][l], strictly lower
+        for (uint p = t; p < C * C; p += 256u) {
+            uint j = p >> 5u;
+            uint l = p & 31u;
+            if (j < c && l < j) {
+                aa[p] = bb[j] * exp(gs[j] - gs[l]) * dk[mbase + p];
+            }
+        }
+        // R (into dl) + the e^{G}·(q̂ᵀS₀) base term of O (straight to global)
+        for (uint p = t; p < c * COLS; p += 256u) {
+            uint j = p / COLS;
+            uint d2 = p % COLS;
+            uint d = d0 + d2;
+            if (d < pc.vd) {
+                uint nbase = (base + j) * pc.nk * kd + khid * kd;
+                float ks0 = 0.0, qs0 = 0.0;
+                for (uint kk = 0u; kk < kd; kk++) {
+                    float sv = ss[kk * COLS + d2];
+                    ks0 += kng[nbase + kk] * sv;
+                    qs0 += qng[nbase + kk] * sv;
+                }
+                float eg = exp(gs[j]);
+                uint ob = (base + j) * pc.nv * pc.vd + h * pc.vd + d;
+                dl[j * COLS + d2] = bb[j] * (v[ob] - eg * ks0);
+                outp[ob] = eg * qs0;
+            }
+        }
+        barrier();
+
+        // Forward substitution: Δ_j = R_j − Σ_{l<j} A[j][l] Δ_l. One SUBGROUP per column: the 32
+        // lanes parallelize the l-sum (each l ≤ 31 → one product per lane + subgroupAdd), and the
+        // per-step sync is subgroupBarrier() — no workgroup barriers in the sequential loop.
+        // Requires requiredSubgroupSize=32 (8 subgroups = COLS ≤ 8 columns per block).
+        {
+            uint sg = gl_SubgroupID;
+            uint lane = gl_SubgroupInvocationID;
+            if (sg < COLS) {
+                for (uint j = 1u; j < c; j++) {
+                    float part = (lane < j) ? aa[j * C + lane] * dl[lane * COLS + sg] : 0.0;
+                    float sum = subgroupAdd(part);
+                    if (lane == 0u) { dl[j * COLS + sg] -= sum; }
+                    subgroupBarrier();
+                }
+            }
+        }
+        barrier(); // Δ final before Wq overwrites aa / O reads dl
+
+        // Wq[i][j] = e^{G_i−G_j} Dq[i][j], j≤i (reuses aa; solve is done with it)
+        for (uint p = t; p < C * C; p += 256u) {
+            uint i = p >> 5u;
+            uint j = p & 31u;
+            if (i < c && j <= i) {
+                aa[p] = exp(gs[i] - gs[j]) * dq[mbase + p];
+            }
+        }
+        if (t < c) { wj[t] = exp(gs[c - 1u] - gs[t]); }
+        barrier();
+
+        // O += Wq·Δ
+        for (uint p = t; p < c * COLS; p += 256u) {
+            uint i = p / COLS;
+            uint d2 = p % COLS;
+            uint d = d0 + d2;
+            if (d < pc.vd) {
+                float acc = 0.0;
+                for (uint j = 0u; j <= i; j++) { acc += aa[i * C + j] * dl[j * COLS + d2]; }
+                outp[(base + i) * pc.nv * pc.vd + h * pc.vd + d] += acc;
+            }
+        }
+        // S ← e^{G_{c−1}} S₀ + Σ_j e^{G_{c−1}−G_j} k̂_j ⊗ Δ_j (in LDS)
+        float egl = exp(gs[c - 1u]);
+        for (uint p = t; p < kd * COLS; p += 256u) {
+            uint kk = p / COLS;
+            uint d2 = p % COLS;
+            float acc = egl * ss[p];
+            for (uint j = 0u; j < c; j++) {
+                acc += wj[j] * kng[(base + j) * pc.nk * kd + khid * kd + kk] * dl[j * COLS + d2];
+            }
+            ss[p] = acc;
+        }
+        barrier(); // next chunk reads ss / overwrites aa/dl/gates
+    }
+
+    // Persist the final state block.
+    for (uint p = t; p < kd * COLS; p += 256u) {
+        uint kk = p / COLS;
+        uint d = d0 + p % COLS;
+        if (d < pc.vd) {
+            state[sbase + kk * pc.vd + d] = ss[p];
+        }
+    }
+}

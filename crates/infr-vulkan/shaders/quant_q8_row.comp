@@ -1,0 +1,74 @@
+#version 460
+// Row-wise (whole-K) int8 activation quantization — MEASUREMENT variant for the int8-coopmat GEMM
+// (native_gemm_i8cm_q8_0.comp "Idea 2": one scale per ROW over the whole K dim, instead of
+// quant_q8's per-32-block scale, so `d_act[row]` becomes block-invariant and factors OUT of the
+// int8-coopmat kernel's per-block sum — removing the per-block d_act fetch/multiply). Coarser than
+// quant_q8's per-block scale (one amax over the whole row instead of one per 32 elements) — this is
+// the ONE precision divergence the i8cm kernel's docs call out as an allowed exception. Gated by
+// INFR_I8_COOPMAT=1 + INFR_I8_ROW_SCALE=1 (see adapter.rs); used ONLY by the int8-coopmat GEMM
+// path, quant_q8 (used by every other int8 kernel) is untouched.
+//
+// ONE workgroup per row (unlike quant_q8's one-workgroup-per-(row,block)): 256 threads = 256/SG
+// subgroups stride over all k elements twice — pass 1 finds the row's amax (subgroupMax per
+// subgroup + a tiny shared-mem tree reduction across the 256/SG subgroups), pass 2 quantizes using
+// that single scale. requiredSubgroupSize=SG (so the NSG-subgroup reduction below is exact).
+//
+// -DSG=16|32 (default 32) sets the pinned subgroup width; the shared partial array and the serial
+// max loop are sized 256/SG, so the reduction covers every subgroup at either width. SG=32 SPIR-V
+// is bit-identical to the pre-SG code (same constants after folding).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef SG
+#define SG 32
+#endif
+#define NSG (256 / SG)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint k; } pc;
+layout(binding = 0) readonly buffer ABuf { float a[]; };            // [m, k]
+layout(binding = 1) writeonly buffer QBuf { int8_t qa[]; };         // [m, k]
+layout(binding = 2) writeonly buffer DBuf { float16_t dactRow[]; }; // [m] — ONE scale per row
+
+shared float red[NSG]; // one subgroupMax partial per subgroup (256/SG subgroups)
+shared float rowMaxSh;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint base = row * pc.k;
+
+    float lmax = 0.0;
+    for (uint i = t; i < pc.k; i += 256u) {
+        lmax = max(lmax, abs(a[base + i]));
+    }
+    float sgmax = subgroupMax(lmax);
+    if (gl_SubgroupInvocationID == 0u) {
+        red[gl_SubgroupID] = sgmax;
+    }
+    barrier();
+    if (t == 0u) {
+        float rmax = red[0];
+        [[unroll]] for (uint s = 1u; s < uint(NSG); s++) {
+            rmax = max(rmax, red[s]);
+        }
+        rowMaxSh = rmax;
+    }
+    barrier();
+
+    float amax = rowMaxSh;
+    float d = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+    for (uint i = t; i < pc.k; i += 256u) {
+        int q = clamp(int(round(a[base + i] * inv)), -127, 127);
+        qa[base + i] = int8_t(q);
+    }
+    if (t == 0u) {
+        dactRow[row] = float16_t(d);
+    }
+}

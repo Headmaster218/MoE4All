@@ -1,0 +1,36 @@
+#version 460
+// Elementwise sigmoid gate: y[i] = a[i] * sigmoid(b[i]). qwen35 attention output gate.
+// gate_stride/gate_row_width/gate_block_width: interleaved gate read.
+// gate_block_width > 0: each head block width, gate at offset gate_row_width within block.
+// gate_stride > 0 && gate_block_width == 0: per-row strided gate read.
+// Both 0: flat gate read.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint n; uint gate_stride; uint gate_row_width; uint gate_block_width;
+} pc;
+layout(binding = 0) readonly buffer AB { float a[]; };
+layout(binding = 1) readonly buffer BB { float b[]; };
+layout(binding = 2) writeonly buffer YB { float y[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+
+    float g;
+    if (pc.gate_block_width > 0u) {
+        uint total_cols = pc.gate_stride / 2u;
+        uint headw = pc.gate_block_width / 2u; // per-head gate width (=hd)
+        uint r = i / total_cols;
+        uint c = i % total_cols;
+        uint head = c / headw;
+        uint off = c % headw;
+        g = b[r * pc.gate_stride + head * pc.gate_block_width + headw + off];
+    } else if (pc.gate_stride > 0u) {
+        uint r = i / pc.gate_row_width;
+        uint c = i % pc.gate_row_width;
+        g = b[r * pc.gate_stride + c];
+    } else {
+        g = b[i];
+    }
+    y[i] = a[i] / (1.0 + exp(-g));
+}

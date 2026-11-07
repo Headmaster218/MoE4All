@@ -1,0 +1,62 @@
+#version 460
+// E2B per-layer inp_gate: fused f32 GEMV + GELU activation * strided up-read.
+// Output buffer MUST be the last binding so n_out=1 correctly marks it in the recorder.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA (STREAMED is the only weight build): the weight is read through a 64-bit
+// buffer_reference into the resident arena (base = arena_lo/arena_hi) instead of a bound SSBO —
+// see linear_f32.comp's header for the campaign rationale. No bound weight SSBO exists.
+layout(push_constant) uniform PC {
+    uint m; uint in_f; uint out_f; uint up_off; uint up_stride; uint arena_lo; uint arena_hi;
+} pc;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { float v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 1) readonly buffer XB { float x[]; };
+layout(binding = 2) readonly buffer UB { float up[]; };
+layout(binding = 3) buffer YB { float y[]; };
+
+#define MROW 4
+shared float red[64 * MROW];
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row_groups = (pc.m + uint(MROW) - 1u) / uint(MROW);
+    if (unit >= pc.out_f * row_groups) { return; }
+    uint o = unit % pc.out_f;
+    uint r0 = (unit / pc.out_f) * uint(MROW);
+    uint t = gl_LocalInvocationID.x;
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+
+    uint wbase = o * pc.in_f;
+    float acc[MROW];
+    for (uint j = 0u; j < uint(MROW); j++) { acc[j] = 0.0; }
+    for (uint i = t; i < pc.in_f; i += 64u) {
+        float wv = WV(wbase + i);
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.m) { acc[j] += wv * x[r * pc.in_f + i]; }
+        }
+    }
+    for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] = acc[j]; }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] += red[j * 64u + t + stride]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.m) {
+                float v = red[j * 64u];
+                float g = 0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)));
+                uint up_idx = pc.up_off + r * pc.up_stride + o;
+                y[r * pc.out_f + o] = g * up[up_idx];
+            }
+        }
+    }
+}

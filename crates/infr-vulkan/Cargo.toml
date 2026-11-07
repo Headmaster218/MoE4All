@@ -1,0 +1,42 @@
+[package]
+name = "infr-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Compiles the parity-only `_at`/`_streamed` recorder entry points that have NO production caller
+# and exist solely for the `weight_addr_parity` integration test to exercise a `_streamed` SPV
+# directly. Off by default so those stay out of the crate's public API and a normal build; the
+# integration tests that call them are `#[cfg(feature = "parity")]` too. Run them with
+# `cargo test -p infr-vulkan --features parity`.
+parity = []
+
+[build-dependencies]
+infr-core.workspace = true
+
+[dependencies]
+infr-prof.workspace = true
+infr-prof-rt.workspace = true
+infr-core.workspace = true
+ash.workspace = true
+infr-cpu.workspace = true
+gpu-allocator.workspace = true
+thiserror.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+indicatif.workspace = true
+rayon.workspace = true
+libc.workspace = true
+# GGUF block layout (`block_layout`) — recorder.rs's resident-BDA streamed dispatch converts
+# element-space expert strides to the per-expert BYTE stride the STREAMED shaders' pointer
+# arithmetic needs; single source of truth with the GGUF loader instead of a second hand-kept table.
+infr-gguf.workspace = true
+
+[dev-dependencies]
+memmap2.workspace = true
+# The shared backend decode-parity harness (`tests/shared_decode_parity.rs`, plus the converted
+# `*_matches_host` unit tests in `adapter.rs`).
+infr-testkit.workspace = true

@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "run_id": "real-single-xhigh-20261011-v2",
+  "evidence": "offline fixed-input local omission simulation",
+  "snapshots": 1872,
+  "miss_layers": 779,
+  "miss_events": 1241,
+  "limitations": [
+    "No speed or downstream quality measurement.",
+    "Original cache state is held fixed; no policy feedback.",
+    "Samples start after 64 eligible forwards per layer; cold start, context changes and state transitions are not validated."
+  ],
+  "candidates": [
+    {
+      "id": "boot-top3-12-20",
+      "protected_top": 3,
+      "each_lt": 0.12,
+      "mass_max": 0.2,
+      "minimum_kept": 3,
+      "fired_layers": 715,
+      "all_misses_omitted_layers": 576,
+      "partial_layers": 139,
+      "omitted_miss_events": 976,
+      "miss_event_coverage": 0.7864625302175665,
+      "all_miss_layer_coverage": 0.7394094993581515,
+      "maximum_omitted_experts": 5,
+      "omitted_mass": {
+        "n": 715,
+        "p50": 0.0810876005676132,
+        "p95": 0.1753249094584856,
+        "max": 0.19985944000000005
+      },
+      "original": {
+        "hidden_relative_l2": {
+          "n": 715,
+          "p50": 0.02074844308251986,
+          "p95": 0.04507132416530995,
+          "max": 0.09338405726605672
+        },
+        "worst_stream_relative_l2": {
+          "n": 715,
+          "p50": 0.0472426412076317,
+          "p95": 0.08981373455870989,
+          "max": 0.16448611171942787
+        }
+      },
+      "renormalized": {
+        "hidden_relative_l2": {
+          "n": 715,
+          "p50": 0.023540704485049056,
+          "p95": 0.05175560394301237,
+          "max": 0.08490499356058241
+        },
+        "worst_stream_relative_l2": {
+          "n": 715,
+          "p50": 0.05367461850744178,
+          "p95": 0.10273287110304354,
+          "max": 0.17421903130264255
+        }
+      },
+      "renormalization_improved_layers": 9
+    },
+    {
+      "id": "top2-12-20",
+      "protected_top": 2,
+      "each_lt": 0.12,
+      "mass_max": 0.2,
+      "minimum_kept": 3,
+      "fired_layers": 735,
+      "all_misses_omitted_layers": 606,
+      "partial_layers": 129,
+      "omitted_miss_events": 1006,
+      "miss_event_coverage": 0.8106365834004835,
+      "all_miss_layer_coverage": 0.7779204107830552,
+      "maximum_omitted_experts": 5,
+      "omitted_mass": {
+        "n": 735,
+        "p50": 0.08250567768984102,
+        "p95": 0.17733787672538662,
+        "max": 0.19985944000000005
+      },
+      "original": {
+        "hidden_relative_l2": {
+          "n": 735,
+          "p50": 0.020875104514605586,
+          "p95": 0.048351141296259954,
+          "max": 0.09338405726605672
+        },
+        "worst_stream_relative_l2": {
+          "n": 735,
+          "p50": 0.048079589515350386,
+          "p95": 0.0937080448678928,
+          "max": 0.20379725944067695
+        }
+      },
+      "renormalized": {
+        "hidden_relative_l2": {
+          "n": 735,
+          "p50": 0.023704963440362825,
+          "p95": 0.05479845469539897,
+          "max": 0.0897289839089665
+        },
+        "worst_stream_relative_l2": {
+          "n": 735,
+          "p50": 0.05437293705950893,
+          "p95": 0.10710477638158694,
+          "max": 0.205366078696413
+        }
+      },
+      "renormalization_improved_layers": 9
+    },
+    {
+      "id": "top2-15-25",
+      "protected_top": 2,
+      "each_lt": 0.15,
+      "mass_max": 0.25,
+      "minimum_kept": 3,
+      "fired_layers": 749,
+      "all_misses_omitted_layers": 643,
+      "partial_layers": 106,
+      "omitted_miss_events": 1066,
+      "miss_event_coverage": 0.8589846897663175,
+      "all_miss_layer_coverage": 0.8254172015404364,
+      "maximum_omitted_experts": 5,
+      "omitted_mass": {
+        "n": 749,
+        "p50": 0.08433123640917396,
+        "p95": 0.20213077344687522,
+        "max": 0.2499993209999375
+      },
+      "original": {
+        "hidden_relative_l2": {
+          "n": 749,
+          "p50": 0.02147798812898119,
+          "p95": 0.05352115919412434,
+          "max": 0.09405860420946115
+        },
+        "worst_stream_relative_l2": {
+          "n": 749,
+          "p50": 0.04969339784169515,
+          "p95": 0.10857499014658877,
+          "max": 0.20563225840320726
+        }
+      },
+      "renormalized": {
+        "hidden_relative_l2": {
+          "n": 749,
+          "p50": 0.024669303536919394,
+          "p95": 0.06204103029495603,
+          "max": 0.098142248698867
+        },
+        "worst_stream_relative_l2": {
+          "n": 749,
+          "p50": 0.05620380573045126,
+          "p95": 0.12867163009339416,
+          "max": 0.20856914545007513
+        }
+      },
+      "renormalization_improved_layers": 11
+    },
+    {
+      "id": "steady-top2-15-30",
+      "protected_top": 2,
+      "each_lt": 0.15,
+      "mass_max": 0.3,
+      "minimum_kept": 3,
+      "fired_layers": 749,
+      "all_misses_omitted_layers": 659,
+      "partial_layers": 90,
+      "omitted_miss_events": 1094,
+      "miss_event_coverage": 0.8815471394037067,
+      "all_miss_layer_coverage": 0.8459563543003851,
+      "maximum_omitted_experts": 5,
+      "omitted_mass": {
+        "n": 749,
+        "p50": 0.08433123640917396,
+        "p95": 0.24052842015971612,
+        "max": 0.2990272834562278
+      },
+      "original": {
+        "hidden_relative_l2": {
+          "n": 749,
+          "p50": 0.02164682775845475,
+          "p95": 0.05813588276007491,
+          "max": 0.09405860420946115
+        },
+        "worst_stream_relative_l2": {
+          "n": 749,
+          "p50": 0.04979159008390665,
+          "p95": 0.11375144222147851,
+          "max": 0.20563225840320726
+        }
+      },
+      "renormalized": {
+        "hidden_relative_l2": {
+          "n": 749,
+          "p50": 0.024916565609892086,
+          "p95": 0.06366107510218837,
+          "max": 0.1320677305617652
+        },
+        "worst_stream_relative_l2": {
+          "n": 749,
+          "p50": 0.057281906946195074,
+          "p95": 0.1327251285738987,
+          "max": 0.25915595151957305
+        }
+      },
+      "renormalization_improved_layers": 12
+    }
+  ]
+}

@@ -1,0 +1,184 @@
+#version 460
+// Fused per-head QK-norm (RMSNorm over hd) + NEOX RoPE, writing f16. One workgroup per (row, head).
+// Assumes rope_dim == hd (Qwen3). x [rows, nheads, hd] f32, nw [hd] f32, y f16 (q buffer / KV cache).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#ifdef KV_Q8
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint nheads; uint hd; uint rope_dim; float theta; uint rope_pos; uint out_base; float eps;
+    // Fused-K cache write, dyn mode only: the cache's ROW capacity (an SWA ring cache recycles
+    // rows the window mask already excludes — the write row is pos % kcap, identity on a
+    // full-context cache where pos < kcap always). 0 = no modulo. Static mode ignores it (the
+    // adapter pre-mods the baked out_base row instead).
+    uint kcap;
+#ifdef KV_BDA
+    // -DKV_BDA (#74 slice 3): the fused-K cache write `y` goes to a 64-bit device address (kv_addr.glsl
+    // `k_addr`, from d_lo/d_hi) instead of the bound `y` SSBO — the `y` binding disappears, and the
+    // recorder keeps the cache bound at that write slot as an inert descriptor for the store→read
+    // barrier (see Recorder::qk_norm_rope_at). Only used when `y` is the KV cache (adapter gate);
+    // the Q-scratch write (no device_addr) stays on the bound build.
+    uint d_lo; uint d_hi;
+#endif
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer NB { float nw[]; };
+#ifdef USE_PARAMS
+// Record-once decode: pos comes from a host-updated params SSBO instead of a push constant, so the
+// command buffer can be replayed across tokens. `pc.rope_pos` is unused; `pc.out_base` is the 0/1
+// out_base multiplier (Q→0, K→pos). Output `y` moves to binding 3 (params takes binding 2) so the
+// recorder's reads|writes split stays output-last. With FREQ_FACTORS (gemma4 full-attention layers
+// replayed), `ff` takes binding 3 and `y` shifts to binding 4 — still output-last.
+layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifdef FREQ_FACTORS
+layout(binding = 3) readonly buffer FF { float ff[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 4) readonly buffer YB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
+layout(binding = 4) buffer YB { float16_t y[]; };
+#endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 3) readonly buffer YB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
+layout(binding = 3) buffer YB { float16_t y[]; };
+#endif
+#elif defined(FREQ_FACTORS)
+// gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
+// those dims are left unrotated). `ff` takes binding 2 (read), `y` shifts to binding 3 (write).
+layout(binding = 2) readonly buffer FF { float ff[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 3) readonly buffer YB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
+layout(binding = 3) buffer YB { float16_t y[]; };
+#endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 2) readonly buffer YB { uvec2 segments[]; };
+#elif !defined(KV_BDA)
+layout(binding = 2) buffer YB { float16_t y[]; };
+#endif
+#ifdef KV_BDA
+#ifdef KV_Q8
+#define KV_STORE_BYTE
+#endif
+#include "kv_addr.glsl"
+#ifdef KV_SEGMENTED
+void kvw(uint idx, float val) {
+    uint shift = uint(findMSB((pc.nheads * pc.hd) << 15u));
+    uint seg = kv_segment(idx, shift);
+    kv_store_half(kv_segment_base(segments[seg]), kv_segment_local(idx, shift), val);
+}
+#define KVW(idx, val) kvw((idx), (val))
+#else
+#ifdef KV_Q8
+#define KVW(idx, val) xs[(idx) % pc.hd] = float(float16_t(val))
+#else
+#define KVW(idx, val) kv_store_half(k_addr, (idx), (val))
+#endif
+#endif
+#else
+#define KVW(idx, val) y[idx] = float16_t(val)
+#endif
+
+shared float xs[512]; // hd up to 512 (gemma4 full layers); 64 threads each handle hd/64 elements
+shared float red[64];
+
+void main() {
+#if defined(KV_BDA) && !defined(KV_SEGMENTED)
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+#endif
+    uint t = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.x;
+    uint h = unit % pc.nheads;
+    uint r = unit / pc.nheads;
+    uint in_base = (r * pc.nheads + h) * pc.hd;
+
+    float pss = 0.0;
+    for (uint i = t; i < pc.hd; i += 64u) { float v = x[in_base + i]; xs[i] = v; pss += v * v; }
+    red[t] = pss;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+
+#ifdef USE_PARAMS
+    uint rope_pos = p_pos;
+    // Cache write row: pos % kcap (ring; see PC.kcap). RoPE keeps the ABSOLUTE position.
+    uint krow = (pc.kcap > 0u) ? (p_pos % pc.kcap) : p_pos;
+    uint out_base = pc.out_base * krow; // pc.out_base is the 0/1 multiplier in dyn mode
+#else
+    uint rope_pos = pc.rope_pos;
+    uint out_base = pc.out_base;
+#endif
+    uint absp = rope_pos + r;
+    uint out_base_idx = ((out_base + r) * pc.nheads + h) * pc.hd;
+    uint hf = pc.rope_dim / 2u;
+    for (uint p = t; p < hf; p += 64u) {
+        uint i0 = p;
+        uint i1 = p + hf;
+        float a = xs[i0] * scale * nw[i0];
+        float b = xs[i1] * scale * nw[i1];
+        float freq = pow(pc.theta, -2.0 * float(p) / float(pc.rope_dim));
+        float ang = float(absp) * freq;
+#ifdef FREQ_FACTORS
+        ang /= ff[p]; // proportional rope: ff[p] huge → ang≈0 → this dim left unrotated
+#endif
+        float s = sin(ang);
+        float co = cos(ang);
+        KVW(out_base_idx + i0, a * co - b * s);
+        KVW(out_base_idx + i1, a * s + b * co);
+    }
+    // Partial RoPE (qwen35: rope_dim=64 < hd=256): dims [rope_dim, hd) are rmsnormed but NOT rotated;
+    // they must still be written through. Empty when rope_dim==hd (qwen3/gemma), so no effect there.
+    for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
+        KVW(out_base_idx + i, xs[i] * scale * nw[i]);
+    }
+#ifdef KV_Q8
+    // The K row is consumed from planar Q8 immediately after this dispatch. Keep the rotated row
+    // in LDS, then let the two wave32 subgroups quantize independent native 32-element blocks.
+    barrier();
+    uint lane = t & 31u;
+    uint slot = t >> 5u;
+    uint row = (pc.kcap > 0u) ? (p_pos % pc.kcap) : p_pos;
+    uint row_width = pc.nheads * pc.hd;
+    uint cap = pc.kcap * row_width;
+    uint nblk = pc.hd / 32u;
+    for (uint base = 0u; base < nblk; base += 2u) {
+        uint blk = base + slot;
+        uint i = blk * 32u + lane;
+        bool valid = blk < nblk;
+        float v = valid ? xs[i] : 0.0;
+        red[t] = abs(v);
+        barrier();
+        for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+            if (valid && lane < stride) {
+                red[t] = max(red[t], red[t + stride]);
+            }
+            barrier();
+        }
+        if (valid) {
+            float amax = red[slot * 32u];
+            float d = amax / 127.0;
+            float inv = amax > 0.0 ? 1.0 / d : 0.0;
+            int q = clamp(int(round(v * inv)), -127, 127);
+            uint elem = row * row_width + h * pc.hd + i;
+            kv_store_byte(k_addr, elem, uint(q) & 0xffu);
+            if (lane == 0u) {
+                uint sb = cap + (elem / 32u) * 2u;
+                uint16_t bits = float16BitsToUint16(float16_t(d));
+                kv_store_byte(k_addr, sb, uint(bits & uint16_t(0xffu)));
+                kv_store_byte(k_addr, sb + 1u, uint(bits >> 8));
+            }
+        }
+        barrier();
+    }
+#endif
+}

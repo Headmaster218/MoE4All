@@ -1,0 +1,48 @@
+#version 460
+// f16-weight GEMV y = x·Wᵀ. ONE workgroup per output element: 64 threads stride the K dimension
+// (coalesced), then a shared-memory tree-reduce. Dispatch rows*out_f workgroups. Resident-BDA: the
+// weight is read through a 64-bit buffer_reference into the resident arena (base = arena_lo/
+// arena_hi) instead of a bound SSBO — see native_gemv.comp's header for the campaign rationale.
+// The ONLY weight build (the bound-SSBO resident twin died with the eager
+// `VulkanBackend::linear_f16` caller, its sole consumer).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint arena_lo; uint arena_hi;
+} pc;
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ArenaW { float16_t v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
+
+shared float red[64];
+
+void main() {
+    // Recovers the flat index from a possibly-2-D dispatch grid — the host splits into (x,y) when
+    // rows*out_f exceeds maxComputeWorkGroupCount[0] (see Recorder::dispatch_wide); this reduces
+    // to gl_WorkGroupID.x when the grid stayed 1-D. Padding workgroups from an uneven split return
+    // before `barrier()`; the guard is workgroup-uniform (unit depends only on gl_WorkGroupID), so
+    // that's safe.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // = r * out_f + o
+    if (unit >= pc.rows * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += float(WV(wbase + i)) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}

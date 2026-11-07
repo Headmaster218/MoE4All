@@ -1,0 +1,28 @@
+#version 460
+// Batched strided row copy (the seam's Op::CopyStrided — q|k|v|z splits etc.): ONE dispatch copies
+// `rows` slices of `nw` u32 words each (dst[dst_off + r*dst_stride + i] = src[src_off + r*src_stride
+// + i], all in WORDS). Replaces the per-row vkCmdCopyBuffer loop — at rows=512 that was 512 copy
+// commands + hazard checks per split op, which dwarfed the actual bytes moved.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nw;         // words per row
+    uint src_off;    // words
+    uint src_stride; // words
+    uint dst_off;    // words
+    uint dst_stride; // words
+} pc;
+
+layout(binding = 0) readonly buffer SB { uint s[]; };
+layout(binding = 1) writeonly buffer DB { uint d[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.rows * pc.nw) {
+        return;
+    }
+    uint r = idx / pc.nw;
+    uint i = idx % pc.nw;
+    d[pc.dst_off + r * pc.dst_stride + i] = s[pc.src_off + r * pc.src_stride + i];
+}

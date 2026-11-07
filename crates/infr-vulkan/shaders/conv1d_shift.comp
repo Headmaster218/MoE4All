@@ -1,0 +1,22 @@
+#version 460
+// Causal depthwise conv, BATCH pass 2 of 2: rebuild the per-channel history from the LAST K-1
+// input rows. Requires rows ≥ K-1 (guaranteed by the host-side routing), so the new state reads
+// only `qkv` — never the state buffer it overwrites (no intra-dispatch hazard).
+//   state[k][ch] = qkv[rows-(K-1)+k][ch]
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint cc; uint kconv; } pc;
+
+layout(binding = 0) readonly buffer XB { float qkv[]; };    // [rows, cc]
+layout(binding = 1) buffer SB { float cstate[]; };          // [(kconv-1)*cc] out
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint km1 = pc.kconv - 1u;
+    if (idx >= km1 * pc.cc) {
+        return;
+    }
+    uint k = idx / pc.cc;
+    uint ch = idx % pc.cc;
+    cstate[idx] = qkv[(pc.rows - km1 + k) * pc.cc + ch];
+}

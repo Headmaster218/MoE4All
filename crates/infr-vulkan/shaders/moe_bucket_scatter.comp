@@ -1,0 +1,39 @@
+#version 460
+// MoE bucketing pass 3 — scatter: place each (token,slot) assignment into its expert's contiguous
+// run. For assignment p (token = p / n_used): expert e = tok_ids[p], slot in the run =
+// offsets[e] + atomicAdd(fill[e],1); write the token row and its routing weight there. Output
+// bucket_rows / bucket_wts are grouped by expert (each expert's tokens are contiguous).
+// DSCALE (diffusion-gemma's per-expert `ffn_down_exps.scale`): bakes dscale[e] into bucket_wts
+// here, where `e` is already in hand — moe_scatter_reduce then needs no changes at all.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n_pairs; uint n_used; } pc;
+layout(binding = 0) readonly buffer TB { uint tok_ids[]; };
+layout(binding = 1) readonly buffer TW { float tok_wts[]; };
+layout(binding = 2) readonly buffer OB { uint offsets[]; };
+#ifdef DSCALE
+layout(binding = 3) readonly buffer DS { float dscale[]; };
+layout(binding = 4) buffer FB { uint fill[]; };
+layout(binding = 5) writeonly buffer RB { uint bucket_rows[]; };
+layout(binding = 6) writeonly buffer WB { float bucket_wts[]; };
+// Inverse map for the batched pipeline's gather-free reduce: assignment p → its bucket slot, so
+// a per-token pass can read its n_used expert outputs back in FIXED slot order (deterministic sum).
+layout(binding = 7) writeonly buffer IB { uint inv_pos[]; };
+#else
+layout(binding = 3) buffer FB { uint fill[]; };
+layout(binding = 4) writeonly buffer RB { uint bucket_rows[]; };
+layout(binding = 5) writeonly buffer WB { float bucket_wts[]; };
+layout(binding = 6) writeonly buffer IB { uint inv_pos[]; };
+#endif
+void main() {
+    uint p = gl_GlobalInvocationID.x;
+    if (p >= pc.n_pairs) { return; }
+    uint e = tok_ids[p];
+    uint pos = offsets[e] + atomicAdd(fill[e], 1u);
+    bucket_rows[pos] = p / pc.n_used; // token row
+    float w = tok_wts[p];
+#ifdef DSCALE
+    w *= dscale[e];
+#endif
+    bucket_wts[pos] = w;
+    inv_pos[p] = pos;
+}

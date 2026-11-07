@@ -1,0 +1,58 @@
+#version 460
+// Mean-centred LayerNorm, one workgroup per row — llama.cpp's LLM_NORM (`ggml_norm`, then the
+// weight multiply and bias add of `llm_graph_context::build_norm`):
+//   mean = Sum(x)/dim;  var = Sum((x-mean)^2)/dim;
+//   y[i] = (x[i]-mean) * inversesqrt(var + eps) * w[i] + b[i]
+// `var` is the BIASED estimator (divided by dim, not dim-1) and `eps` sits INSIDE the sqrt, added
+// to the variance — both read off `ggml_compute_forward_norm_f32`, and both silent precision bugs
+// if moved. The RMS sibling is `rmsnorm.comp`; this one costs a SECOND cooperative reduction,
+// because the mean must be known before any variance term can be formed.
+// Only user: deepseek32's `indexer_k_norm` (`Op::LayerNorm`) — the family's one non-RMS norm.
+// Requires requiredSubgroupSize=32 (wave32 -> 8 subgroups).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define NTHREAD 256u
+#define NSGMAX 8
+
+layout(local_size_x = NTHREAD, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint dim; float eps; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer WB { float w[]; };
+layout(binding = 2) readonly buffer BB { float b[]; };
+layout(binding = 3) buffer YB { float y[]; };
+
+shared float part[NSGMAX];
+
+// Sum `v` across the whole workgroup; every invocation gets the total. Called twice (mean, then
+// variance) from uniform control flow, so the trailing barrier is load-bearing: it retires every
+// invocation's reads of `part` before the next call overwrites the same slots.
+float wg_sum(float v) {
+    v = subgroupAdd(v);
+    if (subgroupElect()) { part[gl_SubgroupID] = v; }
+    barrier();
+    float tot = 0.0;
+    uint nsg = gl_NumSubgroups;
+    for (uint s = 0u; s < nsg; s++) { tot += part[s]; }
+    barrier();
+    return tot;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint base = r * pc.dim;
+
+    float s = 0.0;
+    for (uint i = t; i < pc.dim; i += NTHREAD) { s += x[base + i]; }
+    float mean = wg_sum(s) / float(pc.dim);
+
+    float vs = 0.0;
+    for (uint i = t; i < pc.dim; i += NTHREAD) { float d = x[base + i] - mean; vs += d * d; }
+    float scale = inversesqrt(wg_sum(vs) / float(pc.dim) + pc.eps);
+
+    for (uint i = t; i < pc.dim; i += NTHREAD) {
+        y[base + i] = (x[base + i] - mean) * scale * w[i] + b[i];
+    }
+}

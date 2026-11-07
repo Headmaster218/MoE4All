@@ -1,0 +1,54 @@
+#version 460
+// D01/H01-ABQ8: two independent row1 native Q8_0 projections in one dispatch.
+// Each (output,projection) workgroup retains native_gemv.comp's exact 64-thread
+// sub-block accumulation and shared reduction. No activation quantization or scratch.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint w_base0; uint w_base1;
+    uint arena0_lo; uint arena0_hi; uint arena1_lo; uint arena1_hi;
+} pc;
+layout(binding = 0) readonly buffer XB { float x_buf[]; };
+layout(binding = 1) writeonly buffer Y0B { float y0_buf[]; };
+layout(binding = 2) writeonly buffer Y1B { float y1_buf[]; };
+
+shared float red[64];
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#define FMT_Q8_0
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    uint projection = gl_WorkGroupID.y;
+    uint o = gl_WorkGroupID.x;
+    // Workgroup-uniform guards, before any barrier. Parent admits only row1 / aligned K.
+    if (projection >= 2u || o >= pc.out_f) { return; }
+    uint t = gl_LocalInvocationID.x;
+    w_addr = projection == 0u ? arena_base(pc.arena0_lo, pc.arena0_hi)
+                              : arena_base(pc.arena1_lo, pc.arena1_hi);
+    uint wbase = (projection == 0u ? pc.w_base0 : pc.w_base1) + o * pc.in_f;
+    uint xbase = 0u;
+    uint nsub = pc.in_f / 32u;
+    float acc = 0.0;
+    for (uint s = t; s < nsub; s += 64u) {
+        acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+    }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) {
+        if (projection == 0u) { y0_buf[o] = red[0]; }
+        else { y1_buf[o] = red[0]; }
+    }
+}

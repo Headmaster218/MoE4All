@@ -1,0 +1,101 @@
+#version 450
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#ifndef COPY_LOCAL
+#define COPY_LOCAL 256
+#endif
+layout(local_size_x = COPY_LOCAL) in;
+
+layout(std430, binding = 0) readonly buffer Journal { uint journal[]; };
+layout(std430, binding = 1) readonly buffer Jobs { uvec4 jobs[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Source {
+    uvec4 chunks[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Destination {
+    uvec4 chunks[];
+};
+layout(push_constant) uniform Params {
+    uint ordinal;
+#ifdef COPY_ROLE_FILTER
+    uint phase;
+    uint gate_base;
+    uint up_base;
+    uint experts;
+#endif
+} p;
+
+const uint JOB_CAPACITY = INFR_MAX_DECODE_ROWS * 16u * 3u;
+const uint JOURNAL_MASK_WORD = INFR_MAX_DECODE_ROWS * 16u;
+const uint JOURNAL_JOB_COUNT_WORD = JOURNAL_MASK_WORD + INFR_MAX_DECODE_ROWS;
+const uint JOURNAL_STATUS_WORD = JOURNAL_MASK_WORD + INFR_MAX_DECODE_ROWS + 3u;
+const uint JOURNAL_WORDS = JOURNAL_STATUS_WORD + 1u;
+
+uint64_t address64(uvec2 address) {
+    return uint64_t(address.x) | (uint64_t(address.y) << 32u);
+}
+
+void main() {
+    if (gl_GlobalInvocationID.y != 0u || gl_GlobalInvocationID.z != 0u) return;
+    if (p.ordinal >= uint(journal.length()) / JOURNAL_WORDS) return;
+#ifdef COPY_ROLE_FILTER
+    if (p.phase < 1u || p.phase > 2u || p.experts == 0u
+        || p.gate_base + p.experts < p.gate_base
+        || p.up_base + p.experts < p.up_base) return;
+#endif
+    uint journal_base = p.ordinal * JOURNAL_WORDS;
+    uint status = journal[journal_base + JOURNAL_STATUS_WORD];
+    if (status != 4u && status != 5u) return;
+    uint job_count = journal[journal_base + JOURNAL_JOB_COUNT_WORD];
+    if (job_count == 0u || job_count > JOB_CAPACITY) return;
+    if (p.ordinal >= uint(jobs.length()) / (JOB_CAPACITY * 2u)) return;
+    uint job_base = p.ordinal * JOB_CAPACITY * 2u;
+    uint64_t lane = uint64_t(gl_WorkGroupID.x) * uint64_t(gl_WorkGroupSize.x)
+                  + uint64_t(gl_LocalInvocationID.x);
+    uint64_t stride = uint64_t(gl_NumWorkGroups.x) * uint64_t(gl_WorkGroupSize.x);
+    if (stride == uint64_t(0)) return;
+
+    // Prepare has validated these jobs. Check again before dereferencing imported BDAs.
+#ifdef COPY_ROLE_FILTER
+    bool mapped_gate_up = false;
+#endif
+    for (uint j = 0u; j < job_count; ++j) {
+        uvec4 a = jobs[job_base + j * 2u];
+        uint bytes = jobs[job_base + j * 2u + 1u].x;
+        uint64_t src = address64(a.xy);
+        uint64_t dst = address64(a.zw);
+        // Status 5 belongs to GPU-owned admission: zero-BDA jobs are serviced by CPU.
+        if ((src == uint64_t(0) && status != 5u) || dst == uint64_t(0) || bytes == 0u) return;
+        if (((a.x | a.z | bytes) & 15u) != 0u) return;
+        uint64_t last = uint64_t(bytes - 1u);
+        if (src + last < src || dst + last < dst) return;
+#ifdef COPY_ROLE_FILTER
+        uint block = jobs[job_base + j * 2u + 1u].y;
+        mapped_gate_up = mapped_gate_up || (src != uint64_t(0)
+            && ((block >= p.gate_base && block - p.gate_base < p.experts)
+                || (block >= p.up_base && block - p.up_base < p.experts)));
+#endif
+    }
+    // The caller orders prepare -> payload -> full FFN with device memory barriers.
+    for (uint j = 0u; j < job_count; ++j) {
+        uvec4 a = jobs[job_base + j * 2u];
+        if (all(equal(a.xy, uvec2(0u)))) continue;
+#ifdef COPY_ROLE_FILTER
+        uint block = jobs[job_base + j * 2u + 1u].y;
+        // With no mapped GU job, delaying the sole Down transfer until H has
+        // finished only creates a bubble. Both phases derive the same decision
+        // from immutable jobs; every mapped payload still copies exactly once.
+        bool early = !mapped_gate_up
+            || (block >= p.gate_base && block - p.gate_base < p.experts)
+            || (block >= p.up_base && block - p.up_base < p.experts);
+        if ((p.phase == 1u) != early) continue;
+#endif
+        uint bytes = jobs[job_base + j * 2u + 1u].x;
+        Source src = Source(address64(a.xy));
+        Destination dst = Destination(address64(a.zw));
+        uint64_t chunks = uint64_t(bytes / 16u);
+        for (uint64_t chunk = lane; chunk < chunks; chunk += stride) {
+            dst.chunks[uint(chunk)] = src.chunks[uint(chunk)];
+        }
+    }
+}

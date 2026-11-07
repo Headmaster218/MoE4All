@@ -1,0 +1,425 @@
+#version 460
+#ifdef MLA_SG
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+// MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per (token, head); 128 lanes
+// cooperate on that head's math. The KV cache holds ONE row per token (key_length =
+// kv_lora_rank + qk_rope_dim wide); V is the first kv_lora_rank columns — aliased from K,
+// no separate v_cache.
+//
+// The q_pe half of each query head is APPLIED ROPE internally here (matching the CPU kernel);
+// the graph passes raw q_pe. q_nope is absorbed via wk_b[h]^T per head before the QK dot.
+// After SDPA the accumulated V is projected back via wv_b[h] per head.
+//
+// Cooperative design (why shared memory, not per-thread arrays): the per-head working state
+// is q_full[576] + vacc[512] = 1088 floats. As per-thread private arrays that is 1088 live
+// registers per thread — far over the ~256 VGPR budget on RDNA3, so the compiler spills to
+// scratch and the GPU hangs (observed: "logical device has been lost" on an RX 7900 XTX with
+// the earlier 128-lane-per-token layout where every lane carried the full arrays). Here the
+// arrays live in WORKGROUP shared memory (576+512 floats = 4352 bytes, trivially within the
+// 64 KiB limit) and the 128 lanes fill/read them cooperatively: each lane owns a strided slice.
+//
+//   -DMLA_SG  The subgroup tier (`mla_sg*`, dispatched through `kernel_sg(.., MLA_SG_WIDTH)`).
+//             Same math, two structural changes: ONE pass over the keys with an online (running
+//             max / running sum) softmax instead of two full passes, and a `subgroupAdd` per key
+//             plus one cross-subgroup fixup per BATCH of keys, instead of a 128-lane
+//             shared-memory tree per key per pass. The scalar build below is untouched and stays
+//             the fallback (`INFR_NO_MLA_SG`, and any device that cannot pin `MLA_SG_WIDTH`).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint q_head_dim;       // qk_nope_dim + qk_rope_dim
+    uint kv_lora_rank;
+    uint qk_nope_dim;
+    uint qk_rope_dim;
+    uint v_head_dim;
+    float scale;
+    uint pos;              // first token position
+    uint mask_type;        // 0 = causal, 1 = sliding window, 2 = canvas
+    uint window;
+    float theta;
+    uint cache_cap_rows;   // ring-buffer row capacity (0 or >= kv_len = full context)
+    uint canvas_lo;        // `AttnMask::Canvas { lo }` lower bound; read on mask_type == 2 only
+} pc;
+
+#define KEY_LEN (pc.kv_lora_rank + pc.qk_rope_dim)
+
+// Q: [rows, n_head, q_head_dim] — f32, un-roped q_pe
+layout(binding = 0) readonly buffer QB { float q[]; };
+// K cache: [cap_rows, key_len] — f16 (quantized), one row per token
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+// wk_b: [n_head, kv_lora_rank, qk_nope_dim] — f32
+layout(binding = 2) readonly buffer WKB { float wk_b[]; };
+// wv_b: [n_head, kv_lora_rank, v_head_dim] — f32
+layout(binding = 3) readonly buffer WVB { float wv_b[]; };
+// dst: [rows, n_head, v_head_dim] — f32 writeonly
+//
+// The two optional read bindings come BEFORE dst, in this order, because the hazard tracker treats
+// the TRAILING binding as the write: the recorder binds [.., ff, kbias, dst], so `dst` must stay
+// last or the read-only buffers would be marked written and `dst` left untracked (no store→read
+// barrier before the wo-projection reads it — nondeterminism).
+//
+//   -DFREQ_FACTORS  YaRN per-pair frequency divisors (`qk_rope_dim/2` floats): the internal q_pe
+//                   rope's rotation angle is DIVIDED by ff[p].
+//   -DKEY_BIAS      Additive per-(row, key) score mask `[rows, kv_len]` (`Op::Mla::key_bias`) —
+//                   deepseek32's lightning-indexer top-k, 0 on the selected keys and -inf
+//                   elsewhere. Indexed by KEY POSITION, not by the ring row.
+#if defined(FREQ_FACTORS) && defined(KEY_BIAS)
+layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) readonly buffer BB { float kbias[]; };
+layout(binding = 6) writeonly buffer DB { float dst[]; };
+#elif defined(FREQ_FACTORS)
+layout(binding = 4) readonly buffer FB { float ff[]; };
+layout(binding = 5) writeonly buffer DB { float dst[]; };
+#elif defined(KEY_BIAS)
+layout(binding = 4) readonly buffer BB { float kbias[]; };
+layout(binding = 5) writeonly buffer DB { float dst[]; };
+#else
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+#endif
+
+// Add the score mask at key POSITION `j` (NOT the ring row) for this workgroup's query row. The
+// no-mask build adds NOTHING rather than adding a literal 0.0 — `x + 0.0` is not the identity on
+// -0.0, so a shared expression would leave deepseek2 one instruction and one IEEE corner away from
+// the arithmetic it had before this build existed.
+#ifdef KEY_BIAS
+#define ADD_KEY_BIAS(d, tok, j) ((d) + kbias[(tok) * pc.kv_len + (j)])
+#else
+#define ADD_KEY_BIAS(d, tok, j) (d)
+#endif
+
+// The absorbed+roped query (key_len wide) and the V accumulator (kv_lora_rank wide) — shared
+// across the workgroup's 128 lanes, each lane owning a strided slice.
+//
+// These two capacities are the kernel's only hard dimension limits (sized for DeepSeek V2/V3:
+// kv_lora_rank 512, qk_rope_dim 64). A shader cannot reject a dispatch, so the HOST enforces them:
+// `MLA_MAX_KEY_LEN` / `MLA_MAX_KV_LORA_RANK` in `src/adapter.rs` mirror these two numbers, are
+// asserted equal to them by the `mla_shader_bounds_match_host` test (which parses THIS file), and
+// the `Op::Mla` arm fails loudly with the offending dims before dispatching.
+#define MLA_MAX_KEY_LEN 576
+#define MLA_MAX_KV_LORA_RANK 512
+shared float sq[MLA_MAX_KEY_LEN];
+shared float sv[MLA_MAX_KV_LORA_RANK];
+#ifdef MLA_SG
+// The pipeline pins `requiredSubgroupSize = MLA_SG_WIDTH` with REQUIRE_FULL_SUBGROUPS
+// (`Recorder::mla`'s `kernel_sg(.., MLA_SG_WIDTH)`), so a 128-lane workgroup is exactly
+// `MLA_NSG` FULL subgroups — not a hope, a pipeline-creation guarantee, and the backend
+// refuses the device outright when 32 is not a pinnable subgroup size (`lib.rs`). The
+// `mla_sg_width_matches_host` test reads this define back out of this file and compares it to
+// the width the host pins, the same way `mla_shader_bounds_match_host` does for the two
+// capacities above.
+#define MLA_SG_WIDTH 32
+#define MLA_NSG (128 / MLA_SG_WIDTH)
+// How many stride-128 columns of one key row a single lane can own — the score loop's unroll
+// width. A HARD bound, not a tuning number: the same bound `MLA_MAX_KEY_LEN` already states,
+// divided by the workgroup width. glslc fails the build rather than let the unroll silently drop
+// a column.
+#define MLA_SG_SLOTS 5
+#if (MLA_MAX_KEY_LEN + 127) / 128 > MLA_SG_SLOTS
+#error "MLA_MAX_KEY_LEN needs more stride-128 slots per lane than the key loop unrolls"
+#endif
+// The same, for the narrower V half the accumulation walks.
+#define MLA_SG_VSLOTS 4
+#if (MLA_MAX_KV_LORA_RANK + 127) / 128 > MLA_SG_VSLOTS
+#error "MLA_MAX_KV_LORA_RANK needs more stride-128 slots per lane than the V loop unrolls"
+#endif
+// Keys scored per barrier. One key per barrier leaves the whole workgroup stalled on a
+// shared-memory round trip for every ~8 useful FMAs a lane does, and at decode (16 workgroups on
+// a 96-CU part) there is no other wave to hide it with. Scoring a batch pays that once per
+// `MLA_SG_KB` keys instead, keeps that many independent key rows in flight against memory
+// latency, and — because the batch's V contributions sum in a register first — turns
+// `MLA_SG_KB` read-modify-writes of `sv` into one.
+#define MLA_SG_KB 8
+// Cross-subgroup scratch: one slot per (batch key, subgroup), PING-PONGED on the batch parity.
+// Batch `i` writes half `i & 1`, so the single barrier inside batch `i+1` is what orders batch
+// `i`'s read against batch `i+2`'s write to that same half. One barrier per batch, not two.
+shared float sgred[2 * MLA_SG_KB * MLA_NSG];
+#else
+// Scratch for the tree reduction (one slot per lane).
+shared float red[128];
+#endif
+
+float kread(uint j, uint d) {
+    // K cache is f16: each u32 holds two f16s at even/odd columns. The half's 16 bits must be
+    // CONVERTED to f32 — `uintBitsToFloat` would reinterpret the f16 bit pattern as f32 (denormals
+    // / garbage). `unpackHalf2x16(h).x` reads the low 16 bits of `h` as an f16 and converts.
+    uint idx = j * KEY_LEN + d;
+    uint w = ku[idx >> 1u];
+    uint h = (idx & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16u);
+    return unpackHalf2x16(h).x;
+}
+
+// Threadgroup sum-reduction of `val` (strided lanes → tree), result in lane 0. The final
+// barrier means a caller's subsequent read of the result by lane 0 is ordered.
+// NOTE: the reduction is INLINED at both call sites in `main` — a `barrier()` inside this
+// helper, called from a loop, deadlocked the workgroup on RDNA3 (RADV/ACO). Keep it that way.
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    // Flat workgroup index over the rows × n_head grid — recovers the index when the dispatch
+    // split into a 2-D grid beyond 65535 groups (see `Recorder::dispatch_wide`); a no-op for
+    // 1-D dispatches (gy == 1, gl_NumWorkGroups.x == the true count).
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint tok = wg / pc.n_head;
+    uint h   = wg % pc.n_head;
+    if (tok >= pc.rows) return;
+
+    uint abs_pos = pc.pos + tok;
+    uint q_off = (tok * pc.n_head + h) * pc.q_head_dim;
+
+    // ── Build q_full = [wk_b[h]^T · q_nope | rope(q_pe)] in shared memory ──
+    // Absorption: sq[j] = Σ_i wk_b[h][i][j] * q_nope[i], j in 0..kv_lora_rank — wk_b[h] is the
+    // per-head [qk_nope_dim, kv_lora_rank] matrix as stored in the GGUF, so element [i][j] with
+    // i the FAST (row) dim: flat = i + j*qk_nope_dim within the head slice.
+    // Each lane owns j = tid, tid+128, ... and sums the qk_nope_dim terms serially.
+    for (uint j = tid; j < pc.kv_lora_rank; j += 128u) {
+        uint wk_base = h * pc.kv_lora_rank * pc.qk_nope_dim + j * pc.qk_nope_dim;
+        float s = 0.0;
+        for (uint i = 0u; i < pc.qk_nope_dim; i++) {
+            s += wk_b[wk_base + i] * q[q_off + i];
+        }
+        sq[j] = s;
+    }
+    // Rope q_pe into sq[kv_lora_rank ..]: pair p owned by lane p, p+128, ... (qk_rope_dim ≤ 64,
+    // so at most ceil(64/128) = 1 pair per lane); each lane computes sin/cos for its pair.
+    uint hf = pc.qk_rope_dim >> 1u;
+    for (uint p = tid; p < hf; p += 128u) {
+        uint i0 = 2u * p;
+        uint i1 = i0 + 1u;
+        float ang = float(abs_pos) * pow(pc.theta, -2.0 * float(p) / float(pc.qk_rope_dim));
+#ifdef FREQ_FACTORS
+        ang /= ff[p];
+#endif
+        float s = sin(ang);
+        float c = cos(ang);
+        float a = q[q_off + pc.qk_nope_dim + i0];
+        float b = q[q_off + pc.qk_nope_dim + i1];
+        sq[pc.kv_lora_rank + i0] = a * c - b * s;
+        sq[pc.kv_lora_rank + i1] = a * s + b * c;
+    }
+    barrier();
+
+    // ── Mask range ──
+    uint lo, hi;
+    if (pc.mask_type == 0u) {
+        // Causal
+        lo = 0u;
+        hi = min(abs_pos + 1u, pc.kv_len);
+        if (pc.window > 0u && abs_pos + 1u > pc.window) {
+            lo = abs_pos + 1u - pc.window;
+        }
+    } else if (pc.mask_type == 1u) {
+        // Sliding window
+        lo = (abs_pos + 1u > pc.window) ? (abs_pos + 1u - pc.window) : 0u;
+        hi = abs_pos + 1u;
+    } else {
+        // Canvas: one fixed span [canvas_lo, kv_len) for EVERY row — `abs_pos` is not consulted.
+        // The clamp is not cosmetic: `n_keys = hi - lo` is unsigned, so a `canvas_lo` past `kv_len`
+        // would wrap to ~4e9 and the score loop would read gigabytes past the cache. Clamping to
+        // `kv_len` makes that an empty span (the zero-output path below) instead.
+        lo = min(pc.canvas_lo, pc.kv_len);
+        hi = pc.kv_len;
+    }
+    hi = min(hi, pc.kv_len);
+    uint n_keys = hi - lo;
+    uint d_off = (tok * pc.n_head + h) * pc.v_head_dim;
+    if (n_keys == 0u) {
+        // No keys to attend to: zero output.
+        for (uint d = tid; d < pc.v_head_dim; d += 128u) {
+            dst[d_off + d] = 0.0;
+        }
+        return;
+    }
+
+    uint cap = (pc.cache_cap_rows > 0u) ? pc.cache_cap_rows : pc.kv_len;
+
+#ifdef MLA_SG
+    // ── One pass: score, online softmax, V accumulation. ──
+    // The scalar build below walks the key range TWICE — once to find the row max, once to
+    // exponentiate — so every key's `sq · K[j]` dot is computed twice. Here the running max `m`
+    // and running denominator `l` are carried forward instead, and `sv` is rescaled by
+    // `exp(m_old - m_new)` on the batches that raise the max. Same value, one pass.
+    for (uint di = tid; di < pc.kv_lora_rank; di += 128u) { sv[di] = 0.0; }
+    float m = -3.0e38;
+    float l = 0.0;
+    barrier();
+    uint batch = 0u;
+    for (uint jj = 0u; jj < n_keys; jj += MLA_SG_KB) {
+        // Each lane's stride-128 slice of each of the batch's key rows: di = tid, tid+128, …
+        // The slices partition [0, KEY_LEN) exactly for any KEY_LEN, and a slot past the end
+        // contributes 0.0, the identity for the sum. Both loop bounds are compile-time constants,
+        // so this unrolls and the whole batch's fetches are independent — `MLA_SG_KB` key rows in
+        // flight against memory latency instead of one.
+        uint half_ = (batch & 1u) * (MLA_SG_KB * MLA_NSG);
+        for (uint b = 0u; b < MLA_SG_KB; b++) {
+            float part = 0.0;
+            uint jr = (lo + min(jj + b, n_keys - 1u)) % cap;
+            bool live = jj + b < n_keys;
+            for (uint s = 0u; s < MLA_SG_SLOTS; s++) {
+                uint d = tid + s * 128u;
+                if (live && d < KEY_LEN) {
+                    part += sq[d] * kread(jr, d);
+                }
+            }
+            // Every lane of a subgroup gets the subgroup's whole sum; the leader publishes it.
+            // The enclosing control flow is workgroup-uniform (`tok`, `h`, and therefore `n_keys`
+            // and `live`, all are), so the subgroup is fully converged here — the requirement
+            // `subgroupAdd` carries.
+            float ssum = subgroupAdd(part);
+            if (subgroupElect()) {
+                sgred[half_ + b * MLA_NSG + gl_SubgroupID] = ssum;
+            }
+        }
+        barrier();
+
+        // Scores for the batch, then one online-softmax step over all of them. `sc`, `m`, `l` and
+        // `alpha` are IDENTICAL in every lane — each is derived from `sgred`, which every lane
+        // reads in the same order — so none of them needs the shared-memory broadcast the scalar
+        // build does for `lmax`/`sumw`.
+        float sc[MLA_SG_KB];
+        float m_new = m;
+        for (uint b = 0u; b < MLA_SG_KB; b++) {
+            float dot = 0.0;
+            for (uint s = 0u; s < MLA_NSG; s++) { dot += sgred[half_ + b * MLA_NSG + s]; }
+            sc[b] = ADD_KEY_BIAS(dot * pc.scale, tok, lo + min(jj + b, n_keys - 1u));
+            if (jj + b < n_keys) {
+                m_new = max(m_new, sc[b]);
+            }
+        }
+        // The rescale for what is already accumulated. 1.0 — exactly, not `exp(0)` — whenever the
+        // running max did not move, which is the overwhelmingly common case past the first keys.
+        float alpha = (m_new > m) ? exp(m - m_new) : 1.0;
+        float psum = 0.0;
+        float pb[MLA_SG_KB];
+        for (uint b = 0u; b < MLA_SG_KB; b++) {
+            // A key past the end weighs 0. Spelled as a guard, not left to `exp(sc - m_new)`: on
+            // a row whose every live score is -inf (a fully masked deepseek32 row) `m_new` is
+            // still the -3e38 sentinel, and `exp(-3e38 - -3e38)` is 1, not 0.
+            pb[b] = (jj + b < n_keys) ? exp(sc[b] - m_new) : 0.0;
+            psum += pb[b];
+        }
+        l = l * alpha + psum;
+        m = m_new;
+        // One read-modify-write of `sv` for the whole batch: the batch's contributions sum in a
+        // register first.
+        //
+        // V is the LEADING `kv_lora_rank` columns of the same K rows, so this re-reads columns the
+        // score loop above already fetched. Holding them instead was measured and is NOT a win:
+        // same 96 VGPRs and no scratch either way (RADV `shaderstats`), +12% pp2048 and +17%
+        // tg64@d2048, but −18% pp512, i.e. a regression against the kernel it replaces on the
+        // short-prompt row. `docs/backlog.md` B-DSHW-MLA-SCALAR-TIER carries the table and the
+        // unexplained part.
+        for (uint s = 0u; s < MLA_SG_VSLOTS; s++) {
+            uint d = tid + s * 128u;
+            if (d < pc.kv_lora_rank) {
+                float acc = 0.0;
+                for (uint b = 0u; b < MLA_SG_KB; b++) {
+                    if (jj + b < n_keys) {
+                        acc += pb[b] * kread((lo + jj + b) % cap, d);
+                    }
+                }
+                sv[d] = sv[d] * alpha + acc;
+            }
+        }
+        batch++;
+    }
+    // `sv` is written and read by ONE lane each (strided ownership), so the only shared hazard in
+    // the loop was `sgred` — already ordered by the ping-pong. This barrier is the one that
+    // publishes `sv` to the wv_b projection below, whose lanes read slices they do not own.
+    barrier();
+    // Matches the scalar build's floor: an all-masked row (every score -inf) leaves l == 0 and a
+    // zero `sv`, and 1/1e-20 keeps the output at zero instead of producing a NaN.
+    float inv_sum = 1.0 / max(l, 1e-20);
+#else
+    // ── Pass 1: scores, find max. Each lane sums its slice of the key_len dot, the workgroup
+    // reduces it, and lane 0 tracks lmax (broadcast via the loop's trailing barrier). ──
+    // The reduction is INLINED (not a helper call) — a `barrier()` inside a function called from
+    // a loop deadlocked on RDNA3 (RADV/ACO); the same tree pattern in `argmax.comp` works in main.
+    float lmax = -3.0e38;
+    for (uint jj = 0u; jj < n_keys; jj++) {
+        uint jr = (lo + jj) % cap;
+        // Lane's slice of Σ_di sq[di] * K[jr][di]: di = tid, tid+128, ... The stride-128 slices
+        // partition [0, KEY_LEN) exactly, and each lane ACCUMULATES its whole slice into its own
+        // red[] slot, so the loop is correct for any KEY_LEN — the trip count per lane is just
+        // ceil(KEY_LEN/128) (5 at KEY_LEN=576), and a lane whose slice is empty leaves red[tid]=0,
+        // the identity for the sum tree below.
+        red[tid] = 0.0;
+        for (uint di = tid; di < KEY_LEN; di += 128u) {
+            red[tid] += sq[di] * kread(jr, di);
+        }
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                red[tid] += red[tid + stride];
+            }
+            barrier();
+        }
+        float d = ADD_KEY_BIAS(red[0] * pc.scale, tok, lo + jj);
+        if (tid == 0u) {
+            lmax = max(lmax, d);
+        }
+        barrier();
+    }
+    // lmax is only valid in thread 0's register; broadcast it to every lane via shared memory
+    // (threads 1..127 would otherwise compute `exp(x - (-3e38)) = +inf` in pass 2).
+    if (tid == 0u) {
+        red[0] = lmax;
+    }
+    barrier();
+    lmax = red[0];
+    barrier();
+
+    // ── Pass 2: softmax + V accumulation. ──
+    if (tid == 0u) {
+        for (uint di = 0u; di < pc.kv_lora_rank; di++) { sv[di] = 0.0; }
+    }
+    barrier();
+    float sumw = 0.0;
+    for (uint jj = 0u; jj < n_keys; jj++) {
+        uint jr = (lo + jj) % cap;
+        red[tid] = 0.0;
+        for (uint di = tid; di < KEY_LEN; di += 128u) {
+            red[tid] += sq[di] * kread(jr, di);
+        }
+        barrier();
+        for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                red[tid] += red[tid + stride];
+            }
+            barrier();
+        }
+        float p = exp(ADD_KEY_BIAS(red[0] * pc.scale, tok, lo + jj) - lmax);
+        // Each lane accumulates its slice of the kv_lora_rank-wide V.
+        for (uint di = tid; di < pc.kv_lora_rank; di += 128u) {
+            sv[di] += p * kread(jr, di);
+        }
+        if (tid == 0u) {
+            sumw += p;
+        }
+        barrier();
+    }
+    // sumw is accumulated in thread 0's register only; broadcast it via shared memory so every
+    // lane uses the true denominator (threads 1..127 would otherwise divide by ~1e-20 → 1e20).
+    if (tid == 0u) {
+        red[0] = sumw;
+    }
+    barrier();
+    float inv_sum = 1.0 / max(red[0], 1e-20);
+#endif
+
+    // ── wv_b[h] applied to V_accum → output. Each lane writes its slice of v_head_dim. ──
+    // wv_b[h] is the per-head [kv_lora_rank, v_head_dim] matrix as stored in the GGUF — element
+    // [i][d] with i the FAST (row) dim: flat = i + d*kv_lora_rank within the head slice.
+    uint wv_off = h * pc.kv_lora_rank * pc.v_head_dim;
+    for (uint d = tid; d < pc.v_head_dim; d += 128u) {
+        float s = 0.0;
+        for (uint i = 0u; i < pc.kv_lora_rank; i++) {
+            s += sv[i] * inv_sum * wv_b[wv_off + i + d * pc.kv_lora_rank];
+        }
+        dst[d_off + d] = s;
+    }
+}

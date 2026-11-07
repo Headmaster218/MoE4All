@@ -1,0 +1,59 @@
+#version 460
+// Causal depthwise 1-D conv + SiLU, BATCH pass 1 of 2 (qwen35/Qwen3.5 SSM input conv, rows ≥ kconv-1).
+// The sequential kernel carries the per-channel history token by token (rows serial steps + a
+// global history shuffle per token). But the conv is depthwise with a fixed kernel: every output
+// depends only on the VIRTUAL sequence [state ‖ qkv] — so all rows·cc outputs are independent:
+//   virtual[i][ch] = i < K-1 ? state[i][ch] : qkv[i-(K-1)][ch]
+//   out[t][ch]     = silu( Σ_k virtual[t+k][ch] · w[ch][k] )
+// One thread per output element. State is NOT touched here — conv1d_shift (pass 2) rebuilds it
+// from the last K-1 qkv rows after this pass has consumed the old state.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA (STREAMED is the only weight build): the conv weight is read through a 64-bit
+// buffer_reference into the resident arena (base = arena_lo/arena_hi) instead of a bound SSBO —
+// see linear_f32.comp's header for the campaign rationale. No bound weight SSBO exists.
+layout(push_constant) uniform PC {
+    uint rows; uint cc; uint kconv; uint arena_lo; uint arena_hi;
+} pc;
+
+layout(binding = 0) readonly buffer XB { float qkv[]; };    // [rows, cc]
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { float v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 2) readonly buffer SB { float cstate[]; }; // [(kconv-1)*cc], pre-call history
+layout(binding = 3) writeonly buffer OB { float outp[]; };  // [rows, cc]
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.rows * pc.cc) {
+        return;
+    }
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    uint t = idx / pc.cc;
+    uint ch = idx % pc.cc;
+    uint km1 = pc.kconv - 1u;
+    float acc = 0.0;
+    if (t >= km1) {
+        // bulk: the whole window lies in qkv — no per-tap select (a ternary here compiles to
+        // OpSelect, which issues BOTH loads incl. a far-out-of-bounds cstate read every tap).
+        uint b = (t - km1) * pc.cc + ch;
+        for (uint k = 0u; k < pc.kconv; k++) {
+            acc += qkv[b + k * pc.cc] * WV(ch * pc.kconv + k);
+        }
+    } else {
+        // first kconv-1 rows: window straddles [state ‖ qkv]
+        for (uint k = 0u; k < pc.kconv; k++) {
+            uint i = t + k; // virtual index
+            float x;
+            if (i < km1) {
+                x = cstate[i * pc.cc + ch];
+            } else {
+                x = qkv[(i - km1) * pc.cc + ch];
+            }
+            acc += x * WV(ch * pc.kconv + k);
+        }
+    }
+    outp[idx] = acc / (1.0 + exp(-acc)); // SiLU
+}

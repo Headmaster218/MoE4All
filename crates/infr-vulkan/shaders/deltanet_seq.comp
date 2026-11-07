@@ -1,0 +1,141 @@
+#version 460
+// Sequential gated-DeltaNet, pass 3/3 (SCAN): the token-serial recurrence, with the state column
+// held entirely in REGISTERS.
+//
+//   per token:  S ← decay·S;  kv = k̂ᵀS;  Δ = (v − kv)·β;  S ← S + k̂⊗Δ;  o = q̂ᵀS
+//
+// WHY THIS REPLACES THE CHUNKED SCAN (deltanet_scan.comp) FOR PREFILL
+// The chunked delta rule looks like it should win — it does ⌈rows/32⌉ state sweeps instead of
+// `rows`. But it does NOT actually save arithmetic: counted out at qwen35/Ornith dims (rows=512,
+// nv=nk=16, kd=vd=128) the chunked scan's R/O/state-update loops total ~420M FMA per layer and this
+// recurrence totals ~402M — the same work, because the chunk form trades the serial state sweeps
+// for the intra-chunk triangular solve and the D/Dq contractions. All the chunk form buys is a
+// shorter dependency chain, and it pays for that with an execution shape that is much worse on
+// RDNA3:
+//   • state in LDS, hammered by every loop, with runtime trip counts (kd, c) that block unrolling;
+//   • ~6 workgroup barriers × 16 chunks syncing 8 waves apiece;
+//   • only nv·(vd/COLS) = 256 workgroups — ~2.7 per CU on a 96-CU part, so there is nothing to hide
+//     latency with. (Measured: the microbench reports ~500µs/op when 10 dispatches overlap but the
+//     model measures ~1060µs/op when layer dependencies serialize them — the tell for an
+//     occupancy-starved kernel.)
+// Result: the chunked scan sustained ~0.76 TFLOP/s. This kernel keeps the state in registers, has
+// ZERO barriers (a workgroup is a single subgroup, so the reductions are subgroupAdd and the lanes
+// are implicitly in lockstep), and launches nv·(vd/NCOL) workgroups. Measured on Ornith-35B pp512:
+// the DeltaNet mixer went 33.0ms → 8.7ms per 512 tokens (scan 31.7 → 8.3, prep 1.3 → 0.5).
+//
+// LAYOUT: one 32-lane workgroup owns NCOL adjacent state columns of one value head; each column's
+// kd entries are split across the lanes, RPL = kd/32 of them per lane, live in registers for the
+// whole scan. The kd-dim contractions (k̂ᵀS, q̂ᵀS) become one subgroupAdd per column. Requires
+// requiredSubgroupSize=32, kd == 128 (RPL=4, so the register arrays are compile-time sized and
+// fully unrollable) and NCOL | vd; the caller falls back to the chunked path otherwise. k̂/q̂ arrive
+// pre-normalized from deltanet_norm and β/decay pre-computed from deltanet_gates_seq, so the inner
+// loop is pure FMA + reductions — no transcendentals, no LDS, no barriers.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define RPL 4u // kd/32, kd == 128
+#ifndef NCOL
+#define NCOL 2u // state columns per subgroup — swept, see below
+#endif
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nv;
+    uint nk;
+    uint kd; // == 128
+    uint vd;
+} pc;
+
+layout(binding = 0) readonly buffer KN { float kng[]; };  // [rows, nk*kd] k̂
+layout(binding = 1) readonly buffer QN { float qng[]; };  // [rows, nk*kd] q̂ ×1/√kd
+layout(binding = 2) readonly buffer VB { float v[]; };    // [rows, nv*vd]
+layout(binding = 3) readonly buffer BG { float bet[]; };  // [rows, nv] β
+layout(binding = 4) readonly buffer DG { float dec[]; };  // [rows, nv] per-token decay
+layout(binding = 5) buffer SB { float state[]; };         // [nv*kd*vd] in/out
+layout(binding = 6) writeonly buffer OB { float outp[]; };// [rows, nv*vd]
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint nblk = pc.vd / NCOL;
+    uint h = gl_WorkGroupID.x / nblk;             // value head
+    uint d0 = (gl_WorkGroupID.x % nblk) * NCOL;   // first of this subgroup's NCOL columns
+    uint khid = h % pc.nk;                        // GQA: nk q/k heads tile up to nv value heads
+    uint kd = pc.kd;
+    uint sbase = h * kd * pc.vd;
+
+    // S[:, d0..d0+NCOL) into registers: lane owns rows {r*32 + lane} of each column. Strided by vd
+    // across lanes (not coalesced), but this is one load + one store for the ENTIRE scan —
+    // nv·vd·kd·2·4B = 2 MiB per layer, negligible — whereas the chunked kernel re-touched its LDS
+    // copy every chunk.
+    float s[NCOL][RPL];
+    [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[c][r] = state[sbase + (r * 32u + lane) * pc.vd + d0 + c];
+        }
+    }
+
+    for (uint tk = 0u; tk < pc.rows; tk++) {
+        uint nbase = tk * pc.nk * kd + khid * kd;
+        // Lane-contiguous → coalesced. Every column-workgroup of a head re-reads the same k̂/q̂ row
+        // (cache-resident: ~1.07 GiB/layer of L2 traffic at NCOL=1). Blocking NCOL columns into one
+        // subgroup divides that traffic by NCOL and makes the NCOL reductions below mutually
+        // independent, so they pipeline instead of each sitting alone on the dependency chain — but
+        // it also cuts the wave count by NCOL, and this kernel is latency-bound, so the two effects
+        // fight. Hence NCOL is a swept tradeoff, not a "more is better" knob; see DN_SEQ_NCOL.
+        float kr[RPL], qr[RPL];
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            uint i = r * 32u + lane;
+            kr[r] = kng[nbase + i];
+            qr[r] = qng[nbase + i];
+        }
+
+        uint ga = tk * pc.nv + h;
+        float decay = dec[ga];
+        float beta = bet[ga];
+        uint ob = tk * pc.nv * pc.vd + h * pc.vd + d0;
+
+        // kv = k̂ᵀ(decay·S), fused with the decay applied in place.
+        float kvp[NCOL];
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            float acc = 0.0;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                s[c][r] *= decay;
+                acc += kr[r] * s[c][r];
+            }
+            kvp[c] = acc;
+        }
+        float dl[NCOL];
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            dl[c] = (v[ob + c] - subgroupAdd(kvp[c])) * beta;
+        }
+
+        // S += k̂⊗Δ, fused with o = q̂ᵀS on the UPDATED state.
+        float op[NCOL];
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            float acc = 0.0;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                s[c][r] += kr[r] * dl[c];
+                acc += qr[r] * s[c][r];
+            }
+            op[c] = acc;
+        }
+        // subgroupAdd broadcasts the total to every lane; lane c retires column c so the NCOL
+        // stores coalesce (columns are contiguous in `outp`). Indices stay compile-time constant —
+        // a lane-indexed register array would spill to scratch.
+        [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+            float o = subgroupAdd(op[c]);
+            if (lane == c) {
+                outp[ob + c] = o;
+            }
+        }
+    }
+
+    [[unroll]] for (uint c = 0u; c < NCOL; c++) {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            state[sbase + (r * 32u + lane) * pc.vd + d0 + c] = s[c][r];
+        }
+    }
+}

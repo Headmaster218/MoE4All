@@ -1,0 +1,149 @@
+#version 460
+// DeepSeek V3.2 lightning indexer (`Op::LightningIndexer`) — the top-k KEY SELECTOR that decides
+// which keys that layer's MLA attention may see. One workgroup per query row; the 256 lanes split
+// the KEY axis (not the head axis: a key's score needs every head summed, so heads stay serial
+// inside a lane, which is also what keeps the sum in `ggml_sum_rows`' ascending-h order).
+//
+//   score[t, j] = Sum_h (w[t, h] * scale) * relu( q[t, h] . k[j] )     for j <= pos + t
+//   dst[t, :]   = the top_k key positions by (score DESC, index ASC)
+//
+// The ReLU is INSIDE the head-weighted sum and `scale` multiplies the WEIGHT, never the score —
+// llama.cpp `deepseek32.cpp`'s non-fused branch (ggml_relu -> ggml_mul -> ggml_sum_rows, with a
+// ggml_scale on indexer_weights). See `Op::LightningIndexer`'s doc for the rest of the contract:
+// ONE key head shared by every query head (MQA), q arrives already assembled and roped, and the
+// Hadamard rotation is deliberately not ported.
+//
+// Two phases, one dispatch:
+//   1. every lane scores its strided slice of the keys into the `sc` SCRATCH buffer (one f32 per
+//      (row, key) — the same `[n_kv, n_tokens]` score tensor llama.cpp materializes);
+//   2. `top_k` selection rounds, each a workgroup argmax over that row's scores.
+//
+// Selection never mutates the scratch, so phase 2 needs no buffer-visibility barrier of its own:
+// the order below is TOTAL (the index breaks every tie), so "already picked" is exactly "ranks at
+// or above the previous winner", and each round takes the maximum strictly below it.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint head_dim;
+    uint top_k;
+    float scale;           // 1/sqrt(head_dim * n_head) — applied to the WEIGHT
+    uint pos;              // absolute position of the first query row
+} pc;
+
+// q: [rows, n_head, head_dim] — f32, already roped
+layout(binding = 0) readonly buffer QB { float q[]; };
+// K cache: [cap_rows, head_dim] — f16, ONE row per token (MQA). Key j is row j: causal masking
+// makes position 0 eligible for every query, so a cache that had wrapped would already have lost
+// it — the host rejects `cap_rows < kv_len` rather than fold an index here.
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+// w: [rows, n_head] — f32, UNSCALED (this kernel applies pc.scale)
+layout(binding = 2) readonly buffer WB { float w[]; };
+// scores scratch: [rows, kv_len] — f32, written in phase 1 and read in phase 2
+layout(binding = 3) buffer SB { float sc[]; };
+// dst: [rows, top_k] — i32 key indices
+layout(binding = 4) writeonly buffer DB { uint dst[]; };
+
+#define NTHREAD 256u
+#define INVALID 0xFFFFFFFFu
+
+shared float sval[NTHREAD];
+shared uint sidx[NTHREAD];
+// The previous round's winner, republished by lane 0 each round (see `main`).
+shared uint prev_idx;
+shared float prev_val;
+
+float kread(uint j, uint d) {
+    // The f16 cache packs two halves per u32. `unpackHalf2x16(h).x` CONVERTS the low 16 bits from
+    // f16 (uintBitsToFloat would reinterpret the pattern as f32) — same read as `mla.comp`.
+    uint idx = j * pc.head_dim + d;
+    uint word = ku[idx >> 1u];
+    uint h = (idx & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+    return unpackHalf2x16(h).x;
+}
+
+// Does candidate `a` rank ABOVE candidate `b`? The op's total order: an eligible key (index below
+// the causal bound `hi`) outranks every ineligible one; two eligible keys go by score descending;
+// everything else — a score tie, and the whole ineligible tail — by ascending index. Strict and
+// total, so no two distinct indices ever compare equal.
+//
+// An empty lane carries `INVALID`, which is not below `hi` and is the largest index, so it loses to
+// every real candidate without a special case. An ineligible key's `sc` slot is never read here.
+bool ranks_above(uint ai, float av, uint bi, float bv, uint hi) {
+    bool ae = ai < hi;
+    bool be = bi < hi;
+    if (ae != be) { return ae; }
+    if (ae && av != bv) { return av > bv; }
+    return ai < bi;
+}
+
+void main() {
+    // Flat workgroup index over `rows` — recovers the index when `dispatch_wide` split the grid in
+    // two dimensions (identical to gl_WorkGroupID.x when it did not).
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= pc.rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+
+    // Causal bound: a key at an absolute position past the query's is not eligible, and only
+    // `kv_len` positions are cached.
+    uint hi = min(pc.pos + row + 1u, pc.kv_len);
+    uint sbase = row * pc.kv_len;
+
+    // ── Phase 1: score every key ──
+    for (uint j = t; j < pc.kv_len; j += NTHREAD) {
+        if (j >= hi) {
+            // Ineligible: `ranks_above` never reads this slot, but it is still initialized —
+            // the scratch is allocated uninitialized and a NaN here would be read back by the
+            // reduction's `av != bv` on a lane that carried it.
+            sc[sbase + j] = 0.0;
+            continue;
+        }
+        float acc = 0.0;
+        for (uint h = 0u; h < pc.n_head; h++) {
+            uint qo = (row * pc.n_head + h) * pc.head_dim;
+            float d = 0.0;
+            for (uint i = 0u; i < pc.head_dim; i++) {
+                d += q[qo + i] * kread(j, i);
+            }
+            acc += (w[row * pc.n_head + h] * pc.scale) * max(d, 0.0);
+        }
+        sc[sbase + j] = acc;
+    }
+    // Phase 2 reads slots other lanes wrote, so the SSBO stores must be VISIBLE, not merely
+    // retired: `barrier()` alone orders execution and shared memory, not buffer memory.
+    memoryBarrierBuffer();
+    barrier();
+
+    // ── Phase 2: `top_k` selection rounds ──
+    for (uint k = 0u; k < pc.top_k; k++) {
+        uint bi = INVALID;
+        float bv = 0.0;
+        for (uint j = t; j < pc.kv_len; j += NTHREAD) {
+            float s = sc[sbase + j];
+            // Already picked: rounds go in descending rank, so anything at or above the previous
+            // winner is spent.
+            if (k > 0u && !ranks_above(prev_idx, prev_val, j, s, hi)) { continue; }
+            if (bi == INVALID || ranks_above(j, s, bi, bv, hi)) { bi = j; bv = s; }
+        }
+        sval[t] = bv;
+        sidx[t] = bi;
+        barrier();
+        // Tree reduce to lane 0. Inlined rather than factored into a helper: a `barrier()` inside a
+        // function called from a loop deadlocked on RDNA3 (RADV/ACO) — see `mla.comp`'s note.
+        for (uint stride = NTHREAD / 2u; stride > 0u; stride >>= 1u) {
+            if (t < stride && ranks_above(sidx[t + stride], sval[t + stride], sidx[t], sval[t], hi)) {
+                sval[t] = sval[t + stride];
+                sidx[t] = sidx[t + stride];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            dst[row * pc.top_k + k] = sidx[0];
+            prev_idx = sidx[0];
+            prev_val = sval[0];
+        }
+        barrier(); // publish this round's winner before the next round's filter reads it
+    }
+}

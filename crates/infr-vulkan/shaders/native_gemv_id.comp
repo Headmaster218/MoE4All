@@ -1,0 +1,122 @@
+#version 460
+// Id-indexed native-block GEMV: y = x · W[ids[slot]]ᵀ, where the weight is expert `ids[slot]` in a
+// stacked role tensor (element base = ids[slot] * stride). Same cooperative-over-K dequant as
+// native_gemv (shared native_decode.glsl, -DFMT_* selects the format) but the expert is chosen from
+// a GPU buffer — lets the GPU-resident decode run router→top-k→experts in one submit, no readback.
+// Reduction: subgroupAdd within each wave + one shared combine across the gl_NumSubgroups waves,
+// one barrier total, wave-size-agnostic (no pinned subgroup size) — same pattern as rmsnorm.comp /
+// mul_mat_vec_q.comp; see native_gemv_mrow.comp for why the m=1 native_gemv keeps its tree.
+//
+// -DPAGED: the pager build (`infr_vulkan::pager::GpuPager`) — `W` is a fixed-slot arena, not one
+// contiguous per-expert-id tensor, so the expert base needs one more hop through a small device LUT
+// (`slot = lut[expert_id]`, host-updated between dispatches — see the pager module doc). Adds one
+// buffer binding + one L1-cache-hot uint read; the non-PAGED build is BYTE-IDENTICAL to before this
+// existed (zero cost when paging is off — this #ifdef is the "new shader variant" the resident-bank
+// fast path keeps, not a runtime branch).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// -DPAGED extends the push constant with the arena's 64-bit base address (split lo/hi to dodge the
+// 8-byte alignment a uint64_t member would force) + the per-slot byte stride — see
+// native_weight_addr.glsl. `slot` still selects the id; `stride` is repurposed as the LUT window base.
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint slot; uint stride;
+    uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#elif defined(STREAMED)
+// -DSTREAMED (resident-BDA): the stacked role tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi. No LUT — the expert base is `ids[slot]` scaled by `stride`,
+// REPURPOSED in this build as the per-expert BYTE stride and applied on the 64-bit pointer, so a
+// bank past 2^32 elements can no longer wrap the old u32 element-space multiply. The within-expert
+// offset stays a u32 element index. Additive: non-STREAMED builds are byte-identical.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint slot; uint stride;
+    uint arena_lo; uint arena_hi;
+} pc;
+#else
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint slot; uint stride; } pc;
+#endif
+// PAGED/STREAMED read the arena by device address (native_weight_addr.glsl), not through binding 0 —
+// the descriptor slot is left for a harmless filler on the Rust side, so binding numbers below are
+// unchanged between builds.
+#if !defined(PAGED) && !defined(STREAMED)
+layout(binding = 0) readonly buffer WB { uint nw[]; };
+#endif
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+layout(binding = 2) readonly buffer IDB { uint ids[]; };
+// `y_buf` (the sole write) is always the LAST binding in either build. `Recorder::dispatch3`'s
+// hazard tracking treats the tail `n_out` buffers of its binding array as writes and everything
+// before as reads (one contiguous split) — the original PAGED layout bound `y_buf` at 3 and `lut`
+// at 4, so the split (`n_out=1`) marked `lut` (a read) as the write and `y_buf` (the real write) as
+// a read, silently skipping the barrier a LATER dispatch needs before reading `y_buf`. Binding LUT
+// ahead of Y here (and in the matching Rust buffer array) keeps Y last in both builds instead.
+#ifdef PAGED
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
+layout(binding = 4) buffer YB { float y_buf[]; };
+#else
+layout(binding = 3) buffer YB { float y_buf[]; };
+#endif
+
+shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
+
+#if defined(PAGED) || defined(STREAMED)
+// Arena read via 64-bit device address (see native_weight_addr.glsl): `w_addr` is set once in main
+// to this slot's base, and NW() dereferences it. PAGED: the LUT stores the SLOT INDEX; the byte
+// address is computed with a 64-bit multiply, so no arena size overflows it (the u32 element-space
+// multiply this replaces was the Scout slot-≥-102 coherent-but-wrong bug). STREAMED: no LUT, the
+// same 64-bit multiply on `ids[...]` directly.
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#endif
+
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+#ifdef PAGED
+    // Slot base BYTE address from the LUT slot index (see native_weight_addr.glsl); wbase keeps only
+    // the small within-expert element offset. `pc.stride` is repurposed in this build as the LUT
+    // WINDOW base and `ids` holds layer-LOCAL expert ids — same contract as
+    // native_gemv_id_multi.comp's PAGED build (see its comment for the tape-window rationale).
+    w_addr = arena_base(lut[pc.stride + ids[pc.slot]].x, lut[pc.stride + ids[pc.slot]].y);
+    uint wbase = o * pc.in_f;
+#elif defined(STREAMED)
+    // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE
+    // stride in this build. wbase keeps only the small within-expert element offset.
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[pc.slot]) * uint64_t(pc.stride);
+    uint wbase = o * pc.in_f;
+#else
+    uint wbase = ids[pc.slot] * pc.stride + o * pc.in_f;
+#endif
+    uint xbase = r * pc.in_f;
+    uint nsub = pc.in_f / 32u;
+    float acc = 0.0;
+    for (uint s = t; s < nsub; s += 64u) {
+        acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+    }
+    float sg = subgroupAdd(acc);
+    if (subgroupElect()) { part[gl_SubgroupID] = sg; }
+    barrier();
+    if (t == 0u) {
+        float tot = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
+        y_buf[unit] = tot;
+    }
+}

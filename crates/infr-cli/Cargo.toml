@@ -1,0 +1,44 @@
+[package]
+name = "infr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+tts = ["dep:infr-tts", "infr-server/tts"]
+
+[[bin]]
+name = "infr"
+path = "src/main.rs"
+
+[dependencies]
+infr-core.workspace = true
+infr-prof-rt.workspace = true
+infr-vulkan.workspace = true
+infr-hub.workspace = true
+infr-engine.workspace = true
+infr-embedding.workspace = true
+infr-vision.workspace = true
+infr-server.workspace = true
+infr-audio = { path = "../infr-audio" }
+infr-tts = { path = "../infr-tts", optional = true }
+infr-llama = { path = "../infr-llama" }
+clap.workspace = true
+clap_complete.workspace = true
+clap_complete_nushell.workspace = true
+clap_mangen.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+regex.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+libc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

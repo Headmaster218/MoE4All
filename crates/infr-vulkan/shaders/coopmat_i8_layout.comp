@@ -1,0 +1,56 @@
+#version 460
+// KNOWN-ANSWER PROBE for the int8 cooperative-matrix accumulator fragment layout that
+// `native_gemm_i8cm_q8_0.comp` reads its `csub[i]` elements with.
+//
+// That kernel applies its per-block rank-1 descale IN-FRAGMENT: it reads accumulator element
+// `csub[i]` as matrix element (row, col) = (2*i + (lane>>4), lane&15). `KHR_cooperative_matrix`
+// fixes that component-index<->element mapping per (type, use, rows, cols, scope) for ONE
+// implementation — NOT across implementations — so the mapping is a property of the driver, not of
+// the spec. This shader is what turns that assumption into a check: it multiplies two KNOWN int8
+// matrices with the same coopmat types/shape/scope the kernel uses, then writes each element back
+// through the kernel's ASSUMED mapping. The host (see `caps::check_i8_coopmat_layout`) compares the
+// written matrix against the known product; a driver that lays the fragment out differently
+// scatters the values and the comparison fails, so the tier is refused instead of returning
+// plausible wrong numbers.
+//
+// A = [16,16] row-major (a[r*16+k]), B = [16,16] column-major (b[c*16+k]) — the same load layouts
+// the kernel uses for its As/Bs staging. The host picks A and B so every element of the product is
+// distinct and non-zero (`caps::layout_probe_inputs`), which is what makes a scrambled write
+// detectable against a zero-initialised output buffer.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer ABuf { int8_t a[]; };    // [16,16] row-major:    A[r][k] = a[r*16+k]
+layout(binding = 1) readonly buffer BBuf { int8_t b[]; };    // [16,16] column-major: B[k][c] = b[c*16+k]
+// outv[0] = elements per lane (csub.length()), outv[1] = gl_SubgroupSize,
+// outv[2 + r*16 + c] = the accumulator element the ASSUMED mapping places at (r,c).
+layout(binding = 2) writeonly buffer OutBuf { int outv[]; };
+
+void main() {
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+    coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> csub =
+        coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopMatLoad(af, a, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(bf, b, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+    csub = coopMatMulAdd(af, bf, csub);
+
+    uint lane = gl_SubgroupInvocationID;
+    uint len = csub.length();
+    if (lane == 0u) {
+        outv[0] = int(len);
+        outv[1] = int(gl_SubgroupSize);
+    }
+    // The assumed mapping, spelled exactly as native_gemm_i8cm_q8_0.comp spells it.
+    for (uint i = 0u; i < len; i++) {
+        uint r = 2u * i + (lane >> 4u);
+        uint c = lane & 15u;
+        if (r < 16u) {
+            outv[2u + r * 16u + c] = csub[i];
+        }
+    }
+}

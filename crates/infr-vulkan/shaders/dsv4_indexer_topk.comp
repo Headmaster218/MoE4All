@@ -1,0 +1,49 @@
+#version 460
+// Exact top-k over the V4 indexer score vector. The total order is score descending, then index
+// ascending, matching the existing lightning indexer and making ties deterministic.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint kv_len; uint top_k; } pc;
+layout(binding = 0) readonly buffer SB { float scores[]; };
+layout(binding = 1) writeonly buffer DB { uint dst[]; };
+
+#define INVALID 0xffffffffu
+shared float sval[256];
+shared uint sidx[256];
+shared float prev_val;
+shared uint prev_idx;
+
+bool above(uint ai, float av, uint bi, float bv) {
+    if (ai == INVALID) { return false; }
+    if (bi == INVALID) { return true; }
+    return av != bv ? av > bv : ai < bi;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    for (uint rank = 0u; rank < pc.top_k; ++rank) {
+        uint bi = INVALID;
+        float bv = 0.0;
+        for (uint j = t; j < pc.kv_len; j += 256u) {
+            float s = scores[j];
+            if (rank > 0u && !above(prev_idx, prev_val, j, s)) { continue; }
+            if (above(j, s, bi, bv)) { bi = j; bv = s; }
+        }
+        sidx[t] = bi;
+        sval[t] = bv;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (t < stride && above(sidx[t + stride], sval[t + stride], sidx[t], sval[t])) {
+                sidx[t] = sidx[t + stride];
+                sval[t] = sval[t + stride];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            dst[rank] = sidx[0];
+            prev_idx = sidx[0];
+            prev_val = sval[0];
+        }
+        barrier();
+    }
+}

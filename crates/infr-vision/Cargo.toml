@@ -1,0 +1,22 @@
+[package]
+name = "infr-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-core.workspace = true
+infr-gguf.workspace = true
+infr-vulkan.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+image.workspace = true
+base64.workspace = true
+bytemuck.workspace = true
+sha2.workspace = true
+libloading = "0.8"
+
+[dev-dependencies]
+half.workspace = true
+rayon.workspace = true

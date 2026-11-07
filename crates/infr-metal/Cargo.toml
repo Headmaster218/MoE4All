@@ -1,0 +1,30 @@
+[package]
+name = "infr-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-core.workspace = true
+indicatif.workspace = true
+infr-gguf.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+
+# Apple-only: `metal`/`objc` link the Objective-C runtime and don't build off macOS. The crate is
+# `#![cfg(target_os = "macos")]`, so on other targets it compiles to an empty lib with no deps.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal.workspace = true
+objc.workspace = true
+
+# objc's `sel_impl!` (inside `msg_send!`) expands a `cfg(feature = "cargo-clippy")` check the
+# crate doesn't declare; register it so `-D warnings` builds don't reject `unexpected_cfgs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[dev-dependencies]
+infr-cpu.workspace = true
+# The shared backend decode-parity harness (`tests/shared_decode_parity.rs`).
+infr-testkit.workspace = true

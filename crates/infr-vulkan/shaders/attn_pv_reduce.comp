@@ -1,0 +1,18 @@
+#version 460
+// Sum the split-K partial outputs of attn_pv: O[i] = Σ_split part[split*total + i], i ∈ [0,total),
+// total = m*nh*hd. One thread per output element. P was 0 on masked keys, so summing all splits
+// (covering the full padded kv) reconstructs the exact O — no max/correction (this is a plain sum,
+// not the racy online-softmax merge of the deleted flash split-K).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint total; uint n_splits; } pc;
+layout(binding = 0) readonly buffer PB { float part[]; };
+layout(binding = 1) writeonly buffer OB { float o[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) return;
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.n_splits; s++) acc += part[s * pc.total + i];
+    o[i] = acc;
+}

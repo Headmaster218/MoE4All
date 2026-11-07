@@ -1,0 +1,12904 @@
+//! Vulkan backend (`ash` + SPIR-V). The MVP `Backend` impl.
+//!
+//! Reference: `~/Projects/llama.cpp/ggml/src/ggml-vulkan/` and its `vulkan-shaders/*.comp`
+//! (reuse the tuned quant matmul / dequant / attention shaders). Enable device features
+//! `VK_KHR_cooperative_matrix`, `shaderFloat16`, `VK_KHR_16bit_storage`,
+//! `VK_KHR_shader_subgroup_extended_types`. See docs/plan.md.
+#![allow(dead_code)]
+// GPU kernel record/dispatch APIs bind many distinct buffers (weights, scales, activations,
+// scratch) — wide signatures are inherent here, not a refactor smell.
+#![allow(clippy::too_many_arguments)]
+
+mod adapter;
+mod arena;
+pub mod benchmark_report;
+mod caps;
+mod cpu_miss;
+pub mod ep;
+mod gemm;
+#[cfg(test)]
+mod host_ready_combined_test_support;
+#[cfg(test)]
+pub(crate) mod indirect_copy;
+pub mod linear;
+mod matmul;
+mod narrow_projection;
+mod ops;
+pub mod p2p;
+pub mod pager;
+mod pcache;
+pub mod pipeline;
+mod recorder;
+mod timeline;
+pub mod tp;
+pub mod tp_allreduce;
+pub mod tp_sem;
+mod transfer;
+pub mod unified;
+mod vkext;
+mod weight_layout;
+
+pub use ep::{EpBuffer, ExpertParallelBackend};
+pub use p2p::{P2pExport, P2pHandleType};
+pub use pipeline::{PipelineBackend, PipelineBuffer};
+pub use recorder::{FlashStage, RecordedCmd, Recorder};
+pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
+pub use tp_allreduce::{AllReduce, AllReduceMode};
+pub use tp_sem::{TpExportSemaphore, TpImportSemaphore};
+
+/// Maximum routed-token rows represented by one GPU-resident MoE journal entry.
+/// Ordinary parallel Decode and packed MTP verification share this protocol limit.
+pub const GPU_RESIDENT_MAX_ROWS: usize = recorder::RESIDENT_JOURNAL_MASK_WORDS;
+
+/// Shared-memory bytes consumed per query row of a flash-attention prefill tile
+/// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
+/// `rows * FLASH_SHARED_PER_ROW <= maxComputeSharedMemorySize`; `use_flash` needs the smallest
+/// tile (`BM=32`) to fit. Keep in sync with `attn_flash{,_warp,_partial}.comp`.
+pub const FLASH_SHARED_PER_ROW: u32 = 908;
+/// Shared-memory bytes used by the dedicated hd256 BM=16 FlashAttention tile. Unlike the hd128
+/// family this is a fixed complete-tile size: `Ss` (4096) + `Ps` (2048) + `Os` (16384) + three
+/// 16-row f32 softmax arrays (192) + the final-tile f16 staging slab (8192) = 30,912 bytes. Keep
+/// in sync with `attn_flash_warp_hd256.comp`.
+pub const FLASH_HD256_BM16_SHARED: u32 = 30_912;
+/// Same, for the register-O flash tile (`sfsh` + `Psh` + `pvsh` + state); smallest tile is `BR=64`.
+/// Keep in sync with `attn_flash_reg.comp`.
+pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
+
+/// O07 sums[256] + part[8] + gated_local[2560], all F32.
+pub(crate) const PLE_GATE_NORM_LDS_SHARED: u32 = 11_296;
+
+fn ple_gate_norm_lds_device_ok(
+    windows: bool,
+    arch: caps::DeviceArch,
+    caps: &infr_core::backend::Capabilities,
+) -> bool {
+    windows
+        && arch == caps::DeviceArch::AmdRdna3
+        && !caps.integrated
+        && caps.subgroup_min > 0
+        && caps.subgroup_min <= 32
+        && caps.subgroup_max >= 32
+        && caps.max_shared_memory_bytes >= PLE_GATE_NORM_LDS_SHARED
+}
+
+use rayon::prelude::*;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::ffi::CStr;
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
+
+mod host_ready;
+use std::time::{Duration, Instant};
+
+use ash::vk;
+use gpu_allocator::vulkan::{
+    Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
+};
+use gpu_allocator::MemoryLocation;
+
+use infr_core::{
+    backend::{
+        Bindings, Buffer, BufferUsage, Capabilities, ExecutionStage, IdleResourceReclaimer, Plan,
+        SegmentedKvSpec, WeightAllocationBatch,
+    },
+    budget::{spill_report_line, SpillNouns, SpillTally},
+    config::Config,
+    error::Result,
+    graph::Graph,
+    hostpager::AlignedHostBuffer,
+    Backend,
+};
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Terse local shorthand for the shared [`infr_core::error::backend`] constructor.
+use infr_core::error::backend as be;
+
+thread_local! {
+    /// Address of the unified execution gate held exclusively by this thread. Vulkan graph
+    /// lowering allocates scratch lazily, so those nested allocations must reuse the outer gate
+    /// instead of trying to acquire the same non-reentrant `RwLock` again.
+    static UNIFIED_EXEC_OWNER: Cell<usize> = const { Cell::new(0) };
+}
+
+struct UnifiedExecScope {
+    previous: usize,
+}
+
+impl UnifiedExecScope {
+    fn enter(owner: usize) -> Self {
+        let previous = UNIFIED_EXEC_OWNER.with(|current| current.replace(owner));
+        Self { previous }
+    }
+}
+
+impl Drop for UnifiedExecScope {
+    fn drop(&mut self) {
+        UNIFIED_EXEC_OWNER.with(|current| current.set(self.previous));
+    }
+}
+
+/// Resolve an `INFR_DEV` value to a Vulkan physical-device index (`None` = "use the discrete
+/// default"). `INFR_DEV` is the SINGLE device-selection env, sharing the CLI's `--dev` grammar, so
+/// it can hold a non-Vulkan spec:
+///   * `None` / empty / whitespace → `None` (discrete default),
+///   * `metal` / `cpu` (case-insensitive) → `None` — TOLERATED, not an error: a process only
+///     reaches the Vulkan constructor when it actually built a Vulkan backend (e.g. a non-macOS
+///     build), so a leftover non-Vulkan spec must not hard-fail device selection,
+///   * anything else is treated as a Vulkan index (`VulkanN`, `vulkanN`, or a bare `N`): parsed,
+///     and range-checked against `device_names.len()`. An unparseable or out-of-range value is a
+///     HARD ERROR — silently running on a different GPU than asked produces plausible-but-wrong
+///     numbers, so a typo must fail loudly. `device_names` (`"Vulkan0=<name>"`, …) feeds the
+///     "no such device" message.
+fn resolve_infr_dev_index(spec: Option<&str>, device_names: &[String]) -> Result<Option<usize>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let s = spec.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower == "metal" || lower == "cpu" {
+        return Ok(None);
+    }
+    let idx_str = lower.strip_prefix("vulkan").unwrap_or(&lower);
+    let idx: usize = idx_str.parse().map_err(|_| {
+        be(format!(
+            "INFR_DEV/--dev: expected `VulkanN` (e.g. Vulkan0, Vulkan1), got `{spec}`"
+        ))
+    })?;
+    if idx >= device_names.len() {
+        return Err(be(format!(
+            "INFR_DEV/--dev `{spec}`: no such Vulkan device (this system has {}: {})",
+            device_names.len(),
+            device_names.join(", ")
+        )));
+    }
+    Ok(Some(idx))
+}
+
+/// Downcast `&dyn Buffer` → `&VkBuffer`, CHECKED.
+///
+/// This used to be an `unsafe fn` that reinterpreted the trait object's data pointer
+/// (`b as *const dyn Buffer as *const () as *const VkBuffer`) with no type check at all, its
+/// "must only be called with buffers returned by `VulkanBackend::alloc`" contract enforced purely
+/// by convention at ~30 call sites. The `Buffer` trait carries `as_any`, so the check is one
+/// `TypeId` comparison — and there are now several other `Buffer` impls a `&dyn Buffer` can
+/// legitimately be (`TpBuffer`, `EpBuffer`, `PipelineBuffer`, `infr-cpu`'s `CpuBuffer`,
+/// `infr-metal`'s `MetalBuffer`). `infr multi` hosts several backends in ONE process and the MTP
+/// draft path can mix them, so a mis-routed buffer is no longer a hypothetical: unchecked, it reads
+/// a foreign struct's first fields as a `vk::Buffer` handle plus offsets and hands them to the
+/// driver — undiagnosable memory corruption or a device loss, arbitrarily far from the routing bug.
+/// Checked, it is an ordinary backend error naming the operation.
+///
+/// Hot path: this runs per dispatch, so the success path must stay a `TypeId` compare and nothing
+/// else — the message is built in the failure branch only (`ok_or_else`), never formatted eagerly.
+/// `&dyn Buffer` exposes no type name, so the error reports what it CAN see (the logical extent and
+/// whether the buffer carries a device address) plus the impls it plausibly was.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn as_vk_buf(b: &dyn Buffer) -> Result<&VkBuffer> {
+    b.as_any().downcast_ref::<VkBuffer>().ok_or_else(|| {
+        be(format!(
+            "vulkan: buffer was not allocated by this VulkanBackend ({} bytes, device_addr={}) — \
+             it is some other `Buffer` impl (a TpBuffer/EpBuffer/PipelineBuffer wrapper, or another \
+             backend's buffer entirely). Unwrap it to the underlying VkBuffer before handing it to \
+             a Vulkan op.",
+            b.len_bytes(),
+            if b.device_addr().is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+        ))
+    })
+}
+
+/// Bounds-check ONE side of a device transfer: `bytes` must fit inside a buffer's LOGICAL extent
+/// ([`VkBuffer::size`] — what the caller asked for, and what [`Buffer::len_bytes`] reports).
+///
+/// `size`, NOT the underlying `vk::Buffer`'s extent, is the right bound. A resident-BDA sub-tensor
+/// (`Backing::BdaSub`) shares one big arena `vk::Buffer` with its neighbours and lives at
+/// `sub_offset` inside it, so the whole-object extent would happily "validate" a transfer that runs
+/// straight over the next sub-tensor. Every transfer path already folds `sub_offset` into its copy
+/// region and then moves exactly `bytes`, so `bytes <= size` is precisely the condition that keeps
+/// the touched range `[sub_offset, sub_offset + bytes)` inside this tensor's own slice of the block.
+///
+/// `op`/`role` only shape the message (`upload`'s wording, which predates this helper, is the
+/// template): "upload: 64 bytes into a 32-byte buffer".
+fn check_extent(op: &str, role: &str, bytes: usize, size: usize) -> Result<()> {
+    if bytes > size {
+        return Err(be(format!(
+            "{op}: {bytes} bytes {role} a {size}-byte buffer"
+        )));
+    }
+    Ok(())
+}
+
+// ── device class (process-global) ─────────────────────────────────────────────
+
+/// The class of the Vulkan device this PROCESS opened — see [`device_class`].
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceClass {
+    /// `deviceType == INTEGRATED_GPU` (see [`Capabilities::integrated`]).
+    pub integrated: bool,
+    /// Compute units, or 0 = unknown (see [`Capabilities::compute_units`]).
+    pub compute_units: u32,
+}
+
+/// Set ONCE by the first [`VulkanBackend::new`] in the process.
+static DEVICE_CLASS: std::sync::OnceLock<DeviceClass> = std::sync::OnceLock::new();
+
+/// The class of the Vulkan device this process opened, or `None` when no Vulkan backend has been
+/// constructed (a CPU/Metal run, or a GPU-less box).
+///
+/// A PROCESS-GLOBAL because its one consumer, the seam's `ubatch_rows`, is itself a process-global
+/// funnel: the prefill loop, the activation reserve, and the SWA ring sizing must all agree on ONE
+/// chunk height, and they are reached from call sites that hold no backend handle. Same shape and
+/// lifetime as the seam's existing `PINNED_UBATCH`. A multi-GPU process mixing an iGPU and a dGPU
+/// would pin whichever opened first; infr opens exactly one device per process today.
+pub fn device_class() -> Option<DeviceClass> {
+    DEVICE_CLASS.get().copied()
+}
+
+/// The SMALLEST `maxStorageBufferRange` any device opened in this process reported — the real
+/// ceiling on one descriptor binding's reach, which used to be assumed at 4 GiB and checked only in
+/// debug builds.
+///
+/// Process-global for the same reason as [`DEVICE_CLASS`]: its consumer is `Recorder::vkb`, the
+/// single choke point every descriptor binding goes through, which is reached from ~360 expression
+/// positions that hold no backend handle. Taking the MINIMUM keeps it conservative if a process
+/// ever opens two devices with different limits (a multi-GPU run) — a bind that fits the smallest
+/// device's limit fits every device's.
+static MAX_STORAGE_BUFFER_RANGE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// See [`MAX_STORAGE_BUFFER_RANGE`]. `u32::MAX` before any device has been opened, i.e. the check
+/// it feeds is inert until a real limit has been reported.
+pub(crate) fn max_storage_buffer_range() -> u32 {
+    MAX_STORAGE_BUFFER_RANGE.load(Ordering::Relaxed)
+}
+
+// ── shared GPU state ──────────────────────────────────────────────────────────
+
+/// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
+/// `live` is true (VK_EXT_memory_budget present, or a test resource profile is accounting for
+/// this backend's allocations), otherwise it equals `total` (best-effort). UMA backend snapshots
+/// additionally cap availability by the shared host-RAM target and live host availability.
+///
+/// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
+/// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR. A UMA
+/// backend with no resolved startup RAM target additionally uses live host availability as a
+/// fallback ceiling; a resolved target is already a frozen total-process budget and must not be
+/// clipped again by transient load-time host pressure.
+#[derive(Clone, Copy, Debug)]
+pub struct VramInfo {
+    pub total: u64,
+    pub available: u64,
+    pub live: bool,
+    /// True when this snapshot counted every heap because the device has unified memory (see
+    /// [`Capabilities::unified_memory`]) — only affects how the guard words its error.
+    pub uma: bool,
+}
+
+impl VramInfo {
+    /// Bytes a new device-local allocation may still take before [`VulkanBackend::check_vram_budget`]
+    /// REFUSES it: this snapshot's free figure minus the guard's own [`GUARD_HEADROOM`].
+    ///
+    /// This is the physical foundation for every sizing decision. Automatic profile headroom and
+    /// explicit budget/reserve knobs are layered over it by `unified_vram_room_for_profile`, so a
+    /// planner and the allocation guard use the same final ceiling. Budgeting against raw
+    /// `available` would plan 256 MiB past even this mandatory guard.
+    ///
+    /// It is a method on the SNAPSHOT rather than on the backend so the seam's placement helpers
+    /// are unit-testable without a GPU (they take a `VramInfo` and derive the ceiling themselves);
+    /// [`VulkanBackend::alloc_room`] is the live-device spelling of the same thing.
+    pub fn alloc_room(&self) -> u64 {
+        self.available.saturating_sub(GUARD_HEADROOM)
+    }
+}
+
+fn backend_physical_alloc_room(vram: VramInfo, tracked_used: u64) -> u64 {
+    if vram.live {
+        vram.alloc_room()
+    } else {
+        // Without VK_EXT_memory_budget the snapshot is the whole heap, not live free memory.
+        // Keep the fallback honest with the backend's own balanced allocation tally.
+        vram.alloc_room().saturating_sub(tracked_used)
+    }
+}
+
+/// One host-RAM ceiling for all owned UMA allocations, regardless of Vulkan heap or location.
+/// The device-local tally remains separate because the spill selector needs that heap alone.
+struct UnifiedRamBudget {
+    limit: Option<u64>,
+    used: AtomicU64,
+}
+
+impl UnifiedRamBudget {
+    fn charge(&self, bytes: u64) {
+        self.used.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn release(&self, bytes: u64) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, mut vram: VramInfo, host_available: Option<u64>) -> VramInfo {
+        let used = self.used.load(Ordering::Relaxed);
+        if !vram.live {
+            vram.available = vram.available.saturating_sub(used);
+        }
+        if let Some(limit) = self.limit {
+            vram.available = vram.available.min(limit.saturating_sub(used));
+        } else if let Some(available) = host_available {
+            // Without a resolved startup target, live host availability is the only host-side
+            // pressure signal. With a target it would double-charge this process's Vulkan
+            // allocations and clean GGUF source pages: both reduce `available`, while the former
+            // are already in `used` and the latter are released as fixed uploads complete. That
+            // transient collapse used to reject an aggressive 35B UMA load with 90 MiB reported
+            // free even though both the Vulkan heap and the frozen process budget had many GiB
+            // left.
+            vram.available = vram.available.min(available);
+        }
+        // Both fallback heaps and the shared target have now had owned bytes subtracted once.
+        vram.live = true;
+        vram
+    }
+}
+
+/// Windows Xe1's mapped-VRAM path slows down before WDDM's reported budget is exhausted. The
+/// A770 sweep in issue #41 measured its best conservative point at 12 GiB of a 15.88 GiB heap and
+/// a stable higher-capacity point at 13.5 GiB. Keep this device policy inside Vulkan, and leave
+/// every explicit user limit and every other architecture on the shared automatic policy.
+fn automatic_device_vram_budget_cap(
+    total: u64,
+    arch: crate::caps::DeviceArch,
+    profile: infr_core::config::AutoProfile,
+    explicit_limit: bool,
+    windows: bool,
+) -> Option<u64> {
+    if explicit_limit || !windows || arch != crate::caps::DeviceArch::IntelXe1 {
+        return None;
+    }
+    let percent = match profile {
+        infr_core::config::AutoProfile::Conservative => 75,
+        infr_core::config::AutoProfile::Aggressive => 85,
+    };
+    Some(total.saturating_mul(percent) / 100)
+}
+
+const AUTO_SUBMIT_INITIAL_CAP: usize = 16;
+fn use_paged_grid_buffer(
+    requested: Option<bool>,
+    measured_device: bool,
+    k: usize,
+    n: usize,
+    rows: usize,
+) -> bool {
+    requested.unwrap_or(measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows))
+}
+
+fn use_decode_down_overlap(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    min_context: u32,
+) -> bool {
+    requested.unwrap_or(measured_device && matches!(rows, 2 | 3) && min_context >= 131072)
+}
+
+fn use_small_decode_policy(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    decode_rows: Option<usize>,
+    mtp_verify: bool,
+) -> bool {
+    requested.unwrap_or(
+        measured_device && !mtp_verify && (1..=3).contains(&rows) && decode_rows == Some(rows),
+    )
+}
+
+fn use_qsa_topk_scan(
+    requested: Option<bool>,
+    measured_device: bool,
+    rows: usize,
+    top: usize,
+    parallel: bool,
+) -> bool {
+    requested.unwrap_or(measured_device && parallel && rows == 1 && top == 512)
+}
+
+const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
+const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
+const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 300_000_000;
+const AGGRESSIVE_SUBMIT_EXPLORE_CAP: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+struct SubmitAutoSettings {
+    profile: infr_core::config::AutoProfile,
+    initial_cap: usize,
+    samples_per_cap: usize,
+    max_rounds: usize,
+    budget_ns: u64,
+    explore_through_cap: usize,
+}
+
+impl SubmitAutoSettings {
+    fn for_profile(profile: infr_core::config::AutoProfile) -> Self {
+        match profile {
+            infr_core::config::AutoProfile::Conservative => Self {
+                profile,
+                initial_cap: AUTO_SUBMIT_INITIAL_CAP,
+                samples_per_cap: AUTO_SUBMIT_SAMPLES_PER_CAP,
+                max_rounds: AUTO_SUBMIT_MAX_ROUNDS,
+                budget_ns: infr_core::SUBMIT_BUDGET_NS,
+                explore_through_cap: AUTO_SUBMIT_INITIAL_CAP,
+            },
+            infr_core::config::AutoProfile::Aggressive => Self {
+                profile,
+                initial_cap: AUTO_SUBMIT_INITIAL_CAP,
+                samples_per_cap: AUTO_SUBMIT_SAMPLES_PER_CAP,
+                max_rounds: AUTO_SUBMIT_MAX_ROUNDS,
+                budget_ns: AGGRESSIVE_SUBMIT_BUDGET_NS,
+                explore_through_cap: AGGRESSIVE_SUBMIT_EXPLORE_CAP,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubmitTimingToken {
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SubmitRoundStats {
+    gpu_ns: u64,
+    dispatches: usize,
+    submits: usize,
+    max_submit_ns: u64,
+}
+
+impl SubmitRoundStats {
+    fn add_submit(&mut self, gpu_ns: u64, dispatches: usize) {
+        self.submits = self.submits.saturating_add(1);
+        if dispatches == 0 {
+            return;
+        }
+        self.gpu_ns = self.gpu_ns.saturating_add(gpu_ns);
+        self.dispatches = self.dispatches.saturating_add(dispatches);
+        self.max_submit_ns = self.max_submit_ns.max(gpu_ns);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.gpu_ns = self.gpu_ns.saturating_add(other.gpu_ns);
+        self.dispatches = self.dispatches.saturating_add(other.dispatches);
+        self.submits = self.submits.saturating_add(other.submits);
+        self.max_submit_ns = self.max_submit_ns.max(other.max_submit_ns);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitTuneStop {
+    NoSplit,
+    Budget,
+    Stable,
+    RoundLimit,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubmitTuneUpdate {
+    cap: usize,
+    stop: Option<SubmitTuneStop>,
+}
+
+/// Finite, monotonic calibration policy for the automatic submit splitter.
+///
+/// Each cap is sampled for two complete forwards. Growth is geometric but bounded by the cap
+/// implied by measured GPU time, so calibration reaches the useful range quickly without ever
+/// jumping from the safe initial value to one noisy estimate. Once the cap no longer causes an
+/// extra split, converges on the GPU-time budget, or consumes the fixed round budget, it freezes.
+struct SubmitAutoPolicy {
+    settings: SubmitAutoSettings,
+    cap: usize,
+    stage: SubmitRoundStats,
+    all: SubmitRoundStats,
+    stage_rounds: usize,
+    stage_splits: usize,
+    total_rounds: usize,
+}
+
+impl SubmitAutoPolicy {
+    fn new(settings: SubmitAutoSettings) -> Self {
+        Self {
+            settings,
+            cap: settings.initial_cap,
+            stage: SubmitRoundStats::default(),
+            all: SubmitRoundStats::default(),
+            stage_rounds: 0,
+            stage_splits: 0,
+            total_rounds: 0,
+        }
+    }
+
+    fn observe_round(
+        &mut self,
+        round: SubmitRoundStats,
+        splitter_splits: usize,
+    ) -> SubmitTuneUpdate {
+        self.stage.merge(round);
+        self.all.merge(round);
+        self.stage_rounds += 1;
+        self.stage_splits = self.stage_splits.saturating_add(splitter_splits);
+        self.total_rounds += 1;
+
+        // A measured command buffer already exceeded the target. Tightening is safe even though
+        // the lower cap has not itself been sampled; unlike growth, it cannot create a longer job.
+        if self.stage.max_submit_ns > self.settings.budget_ns {
+            let scaled = ((self.cap as u128) * (self.settings.budget_ns as u128)
+                / (self.stage.max_submit_ns as u128)) as usize;
+            self.cap = scaled.clamp(self.settings.initial_cap, self.cap);
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::Budget),
+            };
+        }
+
+        if self.stage_rounds < self.settings.samples_per_cap
+            && self.total_rounds < self.settings.max_rounds
+        {
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: None,
+            };
+        }
+
+        // The cap did not create a command-buffer boundary in either sample. A larger number
+        // cannot improve this graph, so retain the finite tested cap as protection for later,
+        // larger graph shapes and stop paying calibration overhead.
+        if self.stage_splits == 0 && self.cap >= self.settings.explore_through_cap {
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::NoSplit),
+            };
+        }
+
+        let measured = infr_core::submit_cap_from_measurement_with_budget(
+            self.stage.gpu_ns,
+            self.stage.dispatches,
+            self.settings.budget_ns,
+        );
+        if measured != 0 && measured <= self.cap {
+            self.cap = measured.max(self.settings.initial_cap);
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::Stable),
+            };
+        }
+        if self.total_rounds >= self.settings.max_rounds {
+            return SubmitTuneUpdate {
+                cap: self.cap,
+                stop: Some(SubmitTuneStop::RoundLimit),
+            };
+        }
+
+        let doubled = self.cap.saturating_mul(2);
+        self.cap = if measured == 0 {
+            doubled
+        } else {
+            doubled.min(measured)
+        };
+        self.stage = SubmitRoundStats::default();
+        self.stage_rounds = 0;
+        self.stage_splits = 0;
+        SubmitTuneUpdate {
+            cap: self.cap,
+            stop: None,
+        }
+    }
+}
+
+struct SubmitAutoTuner {
+    policy: SubmitAutoPolicy,
+    generation: u64,
+    owner: Option<std::thread::ThreadId>,
+    round: SubmitRoundStats,
+}
+
+impl SubmitAutoTuner {
+    fn new(settings: SubmitAutoSettings) -> Self {
+        Self {
+            policy: SubmitAutoPolicy::new(settings),
+            generation: 0,
+            owner: None,
+            round: SubmitRoundStats::default(),
+        }
+    }
+
+    fn begin_round(&mut self) -> Option<SubmitTimingToken> {
+        if self.owner.is_some() {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.owner = Some(std::thread::current().id());
+        self.round = SubmitRoundStats::default();
+        Some(SubmitTimingToken {
+            generation: self.generation,
+        })
+    }
+
+    fn token_for_current_thread(&self) -> Option<SubmitTimingToken> {
+        (self.owner == Some(std::thread::current().id())).then_some(SubmitTimingToken {
+            generation: self.generation,
+        })
+    }
+
+    fn record_submit(&mut self, token: SubmitTimingToken, gpu_ns: u64, dispatches: usize) {
+        if self.owner.is_some() && token.generation == self.generation {
+            self.round.add_submit(gpu_ns, dispatches);
+        }
+    }
+
+    fn finish_round(
+        &mut self,
+        token: SubmitTimingToken,
+        splitter_splits: usize,
+    ) -> Option<SubmitTuneUpdate> {
+        if self.owner.is_none() || token.generation != self.generation {
+            return None;
+        }
+        self.owner = None;
+        Some(
+            self.policy
+                .observe_round(std::mem::take(&mut self.round), splitter_splits),
+        )
+    }
+
+    fn cancel_round(&mut self, token: SubmitTimingToken) {
+        if self.owner.is_some() && token.generation == self.generation {
+            self.owner = None;
+            self.round = SubmitRoundStats::default();
+        }
+    }
+}
+
+pub(crate) struct SubmitTuneRound {
+    shared: Arc<VulkanShared>,
+    token: Option<SubmitTimingToken>,
+    cap: usize,
+}
+
+impl SubmitTuneRound {
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
+    pub(crate) fn finish(mut self, splitter_splits: usize) {
+        if let Some(token) = self.token.take() {
+            self.shared.finish_submit_tune_round(token, splitter_splits);
+        }
+    }
+}
+
+/// Select the cap for one transient/static graph. Automatic token-row paged-MoE decode already
+/// has mandatory pager submission boundaries between expert layers; inheriting a cap calibrated
+/// from a large prefill only subdivides those bounded segments again. Explicit overrides remain
+/// authoritative, and integrated GPUs retain their established TDR-safe platform cap.
+fn static_submit_mode(
+    explicit: bool,
+    integrated: bool,
+    token_row_paged_moe: bool,
+    current_cap: usize,
+) -> (usize, bool) {
+    if token_row_paged_moe && !explicit {
+        (infr_core::initial_submit_dispatch_cap(integrated), false)
+    } else {
+        (current_cap, true)
+    }
+}
+
+impl Drop for SubmitTuneRound {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.shared.cancel_submit_tune_round(token);
+        }
+    }
+}
+
+struct VulkanShared {
+    // NOTE: field declaration order matters for drop.
+    // Rust drops struct fields in *declaration order*.  We keep `allocator`
+    // in a `ManuallyDrop` so we can drop it explicitly before calling
+    // `destroy_device` in the `Drop` impl.
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    exact_silu_quant_order: bool,
+    narrow_f32_device: bool,
+    /// VK_DRIVER_ID_AMD_PROPRIETARY (amdvlk / LLPC) — read once from the probed driver, because the
+    /// shader-compiler defects it has (see `attn_flash_warp_hd256.comp`) are driver properties, not
+    /// device capabilities. `driver_id_reported` guards the default-valued case.
+    amd_proprietary_driver: bool,
+    device: ash::Device,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    /// Optional KHR indirect-copy ABI; availability alone never selects a recorder policy.
+    #[cfg(test)]
+    indirect_copy: Option<crate::indirect_copy::Device>,
+    /// Optional transfer-only queue for imported host-RAM to unified-arena copies. Its absence
+    /// preserves the established main-queue path on devices without the required family or
+    /// timeline support.
+    dedicated_transfer: Option<Mutex<crate::transfer::DedicatedTransferQueue>>,
+    /// Conservative lock-free gate for completed-owner retirement. Publish true BEFORE submit;
+    /// recompute under the same dedicated queue mutex after every submit/retirement mutation.
+    dedicated_transfer_keepalive_pending: AtomicBool,
+    /// Vulkan requires host access to one queue to be externally synchronized. It also turns the
+    /// rare submit-OOM recovery into one atomic drain/retry boundary across the graph and Prefill
+    /// upload threads without changing GPU submission order.
+    queue_access: Arc<Mutex<()>>,
+    /// Keeps affected AMD Windows drivers from evicting idle dedicated VRAM into their system-RAM
+    /// backing store while model weights are loading or a server is between requests.
+    vram_keepalive: Option<VramKeepalive>,
+    /// First unrecoverable queue-submit result, or `SUCCESS` while submissions are usable. Pager
+    /// residency is resolved before its copies are submitted, so allowing a later request after an
+    /// ultimately failed submit could turn those unexecuted copies into false cache hits.
+    queue_submit_failure: AtomicI32,
+    /// Global buffer-lifetime generation for revalidating unsubmitted raw references.
+    resource_epoch: AtomicU64,
+    /// Serialises all one-shot command-buffer submissions.
+    cmd_pool: Mutex<vk::CommandPool>,
+    /// Completed transient recorder command buffers. Acquisition resets one before recording.
+    recorder_cmds: Mutex<Vec<vk::CommandBuffer>>,
+    recorder_prepared_pools: recorder::PreparedPoolCache,
+    /// Completed transient recorder descriptor-pool tranches. They are reset on acquisition.
+    recorder_desc_pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// Completed fences from non-blocking recorder submissions. They are reset on acquisition.
+    recorder_fences: Mutex<Vec<vk::Fence>>,
+    /// Two-timestamp query pools used only during finite submit-cap calibration. Recycled across
+    /// recorder segments; after calibration they remain idle until backend teardown.
+    recorder_submit_query_pools: Mutex<Vec<vk::QueryPool>>,
+    /// Must be dropped before the device is destroyed.
+    allocator: ManuallyDrop<Mutex<Allocator>>,
+    caps: Capabilities,
+    /// Subgroup operations actually available to compute shaders; empty means scalar fallback.
+    compute_subgroup_operations: vk::SubgroupFeatureFlags,
+    /// Architecture bucket retained for narrow Vulkan kernel-policy decisions that must not leak
+    /// vendor-specific flags into infr-core's backend-neutral `Capabilities`.
+    device_arch: crate::caps::DeviceArch,
+    /// Windows NVIDIA drivers can expose the BAR/ReBAR aperture as a second DEVICE_LOCAL heap
+    /// backed by the same framebuffer. Count only the largest local heap for physical VRAM.
+    largest_device_local_heap_only: bool,
+    /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
+    has_mem_budget: bool,
+    /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
+    /// (`VkPhysicalDeviceMaintenance3Properties`, ~4 GiB on RADV). The weight arena
+    /// (`reserve_weights`) splits its up-front reservation into blocks no larger than this, since a
+    /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
+    /// (the Vulkan-guaranteed floor) if the device reports 0.
+    max_mem_alloc_size: u64,
+    /// Alignment and supported physical buffer cap for upfront resident-weight batches.
+    resident_weight_alignment: u64,
+    resident_weight_block_cap: u64,
+    /// `maxPushConstantsSize` — every kernel's push block is checked against THIS rather than
+    /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
+    /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
+    max_push_constants: u32,
+    /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
+    /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
+    /// UNSET when the probe was never run, which is every default run — the tier it guards is
+    /// opt-in (`INFR_I8_COOPMAT=1`), so the probe's init cost is only paid by a caller asking for
+    /// it. Read through [`VulkanBackend::i8_coopmat_ready`], where unset means "not usable".
+    i8cm_layout_ok: OnceLock<bool>,
+    /// `VK_KHR_push_descriptor` loader, when the device supports it — every dispatch's
+    /// descriptor binding then records via `cmd_push_descriptor_set` (recorder.rs
+    /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
+    /// `cmd_bind_descriptor_sets` per op. `None` falls back to the pooled path.
+    push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    conditional_rendering: Option<ash::ext::conditional_rendering::Device>,
+    /// `VK_KHR_external_memory_fd` loader (`vkGetMemoryFdKHR` / `vkGetMemoryFdPropertiesKHR`), when
+    /// the device enabled it. `Some` is the gate for the host-less cross-device P2P transport (a
+    /// buffer's memory exported as an fd on one backend and imported on another — see `p2p.rs`).
+    /// `None` on any device/driver without the extension, in which case no P2P path is offered and
+    /// the default single-device behaviour is unchanged.
+    external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// True when this device enabled `VK_EXT_external_memory_dma_buf`, so the P2P export/import may
+    /// use the dma-buf handle type (the cross-GPU-portable one on Linux) in addition to opaque-fd.
+    has_dma_buf: bool,
+    /// Optional import of ordinary process RAM as a Vulkan transfer buffer. This aliases the host
+    /// pager's one existing allocation; it does not create a GTT mirror or consume the VRAM budget.
+    external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    host_import_alignment: usize,
+    /// A platform safety ceiling for external host-memory aliases. This limits only the DMA view;
+    /// the complete RAM pager store remains available through direct/staged uploads.
+    host_dma_import_limit: Option<usize>,
+    /// The transport plan shared with the pager. Keeping this handle below the pager abstraction
+    /// lets queue-submit recovery shed unused imported-host aliases without taking the pager lock
+    /// or changing logical residency state.
+    session_transfer_plan: RwLock<Option<Weak<crate::transfer::SessionTransferPlan>>>,
+    /// `VK_KHR_external_semaphore_fd` loader — exports/imports a semaphore fd so a tensor-parallel
+    /// all-reduce can order a peer's read after this device's GPU-side signal with no host round-trip
+    /// (`AllReduceMode::P2pSemaphore`). `None` = the all-reduce uses the host fence (`queue_wait_idle`)
+    /// instead. `Some` whenever the device enabled the extension, in which case the semaphore-ordered
+    /// all-reduce path is LIVE (see `external_semaphore_supported`); a device that can't import a
+    /// cross-device semaphore falls back to the host fence.
+    external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
+    /// Generic cache of compute kernels by name (see `ops.rs`).
+    kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
+    /// Device pipeline cache, seeded from disk at init and persisted back (see `pcache.rs`) so
+    /// pipeline creation after the first-ever launch reuses cached driver binaries. Null when
+    /// creation failed (caching is then simply off — Vulkan accepts a null cache everywhere).
+    pipeline_cache: vk::PipelineCache,
+    /// Disk persistence for `pipeline_cache`; `None` = INFR_NO_PIPELINE_CACHE or no cache dir.
+    pcache: Option<crate::pcache::PcachePersist>,
+    /// Active weight-load progress bar (see [`VulkanBackend::weight_progress`]). Every
+    /// `BufferUsage::Weights` allocation advances it, so no model loader can forget to tick it.
+    weight_pb: Mutex<Option<indicatif::ProgressBar>>,
+    /// Cumulative device-local bytes THIS backend has committed (pooled/dedicated allocations +
+    /// weight-arena blocks). The VRAM budget guard's fallback accounting when
+    /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
+    /// (it also sees other processes' VRAM).
+    device_used: AtomicU64,
+    /// Includes UMA overflow and staging/readback, but excludes imported aliases and subranges.
+    unified_ram: Option<UnifiedRamBudget>,
+    /// Concurrently-live [`BufferUsage::Activations`] bytes, and the high-water mark that figure
+    /// has reached since this backend was built ([`VulkanBackend::activation_peak`]).
+    ///
+    /// The seam's activation reserve is a PREDICTION of `act_peak`, and nothing else in the tree
+    /// observes the predicted quantity — so a reserve could be wrong by a factor and only show up
+    /// as a mid-prefill allocation failure on some unrelated model. These two counters are what
+    /// make the prediction checkable: the runner compares them against what it reserved when a
+    /// generation ends. Charged in `make_alloc` (the single funnel every `Activations` allocation
+    /// takes) and released in `VkBuffer::drop` via its `act_bytes`.
+    act_live: AtomicU64,
+    act_peak: AtomicU64,
+    /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
+    /// before submitting it and opening the next (`0` = unlimited, never split).
+    ///
+    /// The GPU hang watchdog is armed per SUBMIT, so a forward pass recorded as one command buffer
+    /// is one indivisible watchdog job. On a 2-CU integrated part that job is ~2.05 s of real GPU
+    /// work and the device kills it at ~2.06 s — a margin so thin it was a coin flip, which is the
+    /// `ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST` this exists to prevent. Splitting the
+    /// SAME work across N command buffers divides the per-job duration by N without removing any
+    /// work: the segments still run back-to-back on the queue (`finish_nowait`, no host sync), the
+    /// watchdog just gets N short jobs to watch instead of one long one.
+    ///
+    /// Automatic mode starts at 16 and samples real GPU command-buffer time for a finite number
+    /// of complete forwards. It grows conservatively, then freezes permanently. An explicit
+    /// `device.submit_dispatches` value bypasses calibration (`0` remains no splitting).
+    submit_dispatch_cap: AtomicUsize,
+    /// Whether `submit_dispatch_cap` came from `device.submit_dispatches`
+    /// (`INFR_SUBMIT_DISPATCHES` / `--set`) rather than the automatic initial default. When true,
+    /// feedback must not re-tune the cap: `0` is an explicit no-split experiment, and `N > 0` is a
+    /// fixed cap experiment.
+    submit_dispatch_cap_explicit: bool,
+    /// Fast gate checked once when a transient recorder is created. False for explicit overrides,
+    /// unsupported timestamp queues, and forever after the finite calibration has stopped.
+    submit_tune_active: AtomicBool,
+    submit_auto_tuner: Mutex<Option<SubmitAutoTuner>>,
+    submit_timestamp_period_ns: f32,
+    submit_timestamp_valid_bits: u32,
+    timeline_clock: Option<crate::timeline::Clock>,
+    timeline_query_pools: Arc<Mutex<Vec<vk::QueryPool>>>,
+    /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
+    /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
+    /// is full. See [`probe_host_visible_non_device_local_type`] for why counting that heap in the
+    /// budget is not enough on its own — the bytes have to be able to land there too.
+    uma_overflow_type: Option<u32>,
+    /// The host-visible memory type on a NON-device-local heap, probed on EVERY device (unlike
+    /// `uma_overflow_type`, which is UMA-only). On a discrete card this heap is system RAM across
+    /// PCIe. `None` if the device exposes no such type. Used ONLY by the opt-in
+    /// `INFR_KV_OVERFLOW` path to place the KV cache in system RAM (read by attention over PCIe
+    /// via its device address — the KV read seam is 100% `bufferDeviceAddress`, so the bytes may
+    /// live off-device with no shader change). See [`Self::alloc_kv_host`].
+    host_overflow_type: Option<u32>,
+    /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
+    /// buffers landed in device-local VRAM vs spilled to system RAM, and their byte totals. Purely
+    /// for the one-shot placement banner (`kv_overflow_report`) so the user sees the resident/spilled
+    /// split; the actual budgeting is `device_used` alone. All 0 when the flag is off. The
+    /// bookkeeping (and the cumulative-cap gate) is the shared [`SpillTally`].
+    kv_spill: SpillTally,
+    /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
+    /// the first staged weight upload of a load and torn down with the weight scope.
+    staging_ring: Mutex<Option<StagingRing>>,
+}
+
+const AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER: u32 = vk::make_api_version(0, 2, 0, 395);
+const AMD_WINDOWS_VRAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+fn needs_amd_windows_vram_keepalive(
+    probe: &crate::caps::DeviceProbe,
+    arch: crate::caps::DeviceArch,
+    driver_version: u32,
+) -> bool {
+    cfg!(target_os = "windows")
+        && probe.driver_id_reported
+        && probe.driver_id == vk::DriverId::AMD_PROPRIETARY
+        && arch == crate::caps::DeviceArch::AmdRdna3
+        && driver_version >= AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER
+}
+
+struct VramKeepalive {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl VramKeepalive {
+    fn start(
+        device: ash::Device,
+        queue: vk::Queue,
+        queue_family_index: u32,
+        queue_access: Arc<Mutex<()>>,
+    ) -> Option<Self> {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("infr-vram-keepalive".into())
+            .spawn(move || {
+                let pool = match unsafe {
+                    device.create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(queue_family_index),
+                        None,
+                    )
+                } {
+                    Ok(pool) => pool,
+                    Err(error) => {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive could not create its command pool: {error}"
+                        );
+                        return;
+                    }
+                };
+                let command = match unsafe {
+                    device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                } {
+                    Ok(commands) => commands[0],
+                    Err(error) => {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive could not allocate its command buffer: {error}"
+                        );
+                        unsafe { device.destroy_command_pool(pool, None) };
+                        return;
+                    }
+                };
+                let fence = match unsafe {
+                    device.create_fence(&vk::FenceCreateInfo::default(), None)
+                } {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive could not create its fence: {error}"
+                        );
+                        unsafe { device.destroy_command_pool(pool, None) };
+                        return;
+                    }
+                };
+                let record_result = unsafe {
+                    device
+                        .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
+                        .and_then(|()| device.end_command_buffer(command))
+                };
+                if let Err(error) = record_result {
+                    tracing::warn!(
+                        "[infr] AMD Windows VRAM keepalive could not record its command buffer: {error}"
+                    );
+                    unsafe {
+                        device.destroy_fence(fence, None);
+                        device.destroy_command_pool(pool, None);
+                    }
+                    return;
+                }
+
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let commands = [command];
+                    let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+                    let submit_result = {
+                        let Ok(_queue) = queue_access.lock() else {
+                            break;
+                        };
+                        unsafe {
+                            device
+                                .reset_fences(&[fence])
+                                .and_then(|()| device.queue_submit(queue, &submits, fence))
+                        }
+                    };
+                    if let Err(error) = submit_result {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive stopped after queue submit failed: {error}"
+                        );
+                        break;
+                    }
+                    if let Err(error) = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }
+                    {
+                        tracing::warn!(
+                            "[infr] AMD Windows VRAM keepalive stopped after fence wait failed: {error}"
+                        );
+                        break;
+                    }
+                    match stop_rx.recv_timeout(AMD_WINDOWS_VRAM_KEEPALIVE_INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
+                    }
+                }
+                unsafe {
+                    device.destroy_fence(fence, None);
+                    device.destroy_command_pool(pool, None);
+                }
+            });
+        match worker {
+            Ok(worker) => Some(Self {
+                stop: Some(stop_tx),
+                worker: Some(worker),
+            }),
+            Err(error) => {
+                tracing::warn!("[infr] AMD Windows VRAM keepalive thread could not start: {error}");
+                None
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for VramKeepalive {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl VulkanShared {
+    fn budget_used(&self) -> u64 {
+        self.unified_ram.as_ref().map_or_else(
+            || self.device_used.load(Ordering::Relaxed),
+            |ram| ram.used.load(Ordering::Relaxed),
+        )
+    }
+
+    fn charge_owned_ram(&self, bytes: u64) {
+        if let Some(ram) = &self.unified_ram {
+            ram.charge(bytes);
+        }
+    }
+
+    fn release_owned_ram(&self, bytes: u64) {
+        if let Some(ram) = &self.unified_ram {
+            ram.release(bytes);
+        }
+    }
+
+    fn dedicated_transfer_families(&self) -> Option<[u32; 2]> {
+        self.dedicated_transfer.as_ref().map(|queue| {
+            let family = queue.lock().unwrap().family_index();
+            [self.queue_family_index, family]
+        })
+    }
+
+    pub(crate) fn submit_dedicated_transfer(
+        &self,
+        queue: vk::Queue,
+        submit: &vk::SubmitInfo<'_>,
+    ) -> Result<()> {
+        if adapter::preparing_commands() {
+            return Err(be("next-token preparation cannot submit GPU transfers"));
+        }
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(be(format!(
+                "dedicated transfer queue is unavailable after an earlier submit failure: {error}"
+            )));
+        }
+        let started = infr_core::pager_profile::active().then(std::time::Instant::now);
+        let mut attempts = 1usize;
+        let mut result = unsafe {
+            self.device
+                .queue_submit(queue, &[*submit], vk::Fence::null())
+        };
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            let Err(error) = result else {
+                break;
+            };
+            if !retryable_queue_submit_error(error) {
+                break;
+            }
+            tracing::warn!(
+                "[infr] dedicated transfer queue_submit hit {error}; draining that queue and retrying after {delay_ms} ms"
+            );
+            if let Err(wait_error) = unsafe { self.device.queue_wait_idle(queue) } {
+                let _ = self.make_queue_unusable(wait_error, "dedicated transfer queue drain");
+                return Err(be(format!(
+                    "dedicated transfer queue drain failed: {wait_error}"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            result = unsafe {
+                self.device
+                    .queue_submit(queue, &[*submit], vk::Fence::null())
+            };
+        }
+        if let Some(t0) = started {
+            let elapsed = t0.elapsed();
+            infr_core::pager_profile::record_queue_submit(0, elapsed);
+            infr_core::pager_profile::record_dedicated_transfer_submit_cpu(elapsed);
+        }
+        match result {
+            Ok(()) => {
+                if attempts > 1 {
+                    tracing::warn!(
+                        "[infr] dedicated transfer queue_submit recovered after {attempts} attempts"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.make_queue_unusable(error, "dedicated transfer queue_submit");
+                Err(be(format!("dedicated transfer queue_submit: {error}")))
+            }
+        }
+    }
+
+    fn submit_transfer_batches(
+        &self,
+        batches: &[crate::transfer::TransferCopyBatch],
+    ) -> Result<Option<u64>> {
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return Ok(None);
+        };
+        let mut retired = std::array::from_fn(|_| Vec::new());
+        let result = {
+            let mut queue = queue.lock().unwrap();
+            // A probe that sees true serializes with this submit. Unwind leaves true (safe),
+            // rather than losing the only retirement notification for accepted GPU work.
+            self.dedicated_transfer_keepalive_pending
+                .store(true, Ordering::Release);
+            let result = queue.submit(self, batches, &mut retired).map(Some);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            result
+        };
+        drop(retired);
+        result
+    }
+
+    fn wait_dedicated_transfer(&self, value: u64) -> Result<()> {
+        let _timeline_wait = infr_core::timeline::span("dma_timeline_wait");
+        if value == 0 {
+            return Ok(());
+        }
+        let timeline = self
+            .dedicated_transfer
+            .as_ref()
+            .ok_or_else(|| be("transfer timeline wait requested without a dedicated queue"))?
+            .lock()
+            .unwrap()
+            .timeline();
+        let semaphores = [timeline];
+        let values = [value];
+        let wait_t0 = infr_core::pager_profile::start();
+        let wait = unsafe {
+            self.device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&semaphores)
+                    .values(&values),
+                u64::MAX,
+            )
+        };
+        if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
+            infr_core::pager_profile::record_dedicated_transfer_timeline_wait(elapsed);
+        }
+        wait.map_err(|error| be(format!("wait dedicated transfer timeline {value}: {error}")))?;
+        self.retire_waited_dedicated_transfer_through(value);
+        Ok(())
+    }
+
+    /// A successful CPU wait proves this prefix without another Vulkan query or queue-idle.
+    fn retire_waited_dedicated_transfer_through(&self, completed: u64) {
+        if completed == 0
+            || !self
+                .dedicated_transfer_keepalive_pending
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.lock() else {
+                return; // No new poisoned-lock/error retirement policy.
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        // The caller still owns Shared while VkBuffer::drop may use its allocator/device.
+        drop(retired);
+    }
+
+    /// A successfully drained compute fence proves ONLY its submitted timeline-wait prefix.
+    /// Pass that submission's captured transfer value, never a current/newest queue value.
+    /// Cleanup is opportunistic: contention leaves owners for a later proof or CPU wait, without
+    /// blocking the foreground on another transfer slot's wait/recording. No Vulkan query needed.
+    pub(crate) fn retire_dedicated_transfer_through(&self, completed: u64) {
+        if completed == 0
+            || !self
+                .dedicated_transfer_keepalive_pending
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.try_lock() else {
+                return;
+            };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        drop(retired);
+    }
+
+    /// Best-effort fallback after an existing queue/device-idle boundary, not per-fence cleanup.
+    /// Main-queue idle alone does not prove all transfer work complete: read the actual timeline.
+    pub(crate) fn retire_completed_dedicated_transfers(&self) {
+        if !self
+            .dedicated_transfer_keepalive_pending
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        let Some(queue) = self.dedicated_transfer.as_ref() else {
+            return;
+        };
+        let retired = {
+            let Ok(mut queue) = queue.try_lock() else {
+                return;
+            };
+            // Another retirement may have won between the atomic load and try_lock.
+            if !queue.has_pending_keepalive() {
+                self.dedicated_transfer_keepalive_pending
+                    .store(false, Ordering::Release);
+                return;
+            }
+            let completed =
+                match unsafe { self.device.get_semaphore_counter_value(queue.timeline()) } {
+                    Ok(value) => value,
+                    Err(_) => return, // Unproven owners stay pinned; D3 error policy is unchanged.
+                };
+            let retired = queue.take_completed_keepalive(completed);
+            self.dedicated_transfer_keepalive_pending
+                .store(queue.has_pending_keepalive(), Ordering::Release);
+            retired
+        };
+        drop(retired);
+    }
+
+    fn queue_submit_commands_recovering(
+        &self,
+        commands: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+        context: &str,
+        transfer_wait: u64,
+    ) -> std::result::Result<(), vk::Result> {
+        self.queue_submit_commands_host_ready_recovering(
+            commands,
+            fence,
+            profile_dispatches,
+            context,
+            transfer_wait,
+            None,
+        )
+    }
+
+    fn queue_submit_commands_host_ready_recovering(
+        &self,
+        commands: &[vk::CommandBuffer],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+        context: &str,
+        transfer_wait: u64,
+        host_ready: Option<(vk::Semaphore, u64)>,
+    ) -> std::result::Result<(), vk::Result> {
+        if transfer_wait == 0 && host_ready.is_none() {
+            let submits = [vk::SubmitInfo::default().command_buffers(commands)];
+            return self.queue_submit_recovering(&submits, fence, profile_dispatches, context);
+        }
+        let mut waits = [vk::Semaphore::null(); 2];
+        let mut values = [0u64; 2];
+        let mut count = 0;
+        if transfer_wait != 0 {
+            let transfer_queue = self
+                .dedicated_transfer
+                .as_ref()
+                .expect("a transfer timeline wait requires the dedicated queue");
+            let transfer_lock_span = infr_core::timeline::span("mainqueue_transfer_lock_wait");
+            let transfer = transfer_queue.lock().unwrap();
+            drop(transfer_lock_span);
+            waits[count] = transfer.timeline();
+            drop(transfer);
+            values[count] = transfer_wait;
+            count += 1;
+        }
+        if let Some((semaphore, value)) = host_ready {
+            waits[count] = semaphore;
+            values[count] = value;
+            count += 1;
+        }
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS; 2];
+        let mut timeline_info =
+            vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&values[..count]);
+        let submits = [vk::SubmitInfo::default()
+            .command_buffers(commands)
+            .wait_semaphores(&waits[..count])
+            .wait_dst_stage_mask(&stages[..count])
+            .push_next(&mut timeline_info)];
+        self.queue_submit_recovering(&submits, fence, profile_dispatches, context)
+    }
+
+    fn queue_submit_failure(&self) -> Option<vk::Result> {
+        let raw = self.queue_submit_failure.load(Ordering::Acquire);
+        (raw != vk::Result::SUCCESS.as_raw()).then(|| vk::Result::from_raw(raw))
+    }
+
+    fn make_queue_unusable(&self, error: vk::Result, context: &str) -> vk::Result {
+        self.queue_submit_failure
+            .compare_exchange(
+                vk::Result::SUCCESS.as_raw(),
+                error.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+        tracing::error!(
+            "[infr] {context} could not be submitted after recovery ({error}); refusing later GPU \
+             submissions because pager residency may describe copies that never executed"
+        );
+        error
+    }
+
+    /// Wait for every in-flight staging copy and tear the ring down. Called when the weight-load
+    /// scope ends, so all weights are fully resident before any forward is recorded — this is the
+    /// synchronization point that replaced the old per-tensor `queue_wait_idle`.
+    fn drain_staging_ring(&self) -> Result<()> {
+        let result = drain_staging_resource(
+            &self.staging_ring,
+            |ring| {
+                let pending: Vec<vk::Fence> = ring
+                    .fences
+                    .iter()
+                    .zip(&ring.busy)
+                    .filter_map(|(&fence, &busy)| busy.then_some(fence))
+                    .collect();
+                let result = if pending.is_empty() {
+                    Ok(())
+                } else {
+                    unsafe { self.device.wait_for_fences(&pending, true, u64::MAX) }
+                };
+                if let Err(error) = result {
+                    // Publish failure while the ring is locked, before another uploader/drainer
+                    // can see it. A later successful cleanup must not revive this queue.
+                    if self.queue_submit_failure().is_none() {
+                        let _ = self.make_queue_unusable(error, "staging-ring fence wait");
+                    }
+                }
+                result
+            },
+            |mut ring| {
+                // This immutable pool handle remains valid even if another pool user panicked.
+                let pool = self.cmd_pool.lock().unwrap_or_else(|p| p.into_inner());
+                unsafe {
+                    self.device.free_command_buffers(*pool, &ring.cmds);
+                    for fence in ring.fences.drain(..) {
+                        self.device.destroy_fence(fence, None);
+                    }
+                }
+                // Both staging buffers and quarantined rollback destinations drop only after
+                // successful completion, or terminal device loss (never a successful upload).
+            },
+        );
+        if let Err(error) = result {
+            if self.queue_submit_failure().is_none() {
+                let _ = self.make_queue_unusable(error, "staging-ring drain");
+            }
+            return Err(be(format!("staging-ring drain: {error}")));
+        }
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(be(format!(
+                "staging-ring drain: queue remains unusable ({error})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn retain_aborted_weight_blocks(&self, mut blocks: Vec<BdaArenaBlock>) {
+        let mut guard = self.staging_ring.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ring) = guard.as_mut() {
+            // A non-terminal wait failure left the ring pending. Preserve its destinations even
+            // if the backend/loader now drops. A later drain can retire these references safely.
+            if ring.retained_weight_blocks.is_empty() {
+                ring.retained_weight_blocks = blocks;
+            } else {
+                ring.retained_weight_blocks.append(&mut blocks);
+            }
+        }
+        // None means another drainer has already completed cleanup (or observed device loss).
+        // In that case these destination references may be released immediately.
+    }
+}
+
+// ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
+// accessed through our Mutexes.
+unsafe impl Send for VulkanShared {}
+unsafe impl Sync for VulkanShared {}
+
+const MEMORY_OOM_RETRY_DELAYS_MS: [u64; 3] = [10, 50, 200];
+const MEMORY_OOM_POST_SHED_DELAYS_MS: [u64; 2] = [100, 250];
+const HOST_DMA_SHED_STEP_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+fn retryable_queue_submit_error(error: vk::Result) -> bool {
+    matches!(
+        error,
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+    )
+}
+
+fn retryable_allocation_error(error: &gpu_allocator::AllocationError) -> bool {
+    matches!(error, gpu_allocator::AllocationError::OutOfMemory)
+}
+
+impl VulkanShared {
+    fn queue_submit_once(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+    ) -> std::result::Result<(), vk::Result> {
+        let started = profile_dispatches
+            .filter(|_| infr_core::pager_profile::active())
+            .map(|_| std::time::Instant::now());
+        let submit_span = infr_core::timeline::span("mainqueue_vk_submit");
+        let result = unsafe { self.device.queue_submit(self.queue, submits, fence) };
+        drop(submit_span);
+        if let (Some(dispatches), Some(t0)) = (profile_dispatches, started) {
+            infr_core::pager_profile::record_queue_submit(dispatches, t0.elapsed());
+        }
+        result
+    }
+
+    fn drain_queue_for_submit_retry(&self) -> std::result::Result<(), vk::Result> {
+        let started = infr_core::pager_profile::active().then(std::time::Instant::now);
+        let result = unsafe { self.device.queue_wait_idle(self.queue) };
+        if let Some(t0) = started {
+            infr_core::pager_profile::record_sync_wait(
+                infr_core::pager_profile::SyncKind::QueueIdle,
+                t0.elapsed(),
+            );
+        }
+        result
+    }
+
+    fn shed_host_dma_imports(&self, target_bytes: usize) -> usize {
+        let plan = self
+            .session_transfer_plan
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        plan.map_or(0, |plan| plan.shed_unused_import_tails(target_bytes))
+    }
+
+    /// Submit one already-ended command buffer batch. OOM leaves Vulkan resources untouched, so
+    /// the exact command can first be retried after draining older work. If WDDM pressure persists,
+    /// retire unused imported-host tails in bounded steps; recorded sources remain alive through
+    /// the command's own keepalive references and future uploads transparently use staging.
+    pub(crate) fn queue_submit_recovering(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+        profile_dispatches: Option<usize>,
+        context: &str,
+    ) -> std::result::Result<(), vk::Result> {
+        if adapter::preparing_commands() {
+            return Err(vk::Result::ERROR_VALIDATION_FAILED_EXT);
+        }
+        let queue_lock_span = infr_core::timeline::span("mainqueue_host_lock_wait");
+        let _queue = self.queue_access.lock().unwrap();
+        drop(queue_lock_span);
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(error);
+        }
+        let mut attempts = 1usize;
+        let mut last = match self.queue_submit_once(submits, fence, profile_dispatches) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_queue_submit_error(error) => error,
+            Err(error) => return Err(self.make_queue_unusable(error, context)),
+        };
+
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            tracing::warn!(
+                "[infr] {context} hit {last}; draining queued work and retrying submit after {delay_ms} ms"
+            );
+            if let Err(error) = self.drain_queue_for_submit_retry() {
+                return Err(self.make_queue_unusable(error, context));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, fence, profile_dispatches) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} queue-submit attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(self.make_queue_unusable(error, context)),
+            }
+        }
+
+        for delay_ms in MEMORY_OOM_POST_SHED_DELAYS_MS {
+            if let Err(error) = self.drain_queue_for_submit_retry() {
+                return Err(self.make_queue_unusable(error, context));
+            }
+            let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+            if released == 0 {
+                tracing::warn!(
+                    "[infr] {context} still cannot submit and no idle Host DMA tail mapping can be released"
+                );
+                break;
+            }
+            tracing::warn!(
+                "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings and will retry after {delay_ms} ms",
+                released as f64 / (1u64 << 30) as f64,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, fence, profile_dispatches) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} queue-submit attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(self.make_queue_unusable(error, context)),
+            }
+        }
+        Err(self.make_queue_unusable(last, context))
+    }
+
+    /// Submit an initialization-only residency probe without poisoning the runtime queue state.
+    /// No pager copy has been promised when the arena-construction probe runs, so an OOM may be
+    /// returned to the placement loop, which drops the empty arena and retries at a smaller size.
+    /// The final session probe may additionally retire every unused Host DMA tail before giving up.
+    fn queue_submit_residency_probe(
+        &self,
+        submits: &[vk::SubmitInfo<'_>],
+        context: &str,
+        shed_host_dma: bool,
+    ) -> std::result::Result<(), vk::Result> {
+        let _queue = self.queue_access.lock().unwrap();
+        if let Some(error) = self.queue_submit_failure() {
+            return Err(error);
+        }
+        let mut attempts = 1usize;
+        let mut last = match self.queue_submit_once(submits, vk::Fence::null(), None) {
+            Ok(()) => return Ok(()),
+            Err(error) if retryable_queue_submit_error(error) => error,
+            Err(error) => return Err(error),
+        };
+
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            self.drain_queue_for_submit_retry()?;
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "[infr] {context} recovered after {attempts} residency-probe attempts"
+                    );
+                    return Ok(());
+                }
+                Err(error) if retryable_queue_submit_error(error) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+
+        if shed_host_dma {
+            loop {
+                self.drain_queue_for_submit_retry()?;
+                let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+                if released == 0 {
+                    break;
+                }
+                tracing::warn!(
+                    "[infr] {context} still cannot submit; released {:.2} GiB of idle Host DMA mappings before retrying the final residency probe",
+                    released as f64 / (1u64 << 30) as f64,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                attempts += 1;
+                match self.queue_submit_once(submits, vk::Fence::null(), None) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "[infr] {context} recovered after {attempts} residency-probe attempts"
+                        );
+                        return Ok(());
+                    }
+                    Err(error) if retryable_queue_submit_error(error) => last = error,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(last)
+    }
+
+    pub(crate) fn queue_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
+        let result = {
+            let _queue = self.queue_access.lock().unwrap();
+            unsafe { self.device.queue_wait_idle(self.queue) }
+        };
+        if result.is_ok() {
+            self.retire_completed_dedicated_transfers();
+        }
+        result
+    }
+
+    fn device_wait_idle_serialized(&self) -> std::result::Result<(), vk::Result> {
+        let result = {
+            let _queue = self.queue_access.lock().unwrap();
+            unsafe { self.device.device_wait_idle() }
+        };
+        if result.is_ok() {
+            self.retire_completed_dedicated_transfers();
+        }
+        result
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl VulkanShared {
+    /// Debounced disk save of the pipeline cache — call after a NEW pipeline lands so long-lived
+    /// processes (serve) persist without waiting for a clean Drop.
+    pub(crate) fn persist_pipeline_cache(&self) {
+        if let Some(pc) = &self.pcache {
+            pc.maybe_save(&self.device, self.pipeline_cache);
+        }
+    }
+
+    fn replay_submit_dispatch_cap(&self) -> usize {
+        if self.submit_dispatch_cap_explicit {
+            self.submit_dispatch_cap.load(Ordering::Relaxed)
+        } else {
+            infr_core::initial_submit_dispatch_cap(self.caps.integrated)
+        }
+    }
+
+    fn begin_submit_tune_round(self: &Arc<Self>, token_row_paged_moe: bool) -> SubmitTuneRound {
+        let (cap, allow_tuning) = static_submit_mode(
+            self.submit_dispatch_cap_explicit,
+            self.caps.integrated,
+            token_row_paged_moe,
+            self.submit_dispatch_cap.load(Ordering::Relaxed),
+        );
+        let token = if allow_tuning && self.submit_tune_active.load(Ordering::Acquire) {
+            self.submit_auto_tuner
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(SubmitAutoTuner::begin_round)
+        } else {
+            None
+        };
+        SubmitTuneRound {
+            shared: Arc::clone(self),
+            token,
+            cap,
+        }
+    }
+
+    fn cancel_submit_tune_round(&self, token: SubmitTimingToken) {
+        if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+            tuner.cancel_round(token);
+        }
+    }
+
+    fn finish_submit_tune_round(&self, token: SubmitTimingToken, splitter_splits: usize) {
+        let result = {
+            let mut guard = self.submit_auto_tuner.lock().unwrap();
+            let Some(tuner) = guard.as_mut() else {
+                return;
+            };
+            tuner
+                .finish_round(token, splitter_splits)
+                .map(|update| (update, tuner.policy.total_rounds, tuner.policy.all))
+        };
+        let Some((update, rounds, all)) = result else {
+            return;
+        };
+        self.submit_dispatch_cap
+            .store(update.cap, Ordering::Relaxed);
+        let Some(stop) = update.stop else {
+            return;
+        };
+        self.submit_tune_active.store(false, Ordering::Release);
+        let reason = match stop {
+            SubmitTuneStop::NoSplit => "the cap no longer creates extra submits",
+            SubmitTuneStop::Budget => "a measured submit reached the GPU-time budget",
+            SubmitTuneStop::Stable => "the measured GPU-time target converged",
+            SubmitTuneStop::RoundLimit => "the calibration round limit was reached",
+        };
+        let avg_dispatch_us = if all.dispatches == 0 {
+            0.0
+        } else {
+            all.gpu_ns as f64 / all.dispatches as f64 / 1e3
+        };
+        tracing::info!(
+            "[infr] submit splitter calibrated: split/{} after {} forward(s), {} timed submit(s), \
+             {:.2} us/dispatch average, {:.2} ms longest submit; {}. The cap is now fixed for \
+             this process.",
+            update.cap,
+            rounds,
+            all.submits,
+            avg_dispatch_us,
+            all.max_submit_ns as f64 / 1e6,
+            reason,
+        );
+    }
+
+    fn submit_timing_token(&self) -> Option<SubmitTimingToken> {
+        if !self.submit_tune_active.load(Ordering::Acquire) {
+            return None;
+        }
+        self.submit_auto_tuner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(SubmitAutoTuner::token_for_current_thread)
+    }
+
+    pub(crate) fn take_submit_timing_query(
+        &self,
+    ) -> Option<(vk::QueryPool, Option<SubmitTimingToken>, bool)> {
+        let token = self.submit_timing_token();
+        let pager_profile = infr_core::pager_profile::active();
+        if token.is_none() && !pager_profile {
+            return None;
+        }
+        let pool = match self.recorder_submit_query_pools.lock().unwrap().pop() {
+            Some(pool) => pool,
+            None => match unsafe {
+                self.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            } {
+                Ok(pool) => pool,
+                Err(e) => {
+                    self.disable_submit_tuning(&format!("could not create timestamp query: {e}"));
+                    return None;
+                }
+            },
+        };
+        Some((pool, token, pager_profile))
+    }
+
+    pub(crate) fn return_submit_timing_query(&self, pool: vk::QueryPool) {
+        if pool != vk::QueryPool::null() {
+            self.recorder_submit_query_pools.lock().unwrap().push(pool);
+        }
+    }
+
+    pub(crate) fn resolve_submit_timing_query(
+        &self,
+        pool: vk::QueryPool,
+        token: Option<SubmitTimingToken>,
+        pager_profile: bool,
+        dispatches: usize,
+    ) {
+        let mut ticks = [0u64; 2];
+        let result = unsafe {
+            self.device.get_query_pool_results(
+                pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        };
+        self.return_submit_timing_query(pool);
+        if let Err(e) = result {
+            if token.is_some() {
+                self.disable_submit_tuning(&format!("could not read timestamp query: {e}"));
+            } else {
+                tracing::warn!("[infr] pager profiler could not read main-queue timestamps: {e}");
+            }
+            return;
+        }
+
+        if pager_profile {
+            infr_core::pager_profile::record_device_interval(
+                infr_core::pager_profile::DeviceIntervalKind::MainQueue,
+                ticks[0],
+                ticks[1],
+                self.submit_timestamp_valid_bits,
+                self.submit_timestamp_period_ns,
+            );
+        }
+
+        let delta = ticks[1].wrapping_sub(ticks[0]);
+        let valid_delta = if self.submit_timestamp_valid_bits >= 64 {
+            delta
+        } else {
+            delta & ((1u64 << self.submit_timestamp_valid_bits) - 1)
+        };
+        let gpu_ns = (valid_delta as f64 * self.submit_timestamp_period_ns as f64) as u64;
+        if let Some(token) = token {
+            if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+                tuner.record_submit(token, gpu_ns, dispatches);
+            }
+        }
+    }
+
+    fn disable_submit_tuning(&self, reason: &str) {
+        if !self.submit_tune_active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let fallback = infr_core::initial_submit_dispatch_cap(self.caps.integrated);
+        self.submit_dispatch_cap.store(fallback, Ordering::Relaxed);
+        if let Some(tuner) = self.submit_auto_tuner.lock().unwrap().as_mut() {
+            tuner.owner = None;
+            tuner.round = SubmitRoundStats::default();
+        }
+        tracing::warn!(
+            "[infr] automatic submit calibration disabled ({reason}); using the conservative \
+             platform fallback {}",
+            if fallback == 0 {
+                "without splitting".to_owned()
+            } else {
+                format!("split/{fallback}")
+            },
+        );
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Drop for VulkanShared {
+    fn drop(&mut self) {
+        if let Some(mut keepalive) = self.vram_keepalive.take() {
+            keepalive.stop();
+        }
+        unsafe {
+            // Also the pipeline cache's TRIPWIRE verdict (see `pcache.rs`): VK_ERROR_DEVICE_LOST is
+            // STICKY — once the device is lost every call returns it — so this one drain doubles as
+            // "did this run hang the GPU?", with no flag to thread through every submit site.
+            let device_lost = matches!(
+                self.device.device_wait_idle(),
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            );
+            self.recorder_prepared_pools.destroy(&self.device);
+            if let Ok(map) = self.kernels.lock() {
+                for k in map.values() {
+                    crate::ops::destroy_compute_kernel(&self.device, k);
+                }
+            }
+            // Persist the pipeline cache (final save — the debounced mid-run saves may have
+            // missed the tail) and destroy it. On a LOST device this discards the file instead of
+            // saving it, and either way it disarms this process's tripwire marker.
+            if let Some(pc) = &self.pcache {
+                pc.finish(&self.device, self.pipeline_cache, device_lost);
+            }
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
+            for pool in self.recorder_desc_pools.lock().unwrap().drain(..) {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            for fence in self.recorder_fences.lock().unwrap().drain(..) {
+                self.device.destroy_fence(fence, None);
+            }
+            for pool in self.recorder_submit_query_pools.lock().unwrap().drain(..) {
+                self.device.destroy_query_pool(pool, None);
+            }
+            if let Some(queue) = self.dedicated_transfer.take() {
+                queue.into_inner().unwrap().destroy(&self.device);
+            }
+            for pool in self.timeline_query_pools.lock().unwrap().drain(..) {
+                self.device.destroy_query_pool(pool, None);
+            }
+            // Destroy command pool.
+            self.recorder_prepared_pools.destroy(&self.device);
+            let pool = self.cmd_pool.lock().unwrap();
+            self.device.destroy_command_pool(*pool, None);
+            // Drop the allocator *before* destroying the device.
+            ManuallyDrop::drop(&mut self.allocator);
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+// ── VkBuffer ──────────────────────────────────────────────────────────────────
+
+/// How a `VkBuffer`'s device memory is owned.
+enum Backing {
+    /// Non-owning snapshot used only by a scoped recording worker. The caller pins the owner.
+    RecordingAlias {
+        mapped: Option<*mut u8>,
+        /// Original arena/shard extent for descriptor range clamping; `None` for whole buffers.
+        backing_len: Option<usize>,
+    },
+    /// A gpu-allocator sub-allocation — freed back to the allocator on drop (transient buffers,
+    /// host-visible staging/readback).
+    Pooled(ManuallyDrop<Allocation>),
+    /// A DEDICATED `VkDeviceMemory` this buffer owns outright, PERSISTENTLY MAPPED — today only the
+    /// UNIFIED-MEMORY overflow spill (`spilled: true`, see
+    /// `probe_host_visible_non_device_local_type`): a GpuOnly buffer placed on the non-device-local
+    /// heap once the synthetic device-local heap is full.
+    /// `upload` memcpys straight through the mapped pointer. Freed (unmapped + `vkFreeMemory`) on
+    /// drop.
+    Vram {
+        memory: vk::DeviceMemory,
+        ptr: *mut u8,
+        /// True when this is a UNIFIED-MEMORY SPILL (see
+        /// `probe_host_visible_non_device_local_type`): the memory came from the non-device-local
+        /// overflow heap, so it is NOT charged to `device_used` (the
+        /// budget guard's device-local tally) — leaving the spill decision to ask "is the
+        /// DEVICE-LOCAL heap full?" without the answer being polluted by the bytes it already
+        /// spilled elsewhere. A `false` (device-local mapped) buffer is charged to `device_used`
+        /// like any other GpuOnly allocation.
+        spilled: bool,
+    },
+    /// A dedicated ordinary DEVICE_LOCAL allocation deliberately chosen from a non-host-visible
+    /// memory type when one exists. This is the portable expert-arena backing on devices whose
+    /// mapped device-local heap is absent or too small (notably RDNA2 on the Windows AMD driver).
+    Device { memory: vk::DeviceMemory },
+    /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (resident weight
+    /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike an owning
+    /// variant, `VkBuffer::buffer` here is NOT this handle's own object: it is the block's buffer,
+    /// shared byte-for-byte with every other sub-tensor carved from the same block, and with the
+    /// block's own keepalive copy. The `Arc` is what keeps the block (and therefore its memory and
+    /// buffer handle) alive for as long as any sub-tensor referencing it is alive; dropping this
+    /// variant frees NOTHING — no `destroy_buffer`, no memory free — that happens exactly once, when
+    /// the last `Arc<BdaBlockHandle>` clone (the arena's own, or the last live sub-tensor's) drops
+    /// and `BdaBlockHandle::buf`'s ordinary `VkBuffer::drop` runs.
+    ///
+    /// Descriptor binds of a sub-tensor (`recorder::Recorder::vkb`) are legal as long as they carry
+    /// this tensor's own `(sub_offset, range)`, never `(0, WHOLE_SIZE)` — the latter describes the
+    /// whole shared block, not the tensor. A big matmul weight is instead read through its 64-bit
+    /// `device_addr()` by a `-DSTREAMED` shader twin, required once the range would exceed
+    /// `maxStorageBufferRange`/4 GiB and preferred for the big matmul families regardless.
+    BdaSub(Arc<BdaBlockHandle>),
+    /// A releasable byte range inside the service-level device arena. The allocation handle
+    /// owns neither a Vulkan buffer nor memory; it keeps the physical shard alive and returns the
+    /// range to the unified allocator when its final reference drops.
+    UnifiedSub(Arc<crate::unified::UnifiedAllocationHandle>),
+    /// A DEDICATED `VkDeviceMemory` allocated with an EXTERNAL handle type (dma-buf / opaque-fd) —
+    /// the cross-device P2P path (see `p2p.rs`). Two flavours share this variant. On the EXPORT
+    /// side (device A) the memory is allocated with `VkExportMemoryAllocateInfo` and its fd handed
+    /// out by `vkGetMemoryFdKHR`; this buffer keeps the underlying pages alive for device B. On the
+    /// IMPORT side (device B) the memory is allocated with `VkImportMemoryFdInfoKHR`, ALIASING
+    /// device A's physical bytes — reads/writes here go straight to A's memory over PCIe, no host
+    /// copy.
+    ///
+    /// Never host-mapped (`mapped_ptr` = `None`, so `upload`/`download` use the staging path).
+    /// Freed with a plain `vkFreeMemory` on drop (no unmap). Deliberately OUTSIDE the VRAM budget
+    /// accounting: this is a gated probe/transport capability, not wired into any model path, and
+    /// the import side aliases memory already owned by the exporting backend.
+    External { memory: vk::DeviceMemory },
+    /// Ordinary process RAM imported through `VK_EXT_external_memory_host`. Vulkan owns only the
+    /// aliasing `VkDeviceMemory`; the `Arc` keeps the original allocation alive until after the
+    /// buffer and import are destroyed.
+    ImportedHost {
+        memory: vk::DeviceMemory,
+        owner: Arc<AlignedHostBuffer>,
+        host_ptr: *mut u8,
+    },
+}
+
+struct VkBuffer {
+    shared: Arc<VulkanShared>,
+    buffer: vk::Buffer,
+    backing: Backing,
+    /// Logical buffer size (what the caller asked for and what `upload`/`fill_buf` touch).
+    size: usize,
+    /// Device-memory bytes actually committed for this buffer (`requirements.size`, i.e. `size`
+    /// rounded up for alignment). Charged to / released from the VRAM budget guard's accounting
+    /// by [`Backing::Vram`], which owns its `VkDeviceMemory` outright.
+    mem_size: u64,
+    location: MemoryLocation,
+    /// Byte offset of this tensor's logical range within `buffer` — `0` for every buffer except a
+    /// resident-BDA weight sub-tensor (`Backing::BdaSub`, see [`BdaWeightArena`]), where several
+    /// `VkBuffer` handles share ONE big `vk::Buffer` (the arena block) and this field is what tells
+    /// them apart. Every upload/download/fill site that touches `buffer` at a byte offset must add
+    /// this in, and [`Buffer::device_addr`] is `block_base_addr + sub_offset`.
+    sub_offset: usize,
+    /// `vkGetBufferDeviceAddress(buffer)` for a buffer that owns ITS OWN `SHADER_DEVICE_ADDRESS`
+    /// buffer object (unlike `Backing::BdaSub`, which shares an arena block's handle and derives
+    /// its address from the block's `base_addr + sub_offset` instead). Populated by `make_buf_ex`/
+    /// `alloc_vram_mapped` whenever they were asked for a device address — today that's the
+    /// resident-BDA/paged-MoE arena blocks themselves (`Backing::Pooled`/`Backing::Vram`) and
+    /// `BufferUsage::KvCache` allocations (see [`Buffer::device_addr`]). `None` for every buffer
+    /// that never requested one.
+    own_addr: Option<u64>,
+    /// This buffer's charge against [`VulkanShared::act_live`] — its logical size when it was
+    /// allocated as [`BufferUsage::Activations`], and `0` for every other usage (weights, KV,
+    /// staging, readback), which the activation high-water mark deliberately does not count.
+    /// Set by `make_alloc`, released by this buffer's `Drop`.
+    act_bytes: u64,
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl VkBuffer {
+    /// Snapshot buffer identity without owning or allocating GPU storage.
+    ///
+    /// # Safety
+    /// The caller must keep the original allocation, buffer identity, and mapping alive and
+    /// unchanged until the scoped recording worker joins and drops all aliases. Pin original
+    /// scratch-pool entries against growth/free. Use the alias only to record descriptors; it
+    /// must never escape the worker or be used for host reads/writes or resource management.
+    /// Recorded commands retain no allocation ownership and require the parent's lifetime and
+    /// resource-epoch validation before submission.
+    pub(crate) unsafe fn recording_alias(&self) -> VkBuffer {
+        let backing_len = match &self.backing {
+            Backing::BdaSub(block) => Some(block.buf.size),
+            Backing::UnifiedSub(handle) => Some(handle.shard_bytes()),
+            Backing::RecordingAlias { backing_len, .. } => *backing_len,
+            _ => None,
+        };
+        VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer: self.buffer,
+            backing: Backing::RecordingAlias {
+                mapped: self.mapped_ptr(),
+                backing_len,
+            },
+            size: self.size,
+            mem_size: 0,
+            location: self.location,
+            sub_offset: self.sub_offset,
+            own_addr: self.device_addr(),
+            act_bytes: 0,
+        }
+    }
+
+    /// Persistently-mapped host pointer for host-visible buffers — pooled host-visible allocations
+    /// AND [`Backing::Vram`] weights (device-local VRAM the host can write through, via ReBAR).
+    /// `None` for plain device-local or arena buffers, which are filled via a staging copy.
+    /// Every "can I just memcpy into this?" decision (`upload`, `fill_buf`) keys off this.
+    fn mapped_ptr(&self) -> Option<*mut u8> {
+        match &self.backing {
+            Backing::RecordingAlias { mapped, .. } => *mapped,
+            Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
+            Backing::Vram { ptr, .. } => Some(*ptr),
+            Backing::Device { .. } => None,
+            // Defensive, not currently reachable: `bda_weight_alloc`'s blocks are plain `GpuOnly`
+            // dedicated allocations (never host-mapped), so `buf.mapped_ptr()` is `None` today. If a
+            // future block ever WERE host-visible, offsetting by `sub_offset` here is what keeps
+            // every "can I just memcpy?" call site (`upload`/`fill_buf`) correct without change.
+            Backing::BdaSub(block) => block
+                .buf
+                .mapped_ptr()
+                .map(|p| unsafe { p.add(self.sub_offset) }),
+            Backing::UnifiedSub(handle) => handle
+                .mapped_ptr()
+                .map(|ptr| unsafe { ptr.add(self.sub_offset) }),
+            // External P2P memory is never host-mapped — reads/writes route through the staging
+            // copy path (device A owns the pages; device B aliases them over PCIe).
+            Backing::External { .. } => None,
+            Backing::ImportedHost { host_ptr, .. } => Some(*host_ptr),
+        }
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Drop for VkBuffer {
+    fn drop(&mut self) {
+        if matches!(&self.backing, Backing::RecordingAlias { .. }) {
+            return;
+        }
+        // Invalidate prepared commands before backing storage or buffer handles can be reused.
+        self.shared.resource_epoch.fetch_add(1, Ordering::AcqRel);
+        // Release this buffer's share of the live-activation tally (see `VulkanShared::act_live`).
+        // `act_peak` is a high-water mark and deliberately never comes back down.
+        if self.act_bytes > 0 {
+            self.shared
+                .act_live
+                .fetch_sub(self.act_bytes, Ordering::Relaxed);
+        }
+        unsafe {
+            match &mut self.backing {
+                Backing::RecordingAlias { .. } => return,
+                Backing::Pooled(alloc) => {
+                    let alloc = ManuallyDrop::take(alloc);
+                    self.shared.release_owned_ram(alloc.size());
+                    // Keep the budget guard's fallback accounting balanced.
+                    if self.location == MemoryLocation::GpuOnly {
+                        self.shared
+                            .device_used
+                            .fetch_sub(alloc.size(), Ordering::Relaxed);
+                    }
+                    self.shared.allocator.lock().unwrap().free(alloc).ok();
+                }
+                // A dedicated VkDeviceMemory we own outright — today only the UMA overflow spill
+                // (`spilled: true`). Only a device-local mapped buffer (`spilled: false`) is charged
+                // to `device_used` at allocation (see `make_buf_ex`) — a UMA spill lives off the
+                // device-local heap and is never counted there — so balance that same charge here.
+                Backing::Vram {
+                    memory, spilled, ..
+                } => {
+                    self.shared.release_owned_ram(self.mem_size);
+                    if !*spilled {
+                        self.shared
+                            .device_used
+                            .fetch_sub(self.mem_size, Ordering::Relaxed);
+                    }
+                    self.shared.device.unmap_memory(*memory);
+                    self.shared.device.free_memory(*memory, None);
+                }
+                Backing::Device { memory } => {
+                    self.shared.release_owned_ram(self.mem_size);
+                    self.shared
+                        .device_used
+                        .fetch_sub(self.mem_size, Ordering::Relaxed);
+                    self.shared.device.free_memory(*memory, None);
+                }
+                // Shares the block's `vk::Buffer` handle byte-for-byte with every other sub-tensor
+                // and the block's own keepalive copy — this handle owns NEITHER the buffer object
+                // NOR its memory, only an `Arc` clone. Dropping the `Arc` (below, implicitly, when
+                // `self.backing` itself drops) is the whole of this handle's cleanup; the actual
+                // `destroy_buffer`/memory-free happens once, inside `BdaBlockHandle::buf`'s own
+                // `VkBuffer::drop`, when the last clone goes away.
+                Backing::BdaSub(_) | Backing::UnifiedSub(_) => {}
+                // A dedicated external-memory allocation (P2P export or import). Never host-mapped,
+                // so no unmap — just free the memory. On the export side this releases device A's
+                // pages once no importer still references the underlying dma-buf/fd (each side owns
+                // an independent `VkDeviceMemory` over the same pages, freed independently).
+                Backing::External { memory } => {
+                    self.shared.device.free_memory(*memory, None);
+                }
+                Backing::ImportedHost { memory, .. } => {
+                    self.shared.device.free_memory(*memory, None);
+                }
+            }
+            // Every OTHER variant owns `self.buffer` outright and must destroy it here. A `BdaSub`
+            // handle's `buffer` is an alias of the block's — destroying it here would destroy the
+            // block out from under every other sub-tensor still referencing it (and double-free when
+            // the block's own `VkBuffer` later drops), so it is the one variant that skips this.
+            if !matches!(self.backing, Backing::BdaSub(_) | Backing::UnifiedSub(_)) {
+                self.shared.device.destroy_buffer(self.buffer, None);
+            }
+        }
+    }
+}
+
+struct ImportedHostShard {
+    offset: usize,
+    len: usize,
+    buffer: Arc<dyn Buffer>,
+}
+
+/// Vulkan aliases over one existing host allocation. A requested byte range may cross a 2-GiB
+/// import shard, so callers iterate the returned pieces rather than assuming one source buffer.
+pub(crate) struct ImportedHostAllocation {
+    base: usize,
+    logical_len: usize,
+    imported_len: usize,
+    shards: Vec<ImportedHostShard>,
+}
+
+pub(crate) struct ImportedHostRange {
+    pub buffer: Arc<dyn Buffer>,
+    pub offset: usize,
+    pub len: usize,
+}
+
+impl ImportedHostAllocation {
+    pub(crate) fn contains(&self, ptr: *const u8, len: usize) -> bool {
+        let Some(offset) = (ptr as usize).checked_sub(self.base) else {
+            return false;
+        };
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.imported_len)
+    }
+
+    pub(crate) fn ranges(&self, ptr: *const u8, len: usize) -> Option<Vec<ImportedHostRange>> {
+        let start = (ptr as usize).checked_sub(self.base)?;
+        let end = start.checked_add(len)?;
+        if end > self.logical_len {
+            return None;
+        }
+        let mut cursor = start;
+        let mut out = Vec::new();
+        while cursor < end {
+            let shard = self
+                .shards
+                .iter()
+                .find(|shard| cursor >= shard.offset && cursor < shard.offset + shard.len)?;
+            let n = (shard.offset + shard.len).min(end) - cursor;
+            out.push(ImportedHostRange {
+                buffer: Arc::clone(&shard.buffer),
+                offset: cursor - shard.offset,
+                len: n,
+            });
+            cursor += n;
+        }
+        Some(out)
+    }
+}
+
+fn proportional_import_index(progress: &[(usize, usize)]) -> Option<usize> {
+    let mut best = None;
+    for (index, &(imported, total)) in progress.iter().enumerate() {
+        if total == 0 || imported >= total {
+            continue;
+        }
+        let Some(previous) = best else {
+            best = Some(index);
+            continue;
+        };
+        let (best_imported, best_total) = progress[previous];
+        let order =
+            (imported as u128 * best_total as u128).cmp(&(best_imported as u128 * total as u128));
+        if order.is_lt() || (order.is_eq() && total > best_total) {
+            best = Some(index);
+        }
+    }
+    best
+}
+
+fn gcd_usize(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+unsafe impl Send for VkBuffer {}
+unsafe impl Sync for VkBuffer {}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Buffer for VkBuffer {
+    fn len_bytes(&self) -> usize {
+        self.size
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn device_addr(&self) -> Option<u64> {
+        if let Some(addr) = self.own_addr {
+            return Some(addr);
+        }
+        match &self.backing {
+            Backing::BdaSub(block) => Some(block.base_addr + self.sub_offset as u64),
+            Backing::UnifiedSub(handle) => Some(handle.base_addr() + self.sub_offset as u64),
+            _ => None,
+        }
+    }
+}
+
+/// A graph-visible full-context KV buffer backed by independently committed physical segments.
+/// The tiny host-visible table stores one device address per live segment; paged KV kernels bind
+/// that table while the ordinary graph continues to carry the original logical tensor extent.
+struct VkSegmentedKvBuffer {
+    shared: Arc<VulkanShared>,
+    spec: SegmentedKvSpec,
+    table: VkBuffer,
+    segments: Mutex<Vec<VkBuffer>>,
+    reservation: Mutex<Option<SegmentedKvReservation>>,
+}
+
+struct SegmentedKvReservation {
+    owner: Arc<crate::unified::UnifiedKvReservation>,
+    start: usize,
+}
+
+impl VkSegmentedKvBuffer {
+    fn committed(&self) -> usize {
+        self.segments.lock().unwrap().len()
+    }
+
+    pub(crate) fn table_buffer(&self) -> &VkBuffer {
+        &self.table
+    }
+
+    pub(crate) fn spec(&self) -> SegmentedKvSpec {
+        self.spec
+    }
+}
+
+impl Buffer for VkSegmentedKvBuffer {
+    fn len_bytes(&self) -> usize {
+        self.spec.logical_bytes
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+pub(crate) fn as_segmented_kv(b: &dyn Buffer) -> Option<&VkSegmentedKvBuffer> {
+    b.as_any().downcast_ref::<VkSegmentedKvBuffer>()
+}
+
+// ── weight arena ────────────────────────────────────────────────────────────────
+
+/// Buffer usage flags for every device buffer (must match across the arena probe and all
+/// allocations so their memory-type bits / alignment agree).
+const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        // Any buffer may serve as vkCmdDispatchIndirect args (the split-K replay prologue writes
+        // the partial pass's workgroup count GPU-side).
+        | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
+);
+
+fn allocation_buffer_usage(device_address: bool) -> vk::BufferUsageFlags {
+    if device_address {
+        BUFFER_USAGE | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+    } else {
+        BUFFER_USAGE
+    }
+}
+
+/// On-demand block size floor for a resident-BDA arena block (see [`BdaWeightArena`]) — big enough
+/// to amortize a dedicated `vkAllocateMemory` across a run of small tensors, small enough not to
+/// waste much on the tail.
+const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
+
+/// Find a host-visible memory type on a non-device-local heap. UMA overflow uses this only after
+/// checking that the device is unified-memory; discrete GPUs also use it explicitly for staging
+/// and opt-in host KV, never as an implicit GpuOnly placement.
+///
+/// This is the other half of the unified-memory fix, and without it widening the budget is not
+/// merely useless but actively harmful. `vram_info` budgets a UMA part against ALL heaps, but
+/// gpu-allocator resolves `MemoryLocation::GpuOnly` to the FIRST DEVICE_LOCAL memory type and
+/// never falls back — so every allocation lands on the device-local heap no matter how full it is.
+/// RADV does not enforce the heap size (a 41 GiB run of 1 GiB allocations succeeded on a
+/// "21.47 GiB" heap), so nothing errors; the kernel simply can no longer validate the buffer list
+/// and the next SUBMIT dies with "Not enough memory for command submission" — a device-lost, i.e.
+/// exactly the silent-degradation failure the guard exists to prevent, just moved later.
+/// MEASURED on RAPHAEL_MENDOCINO with gemma-4-31B: weights + KV + activations cross the
+/// device-local heap's 21.47 GiB and the guard sits there reporting 10.70 GiB "available" (which
+/// is precisely heap 0's size — capacity nothing could reach) while the submit fails.
+///
+/// So the overflow must be PLACED, not just counted. On an APU heap 0 is the same DDR at the same
+/// bandwidth as the synthetic device-local heap — the weights are read out of GTT either way
+/// (`mem_info_gtt_used` accounts for them on both paths) — so spilling there costs no bandwidth.
+/// On a DISCRETE card the same heap means "across PCIe", so callers may use it only for explicit
+/// host placement or transfer staging, never as an automatic GpuOnly overflow.
+fn probe_host_visible_non_device_local_type(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+) -> Option<u32> {
+    let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    (0..mp.memory_type_count).find(|&i| {
+        let t = mp.memory_types[i as usize];
+        let heap = mp.memory_heaps[t.heap_index as usize];
+        t.property_flags.contains(want)
+            && !t
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && !heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    })
+}
+
+/// Opt-in: place the KV cache VRAM-FIRST, spilling to system RAM only what does not fit. Each
+/// per-layer/per-side KV buffer is tried in device-local VRAM (budget-guarded); once the VRAM
+/// budget is reached, that buffer — and, since the budget only shrinks as later buffers land, every
+/// subsequent one — is placed in host RAM and read by attention over PCIe via its device address
+/// (the KV read seam is 100% `bufferDeviceAddress`, so off-device bytes need no shader change). So a
+/// context whose KV overflows VRAM by a modest amount keeps most layers resident and pays PCIe only
+/// on the spilled tail; a context that overflows entirely spills entirely (slice-1 whole-host as the
+/// limiting case). `INFR_KV_OVERFLOW=1` (config `kv.overflow`). Default OFF (empty or `0` = off) =
+/// today's VRAM-only behavior, unchanged. See [`VulkanBackend::alloc_kv_host`],
+/// [`VulkanBackend::vram_budget_fits`], and the ctx-clamp ladder's last rung.
+///
+/// Read off the backend's `Config`, not the process environment; `budget::flag_from`'s grammar
+/// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer.
+fn kv_overflow_enabled(cfg: &infr_core::config::Config) -> bool {
+    cfg.kv.overflow
+}
+
+/// Nouns for this backend's KV placement banner (see [`spill_report_line`], which owns the
+/// skeleton every spill class shares). The spill clause is Vulkan-specific twice over: the host
+/// bytes are ordinary host-visible memory (not page-locked) and attention reaches them
+/// by DEVICE ADDRESS, which is the fact that makes off-device KV work at all here.
+const KV_SPILL: SpillNouns<'static> = SpillNouns {
+    env: "INFR_KV_OVERFLOW",
+    noun: "KV buffers",
+    resident_note: "no PCIe KV reads.",
+    spill_note: "SYSTEM RAM — attention reads those K/V over PCIe by device address (PCIe-bound \
+                 on the spilled layers). Spilled KV bytes are exempt from the VRAM budget guard.",
+};
+
+/// Diagnostic cap (in MiB) on CUMULATIVE KV bytes the VRAM-first spill will place in device-local
+/// VRAM before spilling the rest to host: `INFR_KV_OVERFLOW_VRAM_MB`. Unset ⇒ no cap (spill only
+/// when VRAM is genuinely full). `0` ⇒ nothing resident (whole-host, the slice-1 case). Its ONLY
+/// purpose is to make the partial-spill mix and the whole-host case reproducible on models that
+/// would otherwise fit entirely — for tests and apples-to-apples benchmarking. Gates KV placement
+/// alone, never the real VRAM guard. Ignored when `INFR_KV_OVERFLOW` is off.
+///
+/// Carried on the `Config` in MiB (`kv.overflow_vram_mb`); the byte conversion is this accessor's.
+///
+/// KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so the
+/// reasoning lives here rather than behind a citation). One read site, and a YAGNI sweep flagged it
+/// as measurement scaffolding. It stays for the same reason as `debug.poison_uninit`: it costs
+/// nothing when unset, and it is what makes a partial-spill placement reproducible on hardware
+/// where the model would otherwise fit — i.e. what lets a placement bug be re-created on a machine
+/// that is not the one that hit it. The feature it serves is opt-in either way.
+fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
+    infr_core::budget::mib_bytes(cfg.kv.overflow_vram_mb)
+}
+
+/// Headroom the VRAM budget reserves below the true heap size, shared by the hard guard
+/// ([`VulkanBackend::check_vram_budget`]) and the non-erroring probe
+/// ([`VulkanBackend::vram_budget_fits`]) so VRAM-first KV spill and the guard agree to the byte on
+/// where "full" is. Absorbs allocation slop (alignment, gpu-allocator block rounding) and
+/// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
+const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
+
+/// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
+/// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
+/// a device-local heap another process has filled reads as full here too; otherwise the heap size
+/// minus this process's tracked device-local bytes (`device_used`; UMA-spilled bytes never touch
+/// `device_used`, so they are correctly excluded).
+fn device_local_room(s: &VulkanShared) -> u64 {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+    if s.has_mem_budget {
+        props2 = props2.push_next(&mut budget);
+    }
+    unsafe {
+        s.instance
+            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+    };
+    let mp = props2.memory_properties;
+    let (mut size, mut avail) = (0u64, 0u64);
+    for i in 0..mp.memory_heap_count as usize {
+        if mp.memory_heaps[i]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        {
+            size += mp.memory_heaps[i].size;
+            avail += budget.heap_budget[i]
+                .saturating_sub(budget.heap_usage[i])
+                .min(mp.memory_heaps[i].size);
+        }
+    }
+    if let Some(profile) = infr_core::test_resource::active() {
+        profile
+            .cap_vram(
+                size,
+                if s.has_mem_budget { avail } else { size },
+                s.device_used.load(Ordering::Relaxed),
+            )
+            .1
+    } else if s.has_mem_budget {
+        avail
+    } else {
+        size.saturating_sub(s.device_used.load(Ordering::Relaxed))
+    }
+}
+
+/// Human byte count for the budget guard's error, in the LARGEST unit that keeps a significant
+/// digit. A fixed `{:.2} GiB` printed "0.00 GiB requested" for anything under ~5 MiB — a guard
+/// error that reads as nonsense exactly when it fires on a small allocation (the last straw on a
+/// budget the big tensors already filled).
+fn fmt_bytes(b: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    match b {
+        b if b >= GIB => format!("{:.2} GiB", b as f64 / GIB as f64),
+        b if b >= MIB => format!("{:.1} MiB", b as f64 / MIB as f64),
+        b if b >= KIB => format!("{:.1} KiB", b as f64 / KIB as f64),
+        b => format!("{b} B"),
+    }
+}
+
+/// Byte span a device-local `vkCmdFillBuffer` must cover to fully zero-init (calloc contract) a
+/// buffer whose LOGICAL size is `logical_size`. `vkCmdFillBuffer` requires a 4-byte-multiple size,
+/// so round UP — the old `size / 4 * 4` truncation left the trailing 1-3 bytes of a
+/// non-multiple-of-4 buffer holding recycled VRAM, violating `Backend::alloc`'s zero-init
+/// guarantee. The backing buffer is CREATED at this same rounded size (see `make_buf_ex` /
+/// `alloc_kv_host`), so the rounded fill stays in-bounds (`dstOffset + size <= buffer size`).
+/// Identity for any 4-aligned size — every current tensor is 4-aligned, so the fill is byte-for-
+/// byte what it was before this rounding existed.
+fn fill_span(logical_size: usize) -> u64 {
+    (logical_size as u64).next_multiple_of(4)
+}
+
+/// Human-readable Vulkan device class for the enumeration listing.
+fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
+    match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+        vk::PhysicalDeviceType::CPU => "cpu",
+        _ => "other",
+    }
+}
+
+fn uses_largest_device_local_heap_only(
+    vendor_id: u32,
+    device_type: vk::PhysicalDeviceType,
+    windows: bool,
+) -> bool {
+    windows
+        && vendor_id == crate::caps::VENDOR_NVIDIA
+        && device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+}
+
+fn physical_vram_heap_mask(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    uma: bool,
+    largest_device_local_heap_only: bool,
+) -> u32 {
+    let heap_count = mp.memory_heap_count as usize;
+    if uma {
+        return (0..heap_count).fold(0, |mask, index| mask | (1 << index));
+    }
+
+    let device_local = |index: usize| {
+        mp.memory_heaps[index]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    };
+    if largest_device_local_heap_only {
+        return (0..heap_count)
+            .filter(|&index| device_local(index))
+            .max_by_key(|&index| mp.memory_heaps[index].size)
+            .map_or(0, |index| 1 << index);
+    }
+
+    (0..heap_count)
+        .filter(|&index| device_local(index))
+        .fold(0, |mask, index| mask | (1 << index))
+}
+
+fn device_local_heap_bytes(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    let properties = unsafe { instance.get_physical_device_properties(pd) };
+    let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let heap_mask = physical_vram_heap_mask(
+        &mp,
+        false,
+        uses_largest_device_local_heap_only(
+            properties.vendor_id,
+            properties.device_type,
+            cfg!(target_os = "windows"),
+        ),
+    );
+    (0..mp.memory_heap_count as usize)
+        .filter(|&h| heap_mask & (1 << h) != 0)
+        .map(|h| mp.memory_heaps[h].size)
+        .sum()
+}
+
+/// Prefer the discrete GPU with the most device-local memory. Vulkan enumeration order is not a
+/// useful performance signal on multi-GPU Windows systems, where a small display adapter may be
+/// `Vulkan0`. Ties retain the first enumerated device; with no discrete GPU, device 0 remains the
+/// fallback.
+fn preferred_device_index(devices: &[(vk::PhysicalDeviceType, u64)]) -> usize {
+    let mut best: Option<(usize, u64)> = None;
+    for (index, &(device_type, vram_bytes)) in devices.iter().enumerate() {
+        if device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+            && best.is_none_or(|(_, best_bytes)| vram_bytes > best_bytes)
+        {
+            best = Some((index, vram_bytes));
+        }
+    }
+    best.map_or(0, |(index, _)| index)
+}
+
+/// A physical device as seen by [`VulkanBackend::enumerate_devices`]. `index` is the `VulkanN` /
+/// `INFR_DEV` / [`VulkanBackend::new_on`] handle. The `external_memory*` flags report whether the
+/// device could, in principle, participate in a host-less GPU↔GPU transfer (dma-buf / fd import) —
+/// the P2P feasibility signal for the multi-GPU campaign; they do NOT imply a P2P path is wired.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub index: usize,
+    pub name: String,
+    /// Vulkan's PCI vendor/device identity. These stay available even when the driver does not
+    /// expose `VK_EXT_pci_bus_info`, so platform benchmark collectors can disambiguate adapters.
+    pub vendor_id: u32,
+    pub device_id: u32,
+    /// PCI BDF from `VK_EXT_pci_bus_info`, when the driver exposes it. This identifies the
+    /// physical endpoint; it says nothing by itself about the upstream slot/switch path.
+    pub pci_address: Option<String>,
+    pub device_type: &'static str,
+    pub integrated: bool,
+    /// Physical DEVICE_LOCAL capacity used for device selection. Windows NVIDIA discrete GPUs
+    /// count only the largest heap so a BAR/ReBAR alias is not added to framebuffer capacity.
+    pub vram_bytes: u64,
+    /// Capacity paired with `vram_available_bytes`: device-local heaps on a discrete GPU and all
+    /// physical-memory heaps on a unified-memory device.
+    pub vram_total_bytes: u64,
+    /// Live bytes currently available to a new process when `vram_live` is true. Without
+    /// `VK_EXT_memory_budget` this falls back to `vram_bytes` and must not be used as an idle test.
+    pub vram_available_bytes: u64,
+    /// Whether `vram_available_bytes` accounts for allocations owned by other processes.
+    pub vram_live: bool,
+    /// True for the device `VulkanBackend::new()` would bind today (`INFR_DEV`, else the largest
+    /// discrete GPU by device-local memory, else device 0).
+    pub is_default_pick: bool,
+    pub external_memory: bool,
+    pub external_memory_fd: bool,
+    pub external_memory_dma_buf: bool,
+    /// The selected device/config can run the dedicated head-dim-256 FlashAttention prefill
+    /// kernel. Control planes use this to avoid reserving a full-context score tile that the
+    /// runtime will never allocate.
+    pub flash_attention_hd256: bool,
+}
+
+/// Copy `src` into a persistently-mapped destination, in PARALLEL for large buffers.
+///
+/// For a ReBAR weight the destination is write-combined VRAM across PCIe, where a single core
+/// cannot saturate the link (measured ~8.2 GiB/s single-threaded on a 7900 XTX / PCIe 4.0 x16).
+/// Splitting the copy across cores lets several write-combine streams be in flight at once. Small
+/// buffers copy inline — below the threshold the rayon fork/join costs more than it saves.
+fn copy_to_mapped(src: &[u8], dst: *mut u8) {
+    /// Below this, a plain memcpy beats paying for fork/join.
+    const PAR_MIN: usize = 4 * 1024 * 1024;
+    /// Chunk per task: big enough to amortize scheduling, small enough to spread over cores.
+    const PAR_CHUNK: usize = 2 * 1024 * 1024;
+
+    if src.len() < PAR_MIN {
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    // `dst` is valid for `src.len()` bytes and the chunks are disjoint, so the per-chunk raw
+    // writes never alias. `usize` is carried across the thread boundary because `*mut u8` is
+    // not `Send`.
+    let base = dst as usize;
+    src.par_chunks(PAR_CHUNK).enumerate().for_each(|(i, c)| {
+        let off = i * PAR_CHUNK;
+        unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (base + off) as *mut u8, c.len()) };
+    });
+}
+
+/// Serialize the entire wait/cleanup, including empty observations by other drainers. On errors
+/// other than device loss, leave the resource in place: completion has not been established.
+/// Device loss permits resource teardown but must still propagate as an error to the caller.
+fn drain_staging_resource<T>(
+    slot: &Mutex<Option<T>>,
+    wait: impl FnOnce(&T) -> std::result::Result<(), vk::Result>,
+    cleanup: impl FnOnce(T),
+) -> std::result::Result<(), vk::Result> {
+    let mut guard = slot.lock().map_err(|_| vk::Result::ERROR_UNKNOWN)?;
+    let Some(resource) = guard.as_ref() else {
+        return Ok(());
+    };
+    let result = wait(resource);
+    if result.is_ok() || result == Err(vk::Result::ERROR_DEVICE_LOST) {
+        if let Some(resource) = guard.take() {
+            cleanup(resource);
+        }
+    }
+    result
+}
+
+/// A ring of REUSED, fixed-size staging buffers — the weight-upload path on every device.
+///
+/// The old path allocated a fresh DEDICATED staging buffer as large as each tensor, memcpy'd into
+/// it, submitted a copy, then `vkQueueWaitIdle`'d and freed it — per tensor. That serialized the
+/// host memcpy against the DMA and paid an allocate/submit/stall/free cycle 443 times.
+///
+/// Here the ring is allocated ONCE per load. Big tensors are chunked across slots, and each slot
+/// carries its own command buffer + fence, so while slot N's DMA is in flight the host is already
+/// memcpy'ing into slot N+1 — the copy engine and the CPU overlap instead of taking turns. A slot
+/// is only waited on when it is reused (its fence), never after every tensor. That overlap is the
+/// whole point: it hides the PCIe crossing behind a full-speed system-RAM memcpy.
+struct StagingRing {
+    /// Fixed-size host-visible staging slots (`RING_SLOTS` × `RING_SLOT_BYTES`).
+    bufs: Vec<VkBuffer>,
+    cmds: Vec<vk::CommandBuffer>,
+    fences: Vec<vk::Fence>,
+    /// Whether slot `i` has work in flight that its fence must be waited on before reuse.
+    busy: Vec<bool>,
+    next: usize,
+    /// Rollbacks whose upload completion could not be established. This deliberate keepalive may
+    /// retain the device after a persistent wait error; freeing pending destinations is unsafe.
+    retained_weight_blocks: Vec<BdaArenaBlock>,
+}
+
+/// RAII for the raw command buffer used by [`VulkanBackend::one_shot`]. Vulkan command buffers do
+/// not free themselves, and every fallible begin/end/submit/wait step must return the handle to the
+/// shared pool on both success and error (including unwinding out of the recording closure).
+struct OneShotCommand<'a> {
+    device: &'a ash::Device,
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+}
+
+impl Drop for OneShotCommand<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.free_command_buffers(self.pool, &[self.cmd]);
+        }
+    }
+}
+
+/// Staging-ring geometry: enough slots to keep the copy engine fed while the host fills the next.
+const RING_SLOTS: usize = 4;
+const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
+
+// ── resident-BDA weight arena ──────────────────────────────────────────────────
+//
+// Allocation-side plumbing for resident weights: they live in big BDA arena blocks addressed by
+// 64-bit device address — the same `bufferDeviceAddress` scheme the paged-MoE/dense-streaming
+// kernels already read weights through (see `pager.rs`, `alloc_arena_bda`), applied to the RESIDENT
+// path. This is the ONLY weight path: every `BufferUsage::Weights` alloc routes through here (see
+// `make_alloc`).
+
+/// Minimum alignment for resident-BDA weight sub-tensors. The on-demand path retains its 256-byte
+/// alignment; upfront batches additionally honor the device's minStorageBufferOffsetAlignment.
+/// Sub-tensors share one buffer object rather than getting their own `VkMemoryRequirements`.
+const BDA_WEIGHT_ALIGN: u64 = 256;
+
+/// Initial and maximum size floors for resident-BDA arena blocks (see
+/// [`VulkanBackend::bda_weight_alloc`]). The first small-tensor block stays at 64 MiB so compact
+/// models retain their old footprint. Each time a small allocation outgrows the available tails,
+/// the next floor doubles through 128 MiB to 256 MiB. Large individual tensors are still allocated
+/// at their exact aligned size: they neither inherit the floor's slack nor advance it.
+const BDA_BLOCK_MIN: u64 = 64 * 1024 * 1024;
+const BDA_BLOCK_MAX: u64 = 256 * 1024 * 1024;
+
+fn bda_block_geometry(want: u64, floor: u64, max_alloc: u64) -> (u64, u64) {
+    let block_bytes = want.max(floor).min(max_alloc);
+    let next_floor = if want <= floor && block_bytes == floor {
+        floor.saturating_mul(2).min(BDA_BLOCK_MAX)
+    } else {
+        floor
+    };
+    (block_bytes, next_floor)
+}
+
+/// Upper bound on ONE resident-BDA addressing unit's byte size (see [`BdaWeightArena`]'s addressing
+/// invariant). The 64-bit promotion protects the arena/expert BASE, but a tensor's (or a per-expert
+/// slice's) intra-unit byte offsets ride u32 push-constants / u32 in-kernel indices — a unit >= 4
+/// GiB truncates into a coherent-but-wrong pointer. This is also `maxStorageBufferRange` on RADV,
+/// the cap on the sub-range a `vkb` descriptor can bind. Enforced today by model reality; a single
+/// >4 GiB tensor would need a wider addressing scheme, not just a bigger allocation.
+const BDA_ADDRESSING_UNIT_MAX: u64 = weight_layout::ADDRESSING_UNIT_MAX;
+
+/// Keepalive + addressing info for one [`BdaWeightArena`] block: a single dedicated
+/// `bufferDeviceAddress` buffer (exactly what [`VulkanBackend::alloc_arena_bda`] builds) that
+/// resident weight tensors bump-allocate BYTE RANGES within, never separate buffer objects (see
+/// [`Backing::BdaSub`]). Held behind an `Arc` so a sub-tensor's `VkBuffer` can keep the block (and
+/// therefore its memory and buffer handle) alive without owning it: the block is destroyed by
+/// `buf`'s own `Drop` exactly once, when the last `Arc` clone — the arena's own plus every live
+/// sub-tensor's — goes away. Never stored directly on `VulkanShared` (see
+/// `VulkanBackend::bda_weight_arena`'s doc for why: `buf` holds an `Arc<VulkanShared>` clone, so
+/// that would form a reference cycle and leak the whole device, exactly the bug
+/// `backend_drop_frees_device_after_moe_pager` guards against for `moe_pager`/`dense_pager`).
+struct BdaBlockHandle {
+    /// The whole block's buffer: a `force_dedicated`, `device_address` allocation
+    /// (`Backing::Pooled`), built by `make_buf_ex` exactly like `alloc_arena_bda`'s paged-MoE arena.
+    buf: VkBuffer,
+    /// `vkGetBufferDeviceAddress(buf.buffer)` — this block's byte-0 device address. A sub-tensor's
+    /// `Buffer::device_addr` is `base_addr + sub_offset`.
+    base_addr: u64,
+}
+
+impl BdaBlockHandle {
+    fn physical_allocation_bytes(&self) -> u64 {
+        // BDA blocks force dedicated allocations. Use the allocator's returned size; the direct
+        // UMA path records its exact vkAllocateMemory allocationSize in mem_size instead.
+        match &self.buf.backing {
+            Backing::Pooled(allocation) => allocation.size(),
+            _ => self.buf.mem_size,
+        }
+    }
+}
+
+/// One [`BdaWeightArena`] block: the shared keepalive handle plus its live bump cursor. Split apart
+/// from `BdaBlockHandle` so the cursor can be mutated (behind `VulkanBackend::bda_weight_arena`'s
+/// `Mutex`) while sub-tensors hold their own `Arc` clone of the handle without needing `&mut`
+/// through it.
+struct BdaArenaBlock {
+    handle: Arc<BdaBlockHandle>,
+    /// This block's total capacity in bytes (`<= max_mem_alloc_size`).
+    size: u64,
+    /// Next free byte offset (pre-alignment). Monotonic — sub-tensors are never freed individually.
+    cursor: u64,
+    /// Raw tensor bytes represented by this block (excludes alignment padding).
+    requested_bytes: u64,
+}
+
+/// The resident-weight sub-allocator (the ONLY primary weight path — see `make_alloc`). Blocks are
+/// created on demand, or prepared transactionally for an upfront ordered allocation batch.
+/// Each block is capped at `max_mem_alloc_size`
+/// (a whole multi-GiB model can't be one `vkAllocateMemory`); a tensor never straddles a block
+/// boundary — one that doesn't fit the current block's remainder opens a fresh one.
+///
+/// Sub-tensors CAN be bound as descriptors (unlike the paged-MoE/dense-streaming `alloc_arena_bda`
+/// blocks, which are only ever read by device address): `recorder::Recorder::vkb` binds each
+/// sub-tensor's own `(sub_offset, range)` rather than the whole block's `(0, WHOLE_SIZE)`, which is
+/// what makes it safe for the small unforked weight consumers (norm gammas, biases, rope tables)
+/// that have no `-DSTREAMED` twin to read this arena the same way they'd read any ordinary buffer.
+///
+/// Addressing invariant (audited): the 64-bit promotion protects the arena/expert BASE; intra-tensor
+/// offsets remain u32 — each addressing unit (one dense tensor / one per-expert slice) must stay
+/// < 4 Gi elements and < 4 GiB bytes; enforced today by model reality, revisit for >4 GiB single
+/// tensors.
+struct BdaWeightArena {
+    blocks: Vec<BdaArenaBlock>,
+    active_plan: Option<BdaWeightPlan>,
+    /// Floor for the next block opened for a small tensor. Adaptive growth avoids the many
+    /// partially-used 64 MiB tails seen on tensor-rich models without charging a 256 MiB minimum
+    /// to every small model.
+    next_block_floor: u64,
+}
+
+impl Default for BdaWeightArena {
+    fn default() -> Self {
+        Self {
+            blocks: Vec::new(),
+            active_plan: None,
+            next_block_floor: BDA_BLOCK_MIN,
+        }
+    }
+}
+
+struct BdaWeightPlan {
+    token: Arc<()>,
+    layout: weight_layout::WeightLayout,
+    /// Kept separate from older blocks so rollback cannot remove or mutate an old allocation.
+    blocks: Vec<BdaArenaBlock>,
+    consumed: usize,
+}
+
+/// Snapshot of arena-owned resident-weight reservations, including the entire active batch.
+/// After rollback, escaped subviews can keep physical blocks alive outside this snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResidentWeightAllocationStats {
+    /// Raw requested tensor bytes, excluding padding. Active batches count all declared tensors.
+    pub requested_bytes: u64,
+    /// Reserved tensor spans including alignment padding (zero-size tensors reserve one span).
+    pub padded_bytes: u64,
+    /// Sum of buffer capacities; on-demand blocks may have unused tails, packed blocks do not.
+    pub capacity_bytes: u64,
+    /// Sum of dedicated Vulkan memory allocation sizes, including driver allocation alignment.
+    pub physical_allocation_bytes: u64,
+    pub block_count: usize,
+}
+
+struct VulkanWeightAllocationBatch<'a> {
+    backend: &'a VulkanBackend,
+    token: Arc<()>,
+    finished: bool,
+}
+
+impl WeightAllocationBatch for VulkanWeightAllocationBatch<'_> {
+    fn finish(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        // Async weight uploads retain only raw destination handles. Complete them before closing
+        // the batch, independently of the caller's longer-lived weight-progress scope. Never
+        // hold the weight-arena mutex while draining the staging ring/command pool.
+        self.backend.shared.drain_staging_ring()?;
+        let mut guard = self.backend.bda_weight_arena.lock().unwrap();
+        let arena = guard
+            .as_mut()
+            .ok_or_else(|| be("resident weight batch lost its arena"))?;
+        let plan = arena
+            .active_plan
+            .as_ref()
+            .filter(|p| Arc::ptr_eq(&p.token, &self.token))
+            .ok_or_else(|| be("resident weight batch is no longer active"))?;
+        if plan.consumed != plan.layout.placements.len() {
+            return Err(be(format!(
+                "resident weight batch incomplete: consumed {} of {} allocations",
+                plan.consumed,
+                plan.layout.placements.len()
+            )));
+        }
+        let plan = arena.active_plan.take().unwrap();
+        let tensors = plan.consumed;
+        let blocks = plan.blocks.len();
+        let requested_bytes: u64 = plan.blocks.iter().map(|b| b.requested_bytes).sum();
+        let padded_bytes: u64 = plan.blocks.iter().map(|b| b.cursor).sum();
+        let capacity_bytes: u64 = plan.blocks.iter().map(|b| b.size).sum();
+        let physical_allocation_bytes: u64 = plan
+            .blocks
+            .iter()
+            .map(|b| b.handle.physical_allocation_bytes())
+            .sum();
+        arena.blocks.extend(plan.blocks);
+        self.finished = true;
+        drop(guard);
+        tracing::info!(
+            "[infr] resident weight batch finished: tensors={tensors} requested_bytes={requested_bytes} \
+             padded_bytes={padded_bytes} capacity_bytes={capacity_bytes} \
+             physical_allocation_bytes={physical_allocation_bytes} blocks={blocks}"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for VulkanWeightAllocationBatch<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Loader unwind drops this guard before its weight buffers, then weight_progress last.
+        // Drain before removing arena keepalives so those later buffer drops cannot free a
+        // destination that still has an in-flight staging copy (including escaped subviews).
+        let drained = self.backend.shared.drain_staging_ring();
+        let plan = {
+            let mut guard = self
+                .backend
+                .bda_weight_arena
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.as_mut().and_then(|arena| {
+                if arena
+                    .active_plan
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.token, &self.token))
+                {
+                    arena.active_plan.take()
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(plan) = plan {
+            if drained.is_err() {
+                self.backend
+                    .shared
+                    .retain_aborted_weight_blocks(plan.blocks);
+            }
+            // Only this batch's arena references disappear; escaped BdaSub Arcs remain valid.
+        }
+        if let Err(error) = drained {
+            tracing::error!("[infr] resident weight rollback drain failed: {error}; pending destinations retained");
+        }
+    }
+}
+
+// ── VulkanBackend ─────────────────────────────────────────────────────────────
+
+/// Vulkan device + allocator + pipeline cache.
+pub struct VulkanBackend {
+    // NOTE: the prefetch worker is declared before `moe_pager` and `shared`, so it is stopped and
+    // joined before either dependency drops. The pager itself likewise drops before `shared`.
+    decode_prefetch: Mutex<Option<adapter::DecodePrefetchScheduler>>,
+    cpu_miss: std::sync::OnceLock<Option<cpu_miss::Worker>>,
+    /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
+    /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
+    /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
+    /// overwhelming common case (fits resident) and costs nothing beyond one `Mutex` lock check
+    /// per `Backend::moe_paged` call.
+    ///
+    /// Owned by the BACKEND handle, NOT `VulkanShared`: the session's arena/LUT/ring buffers each
+    /// hold an `Arc<VulkanShared>` clone, so parking the session on `VulkanShared` formed an Arc
+    /// CYCLE — the shared state (device, allocator, weight arena, the pager arenas themselves:
+    /// ~23 GiB after a Scout load) never dropped until process exit, and every LATER model load
+    /// in the same process hit the VRAM budget guard with "N GiB already in use" (the
+    /// `cpu_backend` gpu_ test-suite flake; see `backend_drop_frees_device_after_moe_pager`).
+    /// The session still lives exactly as long as a loaded paged model can be generated with:
+    /// `infr-llama`'s sessions own the `VulkanBackend`, and a new backend is a new device whose
+    /// buffers couldn't read the old session anyway.
+    moe_pager: Arc<crate::pager::MoePagerCell>,
+    /// `ParallelSeam` eagerly creates every KV slot after its warmup forward. While that startup
+    /// batch is in progress, the runner must not admit optional Host DMA aliases after slot 0 and
+    /// consume driver capacity needed by the remaining persistent slots.
+    session_finalization_deferred: Arc<std::sync::atomic::AtomicBool>,
+    /// Dense layer-streaming cache (see `pager::DensePagerSession`) — `Some` only when the loaded
+    /// DENSE model's per-layer weights don't fit VRAM and the seam's placement chose streaming.
+    /// Same drop-ordering/ownership story as `moe_pager` (declared before `shared` so its
+    /// arena/ring buffers free first; owned by the backend HANDLE, never `VulkanShared` — the Arc
+    /// cycle lesson on `moe_pager`'s doc applies unchanged).
+    dense_pager: crate::pager::DensePagerCell,
+    /// Logical runtime phase arena retained across consecutive paged-MoE executes. Its Vulkan
+    /// ranges may be physically segmented, but graph scratch and pooled high-water workspaces have
+    /// one Decode/Prefill lifetime. This avoids restoring and immediately re-loaning expert slots
+    /// every token; declaring it before `shared` also guarantees its buffers drop first.
+    runtime_phase: Arc<Mutex<adapter::RuntimePhaseArena>>,
+    /// Resident-weight sub-allocator (see [`BdaWeightArena`]) — `None` until the first weight alloc;
+    /// `make_alloc` routes every `BufferUsage::Weights` here (the sole weight path).
+    ///
+    /// Same drop-ordering/ownership story as `moe_pager`/`dense_pager` above and for the identical
+    /// reason: each block's `BdaBlockHandle::buf` holds its own `Arc<VulkanShared>` clone, so
+    /// parking this arena ON `VulkanShared` would form the same reference cycle that leaked the
+    /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
+    /// `backend_drop_frees_device_after_moe_pager`.
+    bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    iq2s_grid: Option<Arc<dyn Buffer>>,
+    iq3s_grid: Option<Arc<dyn Buffer>>,
+    /// Service-level elastic VRAM arena. Kept on backend handles rather than `VulkanShared`
+    /// because its physical shard buffers retain `Arc<VulkanShared>` and would otherwise form a
+    /// device-leaking reference cycle.
+    unified_pool: Arc<Mutex<Option<Arc<crate::unified::UnifiedVramPool>>>>,
+    /// Allocation/execution gate shared by the LLM and auxiliary backend forks. An execution owns
+    /// the write side because both primary and auxiliary graphs allocate elastic scratch lazily;
+    /// the thread-local owner lets those nested allocations reuse the non-reentrant lease.
+    unified_exec: Arc<RwLock<()>>,
+    /// Independent runtime caches across clients sharing the serialized execution gate.
+    unified_phases: Arc<UnifiedPhaseRegistry>,
+    unified_phase_id: u64,
+    auxiliary_runtime_reaper: Option<AuxiliaryRuntimeReaper>,
+    /// Auxiliary-engine allocation routing. `None` keeps every established LLM allocation path;
+    /// an Embedding fork sends only weights and graph activations into the shared elastic arena.
+    unified_client: Option<UnifiedClient>,
+    /// The engine configuration this backend reads its knobs from — one value, held for the
+    /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
+    /// R4/R6).
+    ///
+    /// Handed in by [`VulkanBackend::new_with`] (S5a); the S2 `Config::load_from_env()` bridge that
+    /// used to build it inside `new_selected` is GONE. `infr-cli` resolves the four layers once in
+    /// `main()` and the `Arc` reaches here through the seam, so nothing on the production path
+    /// crosses this boundary through the environment. The env-only [`VulkanBackend::new`] entry
+    /// point remains for this crate's own GPU tests and for external library callers.
+    cfg: Arc<Config>,
+    shared: Arc<VulkanShared>,
+}
+
+#[derive(Clone, Copy)]
+enum UnifiedClient {
+    Embedding,
+    Vision,
+}
+
+struct UnifiedPhaseState {
+    active: Option<u64>,
+    next_id: u64,
+    arenas: Vec<(u64, std::sync::Weak<Mutex<adapter::RuntimePhaseArena>>)>,
+    idle_reclaimers: Vec<(u64, Weak<dyn IdleResourceReclaimer>)>,
+}
+
+struct UnifiedPhaseRegistry {
+    state: Mutex<UnifiedPhaseState>,
+}
+
+impl UnifiedPhaseRegistry {
+    const PRIMARY_ID: u64 = 1;
+
+    fn new(primary: &Arc<Mutex<adapter::RuntimePhaseArena>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(UnifiedPhaseState {
+                active: None,
+                next_id: Self::PRIMARY_ID + 1,
+                arenas: vec![(Self::PRIMARY_ID, Arc::downgrade(primary))],
+                idle_reclaimers: Vec::new(),
+            }),
+        })
+    }
+
+    fn register(&self, arena: &Arc<Mutex<adapter::RuntimePhaseArena>>) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1).max(Self::PRIMARY_ID + 1);
+        state.arenas.push((id, Arc::downgrade(arena)));
+        id
+    }
+
+    fn register_idle_reclaimer(&self, owner: u64, reclaimer: Weak<dyn IdleResourceReclaimer>) {
+        let mut state = self.state.lock().unwrap();
+        state
+            .idle_reclaimers
+            .retain(|(_, entry)| entry.strong_count() != 0);
+        state.idle_reclaimers.push((owner, reclaimer));
+    }
+
+    fn idle_reclaim_candidates(&self, current: u64) -> Vec<Arc<dyn IdleResourceReclaimer>> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .idle_reclaimers
+            .retain(|(_, entry)| entry.strong_count() != 0);
+        state
+            .idle_reclaimers
+            .iter()
+            .filter(|(owner, _)| *owner != current)
+            .filter_map(|(_, entry)| entry.upgrade())
+            .collect()
+    }
+
+    /// Track transitions without destroying another client's reusable workspace.
+    fn activate(&self, id: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.arenas.retain(|(_, arena)| arena.strong_count() != 0);
+        if state.active == Some(id) {
+            return false;
+        }
+        state.active = Some(id);
+        true
+    }
+
+    /// The caller holds the execution gate. Prefer auxiliary caches, then primary scratch;
+    /// never reclaim the current execute's workspace, which may already be referenced by commands.
+    fn reclaim_candidates(&self, current: u64) -> Vec<Arc<Mutex<adapter::RuntimePhaseArena>>> {
+        let mut state = self.state.lock().unwrap();
+        state.arenas.retain(|(_, arena)| arena.strong_count() != 0);
+        let mut peers = state
+            .arenas
+            .iter()
+            .filter_map(|&(id, ref arena)| {
+                (id != current)
+                    .then(|| arena.upgrade().map(|arena| (id, arena)))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by_key(|(id, _)| *id == Self::PRIMARY_ID);
+        peers.into_iter().map(|(_, arena)| arena).collect()
+    }
+
+    fn claim_with_reclaim<T>(
+        &self,
+        current: u64,
+        mut claim: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let mut error = match claim() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        for arena in self.reclaim_candidates(current) {
+            arena.lock().unwrap().release_phase();
+            match claim() {
+                Ok(value) => return Ok(value),
+                Err(next) => error = next,
+            }
+        }
+        // Callbacks run without the registry lock and must never wait on a request-owned lock.
+        // Preserve the successful fast path and exhaust the existing scratch recovery first.
+        for reclaimer in self.idle_reclaim_candidates(current) {
+            if reclaimer.try_reclaim_idle() {
+                match claim() {
+                    Ok(value) => return Ok(value),
+                    Err(next) => error = next,
+                }
+            }
+        }
+        Err(error)
+    }
+}
+
+const AUXILIARY_RUNTIME_IDLE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct AuxiliaryRuntimeDeadline {
+    deadline: Option<Instant>,
+    stop: bool,
+}
+
+impl AuxiliaryRuntimeDeadline {
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
+struct AuxiliaryRuntimeReaper {
+    state: Arc<(Mutex<AuxiliaryRuntimeDeadline>, Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AuxiliaryRuntimeReaper {
+    fn spawn(
+        arena: &Arc<Mutex<adapter::RuntimePhaseArena>>,
+        gate: &Arc<RwLock<()>>,
+    ) -> Result<Self> {
+        let state = Arc::new((
+            Mutex::new(AuxiliaryRuntimeDeadline::default()),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let arena = Arc::downgrade(arena);
+        let gate = Arc::downgrade(gate);
+        let worker = std::thread::Builder::new()
+            .name("infr-aux-runtime-idle".into())
+            .spawn(move || {
+                let (state, changed) = &*worker_state;
+                let mut idle = state.lock().unwrap();
+                loop {
+                    if idle.stop {
+                        return;
+                    }
+                    let Some(deadline) = idle.deadline else {
+                        idle = changed.wait(idle).unwrap();
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if !idle.expired(now) {
+                        idle = changed.wait_timeout(idle, deadline - now).unwrap().0;
+                        continue;
+                    }
+                    let Some(gate) = gate.upgrade() else { return };
+                    // Do not wait on the GPU gate while holding the deadline lock: the executing
+                    // client refreshes its deadline before releasing that same gate.
+                    match gate.try_write() {
+                        Ok(_exclusive) => {
+                            if let Some(arena) = arena.upgrade() {
+                                arena.lock().unwrap().release_phase();
+                            }
+                            idle.deadline = None;
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            idle = changed
+                                .wait_timeout(idle, Duration::from_millis(20))
+                                .unwrap()
+                                .0;
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => return,
+                    };
+                }
+            })
+            .map_err(|error| be(format!("start auxiliary runtime reaper: {error}")))?;
+        Ok(Self {
+            state,
+            worker: Some(worker),
+        })
+    }
+
+    fn arm(&self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().deadline = Some(Instant::now() + AUXILIARY_RUNTIME_IDLE);
+        changed.notify_one();
+    }
+}
+
+impl Drop for AuxiliaryRuntimeReaper {
+    fn drop(&mut self) {
+        let (state, changed) = &*self.state;
+        state.lock().unwrap().stop = true;
+        changed.notify_one();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Device memory info for a backend's shared state — the body of [`VulkanBackend::vram`],
+/// factored out so scopes that only hold the `Arc<VulkanShared>` (e.g. [`WeightProgress`]'s
+/// post-load log) can read it too.
+///
+/// WHICH HEAPS COUNT — the whole point of this function, and the difference between refusing a
+/// model the box could run and TDR-ing one it could not:
+///
+/// DISCRETE card — device-local heaps ONLY. The other heap is host RAM reachable over PCIe (GTT).
+/// It is NOT capacity: RADV happily accepts a device-local allocation past the VRAM heap's size and
+/// quietly spills the excess into GTT — MEASURED on a 7900 XTX, where a 41 GiB run of 1 GiB
+/// device-local allocations succeeded and landed as `mem_info_vram_used` 23.08 GiB +
+/// `mem_info_gtt_used` 18.01 GiB. Every byte on the GTT side is then read across PCIe at a fraction
+/// of VRAM bandwidth. Counting it would turn a clean load error into a mysteriously slow model, so
+/// the guard budgets device-local alone. THIS IS THE PRE-EXISTING BEHAVIOR AND MUST NOT CHANGE.
+///
+/// UNIFIED-MEMORY part (an APU — see [`Capabilities::unified_memory`]) — ALL heaps. There is no
+/// VRAM here to spill out of; both heaps are the same DDR at the same bandwidth, and the driver's
+/// split between them is bookkeeping, not physics. MEASURED on RADV RAPHAEL_MENDOCINO: it
+/// advertises a 21.47 GiB "DEVICE_LOCAL" heap and a 10.73 GiB host-visible one, which sum to
+/// EXACTLY `mem_info_vram_total` (2 GiB carveout) + `mem_info_gtt_total` (30.20 GiB) — RADV
+/// synthesizes the device-local heap as 2/3 of (carveout + GTT). The same 41 GiB device-local probe
+/// on that device landed as `mem_info_gtt_used` 30.01 GiB and `mem_info_vram_used` 1.03 GiB: the
+/// "device-local" heap IS system RAM through the GART, and the 2 GiB carveout is not where the
+/// weights go. So the honest capacity is the SUM of the heaps, and budgeting against the
+/// device-local slice alone refuses models (gemma-4-31B UD-Q5_K_XL: 20.37 GiB of weights against a
+/// 21.22 GiB budget) that fit the machine with room to spare.
+///
+/// Counting the overflow heap is only half of it — `probe_host_visible_non_device_local_type` is
+/// what lets bytes actually LAND there once the device-local heap is full. Above the summed budget
+/// the failure mode is the same on both classes (the driver oversubscribes and starts evicting),
+/// which is why the guard exists at all — it just now guards the right number on each.
+///
+/// Windows NVIDIA is a narrower exception: the BAR/ReBAR aperture can be exposed as another
+/// DEVICE_LOCAL heap backed by the same framebuffer, so only the largest local heap counts there.
+fn physical_vram_info(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    uma: bool,
+    largest_device_local_heap_only: bool,
+    has_mem_budget: bool,
+    tracked_used: u64,
+) -> VramInfo {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+    if has_mem_budget {
+        props2 = props2.push_next(&mut budget);
+    }
+    unsafe { instance.get_physical_device_memory_properties2(physical_device, &mut props2) };
+    let mp = props2.memory_properties;
+
+    // Discrete: device-local heaps only. UMA: every heap (they are one pool of DDR). The live
+    // VK_EXT_memory_budget figure is used on BOTH — it is what accounts for other processes, and
+    // on a shared-memory part that matters more, not less: a second infr holding 21 GiB of the
+    // same DDR is exactly the thing a UMA guard must see.
+    let mut total = 0u64;
+    let mut available = 0u64;
+    let heap_mask = physical_vram_heap_mask(&mp, uma, largest_device_local_heap_only);
+    for i in 0..mp.memory_heap_count as usize {
+        if heap_mask & (1 << i) != 0 {
+            total += mp.memory_heaps[i].size;
+            available += if has_mem_budget {
+                // Live free = budget - usage (the budget is a CEILING, not free bytes). Clamped to
+                // the heap size so a driver that reports usage past the heap (RADV on an APU, once
+                // something has oversubscribed the synthetic split) can't hand back a bogus figure.
+                budget.heap_budget[i]
+                    .saturating_sub(budget.heap_usage[i])
+                    .min(mp.memory_heaps[i].size)
+            } else {
+                mp.memory_heaps[i].size
+            };
+        }
+    }
+    let mut live = has_mem_budget;
+    if let Some(profile) = infr_core::test_resource::active() {
+        (total, available) = profile.cap_vram(total, available, tracked_used);
+        // The synthetic free figure already subtracts this backend's tracked allocations. Mark it
+        // live so fallback accounting does not subtract them a second time.
+        live = true;
+    }
+    VramInfo {
+        total,
+        available,
+        live,
+        uma,
+    }
+}
+
+fn raw_vram_info(s: &VulkanShared) -> VramInfo {
+    physical_vram_info(
+        &s.instance,
+        s.physical_device,
+        s.caps.unified_memory,
+        s.largest_device_local_heap_only,
+        s.has_mem_budget,
+        s.budget_used(),
+    )
+}
+
+fn vram_info(s: &VulkanShared) -> VramInfo {
+    let vram = raw_vram_info(s);
+    s.unified_ram.as_ref().map_or(vram, |ram| {
+        ram.snapshot(vram, infr_core::hostmem::available_bytes())
+    })
+}
+
+/// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
+/// `BufferUsage::Weights` allocations advance the bar; on drop it finishes and clears it.
+pub struct WeightProgress {
+    shared: Arc<VulkanShared>,
+    /// `prof.vram` (`INFR_PROF_VRAM`), copied off the backend's `Config` when the scope opens —
+    /// `Drop` holds only the shared state, so the flag rides along rather than being looked up
+    /// (S5a; R4 — no global, no second config).
+    vram_log: bool,
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Drop for WeightProgress {
+    fn drop(&mut self) {
+        // Drain the staging ring FIRST: its copies are still in flight (we fence per slot instead
+        // of stalling the queue per tensor), and the weights must be fully resident before the
+        // loader records a forward.
+        if let Err(error) = self.shared.drain_staging_ring() {
+            tracing::error!("[infr] weight-progress drain failed: {error}");
+        }
+        if let Some(pb) = self
+            .shared
+            .weight_pb
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            pb.finish_and_clear();
+        }
+        // Post-load memory-hygiene visibility (`prof.vram`): the LIVE in-use figure right
+        // after the LAST weight upload — the number the VRAM-audit residual math (in-use minus
+        // weights+KV estimate) starts from. The upload staging that ran under this scope was
+        // dedicated-allocated (see `Backend::upload`), so by this drop it has fully returned
+        // its device memory; what remains is weights + already-allocated session buffers.
+        if self.vram_log {
+            let v = vram_info(&self.shared);
+            tracing::info!(
+                "post-load vram in use: {:.2} GiB of {:.2} GiB ({})",
+                v.total.saturating_sub(v.available) as f64 / (1u64 << 30) as f64,
+                v.total as f64 / (1u64 << 30) as f64,
+                if v.live { "live" } else { "tracked" },
+            );
+        }
+    }
+}
+
+impl infr_core::backend::ProgressScope for WeightProgress {}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl VulkanBackend {
+    pub(crate) fn background_expert_transfer_ready(&self) -> bool {
+        self.background_expert_transfer_executor().is_some()
+    }
+
+    pub(crate) fn background_expert_transfer_executor(
+        &self,
+    ) -> Option<crate::transfer::BackgroundTransferExecutor> {
+        crate::transfer::BackgroundTransferExecutor::from_backend(self)
+    }
+
+    /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
+    /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
+    pub fn max_shared_memory_bytes(&self) -> u32 {
+        self.shared.caps.max_shared_memory_bytes
+    }
+
+    /// Borrowed capabilities — the kernel-tier fallback ladder's gate (`caps.f16_coopmat`,
+    /// `caps.f16`, `caps.i8_dot`). Cheap: a reference, not the [`Backend::capabilities`] clone (which
+    /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
+    pub(crate) fn caps(&self) -> &Capabilities {
+        &self.shared.caps
+    }
+
+    /// True on the AMD proprietary Windows driver (amdvlk / LLPC). Kernel-tier picks use this to
+    /// dodge driver compiler faults — the hd256 fused flash build is the current case, see
+    /// `attn_flash_warp_hd256.comp`'s UNROLL macro. RADV (`AMD_OPEN_SOURCE`) and every other vendor
+    /// get the default build.
+    pub(crate) fn is_amd_proprietary_driver(&self) -> bool {
+        self.shared.amd_proprietary_driver
+    }
+
+    /// The measured Windows/RDNA3 decode policy. Keep the unmeasured Linux/RADV path unchanged,
+    /// and keep architecture quirks out of the backend-neutral capability API.
+    pub(crate) fn prefers_generic_hd256_decode(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// The four-column-worker hd256 prefill layout measured on Windows/Navi 31. Other drivers
+    /// retain the established shader until separately validated.
+    pub(crate) fn prefers_hd256_prefill_cw4(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// The BR128/f16-score hd256 prefill layout measured on Windows/Navi 31. It halves repeated
+    /// long-context K/V reads while staying within RDNA3's 32 KiB workgroup-memory limit.
+    pub(crate) fn prefers_hd256_prefill_br128_f16score(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// The Qwen3.8 HC-down PF4 layout measured on Windows/Navi 31. Other drivers and architectures
+    /// retain the established kernel until separately validated.
+    pub(crate) fn prefers_qwen_hc_down_prefetch4(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// IQ4_NL pair-table MMQ was measured on Windows/Navi 31; other architectures keep the
+    /// scalar codebook kernel until their occupancy and initialization costs are validated.
+    pub(crate) fn prefers_iq4_pair_lut(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_deltanet_fused_norm(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_kquant_packed_decode(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_q8_prefill_bm128(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+            && self.shared.caps.name.contains("Radeon RX 7900 XTX")
+    }
+
+    pub(crate) fn prefers_segmented_q8_decode(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_hc_up_mix(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    pub(crate) fn prefers_ple_gate_norm_lds(&self) -> bool {
+        ple_gate_norm_lds_device_ok(
+            cfg!(target_os = "windows"),
+            self.shared.device_arch,
+            &self.shared.caps,
+        )
+    }
+
+    pub(crate) fn prefers_silu_quant_q8(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+            && self.shared.exact_silu_quant_order
+    }
+
+    pub(crate) fn prefers_qsa_topk_ordered(&self) -> bool {
+        cfg!(target_os = "windows")
+            && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+            && !self.shared.caps.integrated
+    }
+
+    /// The hd256/Q8/GQA4 replay layout measured on Windows/Navi 31. Its register/LDS tradeoff is
+    /// device-sensitive, so unmeasured drivers and architectures
+    /// retain the established per-query-head replay kernel even when the feature knobs are enabled.
+    pub(crate) fn prefers_q8_decode_gqa4_replay(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    /// The planar-Q8 hd256 query-int8 path measured on Windows/Navi 31. Packed integer-dot is
+    /// still checked separately; other devices retain fp16 Q.K until they have matched A/B data.
+    pub(crate) fn prefers_q8_qk_i8(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    fn measured_decode_kernel_device(&self) -> bool {
+        cfg!(target_os = "windows") && self.shared.device_arch == crate::caps::DeviceArch::AmdRdna3
+    }
+
+    pub(crate) fn use_paged_grid_buffer(&self, k: usize, n: usize, rows: usize) -> bool {
+        use_paged_grid_buffer(
+            self.cfg().kernels.vulkan.gemv.id_grid_buffer,
+            self.measured_decode_kernel_device(),
+            k,
+            n,
+            rows,
+        )
+    }
+
+    pub(crate) fn paged_grid_buffer_nr(&self) -> u32 {
+        self.cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .id_grid_buffer_nr
+            .unwrap_or_else(|| {
+                if self.measured_decode_kernel_device() {
+                    2
+                } else {
+                    4
+                }
+            })
+    }
+
+    pub(crate) fn use_q8_wave32(&self) -> bool {
+        self.cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .q8_wave32
+            .unwrap_or_else(|| self.measured_decode_kernel_device())
+    }
+
+    pub(crate) fn use_decode_down_overlap(&self, rows: usize, min_context: u32) -> bool {
+        use_decode_down_overlap(
+            self.cfg().kernels.vulkan.decode_down_overlap,
+            self.measured_decode_kernel_device(),
+            rows,
+            min_context,
+        )
+    }
+
+    pub(crate) fn use_decode_sparse_lut(
+        &self,
+        rows: usize,
+        decode_rows: Option<usize>,
+        mtp_verify: bool,
+    ) -> bool {
+        use_small_decode_policy(
+            self.cfg().kernels.vulkan.decode_sparse_lut,
+            self.measured_decode_kernel_device(),
+            rows,
+            decode_rows,
+            mtp_verify,
+        )
+    }
+
+    pub(crate) fn use_decode_early_submit(
+        &self,
+        rows: usize,
+        decode_rows: Option<usize>,
+        mtp_verify: bool,
+    ) -> bool {
+        use_small_decode_policy(
+            self.cfg().kernels.vulkan.decode_early_submit,
+            self.measured_decode_kernel_device(),
+            rows,
+            decode_rows,
+            mtp_verify,
+        )
+    }
+
+    pub(crate) fn cpu_miss_worker(&self) -> Option<&cpu_miss::Worker> {
+        let cfg = &self.cfg().kernels.vulkan;
+        self.cpu_miss
+            .get_or_init(|| {
+                cpu_miss::Worker::new_options(
+                    cfg.cpu_miss_threads,
+                    cfg.cpu_miss_push,
+                    cfg.cpu_miss_split_acc,
+                    cfg.cpu_miss_flush_denormals,
+                    cfg.cpu_miss_spin,
+                    cfg.cpu_miss_grouped_dot,
+                    cfg.cpu_miss_idle_park,
+                    if cfg.cpu_miss_token_park {
+                        cfg.cpu_miss_poll
+                    } else {
+                        0
+                    },
+                    self.cfg().prof.cpu_miss_fixture_dir.clone(),
+                )
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn use_qsa_topk_scan(&self, rows: usize, top: usize, parallel: bool) -> bool {
+        use_qsa_topk_scan(
+            self.cfg().kernels.vulkan.qsa_topk_scan,
+            self.measured_decode_kernel_device(),
+            rows,
+            top,
+            parallel,
+        )
+    }
+
+    /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
+    /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering
+    /// (`docs/config-plan.md` R6).
+    ///
+    /// `pub` because `infr-llama`'s seam reads the paging/KV knobs off the backend it already
+    /// holds rather than growing a second env-sourced config of its own.
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Names of every compute kernel this backend has BUILT so far — the `kernel`/`kernel_sg`
+    /// cache keys, which are also the `INFR_PROF_OPS` labels. Sorted.
+    ///
+    /// For tests that need to assert WHICH kernel a dispatch path selected. A parity test between
+    /// two kernel variants is vacuous if the selector quietly sent both legs to the same one, and
+    /// nothing else in the API makes that observable: the choice happens inside `Recorder` and
+    /// leaves no trace in the output (which is the whole point when the variants agree bitwise).
+    pub fn built_kernel_names(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = self
+            .shared
+            .kernels
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
+    /// device + compute queue with the required extensions/features, set up the allocator.
+    /// `Err` on Apple (Vulkan is unsupported there — use the Metal backend), `Ok(())` everywhere
+    /// else. Split into two `cfg` bodies so the guard is a runtime `Result` the caller `?`s: that
+    /// keeps the Vulkan body in [`new`](Self::new) compiling on macOS while never executing it.
+    #[cfg(target_os = "macos")]
+    fn reject_on_apple() -> Result<()> {
+        Err(be(
+            "Vulkan is not supported on Apple. Use the native Metal backend: it is the default on \
+             macOS, or select it explicitly with `--dev metal` (or INFR_DEV=metal). (The only \
+             Vulkan on Apple is MoltenVK, which this backend deliberately does not target.)",
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn reject_on_apple() -> Result<()> {
+        Ok(())
+    }
+
+    /// Default-device rule: honor `INFR_DEV=VulkanN` (the CLI's `--dev`, matching llama.cpp's
+    /// naming) if set, else the `DISCRETE_GPU` with the most device-local memory, else device 0.
+    /// An out-of-range / unparseable Vulkan index is a hard error
+    /// (silently running on a different GPU than asked produces plausible-but-wrong numbers).
+    ///
+    /// `INFR_DEV` is now the SINGLE device-selection env, so it can also hold `metal`/`cpu` (the
+    /// non-Vulkan backends). The index resolver ([`resolve_infr_dev_index`]) TOLERATES those — a
+    /// `metal`/`cpu` (or empty/unset) value falls back to the discrete default rather than erroring
+    /// — since a process that reaches this Vulkan constructor built a Vulkan backend regardless.
+    /// Split out of `new()` so `new_on` can bypass it, and so the behavior is a single named unit.
+    ///
+    /// `spec` is `device.dev` off the caller's [`Config`] (S5a) — the raw string, unparsed, exactly
+    /// as `INFR_DEV` delivered it before. §6.12/§10.8: the CLI's `parse_dev_spec` and this
+    /// crate's [`resolve_infr_dev_index`] are two DIFFERENT parsers of that one string and are
+    /// deliberately NOT unified.
+    fn pick_default_device(
+        instance: &ash::Instance,
+        pdevices: &[vk::PhysicalDevice],
+        spec: Option<&str>,
+    ) -> Result<vk::PhysicalDevice> {
+        if pdevices.is_empty() {
+            return Err(be("no Vulkan physical devices found"));
+        }
+        // A pinned Vulkan index needs the device names for the "no such device" message; build them
+        // once (cold init path, a handful of devices).
+        let names: Vec<String> = pdevices
+            .iter()
+            .enumerate()
+            .map(|(i, &pd)| {
+                let p = unsafe { instance.get_physical_device_properties(pd) };
+                let n = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                format!("Vulkan{i}={n}")
+            })
+            .collect();
+        match resolve_infr_dev_index(spec, &names)? {
+            Some(idx) => Ok(pdevices[idx]), // range already checked by the resolver
+            None => {
+                let devices = pdevices
+                    .iter()
+                    .map(|&pd| {
+                        let p = unsafe { instance.get_physical_device_properties(pd) };
+                        (p.device_type, device_local_heap_bytes(instance, pd))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(pdevices[preferred_device_index(&devices)])
+            }
+        }
+    }
+
+    /// Enumerate ALL Vulkan physical devices WITHOUT building a backend (a cheap instance +
+    /// `enumerate_physical_devices`, torn down before returning). Feeds the `infr devices` listing
+    /// and the interconnect probe. Each entry's `index` is the `VulkanN` / `INFR_DEV` / `new_on`
+    /// handle. Also reports the external-memory extensions each device exposes — the P2P /
+    /// host-less-transfer feasibility signal the multi-GPU campaign needs.
+    ///
+    /// Takes the caller's [`Config`] because `is_default_pick` marks the device
+    /// [`new_with`](Self::new_with) WOULD bind, which `device.dev` (`INFR_DEV`) steers (S5a).
+    pub fn enumerate_devices(cfg: &Config) -> Result<Vec<DeviceInfo>> {
+        Self::reject_on_apple()?;
+        let entry =
+            unsafe { ash::Entry::load() }.map_err(|e| be(format!("ash::Entry::load: {e}")))?;
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let instance = unsafe {
+            entry.create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app_info),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("create_instance: {e}")))?;
+
+        let result = (|| -> Result<Vec<DeviceInfo>> {
+            let pdevices = unsafe { instance.enumerate_physical_devices() }
+                .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
+            let default_pick =
+                Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref()).ok();
+            let mut out = Vec::with_capacity(pdevices.len());
+            for (index, &pd) in pdevices.iter().enumerate() {
+                let p = unsafe { instance.get_physical_device_properties(pd) };
+                let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                let vram_bytes = device_local_heap_bytes(&instance, pd);
+                let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
+                    .unwrap_or_default();
+                let has = |name: &CStr| {
+                    exts.iter()
+                        .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
+                };
+                let pci_address = has(c"VK_EXT_pci_bus_info").then(|| {
+                    let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+                    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+                    unsafe { instance.get_physical_device_properties2(pd, &mut props) };
+                    format!(
+                        "{:04x}:{:02x}:{:02x}.{:x}",
+                        pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function
+                    )
+                });
+                let integrated = p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+                let vram = physical_vram_info(
+                    &instance,
+                    pd,
+                    integrated,
+                    uses_largest_device_local_heap_only(
+                        p.vendor_id,
+                        p.device_type,
+                        cfg!(target_os = "windows"),
+                    ),
+                    has(c"VK_EXT_memory_budget"),
+                    0,
+                );
+                let flash_attention_hd256 = probe_flash_attention_hd256(
+                    &entry,
+                    &instance,
+                    pd,
+                    &has,
+                    cfg.kernels.vulkan.f16,
+                    cfg.kernels.vulkan.coopmat,
+                );
+                out.push(DeviceInfo {
+                    index,
+                    name,
+                    vendor_id: p.vendor_id,
+                    device_id: p.device_id,
+                    pci_address,
+                    device_type: device_type_str(p.device_type),
+                    integrated,
+                    vram_bytes,
+                    vram_total_bytes: vram.total,
+                    vram_available_bytes: vram.available,
+                    vram_live: vram.live,
+                    is_default_pick: default_pick == Some(pd),
+                    external_memory: has(c"VK_KHR_external_memory"),
+                    external_memory_fd: has(c"VK_KHR_external_memory_fd"),
+                    external_memory_dma_buf: has(c"VK_EXT_external_memory_dma_buf"),
+                    flash_attention_hd256,
+                });
+            }
+            Ok(out)
+        })();
+        unsafe { instance.destroy_instance(None) };
+        result
+    }
+
+    /// **The real constructor (S5a).** Build a backend on the default device, reading every
+    /// construction-time knob — device pick, capability masking, subgroup preference, the submit
+    /// splitter, the VRAM guard, the pipeline-cache and pager diagnostics — from `cfg` instead of
+    /// the process environment. The `Arc` is held for the backend's whole life and borrowed
+    /// (never cloned) at each read site (`docs/config-plan.md` R4/R6).
+    ///
+    /// Device pick: `cfg.device.dev` (`INFR_DEV`) if it names a `VulkanN`, else the discrete GPU
+    /// with the most device-local memory, else device 0. See [`new_on_with`](Self::new_on_with) to
+    /// pin a SPECIFIC index.
+    pub fn new_with(cfg: Arc<Config>) -> Result<Self> {
+        Self::new_selected(None, cfg)
+    }
+
+    /// [`new_with`](Self::new_with) pinned to physical-device `index`. See
+    /// [`new_on`](Self::new_on) for the index semantics.
+    pub fn new_on_with(index: usize, cfg: Arc<Config>) -> Result<Self> {
+        Self::new_selected(Some(index), cfg)
+    }
+
+    /// Default-device constructor for callers that have no [`Config`] to hand in — this crate's own
+    /// `#[cfg(test)]` GPU tests and external library users. Resolves `Default` < environment once
+    /// (the same fold [`Config::load_from_env`] performs, but FALLIBLE, so `INFR_SG` /
+    /// `INFR_SUBMIT_DISPATCHES` / the device lists still reject a bad value LOUDLY here exactly as
+    /// the pre-S5a read sites did) and forwards to [`new_with`](Self::new_with). Every caller
+    /// inside `infr-llama` and `infr-cli` passes its own `Arc<Config>` instead.
+    pub fn new() -> Result<Self> {
+        Self::new_with(Self::cfg_from_env()?)
+    }
+
+    /// Construct a backend pinned to physical-device `index` (enumeration order, matching
+    /// [`enumerate_devices`](Self::enumerate_devices) and `INFR_DEV=VulkanN`), IGNORING the
+    /// `device.dev` spec and the discrete-default rule. This is the multi-device foundation: two
+    /// backends built with different indices can be held live simultaneously (each owns its own
+    /// instance + logical device + allocator), enabling later tensor/expert-parallel slices. An
+    /// out-of-range `index` is a hard error, never a silent fallback.
+    ///
+    /// The environment-sourced twin of [`new_on_with`](Self::new_on_with); see [`new`](Self::new).
+    pub fn new_on(index: usize) -> Result<Self> {
+        Self::new_on_with(index, Self::cfg_from_env()?)
+    }
+
+    /// `Default` < environment, for the [`new`](Self::new)/[`new_on`](Self::new_on)/
+    /// [`enumerate_devices_from_env`](Self::enumerate_devices_from_env) entry points that are handed
+    /// no `Config`.
+    ///
+    /// Deliberately NOT [`Config::load_from_env`]: that one is infallible (S2 needed it to be,
+    /// because the loud keys were still read — and still rejected — at their own sites). S5a moved
+    /// the last two of those five (`INFR_SG`, `INFR_SUBMIT_DISPATCHES`) onto `Config`, so swallowing
+    /// a layer error here would SILENTLY drop an error a `VulkanBackend::new()` caller gets today
+    /// (R1). No file layer either — these knobs were env-only, and a second diagnostics banner
+    /// would print.
+    fn cfg_from_env() -> Result<Arc<Config>> {
+        let layer = infr_core::config::ConfigLayer::env().map_err(|e| be(e.to_string()))?;
+        Ok(Arc::new(Config::load_from_layers(&[layer])))
+    }
+
+    /// [`enumerate_devices`](Self::enumerate_devices) for callers with no [`Config`] — see
+    /// [`new`](Self::new).
+    pub fn enumerate_devices_from_env() -> Result<Vec<DeviceInfo>> {
+        let cfg = Self::cfg_from_env()?;
+        Self::enumerate_devices(&cfg)
+    }
+
+    fn new_selected(explicit_index: Option<usize>, cfg: Arc<Config>) -> Result<Self> {
+        cfg.kernels
+            .vulkan
+            .validate_attention_splits()
+            .map_err(|e| be(e.to_string()))?;
+
+        // Apple: the Vulkan backend is DELIBERATELY unsupported (the only Vulkan on Apple is
+        // MoltenVK, which lacks features this backend depends on — e.g. `bufferDeviceAddress` for
+        // the paged MoE arena — and is slower than talking to Metal directly). infr ships a NATIVE
+        // Metal backend for Apple GPUs. The `?` on a runtime `Result` here does NOT trip
+        // `unreachable_code`, so the Vulkan body below still compiles clean on macOS (it is simply
+        // never reached). See `reject_on_apple`.
+        Self::reject_on_apple()?;
+
+        // Every knob below is resolved ONCE, here, from the caller's config — the construction-time
+        // tier (`docs/config-plan.md` §7 S5a). Borrowed, never cloned (R6); `cfg` itself moves onto
+        // the backend at the bottom of this function.
+        let vkcfg = &cfg.kernels.vulkan;
+
+        // ── entry ──────────────────────────────────────────────────────────────
+        let entry =
+            unsafe { ash::Entry::load() }.map_err(|e| be(format!("ash::Entry::load: {e}")))?;
+
+        // ── instance (Vulkan 1.3) ──────────────────────────────────────────────
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"infr")
+            .application_version(vk::make_api_version(0, 0, 1, 0))
+            .engine_name(c"infr-vulkan")
+            .engine_version(vk::make_api_version(0, 0, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+
+        // Native Vulkan drivers only (Linux/Windows AMD/NVIDIA/Intel). The MoltenVK portability
+        // opt-in that used to live here was removed with the Apple guard above — Apple is the only
+        // place a portability driver is enumerated, and infr no longer runs Vulkan there.
+        let instance = unsafe {
+            entry.create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app_info),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("create_instance: {e}")))?;
+
+        // RAII cleanup for the partially-built device. `ash::Instance`/`Device` have NO `Drop`
+        // (only `VulkanShared::Drop` frees them), so every `Err`/`?` return below this point would
+        // otherwise leak the `VkInstance` — and, once they exist, the `VkDevice` + command pool —
+        // for the whole process life. That is a RECOVERABLE path (the seam catches the `Err` and
+        // falls back to CPU), so the leak is permanent per launch: the subgroup-32 rejection, the
+        // `INFR_SG`/`INFR_SUBMIT_DISPATCHES` env guards, `!has_bda`, a failed `create_command_pool`
+        // or allocator build all return here. Mirror `enumerate_devices`, which destroys its
+        // instance unconditionally on the way out. Holds independent handle CLONES (ash handles are
+        // trivially copyable and their `Drop` is a no-op), so the success path — which DISARMS this
+        // just before the originals move into `VulkanShared` — is byte-for-byte unchanged and never
+        // double-frees.
+        struct InstanceCleanup {
+            instance: ash::Instance,
+            device: Option<ash::Device>,
+            pool: vk::CommandPool,
+            armed: bool,
+        }
+        impl Drop for InstanceCleanup {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                unsafe {
+                    if let Some(device) = &self.device {
+                        if self.pool != vk::CommandPool::null() {
+                            device.destroy_command_pool(self.pool, None);
+                        }
+                        device.destroy_device(None);
+                    }
+                    self.instance.destroy_instance(None);
+                }
+            }
+        }
+        let mut cleanup = InstanceCleanup {
+            instance: instance.clone(),
+            device: None,
+            pool: vk::CommandPool::null(),
+            armed: true,
+        };
+
+        // ── physical device: `INFR_DEV` if set, else prefer discrete ──────────
+        // `INFR_DEV=VulkanN` (set by the CLI's `--dev`) pins the Nth device in ENUMERATION order,
+        // matching llama.cpp's `--dev VulkanN` naming so the two tools address the same GPU on a
+        // multi-GPU box. Unset => the historical rule: first DISCRETE_GPU, else device 0.
+        //
+        // An out-of-range / unparseable INFR_DEV is a hard error, NOT a fallback: silently running
+        // on a different GPU than the one asked for produces numbers that look plausible and are
+        // wrong, which is far worse than refusing to start.
+        let pdevices = unsafe { instance.enumerate_physical_devices() }
+            .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
+        if pdevices.is_empty() {
+            return Err(be("no Vulkan physical devices"));
+        }
+
+        // Make enumeration VISIBLE (the campaign asked for it): one line per physical device at
+        // init — index (the `VulkanN` / `INFR_DEV` / `new_on` handle), name, class, device-local
+        // heap. Silent-picking one GPU on a multi-GPU box is exactly what hid device selection.
+        for (i, &pd) in pdevices.iter().enumerate() {
+            let p = unsafe { instance.get_physical_device_properties(pd) };
+            let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
+            let dev_local = device_local_heap_bytes(&instance, pd);
+            tracing::info!(
+                "[infr] vulkan device Vulkan{i}: {name} ({}, {})",
+                device_type_str(p.device_type),
+                fmt_bytes(dev_local),
+            );
+        }
+
+        // Explicit index (`new_on`) wins outright and bypasses the env/discrete rule — the
+        // multi-device path. `None` = the historical default, byte-for-byte unchanged below.
+        let physical_device = match explicit_index {
+            Some(idx) => *pdevices.get(idx).ok_or_else(|| {
+                be(format!(
+                    "VulkanBackend::new_on({idx}): no such Vulkan device (this system has {})",
+                    pdevices.len()
+                ))
+            })?,
+            None => Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref())?,
+        };
+
+        // Selection log: which of the enumerated devices this backend actually bound.
+        {
+            let p = unsafe { instance.get_physical_device_properties(physical_device) };
+            let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
+            let idx = pdevices.iter().position(|&pd| pd == physical_device);
+            tracing::info!(
+                "[infr] vulkan: selected {}{name} ({})",
+                idx.map(|i| format!("Vulkan{i}=")).unwrap_or_default(),
+                device_type_str(p.device_type),
+            );
+        }
+
+        // ── compute queue family ───────────────────────────────────────────────
+        // The first COMPUTE-capable family. On amdgpu this is the universal (graphics) family, so
+        // the work lands on the `gfx` ring. Moving it to a compute-ONLY family (the `comp` rings)
+        // was tried and is strictly WORSE on the surveyed integrated part: the same ~2 s forward
+        // that is an intermittent device-lost on `gfx` is a DETERMINISTIC one on `comp` (measured
+        // 4/4 runs), i.e. the compute ring's effective hang budget there is TIGHTER, not the 60 s
+        // its module-parameter default advertises. The submit splitter is what actually bounds the
+        // job (see `VulkanShared::submit_dispatch_cap`); the ring choice is not a lever.
+        let qf_props =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_family_index = qf_props
+            .iter()
+            .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .map(|i| i as u32)
+            .ok_or_else(|| be("no compute queue family found"))?;
+        #[cfg(test)]
+        let test_aux_compute = std::env::var("MOE4ALL_TEST_AUX_COMPUTE_QUEUE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        #[cfg(test)]
+        if test_aux_compute && qf_props[queue_family_index as usize].queue_count < 2 {
+            return Err(be(
+                "test auxiliary compute queue requires main-family queue_count >= 2",
+            ));
+        }
+        let dedicated_transfer_family_index = qf_props
+            .iter()
+            .position(|p| {
+                p.queue_count > 0
+                    && p.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                    && !p
+                        .queue_flags
+                        .intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            })
+            .map(|i| i as u32);
+        let submit_timestamp_valid_bits =
+            qf_props[queue_family_index as usize].timestamp_valid_bits;
+
+        // ── probe device extensions ────────────────────────────────────────────
+        let avail_exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .map_err(|e| be(format!("enumerate device extensions: {e}")))?;
+
+        let has_ext = |name: &CStr| -> bool {
+            avail_exts
+                .iter()
+                .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
+        };
+
+        #[cfg(test)]
+        let indirect_copy_support = unsafe {
+            crate::indirect_copy::query(
+                &instance,
+                physical_device,
+                has_ext(crate::indirect_copy::EXTENSION_NAME),
+            )
+        };
+        #[cfg(test)]
+        let enable_indirect_copy =
+            indirect_copy_support.supports_queue(qf_props[queue_family_index as usize].queue_flags);
+
+        #[cfg(test)]
+        let test_shader_clock =
+            shader_clock_test_opt_in(std::env::var_os("MOE4ALL_TEST_SHADER_CLOCK").as_deref());
+        #[cfg(not(test))]
+        let test_shader_clock = false;
+        #[cfg(test)]
+        let mut shader_clock_ci = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
+        #[cfg(test)]
+        if test_shader_clock {
+            if !has_ext(c"VK_KHR_shader_clock") {
+                return Err(be(
+                    "MOE4ALL_TEST_SHADER_CLOCK=1 requires VK_KHR_shader_clock",
+                ));
+            }
+            let mut clock_features =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut shader_clock_ci);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut clock_features) };
+            if shader_clock_ci.shader_subgroup_clock == vk::FALSE {
+                return Err(be(
+                    "MOE4ALL_TEST_SHADER_CLOCK=1 requires shaderSubgroupClock",
+                ));
+            }
+            // Enable only reported bits; device-clock timestamps remain optional.
+            shader_clock_ci.shader_subgroup_clock = vk::TRUE;
+            shader_clock_ci.shader_device_clock =
+                u32::from(shader_clock_ci.shader_device_clock != vk::FALSE);
+        }
+
+        let has_coop_matrix = has_ext(c"VK_KHR_cooperative_matrix");
+        let has_16bit_storage = has_ext(c"VK_KHR_16bit_storage");
+        let has_8bit_storage = has_ext(c"VK_KHR_8bit_storage");
+        // Packed i8 (int8) dot (dp4a) — the decode i8 `mmv` accumulate. Promoted to core in Vulkan
+        // 1.3; probed via the KHR ext for pre-1.3 drivers. Detection-only here (caps.i8_dot); the
+        // adapter's i8-mmv gate consults it so a device without packed dot routes to the scalar
+        // dequant GEMV instead of dispatching a dp4a kernel it can't run.
+        let has_i8_dot_ext = has_ext(c"VK_KHR_shader_integer_dot_product");
+        // f8 (== fp8, E4M3/E5M2) storage/convert support. ash 0.38 has no constant for the ext, so
+        // match the raw name. Absent on RDNA3 → caps.f8 false.
+        let has_f8_ext = has_ext(c"VK_EXT_shader_float8");
+        // bf16 (bfloat16) storage/convert. ash 0.38 has no constant for the ext → match the raw
+        // name. Absent on RDNA3 → caps.bf16 false; present on RDNA4/Navi44.
+        let has_bf16_ext = has_ext(c"VK_KHR_shader_bfloat16");
+        // …and their FEATURE bits, which ash 0.38 also has no struct for (see `vkext`). These two
+        // were the only capabilities here gated on an extension string alone; the kernels that use
+        // them declare `bfloat16_t` / `floate4m3_t` coopmat operands, which the spec requires the
+        // matching feature to be enabled for — so "the string was present" was never the same claim
+        // as "the device will run it". Skipped entirely (all-false) unless the extension is
+        // advertised: chaining a struct a driver does not know is UB.
+        // UNEXERCISED ON THIS HARDWARE — RDNA3 advertises neither extension (see the module doc).
+        let post_ash = unsafe {
+            crate::vkext::query_post_ash_features(
+                &instance,
+                physical_device,
+                has_bf16_ext,
+                has_f8_ext,
+            )
+        };
+        let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
+        let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
+        // External-memory (host-LESS cross-device P2P): export a buffer's memory as an fd on one
+        // device and import it on another so device B reads/writes device A's physical bytes over
+        // PCIe with no host bounce (see `p2p.rs`). `VK_KHR_external_memory` is core in Vulkan 1.1
+        // (this backend targets 1.3), so the `VkExternalMemoryBufferCreateInfo` /
+        // `VkExportMemoryAllocateInfo` / `VkImportMemoryFdInfoKHR` structs need no extension enable —
+        // only the fd op extension (`vkGetMemoryFdKHR`/`vkGetMemoryFdPropertiesKHR`) and, for the
+        // dma-buf handle type (the cross-GPU-portable one on Linux), `VK_EXT_external_memory_dma_buf`.
+        // Both are GATED: a device lacking them simply reports no P2P support (`caps` below), the
+        // default single-device path is untouched, and no P2P handle type is offered.
+        let has_ext_mem_fd = has_ext(c"VK_KHR_external_memory_fd");
+        let has_ext_mem_dma_buf = has_ext(c"VK_EXT_external_memory_dma_buf");
+        let has_ext_mem_host = has_ext(c"VK_EXT_external_memory_host");
+        let host_import_alignment = if has_ext_mem_host {
+            let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut props) };
+            host_props.min_imported_host_pointer_alignment as usize
+        } else {
+            0
+        };
+        // External SEMAPHORE fd — the tensor-parallel all-reduce orders a peer's cross-device read
+        // after this device's GPU-side signal with NO host round-trip: export a timeline semaphore as
+        // an fd here, import it on the peer, signal a value on this device's submit and wait it on the
+        // peer's (see `tp_sem.rs`). `VK_KHR_external_semaphore` is core in Vulkan 1.1, so only the fd
+        // op extension needs enabling; the timeline-semaphore feature (core 1.2) is probed + enabled
+        // below. GATED: a device lacking either reports no support and the all-reduce falls back to
+        // the host fence. `VK_EXT_external_semaphore_fd` uses OPAQUE_FD (same-driver cross-device,
+        // which the dGPU+iGPU pair here both being RADV satisfies).
+        let has_ext_sem_fd = has_ext(c"VK_KHR_external_semaphore_fd");
+        // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
+        // straight into the command buffer instead of `alloc_set` (pool allocate) +
+        // `update_descriptor_sets` (a separate driver call) + `cmd_bind_descriptor_sets` per op —
+        // measured as a real per-forward host-side cost at small-m shapes (many-op graphs where
+        // GPU busy time is small, so the fixed per-dispatch descriptor churn is a bigger fraction
+        // of wall time). Near-universally supported (desktop RADV/NVIDIA/Intel); the pooled path
+        // stays as a fallback for drivers that lack it (e.g. some portability/MoltenVK builds).
+        // `kernels.vulkan.push_desc = false` (`INFR_NO_PUSH_DESC=1`) forces the pooled-classic
+        // fallback even when the extension exists — lets a RADV dev box exercise the code path a
+        // driver WITHOUT push descriptors takes (field report: teardown validation findings on
+        // Intel Arc/ANV that RADV runs never reproduce because the classic pools are never created
+        // here). Test/diagnosis knob only.
+        let has_push_descriptor = has_ext(c"VK_KHR_push_descriptor") && vkcfg.push_desc;
+        let probe_conditional =
+            has_ext(c"VK_EXT_conditional_rendering") && vkcfg.decode_gpu_resident;
+
+        // ── probe features (via VK 1.1 get_physical_device_features2) ─────────
+        // Memory model and subgroup-size-control are probed rather than assumed: a portability
+        // device (MoltenVK) may lack either, and enabling an unsupported feature fails
+        // create_device outright.
+        let mut f16_feat = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+        let mut memmodel_feat = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+        let mut sgsize_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut coopmat_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut intdot_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        // Buffer-device-address: lets a shader read a buffer via a 64-bit `VkDeviceAddress`
+        // (`GL_EXT_buffer_reference`), bypassing one SSBO binding's `maxStorageBufferRange` (~4 GiB
+        // on RADV). infr's paged-MoE expert arena REQUIRES it — a per-role pool now spans as much
+        // VRAM as the budget allows, addressed by a raw pointer. Core in Vulkan 1.2, so it is
+        // hard-required below (not an opt-in ladder like coopmat).
+        let mut bda_feat = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+        // Timeline semaphore (core 1.2) — required by the tensor-parallel external-semaphore
+        // all-reduce (a shared timeline signalled on one device, waited on another). Probed so we
+        // never try to enable it where absent (which would fail create_device).
+        let mut timeline_feat = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut conditional_feat = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+        let mut feat2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f16_feat)
+            .push_next(&mut memmodel_feat)
+            .push_next(&mut sgsize_feat)
+            .push_next(&mut coopmat_feat)
+            .push_next(&mut intdot_feat)
+            .push_next(&mut bda_feat)
+            .push_next(&mut timeline_feat);
+        if probe_conditional {
+            feat2 = feat2.push_next(&mut conditional_feat);
+        }
+        unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+        // Core Vulkan 1.0 feature (no extension struct — `get_physical_device_features2` always
+        // populates the chain's base `.features`). Several KV-cache dequant/attention shaders
+        // (dequant_turbo_f16.comp, dequant_q8_f16.comp, attn_*.comp) declare SPIR-V's `Int16`
+        // capability (16-bit integer arithmetic, e.g. GL_EXT_shader_explicit_arithmetic_types_int16
+        // int16_t/uint16_t locals — distinct from `storageBuffer16BitAccess`, which only covers
+        // 16-bit SSBO/UBO *storage*, not arithmetic): VUID-VkShaderModuleCreateInfo-pCode-08740
+        // requires `shaderInt16` enabled on the DEVICE for that capability, same class of bug as the
+        // `shaderIntegerDotProduct` one fixed below — detected via caps but never chained into
+        // `device_ci`, so vkCreateShaderModule for those kernels violated the VUID under validation.
+        let has_int16 = feat2.features.shader_int16 != 0;
+        // Same 08740 class as `shaderInt16` above, for 64-bit integer arithmetic: the BDA arena
+        // helper `native_weight_addr.glsl` (paged-MoE `-DPAGED` builds AND dense-streaming
+        // `-DSTREAMED` builds) composes a 64-bit slot address from lo/hi u32 halves
+        // (`uint64_t(hi) << 32 | uint64_t(lo)`, `GL_EXT_shader_explicit_arithmetic_types_int64`),
+        // which emits SPIR-V's `Int64` capability — so `shaderInt64` MUST be enabled on the device
+        // or vkCreateShaderModule for those kernels violates the VUID under validation. Core 1.0
+        // feature; RADV/desktop support it universally, probed here for portability devices.
+        let has_int64 = feat2.features.shader_int64 != 0;
+        // Read AFTER the `feat2.features` access above: `feat2` holds a mutable borrow of every
+        // pushed feature struct (incl. `bda_feat`) until its last use, so the pushed structs can
+        // only be read once `feat2` itself is done being touched.
+        let has_bda = bda_feat.buffer_device_address != 0;
+        let has_conditional = probe_conditional && conditional_feat.conditional_rendering != 0;
+        // The external-semaphore all-reduce needs BOTH the fd extension and the timeline feature
+        // (read here, after `feat2`'s last use, for the same borrow reason as `has_bda`).
+        let has_ext_sem = has_ext_sem_fd && timeline_feat.timeline_semaphore != 0;
+        // The same transfer-only queue consumes either imported host RAM or a temporary
+        // host-visible staging buffer. It therefore remains useful on devices that cannot expose
+        // their expert arena through ReBAR or VK_EXT_external_memory_host (notably RDNA2).
+        let dedicated_transfer_family_index = (cfg.paging.dedicated_transfer
+            && timeline_feat.timeline_semaphore != 0)
+            .then_some(dedicated_transfer_family_index)
+            .flatten();
+        let timeline_enabled = has_ext_sem || dedicated_transfer_family_index.is_some();
+        #[cfg(test)]
+        if test_aux_compute && timeline_feat.timeline_semaphore == 0 {
+            return Err(be(
+                "test auxiliary compute queue requires timeline semaphores",
+            ));
+        }
+        #[cfg(test)]
+        let timeline_enabled = timeline_enabled || test_aux_compute;
+        // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
+        // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
+        // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
+        // real target this never fires — it is the clean guard for a driver/portability layer that
+        // somehow omits it, failing at init with a clear message instead of miscompiling a shader.
+        if !has_bda {
+            let p = unsafe { instance.get_physical_device_properties(physical_device) };
+            let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let (major, minor, patch) = (
+                vk::api_version_major(p.api_version),
+                vk::api_version_minor(p.api_version),
+                vk::api_version_patch(p.api_version),
+            );
+            return Err(be(format!(
+                "this GPU/driver does not support bufferDeviceAddress (the 64-bit shader address \
+                 space), which infr's paged-MoE arena requires — {name} / Vulkan \
+                 {major}.{minor}.{patch}. bufferDeviceAddress is core in Vulkan 1.2; update the \
+                 driver or use a device that exposes it."
+            )));
+        }
+        let has_f16 = f16_feat.shader_float16 != 0;
+        let has_memmodel = memmodel_feat.vulkan_memory_model != 0;
+        let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
+        let has_sgsize = sgsize_feat.subgroup_size_control != 0;
+        let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
+        // Packed i8 dot: ext advertised AND the feature bit set (same ext-AND-feature discipline as
+        // coopmat). Detection-only — the current i8 mmv is DEFAULT-OFF at m=1 (scalar wins), and no
+        // shader here uses the ext builtin yet, so we don't add it to the enabled feature chain; the
+        // adapter's i8-mmv gate reads `caps.i8_dot` before ever dispatching a dp4a kernel.
+        let has_i8_dot = has_i8_dot_ext && intdot_feat.shader_integer_dot_product != 0;
+        // i8 (int8) shader storage/math — the same `shaderFloat16Int8` feature struct carries it.
+        let has_int8 = f16_feat.shader_int8 != 0;
+        // Extension presence alone doesn't guarantee the FEATURE bit (a driver may advertise
+        // VK_KHR_cooperative_matrix with cooperativeMatrix=false — enabling it then fails
+        // create_device, the same failure class #32 fixed for memmodel/sgsize). This is the
+        // PREREQUISITE (unit exists + usable); which COMPONENT TYPES it accepts is a separate
+        // enumeration below — the ext bit does NOT imply f16 support (the spec only promises a unit
+        // exists, not that it does f16), so we don't assume it.
+        let has_coop_ext_feat = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
+
+        // Enumerate the device's cooperative-matrix configs ONCE — the AUTHORITATIVE source for
+        // which component types AND tile dimensions the matrix unit accepts. Each config lists
+        // m/n/k size + a/b/c/result types; the ext's presence alone tells us nothing about them.
+        // Empty when the ext/feature is absent. Extract a Copy tuple — the returned structs borrow
+        // the loader `cm`, so we can't let them outlive this block.
+        type CoopmatConfig = (
+            u32,
+            u32,
+            u32,
+            vk::ComponentTypeKHR,
+            vk::ComponentTypeKHR,
+            vk::ComponentTypeKHR,
+            vk::ComponentTypeKHR,
+        );
+        let coopmat_configs: Vec<CoopmatConfig> = if has_coop_ext_feat {
+            let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+            unsafe { cm.get_physical_device_cooperative_matrix_properties(physical_device) }
+                .map(|v| {
+                    v.iter()
+                        .map(|p| {
+                            (
+                                p.m_size,
+                                p.n_size,
+                                p.k_size,
+                                p.a_type,
+                                p.b_type,
+                                p.c_type,
+                                p.result_type,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Diagnostic: dump every enumerated (M,N,K,aType,bType,cType,resultType) — the definitive
+        // list of what the matrix unit accepts, for bringing up new HW (RDNA4 fp8, bf16, Intel's
+        // 8/8/16 tiles) and sanity-checking the per-type/per-dim detection below.
+        // `debug.coopmat` (`INFR_DEBUG_COOPMAT=1`).
+        if cfg.debug.coopmat {
+            let raws: Vec<(u32, u32, u32, i32, i32, i32, i32)> = coopmat_configs
+                .iter()
+                .map(|&(m, n, k, a, b, c, r)| {
+                    (m, n, k, a.as_raw(), b.as_raw(), c.as_raw(), r.as_raw())
+                })
+                .collect();
+            tracing::info!(
+                "[infr] coopmat configs (M,N,K,aType_raw,bType_raw,cType_raw,resultType_raw): \
+                 {raws:?}"
+            );
+        }
+        // f16 coopmat: configs with f16 A AND B operands (accumulator/result f16 or f32), reduced
+        // to ONE chosen (M,N,K) tile by `select_coopmat_shape`'s preference order: 16x16x16 first
+        // (the shape every production coopmat shader is built for — every `coopmat<...,16,16,...>`
+        // declaration across gemm_coopmat*/gemm_warp/native_gemm*/attn_*/deltanet_prep), then
+        // 8x8x16 (Intel Arc/ANV XMX — ONLY under the `INFR_CM_8X8=1` opt-in, and only the
+        // `native_gemm_warp` `_cm8` builds exist at that shape). Component types alone are NOT
+        // sufficient — an Intel A770 (Mesa ANV) advertises f16×f16→f32 only at M=8,N=8,K=16;
+        // creating our 16x16x16 pipeline on such a device silently fails
+        // vkCreateComputePipelines (the segfault bug — the result wasn't checked, see
+        // `create_compute_pipeline` below). Requiring the shape match here makes an unsupported
+        // device fall back to the non-coopmat ladder instead of crashing. Derived from the
+        // enumeration, not assumed from the ext bit. `has_coop_matrix` (any usable f16 shape)
+        // keeps its downstream role (ext-enable, feature chain).
+        // ── driver trust: the ONE place a vendor/driver id reaches a decision ────────────────────
+        // Every other gate here is capability-first (probe, don't ask who made it), and that is why
+        // new hardware needs no code. This exception exists because capability-first assumes the
+        // device tells the truth, and llama.cpp has documented two drivers that do not — see
+        // `caps::coopmat_trust` for both rules and their upstream citation. The verdict is applied
+        // as a FILTER over the enumerated shape list below, so a shape this driver may not be
+        // believed about never reaches the tile preference order.
+        let device_probe = probe_device_facts(&instance, physical_device, &has_ext);
+        let device_arch = crate::caps::device_architecture(&device_probe);
+        // A driver that never reported an id must not be PRINTED as one either (ash's `DriverId`
+        // default is `AMD_PROPRIETARY`).
+        let driver_label = if device_probe.driver_id_reported {
+            format!("{:?}", device_probe.driver_id)
+        } else {
+            "driver-unreported".to_string()
+        };
+        let coopmat_trust = crate::caps::coopmat_trust(&device_probe, device_arch);
+        match coopmat_trust {
+            crate::caps::CoopmatTrust::Enumerated => {}
+            crate::caps::CoopmatTrust::Tile8Only(why) if has_coop_matrix => {
+                tracing::warn!(
+                    "[infr] cooperative matrix: 16x16x16 REFUSED on this device ({device_arch:?}, \
+                     {driver_label}) — {why}"
+                );
+            }
+            crate::caps::CoopmatTrust::Refused(why) if has_coop_matrix => {
+                tracing::warn!(
+                    "[infr] cooperative matrix REFUSED on this device ({device_arch:?}, \
+                     {driver_label}) — {why}"
+                );
+            }
+            // The device enumerates no coopmat at all: nothing to refuse, so stay silent.
+            _ => {}
+        }
+        let trusted = |&&(m, n, k, ..): &&CoopmatConfig| {
+            crate::caps::coopmat_shape_trusted(coopmat_trust, (m, n, k))
+        };
+
+        // ── VK_NV_cooperative_matrix2: capability only, no kernel path ──────────────────────────
+        // There is no coopmat2 shader in this backend (the only coopmat2 code anywhere is
+        // `examples/coopmat2_test.rs`, a standalone research probe). This runs the full gate anyway
+        // and REPORTS it, so "would this box qualify?" is answered by the log line rather than by
+        // reading the extension list — the extension being present says almost nothing, which is the
+        // whole reason `caps::check_coopmat2_support` exists. Warn only when the extension IS
+        // advertised and the gate still says no; silent on every device that lacks it entirely.
+        let coopmat2_probe = probe_coopmat2(&entry, &instance, physical_device, &has_ext, has_bda);
+        let coopmat2 = crate::caps::check_coopmat2_support(&coopmat2_probe);
+        if let (true, Err(why)) = (coopmat2_probe.has_ext, &coopmat2) {
+            tracing::warn!(
+                "[infr] VK_NV_cooperative_matrix2 advertised but NOT usable on this device \
+                 ({device_arch:?}, {driver_label}) — {why}"
+            );
+        }
+
+        let f16c = vk::ComponentTypeKHR::FLOAT16;
+        let cm8_env = vkcfg.coopmat_8x8;
+        let coopmat_f16 = crate::caps::select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(trusted)
+                .filter(|&&(_, _, _, a, b, _, _)| a == f16c && b == f16c)
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            cm8_env,
+        );
+        // Extension-added ComponentTypeKHR raw values (ash 0.38 predates these variants, so match by
+        // raw i32). CONFIRMED on RDNA4/Navi44 via INFR_DEBUG_COOPMAT — all CORE types are 0..=10
+        // (FLOAT16=0/FLOAT32=1/SINT8=3/UINT8=7/…), these are the KHR-standard ext values:
+        const CT_E4M3: i32 = 1_000_491_002; // VK_COMPONENT_TYPE_FLOAT_E4M3_KHR
+        const CT_E5M2: i32 = 1_000_491_003; // VK_COMPONENT_TYPE_FLOAT_E5M2_KHR
+        const CT_BF16: i32 = 1_000_141_000; // VK_COMPONENT_TYPE_BFLOAT16_KHR
+        let is_f8 = |t: i32| t == CT_E4M3 || t == CT_E5M2;
+        // f8 coopmat: configs with fp8 (E4M3/E5M2) A AND B operands, 16x16x16 ONLY (no f8 shader
+        // exists at any other shape → `allow_8x8x16 = false`). Uses the KHR-standard fp8 raw
+        // values (confirmed on RDNA4) rather than the older `>= 1e9` heuristic, which also
+        // matched bf16 (`CT_BF16` is ext-range too) and would false-positive f8 on a bf16-only
+        // unit. Also requires the float8 storage ext. NEVER Some on RDNA3 (enumerates no fp8
+        // config).
+        let coopmat_f8 = crate::caps::select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(trusted)
+                .filter(|&&(_, _, _, a, b, _, _)| is_f8(a.as_raw()) && is_f8(b.as_raw()))
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
+        )
+        // The shader declares `floate4m3_t` coopmat operands, so the tier needs the extension AND
+        // `shaderFloat8CooperativeMatrix` — not merely an enumerated fp8 config.
+        .filter(|_| has_f8_ext && post_ash.f8_coopmat);
+        // bf16 coopmat: BFLOAT16 A AND B operands, 16x16x16 only. Confirmed on RDNA4/Navi44
+        // (bf16×bf16→bf16 and →f32); RDNA3 enumerates none. Same discipline as f8/f16 above.
+        let coopmat_bf16 = crate::caps::select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(trusted)
+                .filter(|&&(_, _, _, a, b, _, _)| a.as_raw() == CT_BF16 && b.as_raw() == CT_BF16)
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
+        )
+        // `native_gemm_warp.comp`'s -DBF16CM build declares `bfloat16_t` coopmat operands
+        // (GL_EXT_bfloat16), so the tier needs the extension AND `shaderBFloat16CooperativeMatrix`
+        // enabled on the device, not just a bf16 config in the enumeration.
+        .filter(|_| has_bf16_ext && post_ash.bf16_coopmat);
+        // i8 coopmat: configs with SINT8 A AND B operands and a SINT32 result, 16x16x16 only (the
+        // shape every int8 coopmat shader here uses) — same discipline as `coopmat_f16`'s shape
+        // selection above. DETECTION ONLY (see the `coopmat_i8` doc comment on `Capabilities`):
+        // the standalone `coopmat_int8_test` harness confirmed this exact config
+        // (SINT8xSINT8->SINT32, subgroup-pinned 32, A RowMajor/B ColumnMajor) dispatches correctly
+        // on this driver, but int8 coopmat hung an OLDER Mesa (commit ad82a77) despite enumerating
+        // fine there too — so detection alone does NOT make this capability a safe default; the
+        // adapter requires `INFR_I8_COOPMAT=1` in addition to `caps.i8_coopmat()`, AND that the
+        // accumulator-layout known-answer probe passed on this driver
+        // (`verify_i8_coopmat_layout`), before ever dispatching the kernel.
+        let i8c = vk::ComponentTypeKHR::SINT8;
+        let i32c = vk::ComponentTypeKHR::SINT32;
+        let coopmat_i8 = crate::caps::select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(trusted)
+                .filter(|&&(_, _, _, a, b, _, r)| a == i8c && b == i8c && r == i32c)
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
+        );
+
+        // ── force-disable capabilities for fallback-path testing on capable HW ──
+        // These knobs drop a DETECTED capability so the next kernel tier down is exercised on a
+        // device that actually has the feature — otherwise the portability fallbacks are only
+        // reachable on hardware we may not own. This is `docs/config-plan.md` §5.2: `Capabilities`
+        // stays a PROBE result (no config fields on it, nothing downstream re-reads a knob), and
+        // the config MASKS the probe right here, at construction. Applied before the ext list /
+        // feature chain so a forced-off feature is genuinely NOT enabled on the device (a faithful
+        // simulation, not just a caps flag flip). f16 is a coopmat prerequisite, so `!f16` ⇒ NO
+        // coopmat too — preserve that AND, it is not a bug.
+        let has_f16 = has_f16 && vkcfg.f16;
+        let coopmat_f16 = coopmat_f16
+            .filter(|_| has_f16 && vkcfg.coopmat)
+            .filter(|&s| {
+                // 8x8x16 additionally needs a pinnable subgroup size 16: the `_cm8` builds run
+                // 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native) and reuse the
+                // kernel's 8-warp index math, so a device that can't pin 16 can't run them.
+                // (Checked here so the coopmat ext is never enabled for a shape we then refuse.
+                // The physical-device subgroup range is queried again for `caps` below; this
+                // early copy exists because that query currently runs after device creation.)
+                if s != infr_core::COOPMAT_TILE_8 {
+                    return true;
+                }
+                let mut sgp = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgp);
+                unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+                has_sgsize && sgp.min_subgroup_size <= 16 && 16 <= sgp.max_subgroup_size
+            });
+        // `has_coop_matrix` = ANY usable f16 coopmat shape — drives the ext enable + feature
+        // chain below. On a 16x16x16 device this is exactly the old boolean; on an 8x8x16-only
+        // device it is false unless INFR_CM_8X8=1 selected the 8x8x16 shape above (default OFF:
+        // the ext is then NOT enabled, byte-identical to the pre-shape-table behavior there).
+        let has_coop_matrix = coopmat_f16.is_some();
+        // f8 coopmat is a coopmat sub-tier, so dropping coopmat drops it too.
+        let coopmat_f8 = coopmat_f8.filter(|_| has_coop_matrix);
+        // bf16 coopmat: same coopmat sub-tier dependency (rides the coopmat device-feature enable).
+        let coopmat_bf16 = coopmat_bf16.filter(|_| has_coop_matrix);
+        // i8 coopmat rides the SAME device feature enable (coopmat_ci is only chained into
+        // device_ci below when `has_coop_matrix`) — without it the extension isn't enabled on the
+        // logical device even if int8 configs were enumerated, so this is a real dependency, not
+        // just symmetry with coopmat_f8 above. `!coopmat`/`!f16` drop it too.
+        let coopmat_i8 = coopmat_i8.filter(|_| has_coop_matrix);
+        let has_i8_dot = has_i8_dot && vkcfg.i8_dot;
+        // INFR_CM_8X8=1 outcome notice (once, at device init): the tester A/B knob must be loud
+        // about whether it actually engaged — on RADV (16x16x16 enumerated) or any device without
+        // an 8x8x16 f16 config it changes NOTHING, and the kernel set stays identical.
+        if cm8_env {
+            match coopmat_f16 {
+                Some(infr_core::COOPMAT_TILE_8) => tracing::info!(
+                    "[infr] INFR_CM_8X8=1: 8x8x16 f16 coopmat selected — native_gemm_warp _cm8 \
+                     prefill tier live (other coopmat families stay on their non-coopmat \
+                     fallbacks)"
+                ),
+                Some(_) => tracing::warn!(
+                    "[infr] INFR_CM_8X8=1 has no effect: device provides the default 16x16x16 \
+                     f16 coopmat tile — kernel set unchanged"
+                ),
+                None => tracing::warn!(
+                    "[infr] INFR_CM_8X8=1 has no effect: device enumerates no usable 8x8x16 f16 \
+                     coopmat config (or coopmat is disabled) — kernel set unchanged"
+                ),
+            }
+        }
+        // Extend the `debug.coopmat` dump with the CHOSEN shape per component type (the raw
+        // enumeration is printed above, before selection).
+        if cfg.debug.coopmat {
+            tracing::info!(
+                "[infr] coopmat chosen shapes (M,N,K): f16={coopmat_f16:?} bf16={coopmat_bf16:?} \
+                 f8={coopmat_f8:?} i8={coopmat_i8:?}"
+            );
+        }
+
+        // ── build extension name list (only available ones) ────────────────────
+        let mut ext_ptrs: Vec<*const i8> = Vec::new();
+        #[cfg(test)]
+        if enable_indirect_copy {
+            ext_ptrs.push(crate::indirect_copy::EXTENSION_NAME.as_ptr());
+        }
+        if has_coop_matrix {
+            ext_ptrs.push(c"VK_KHR_cooperative_matrix".as_ptr());
+        }
+        if has_16bit_storage {
+            ext_ptrs.push(c"VK_KHR_16bit_storage".as_ptr());
+        }
+        if has_8bit_storage {
+            ext_ptrs.push(c"VK_KHR_8bit_storage".as_ptr());
+        }
+        if has_subgroup_ext {
+            ext_ptrs.push(c"VK_KHR_shader_subgroup_extended_types".as_ptr());
+        }
+        if has_mem_budget {
+            ext_ptrs.push(c"VK_EXT_memory_budget".as_ptr());
+        }
+        if has_push_descriptor {
+            ext_ptrs.push(c"VK_KHR_push_descriptor".as_ptr());
+        }
+        if has_conditional {
+            ext_ptrs.push(c"VK_EXT_conditional_rendering".as_ptr());
+        }
+        if test_shader_clock {
+            ext_ptrs.push(c"VK_KHR_shader_clock".as_ptr());
+        }
+        let has_timeline_clock =
+            infr_core::timeline::device_enabled() && has_ext(c"VK_EXT_calibrated_timestamps");
+        if has_timeline_clock {
+            ext_ptrs.push(c"VK_EXT_calibrated_timestamps".as_ptr());
+        }
+        // The int8 dp4a decode GEMVs (native_mmv.comp, native_mmv_mrow.comp, native_mmv_id_q4k.comp,
+        // mul_mat_vec_q.comp's dotPacked builtins) compile to SPIR-V with the DotProduct /
+        // DotProductInput4x8BitPacked capabilities, which VUID-VkShaderModuleCreateInfo-pCode-08740
+        // requires `shaderIntegerDotProduct` to be enabled on the DEVICE for — not just detected.
+        // This was previously probed into `caps.i8_dot` (detection-only, per an now-stale comment
+        // claiming no shader used the builtin yet) but never actually enabled, so vkCreateShaderModule
+        // for those kernels violated the VUID on any driver that validates it (reproduced on the
+        // 7900 XTX under validation layers with an 8B model, which is wide enough to select the mmv
+        // dp4a tier — the small model's shapes never hit it, hence the bug staying latent).
+        if has_i8_dot {
+            ext_ptrs.push(c"VK_KHR_shader_integer_dot_product".as_ptr());
+        }
+        // bf16/fp8: enabled ONLY when the coopmat tier that needs them survived the selection
+        // above, since that tier's shaders are the only code here declaring `bfloat16_t` /
+        // `floate4m3_t`. The matching feature structs are chained into `device_ci` below — a
+        // SPIR-V module using those types with the feature un-enabled violates its VUID, which is
+        // the gap the extension-string-only gate left. Never taken on this box (no such device).
+        if coopmat_bf16.is_some() {
+            ext_ptrs.push(c"VK_KHR_shader_bfloat16".as_ptr());
+        }
+        if coopmat_f8.is_some() {
+            ext_ptrs.push(c"VK_EXT_shader_float8".as_ptr());
+        }
+        // External-memory fd ops + dma-buf handle type for the cross-device P2P transport (gated —
+        // see the probe above). `VK_KHR_external_memory` itself is core in 1.1 and needs no enable.
+        if has_ext_mem_fd {
+            ext_ptrs.push(c"VK_KHR_external_memory_fd".as_ptr());
+        }
+        if has_ext_mem_dma_buf {
+            ext_ptrs.push(c"VK_EXT_external_memory_dma_buf".as_ptr());
+        }
+        if has_ext_mem_host {
+            ext_ptrs.push(c"VK_EXT_external_memory_host".as_ptr());
+        }
+        // External-semaphore fd ops for the tensor-parallel all-reduce's GPU-side cross-device sync
+        // (gated). `VK_KHR_external_semaphore` is core in 1.1 (no enable); the timeline-semaphore
+        // feature is enabled via `timeline_sem_ci` chained into `device_ci` below.
+        if has_ext_sem {
+            ext_ptrs.push(c"VK_KHR_external_semaphore_fd".as_ptr());
+        }
+        // A portability (layered) device REQUIRES VK_KHR_portability_subset to be enabled when
+        // it advertises it (Vulkan valid-usage rule); MoltenVK does.
+        if has_ext(c"VK_KHR_portability_subset") {
+            ext_ptrs.push(c"VK_KHR_portability_subset".as_ptr());
+        }
+
+        // ── logical device ─────────────────────────────────────────────────────
+        let priorities = [1.0f32];
+        let queue_ci = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&priorities);
+        #[cfg(test)]
+        let test_main_priorities = [1.0f32, 1.0f32];
+        #[cfg(test)]
+        let queue_ci = if test_aux_compute {
+            queue_ci.queue_priorities(&test_main_priorities)
+        } else {
+            queue_ci
+        };
+        let mut queue_cis = vec![queue_ci];
+        if let Some(family) = dedicated_transfer_family_index {
+            queue_cis.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&priorities),
+            );
+        }
+
+        // Feature chain — needed for cooperative-matrix kernels:
+        //   shaderFloat16 (f16 math), 16-bit storage (f16 SSBOs), Vulkan memory model
+        //   (required by coopmat), cooperativeMatrix itself.
+        let mut shader_f16_ci = vk::PhysicalDeviceShaderFloat16Int8Features::default()
+            .shader_float16(has_f16)
+            .shader_int8(true);
+        let mut storage16_ci = vk::PhysicalDevice16BitStorageFeatures::default()
+            .storage_buffer16_bit_access(has_16bit_storage);
+        let mut storage8_ci = vk::PhysicalDevice8BitStorageFeatures::default()
+            .storage_buffer8_bit_access(has_8bit_storage);
+        let mut memmodel_ci = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
+            .vulkan_memory_model(has_memmodel)
+            .vulkan_memory_model_device_scope(has_memmodel_dev);
+        // Chained below only when `has_coop_matrix` (ext AND probed feature) — see the probe.
+        let mut coopmat_ci =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        // Lets us pin the subgroup size to 32 (RDNA3 coopmat is wave32) for the tiled GEMM.
+        let mut sgsize_ci = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+            .subgroup_size_control(has_sgsize)
+            .compute_full_subgroups(has_full_sg);
+        // Chained below only when `has_i8_dot` — see the ext_ptrs comment above.
+        let mut intdot_ci = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+            .shader_integer_dot_product(true);
+        // Buffer-device-address — hard-required above, so always enabled (the paged-MoE arena is
+        // addressed by a `VkDeviceAddress`). Core in 1.2, promoted from VK_KHR_buffer_device_address,
+        // so it needs no device extension on a 1.3 device — only the feature enable.
+        let mut bda_ci =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        // Timeline semaphore — enabled only when the external-semaphore all-reduce path is available
+        // (chained below when `has_ext_sem`).
+        let mut timeline_sem_ci =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
+        let mut conditional_ci = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default()
+            .conditional_rendering(true);
+        #[cfg(test)]
+        let mut indirect_copy_ci = indirect_copy_support.enable_features();
+        #[cfg(test)]
+        let mut indirect_copy_sync2_ci = vk::PhysicalDeviceSynchronization2Features::default()
+            .synchronization2(indirect_copy_support.synchronization2);
+
+        // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
+        // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
+        // exclusive per the spec; this device_ci never chains `PhysicalDeviceFeatures2` itself, only
+        // extension-specific feature structs, so `enabled_features` is the correct, conflict-free
+        // slot for it).
+        let core_features = vk::PhysicalDeviceFeatures::default()
+            .shader_int16(has_int16)
+            .shader_int64(has_int64);
+        let mut device_ci = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_cis)
+            .enabled_extension_names(&ext_ptrs)
+            .enabled_features(&core_features)
+            .push_next(&mut shader_f16_ci)
+            .push_next(&mut storage16_ci)
+            .push_next(&mut storage8_ci)
+            .push_next(&mut memmodel_ci)
+            .push_next(&mut sgsize_ci)
+            .push_next(&mut bda_ci);
+        if has_i8_dot {
+            device_ci = device_ci.push_next(&mut intdot_ci);
+        }
+        if has_coop_matrix {
+            device_ci = device_ci.push_next(&mut coopmat_ci);
+        }
+        if timeline_enabled {
+            device_ci = device_ci.push_next(&mut timeline_sem_ci);
+        }
+        if has_conditional {
+            device_ci = device_ci.push_next(&mut conditional_ci);
+        }
+        #[cfg(test)]
+        if enable_indirect_copy && indirect_copy_support.synchronization2 {
+            device_ci = device_ci.push_next(&mut indirect_copy_sync2_ci);
+        }
+        #[cfg(test)]
+        if test_shader_clock {
+            device_ci = device_ci.push_next(&mut shader_clock_ci);
+        }
+        // The two post-ash feature structs (see `vkext`): chained by hand, asking for exactly the
+        // bits the device reported, and only when their tier is live. Both must outlive
+        // `create_device`, which the block below guarantees.
+        let mut bf16_ci = crate::vkext::ShaderBfloat16Features::enable(&post_ash);
+        let mut f8_ci = crate::vkext::ShaderFloat8Features::enable(&post_ash);
+        if coopmat_bf16.is_some() {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut bf16_ci) };
+        }
+        if coopmat_f8.is_some() {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut f8_ci) };
+        }
+        #[cfg(test)]
+        if enable_indirect_copy {
+            unsafe { crate::vkext::chain_into_device_ci(&mut device_ci, &mut indirect_copy_ci) };
+        }
+
+        let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
+            .map_err(|e| be(format!("create_device: {e}")))?;
+        // Register the device so any Err below (subgroup-32/env guards, allocator build) destroys
+        // it instead of leaking it — see `InstanceCleanup` above.
+        cleanup.device = Some(device.clone());
+        #[cfg(test)]
+        let indirect_copy = if enable_indirect_copy {
+            unsafe {
+                crate::indirect_copy::Device::load(
+                    &instance,
+                    &device,
+                    indirect_copy_support,
+                    qf_props[queue_family_index as usize].queue_flags,
+                )
+            }
+        } else {
+            None
+        };
+        let timeline_clock = has_timeline_clock
+            .then(|| crate::timeline::Clock::new(&entry, &instance, &device, physical_device))
+            .flatten();
+
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
+        // ── command pool ───────────────────────────────────────────────────────
+        let cmd_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("create_command_pool: {e}")))?;
+        // Register the pool too, so a later Err frees it alongside the device.
+        cleanup.pool = cmd_pool;
+
+        // ── capabilities ───────────────────────────────────────────────────────
+        // Query base limits + the subgroup-size range together via properties2 (the coopmat GEMM
+        // pins requiredSubgroupSize=32, so the fallback ladder needs to know whether 32 is in range).
+        let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
+        // splits its up-front reservation into blocks no larger than this.
+        let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut maint4_props = vk::PhysicalDeviceMaintenance4Properties::default();
+        let has_maint4_props = has_ext(c"VK_KHR_maintenance4")
+            || unsafe { instance.get_physical_device_properties(physical_device) }.api_version
+                >= vk::API_VERSION_1_3;
+        let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut sgsize_props)
+            .push_next(&mut maint3_props)
+            .push_next(&mut subgroup_props);
+        if has_maint4_props {
+            props2 = props2.push_next(&mut maint4_props);
+        }
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        let props = props2.properties;
+        let compute_subgroup_operations = compute_subgroup_operations(
+            subgroup_props.supported_stages,
+            subgroup_props.supported_operations,
+        );
+        // 0 = not reported → fall back to the Vulkan-guaranteed floor (2^30 = 1 GiB).
+        let max_mem_alloc_size = if maint3_props.max_memory_allocation_size == 0 {
+            1 << 30
+        } else {
+            maint3_props.max_memory_allocation_size
+        };
+        let resident_weight_alignment =
+            BDA_WEIGHT_ALIGN.max(props.limits.min_storage_buffer_offset_alignment);
+        let resident_weight_block_cap = max_mem_alloc_size.min(BDA_ADDRESSING_UNIT_MAX).min(
+            if maint4_props.max_buffer_size == 0 {
+                max_mem_alloc_size
+            } else {
+                maint4_props.max_buffer_size
+            },
+        );
+        let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // (0,0) when subgroup-size-control is unsupported: can't pin any size — the adapter treats
+        // that as "no 32-pin available" and uses the driver's default subgroup for the fallback.
+        let (subgroup_min, subgroup_max) = if has_sgsize {
+            (
+                sgsize_props.min_subgroup_size,
+                sgsize_props.max_subgroup_size,
+            )
+        } else {
+            (0, 0)
+        };
+
+        // infr's Vulkan compute kernels are written for a PINNED subgroup size of 32 (RDNA3 wave32):
+        // rmsnorm / softmax / quant_q8 / the coopmat GEMM / attention QK+PV / flash / DeltaNet all
+        // run at wave32. Explicit specializations dispatch via `kernel_sg(..., 32)`; the ordinary
+        // `kernel()` builder also inspects SPIR-V and safely pins subgroup-using modules to 32. Both
+        // set `requiredSubgroupSize=32` and FAIL pipeline creation on any device that can't provide
+        // it (no `subgroup_size_control`, or 32 outside `[minSubgroupSize, maxSubgroupSize]`).
+        // rmsnorm/softmax run on EVERY forward
+        // and are NOT coopmat-gated, so gating only the coopmat caps wouldn't prevent the crash —
+        // the whole backend needs 32. Refuse the Vulkan backend here (a clean Err, not a mid-forward
+        // panic) so `gpu_available()`/the seam falls back to CPU. Every real target — RADV (32-64),
+        // NVIDIA (32), Intel Arc (…-32) — provides 32; this only rejects exotic no-32 /
+        // no-size-control devices (older/mobile/llvmpipe), which can't run these wave32 kernels
+        // correctly anyway.
+        if !(has_sgsize && subgroup_min <= 32 && 32 <= subgroup_max) {
+            return Err(be(format!(
+                "infr's Vulkan backend requires a pinnable subgroup size of 32 (wave32); this \
+                 device's subgroup range is [{subgroup_min}, {subgroup_max}] and \
+                 subgroup_size_control={has_sgsize} — falling back to another backend"
+            )));
+        }
+
+        // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
+        // Capability-driven: any device whose smallest pinnable subgroup is ≤16 likely has
+        // SIMD8/SIMD16 EUs (Intel Arc, future small-subgroup GPUs) where pinning the decode
+        // GEMV family at 32 starves per-lane registers (llama.cpp pins 16 for mul_mat_vec
+        // on Intel for exactly this). `max(16, subgroup_min)` keeps this Battlemage-proof
+        // (min=8 SKUs still get 16, never 8 — the kernels' lane math is only built for 16/32).
+        // Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default kernel/pipeline
+        // set there is byte-identical to before this field existed.
+        let sg_default = if subgroup_min <= 16 {
+            16u32.max(subgroup_min)
+        } else {
+            32
+        };
+        // `device.subgroup_pref` (`INFR_SG=16|32`): A/B override (Intel testers; inert on devices
+        // that can't pin the value). The env layer already rejects anything but "16"/"32" with the
+        // pre-S5a wording, but the field is now also reachable from the TOML file and `--set`, so
+        // the "only 16 and 32 have builds" POLICY stays here at the consumer (R5) and still refuses
+        // a value it has no kernels for.
+        let sg_pref = match cfg.device.subgroup_pref {
+            Some(16) => 16,
+            Some(32) => 32,
+            Some(other) => {
+                return Err(be(format!(
+                    "device.subgroup_pref (INFR_SG) must be 16 or 32 (got {other}) — the decode \
+                     GEMV family only has subgroup-16 and subgroup-32 builds"
+                )))
+            }
+            None => sg_default,
+        };
+        // A 16 request/default is only usable where 16 is pinnable; otherwise CLEANLY fall back
+        // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
+        // unchanged). 32 is always pinnable here (hard-required above).
+        let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
+            tracing::warn!(
+                "[infr] INFR_SG=16 requested but this device's subgroup range \
+                 [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
+            );
+            32
+        } else {
+            sg_pref
+        };
+
+        // ── integrated GPU + compute-unit count ───────────────────────────────────────────────
+        // An iGPU/APU is NOT just "a slow discrete card": it is forced onto the non-coopmat kernel
+        // tier (RDNA2/Raphael enumerates no cooperative matrix at all) AND carries ~1/50th the
+        // compute, so a prefill chunk sized for a 96-CU card becomes a single multi-SECOND command
+        // buffer — past the ~10 s `gfx`-ring watchdog it is a GPU reset, not merely slow. Detect the
+        // device class here and let the seam bound its per-submit work (`Capabilities::integrated`).
+        let integrated = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        // Shader-core count (0 = unknown), from whichever of the four per-vendor sources this
+        // device actually reports — see `caps::shader_core_count`, which owns that order. The
+        // property structs it reads were already chained by `probe_device_facts` above; nothing here
+        // queries the device again.
+        let compute_units = crate::caps::shader_core_count(&device_probe);
+
+        let caps = Capabilities {
+            name: device_name,
+            f16: has_f16,
+            coopmat_f16,
+            // Extension AND feature bit, like every other capability here (see `vkext`).
+            f8: has_f8_ext && post_ash.f8,
+            coopmat_f8,
+            i8: has_int8,
+            i8_dot: has_i8_dot,
+            coopmat_i8,
+            bf16: has_bf16_ext && post_ash.bf16_type,
+            coopmat_bf16,
+            subgroup_min,
+            subgroup_max,
+            sg_pref,
+            integrated,
+            compute_units,
+            buffer_device_address: has_bda,
+            max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
+            // An INTEGRATED_GPU has no VRAM to be separate FROM: its "device-local" heap is system
+            // DDR reached through the GART (proven on RADV RAPHAEL_MENDOCINO — see `vram_info`,
+            // which is the only consumer that matters today). A DISCRETE_GPU is never UMA, and
+            // that is the class this must not perturb, so key off the device type exactly like
+            // `integrated` above (llama.cpp's Vulkan backend sets its `uma` flag the same way).
+            // Note this is a strictly WEAKER claim than `integrated`, which additionally means
+            // "submits must stay under a TDR watchdog" — the two happen to coincide on Vulkan.
+            unified_memory: integrated,
+            // The seam adapter records the decode graph once and replays it (params-driven `_dyn`
+            // kernels); the runner compiles the eligible qwen3 decode graph once.
+            decode_replay: true,
+            combined_gu: true,
+            qsa_prepare: true,
+            embed_gather: true,
+            gpu_sample: true,
+            sample_rows: true,
+            argmax_rows: true,
+            argmax_prob: true,
+            // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — the
+            // `rmsnorm_gate` kernel (rmsnorm.comp's -DGATE build). Collapses QkNorm→GatedAct's
+            // read-after-write barrier into one dispatch. INFR_NO_GATED_RMSNORM forces the split
+            // form for A/B.
+            gated_rmsnorm: true,
+            // Two F32 DeltaNet projections share one dispatch while retaining separate weights
+            // and outputs. The paired kernel mirrors every scalar/vec4/mrow shape tier.
+            linear_pair_f32: true,
+            linear_pair_q8: cfg.kernels.vulkan.q8_linear_pair
+                && cfg!(target_os = "windows")
+                && !integrated
+                && device_arch == crate::caps::DeviceArch::AmdRdna3,
+            // Qwen3.8 decode-only mixed Q8_0 down + scaled SiLU + F32 inject dispatch.
+            qwen_hc_down_inject: true,
+            // Every KV write/read kernel maps position -> row modulo the cache's row capacity
+            // (identity on full-context caches), so SWA layers may get window-sized ring caches.
+            kv_swa_ring: true,
+            // `execute_static`/the replay tape dispatch straight against the bound buffers (only
+            // `Internal` handles get backend scratch — see `alloc_scratch`), so an op writing a
+            // bound `Input` writes the caller's memory and the next execute sees it.
+            graph_input_inplace: true,
+        };
+
+        // Publish this device's descriptor-range ceiling before anything can record a binding
+        // against it (see `MAX_STORAGE_BUFFER_RANGE`).
+        MAX_STORAGE_BUFFER_RANGE
+            .fetch_min(props.limits.max_storage_buffer_range, Ordering::Relaxed);
+
+        // Publish the device class BEFORE any caller can size a prefill chunk against it (the seam
+        // reads this in `ubatch_rows`, which runs on the first session/KV allocation — strictly
+        // after `VulkanBackend::new` returns).
+        let _ = DEVICE_CLASS.set(DeviceClass {
+            integrated: caps.integrated,
+            compute_units: caps.compute_units,
+        });
+
+        // One-line device banner (stderr) — the first thing to check on a portability bug report:
+        // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the
+        // subgroup range + shared-mem budget. Printed on every `VulkanBackend::new()` (no
+        // process-wide dedup): a single run constructing several backends on the same device (an
+        // `infr bench` MTP rep loop; a CPU/Vulkan parity check) now genuinely means one construction
+        // per printed line, not a duplicate — `DenseSeamChat`'s MTP chat path shares ONE backend
+        // across `warmup()` + every turn (see `chat/vulkan.rs`'s `mtp_vk`), so an ordinary
+        // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
+        let yn = |b: bool| if b { "y" } else { "n" };
+        tracing::info!(
+            "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
+             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{} KiB",
+            caps.name,
+            device_arch,
+            driver_label,
+            yn(caps.f16),
+            yn(caps.f16_coopmat()),
+            yn(caps.bf16),
+            yn(caps.bf16_coopmat()),
+            yn(caps.f8),
+            yn(caps.f8_coopmat()),
+            yn(caps.i8),
+            yn(caps.i8_dot),
+            yn(caps.i8_coopmat()),
+            yn(coopmat2.is_ok()),
+            caps.subgroup_min,
+            caps.subgroup_max,
+            caps.sg_pref,
+            // Shader cores (AMD CUs / NVIDIA SMs / Intel Xe-cores), "?" when this device reports
+            // none — see `caps::shader_core_count`.
+            if caps.compute_units > 0 {
+                caps.compute_units.to_string()
+            } else {
+                "?".to_string()
+            },
+            caps.max_shared_memory_bytes / 1024,
+        );
+        // Submit splitter (see `VulkanShared::submit_dispatch_cap`). An explicit value is fixed
+        // (`0` = never split). Automatic mode starts at the safe floor and samples actual GPU
+        // command-buffer duration for a bounded number of forwards before freezing permanently.
+        let submit_dispatch_cap_explicit = cfg.device.submit_dispatches.is_some();
+        let submit_timestamp_period_ns = props.limits.timestamp_period;
+        let submit_auto_supported = !submit_dispatch_cap_explicit
+            && submit_timestamp_valid_bits > 0
+            && submit_timestamp_period_ns.is_finite()
+            && submit_timestamp_period_ns > 0.0;
+        let submit_auto_settings = SubmitAutoSettings::for_profile(cfg.device.auto_profile);
+        let submit_dispatch_cap = cfg.device.submit_dispatches.unwrap_or_else(|| {
+            if submit_auto_supported {
+                submit_auto_settings.initial_cap
+            } else {
+                infr_core::initial_submit_dispatch_cap(caps.integrated)
+            }
+        });
+        let submit_auto_tuner =
+            submit_auto_supported.then(|| SubmitAutoTuner::new(submit_auto_settings));
+        if submit_auto_supported {
+            tracing::info!(
+                "[infr] submit splitter: {} automatic GPU calibration starts at split/{}; {} \
+                 sample(s) per cap, explores through split/{}, targets {:.0} ms GPU time, at \
+                 most {} forwards, then the cap freezes",
+                submit_auto_settings.profile,
+                submit_auto_settings.initial_cap,
+                submit_auto_settings.samples_per_cap,
+                submit_auto_settings.explore_through_cap,
+                submit_auto_settings.budget_ns as f64 / 1e6,
+                submit_auto_settings.max_rounds,
+            );
+        } else if !submit_dispatch_cap_explicit {
+            tracing::warn!(
+                "[infr] compute queue exposes no usable Vulkan timestamps; automatic submit \
+                 calibration is unavailable, using {}",
+                if submit_dispatch_cap == 0 {
+                    "no splitting".to_owned()
+                } else {
+                    format!("split/{submit_dispatch_cap}")
+                },
+            );
+        }
+        // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
+        // pass split across several submits so no single command buffer can trip the GPU's hang
+        // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
+        // prefills slowly. Silent on every discrete device (nothing changed there).
+        if caps.integrated {
+            tracing::info!(
+                "[infr] GPU: INTEGRATED (cu:{}) — prefill chunk {} rows, forward split every {} \
+                 dispatches to stay under the GPU hang watchdog; INFR_UBATCH / \
+                 INFR_SUBMIT_DISPATCHES override",
+                if caps.compute_units > 0 {
+                    caps.compute_units.to_string()
+                } else {
+                    "?".to_string()
+                },
+                infr_core::integrated_ubatch_rows(caps.compute_units),
+                submit_dispatch_cap,
+            );
+        }
+        // On a unified-memory part the budget guard counts EVERY heap, not just the device-local
+        // one (see `vram_info`) — a materially different capacity, and the second thing to check
+        // when an iGPU either loads a model you didn't expect to fit or starts swapping. Print the
+        // number it will actually budget against. Silent on every discrete device.
+        if caps.unified_memory {
+            let mp = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            let (mut all, mut dev_local) = (0u64, 0u64);
+            for i in 0..mp.memory_heap_count as usize {
+                all += mp.memory_heaps[i].size;
+                if mp.memory_heaps[i]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+                {
+                    dev_local += mp.memory_heaps[i].size;
+                }
+            }
+            tracing::info!(
+                "[infr] GPU: UNIFIED MEMORY — budgeting against all {} heaps ({}), not the \
+                 device-local slice alone ({}); this GPU's memory IS system RAM",
+                mp.memory_heap_count,
+                fmt_bytes(all),
+                fmt_bytes(dev_local),
+            );
+        }
+
+        // ── gpu-allocator ──────────────────────────────────────────────────────
+        let allocator = Allocator::new(&AllocatorCreateDesc {
+            instance: instance.clone(),
+            device: device.clone(),
+            physical_device,
+            debug_settings: Default::default(),
+            // Every gpu-allocator allocation gets VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, which the
+            // paged-MoE arena buffer (created with SHADER_DEVICE_ADDRESS usage) requires before it
+            // can be bound. Harmless for all other buffers. `has_bda` is hard-required above.
+            buffer_device_address: true,
+            allocation_sizes: Default::default(),
+        })
+        .map_err(|e| be(format!("gpu_allocator::Allocator::new: {e}")))?;
+
+        // ── on-disk pipeline cache (see `pcache.rs`) ───────────────────────────
+        let pcache = crate::pcache::PcachePersist::new(&props, vkcfg.pipeline_cache_disk);
+        let initial = pcache.as_ref().and_then(|p| p.load()).unwrap_or_default();
+        let mut pc_info = vk::PipelineCacheCreateInfo::default();
+        if !initial.is_empty() {
+            pc_info = pc_info.initial_data(&initial);
+        }
+        // A corrupt-but-well-enveloped blob can still fail creation: retry empty, never fatal.
+        let pipeline_cache = unsafe { device.create_pipeline_cache(&pc_info, None) }
+            .or_else(|_| unsafe {
+                device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+            })
+            .unwrap_or(vk::PipelineCache::null());
+
+        // Built before `instance`/`device` move into `VulkanShared` below.
+        let push_descriptor =
+            has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+        let conditional_rendering = has_conditional
+            .then(|| ash::ext::conditional_rendering::Device::new(&instance, &device));
+        if vkcfg.decode_gpu_resident {
+            if has_conditional {
+                tracing::info!(
+                    layers = vkcfg.decode_gpu_resident_layers,
+                    submit_layers = if vkcfg.decode_gpu_resident_submit_layers == 0 {
+                        "auto".to_owned()
+                    } else {
+                        vkcfg.decode_gpu_resident_submit_layers.to_string()
+                    },
+                    hit_first = vkcfg.decode_gpu_resident_hit_first,
+                    early_recovery = vkcfg.decode_gpu_resident_early_recovery,
+                    "[infr] GPU-resident paged Decode controller enabled"
+                );
+            } else {
+                tracing::warn!(
+                    "[infr] GPU-resident paged Decode unavailable: device lacks VK_EXT_conditional_rendering; using CPU-controlled paging"
+                );
+            }
+        }
+
+        // External-memory fd loader (`vkGetMemoryFdKHR`/`vkGetMemoryFdPropertiesKHR`) — present only
+        // when the device extension was enabled above. `Some` here is the sole gate the P2P path
+        // checks (`p2p.rs`); `None` = this backend offers no host-less cross-device transport.
+        let external_memory_fd =
+            has_ext_mem_fd.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+        let external_memory_host = has_ext_mem_host
+            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        // External-semaphore fd loader (`vkGetSemaphoreFdKHR`/`vkImportSemaphoreFdKHR`) — the gate for
+        // the tensor-parallel GPU-side all-reduce sync. `Some` only when the fd ext AND the timeline
+        // feature are both present (both enabled above); else the all-reduce uses the host fence.
+        let external_semaphore_fd =
+            has_ext_sem.then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
+
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        // Probed for UMA parts ONLY — on a discrete card the non-device-local heap is host RAM
+        // across PCIe and must never receive a GpuOnly buffer.
+        let uma_overflow_type = caps
+            .unified_memory
+            .then(|| probe_host_visible_non_device_local_type(&mem_props))
+            .flatten();
+        // Same probe, but WITHOUT the UMA gate — on a discrete card this resolves to the GTT
+        // host-visible type (system RAM over PCIe). KV overflow and portable transfer staging use
+        // it explicitly; ordinary GpuOnly allocations never do.
+        let host_overflow_type = probe_host_visible_non_device_local_type(&mem_props);
+        let dedicated_transfer = dedicated_transfer_family_index.and_then(|family| {
+            match crate::transfer::DedicatedTransferQueue::new(
+                &device,
+                family,
+                qf_props[family as usize].timestamp_valid_bits,
+                submit_timestamp_period_ns,
+            ) {
+                Ok(queue) => {
+                    tracing::info!("[infr] pager: dedicated transfer queue family {family} enabled");
+                    Some(Mutex::new(queue))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[infr] pager: dedicated transfer queue unavailable ({error}); using the main queue"
+                    );
+                    None
+                }
+            }
+        });
+        tracing::info!(
+            host_import_requested = cfg.paging.host_dma,
+            dedicated_transfer_requested = cfg.paging.dedicated_transfer,
+            dedicated_transfer_active = dedicated_transfer.is_some(),
+            "[infr] pager transfer policy"
+        );
+        let queue_access = Arc::new(Mutex::new(()));
+        let vram_keepalive = if needs_amd_windows_vram_keepalive(
+            &device_probe,
+            device_arch,
+            props.driver_version,
+        ) {
+            tracing::info!(
+                "[infr] AMD Windows VRAM keepalive enabled for Vulkan driver {}.{}.{}; one empty submit per second prevents idle dedicated-VRAM eviction into system RAM",
+                vk::api_version_major(props.driver_version),
+                vk::api_version_minor(props.driver_version),
+                vk::api_version_patch(props.driver_version),
+            );
+            VramKeepalive::start(
+                device.clone(),
+                queue,
+                queue_family_index,
+                queue_access.clone(),
+            )
+        } else {
+            None
+        };
+
+        // Success: the instance/device/pool now move into `VulkanShared` (which owns their
+        // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
+        cleanup.armed = false;
+
+        let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let unified_phases = UnifiedPhaseRegistry::new(&runtime_phase);
+        let unified_ram = caps.unified_memory.then(|| {
+            let resident = infr_core::hostmem::process_resident_bytes();
+            let limit = infr_core::hostmem::unified_device_budget_for_snapshot(
+                &cfg,
+                infr_core::hostmem::available_bytes(),
+                infr_core::hostmem::total_bytes(),
+                resident,
+            );
+            tracing::info!(
+                shared_device_budget_bytes = limit,
+                host_baseline_resident_bytes = resident,
+                "[infr] UMA RAM and Vulkan heaps share one process budget; device allocations are charged once, not added to an independent RAM cache"
+            );
+            UnifiedRamBudget {
+                limit,
+                used: AtomicU64::new(0),
+            }
+        });
+        let mut backend = Self {
+            decode_prefetch: Mutex::new(None),
+            cpu_miss: std::sync::OnceLock::new(),
+            moe_pager: Arc::new(Mutex::new(None)),
+            session_finalization_deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dense_pager: Mutex::new(None),
+            runtime_phase,
+            bda_weight_arena: Mutex::new(None),
+            iq2s_grid: None,
+            iq3s_grid: None,
+            unified_pool: Arc::new(Mutex::new(None)),
+            unified_exec: Arc::new(RwLock::new(())),
+            unified_phases,
+            unified_phase_id: UnifiedPhaseRegistry::PRIMARY_ID,
+            auxiliary_runtime_reaper: None,
+            unified_client: None,
+            cfg,
+            shared: Arc::new(VulkanShared {
+                _entry: entry,
+                instance,
+                physical_device,
+                // This fusion preserves the split shader's measured driver arithmetic order.
+                // Unknown compilers retain the original pair until exactness is qualified.
+                exact_silu_quant_order: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY
+                    && props.driver_version == 8_389_003,
+                narrow_f32_device: crate::narrow_projection::device_eligible(
+                    &device_probe,
+                    device_arch,
+                    has_bda,
+                    cfg!(target_os = "windows"),
+                ),
+                amd_proprietary_driver: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
+                device,
+                queue,
+                queue_family_index,
+                dedicated_transfer,
+                dedicated_transfer_keepalive_pending: AtomicBool::new(false),
+                #[cfg(test)]
+                indirect_copy,
+                queue_access,
+                vram_keepalive,
+                queue_submit_failure: AtomicI32::new(vk::Result::SUCCESS.as_raw()),
+                resource_epoch: AtomicU64::new(1),
+                cmd_pool: Mutex::new(cmd_pool),
+                recorder_cmds: Mutex::new(Vec::new()),
+                recorder_prepared_pools: recorder::PreparedPoolCache::default(),
+                recorder_desc_pools: Mutex::new(Vec::new()),
+                recorder_fences: Mutex::new(Vec::new()),
+                recorder_submit_query_pools: Mutex::new(Vec::new()),
+                allocator: ManuallyDrop::new(Mutex::new(allocator)),
+                caps,
+                compute_subgroup_operations,
+                device_arch,
+                largest_device_local_heap_only: uses_largest_device_local_heap_only(
+                    device_probe.vendor_id,
+                    props.device_type,
+                    cfg!(target_os = "windows"),
+                ),
+                has_mem_budget,
+                max_mem_alloc_size,
+                resident_weight_alignment,
+                resident_weight_block_cap,
+                max_push_constants: props.limits.max_push_constants_size,
+                i8cm_layout_ok: OnceLock::new(),
+                push_descriptor,
+                conditional_rendering,
+                external_memory_fd,
+                has_dma_buf: has_ext_mem_dma_buf,
+                external_memory_host,
+                host_import_alignment,
+                host_dma_import_limit: crate::caps::host_dma_import_limit(
+                    device_probe.vendor_id,
+                    cfg!(target_os = "windows"),
+                ),
+                session_transfer_plan: RwLock::new(None),
+                external_semaphore_fd,
+                kernels: Mutex::new(HashMap::new()),
+                pipeline_cache,
+                pcache,
+                weight_pb: Mutex::new(None),
+                device_used: AtomicU64::new(0),
+                unified_ram,
+                act_live: AtomicU64::new(0),
+                act_peak: AtomicU64::new(0),
+                submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
+                submit_dispatch_cap_explicit,
+                submit_tune_active: AtomicBool::new(submit_auto_supported),
+                submit_auto_tuner: Mutex::new(submit_auto_tuner),
+                submit_timestamp_period_ns,
+                submit_timestamp_valid_bits,
+                timeline_clock,
+                timeline_query_pools: Arc::new(Mutex::new(Vec::new())),
+                uma_overflow_type,
+                host_overflow_type,
+                kv_spill: SpillTally::default(),
+                staging_ring: Mutex::new(None),
+            }),
+        };
+
+        // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
+        // once the backend exists. No-op unless that tier is actually asked for.
+        backend.verify_i8_coopmat_layout();
+
+        if backend
+            .cfg()
+            .kernels
+            .vulkan
+            .gemv
+            .id_grid_buffer
+            .unwrap_or(backend.measured_decode_kernel_device())
+        {
+            let words: Vec<u32> = infr_core::iquant_grids::IQ2S_GRID
+                .iter()
+                .flat_map(|&word| [word as u32, (word >> 32) as u32])
+                .collect();
+            let grid = backend.make_buf(words.len() * 4, MemoryLocation::GpuOnly, "iq2s-grid")?;
+            backend.upload(&grid, bytemuck::cast_slice(&words))?;
+            backend.iq2s_grid = Some(Arc::new(grid));
+            let grid = backend.make_buf(2048, MemoryLocation::GpuOnly, "iq3s-grid")?;
+            backend.upload(
+                &grid,
+                bytemuck::cast_slice(&infr_core::iquant_grids::IQ3S_GRID),
+            )?;
+            backend.iq3s_grid = Some(Arc::new(grid));
+        }
+
+        Ok(backend)
+    }
+
+    /// Alias existing host-pager allocations as transfer buffers. Import shards are assigned to
+    /// the arena with the lowest imported-block fraction, so a finite WDDM host-import budget is
+    /// shared proportionally instead of being exhausted by the first size class. Failure remains
+    /// an optimization fallback: ranges without an alias use direct mapped or staged uploads.
+    pub(crate) fn build_session_transfer_plan(
+        &self,
+        allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
+    ) -> crate::transfer::SessionTransferPlan {
+        if !self.cfg().paging.host_dma {
+            return crate::transfer::SessionTransferPlan::default();
+        }
+        let Some(ext) = self.shared.external_memory_host.as_ref() else {
+            return crate::transfer::SessionTransferPlan::default();
+        };
+        let alignment = self.shared.host_import_alignment.max(1);
+        if alignment > AlignedHostBuffer::ALIGNMENT {
+            tracing::warn!(
+                "[infr] host DMA disabled: Vulkan import alignment {} exceeds arena alignment {}",
+                alignment,
+                AlignedHostBuffer::ALIGNMENT,
+            );
+            return crate::transfer::SessionTransferPlan::default();
+        }
+
+        crate::transfer::SessionTransferPlan::new(self.try_import_host_allocations(
+            ext,
+            allocations,
+            alignment,
+        ))
+    }
+
+    fn try_import_host_allocations(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        allocations: Vec<(Arc<AlignedHostBuffer>, usize)>,
+        alignment: usize,
+    ) -> Vec<ImportedHostAllocation> {
+        const IMPORT_SHARD_MAX: usize = 2 * 1024 * 1024 * 1024;
+        let max_shard =
+            IMPORT_SHARD_MAX.min(self.shared.max_mem_alloc_size as usize) / alignment * alignment;
+        if max_shard == 0 {
+            tracing::warn!(
+                "[infr] host DMA disabled: Vulkan host-import shard limit is smaller than its alignment"
+            );
+            return Vec::new();
+        }
+
+        struct PendingImport {
+            owner: Arc<AlignedHostBuffer>,
+            logical_len: usize,
+            offset: usize,
+            quantum: usize,
+            block_bytes: usize,
+            shards: Vec<ImportedHostShard>,
+        }
+
+        let mut pending = Vec::new();
+        for (owner, block_bytes) in allocations {
+            if owner.is_empty() {
+                continue;
+            }
+            if !(owner.as_ptr() as usize).is_multiple_of(alignment)
+                || !owner.allocated_len().is_multiple_of(alignment)
+            {
+                tracing::warn!(
+                    "[infr] host DMA skipped one arena: ptr/size does not meet Vulkan import alignment {}",
+                    alignment,
+                );
+                continue;
+            }
+            let block_bytes = block_bytes.max(alignment);
+            let gcd = gcd_usize(block_bytes, alignment);
+            let quantum = block_bytes
+                .checked_div(gcd)
+                .and_then(|n| n.checked_mul(alignment))
+                .filter(|&n| n <= max_shard)
+                .unwrap_or(alignment);
+            pending.push(PendingImport {
+                logical_len: owner.len(),
+                owner,
+                offset: 0,
+                quantum,
+                block_bytes,
+                shards: Vec::new(),
+            });
+        }
+
+        let arena_count = pending.len();
+        let mut limit_error = None;
+        let import_limit = self.shared.host_dma_import_limit;
+        let mut imported_bytes = 0usize;
+        let mut policy_limit_reached = false;
+        while let Some(index) = proportional_import_index(
+            &pending
+                .iter()
+                .map(|state| (state.offset.min(state.logical_len), state.logical_len))
+                .collect::<Vec<_>>(),
+        ) {
+            let state = &pending[index];
+            let remaining = state.owner.allocated_len() - state.offset;
+            let budget_remaining = import_limit
+                .map(|limit| limit.saturating_sub(imported_bytes))
+                .unwrap_or(usize::MAX);
+            if budget_remaining < state.quantum {
+                policy_limit_reached = import_limit.is_some();
+                break;
+            }
+            let mut len = remaining.min(max_shard).min(budget_remaining);
+            if len < remaining {
+                len = len / state.quantum * state.quantum;
+            }
+            if len == 0 {
+                policy_limit_reached = import_limit.is_some();
+                break;
+            }
+            let minimum = state.quantum.min(len);
+            let mut reduced = false;
+
+            loop {
+                let state = &pending[index];
+                match self.try_import_host_shard(ext, Arc::clone(&state.owner), state.offset, len) {
+                    Ok(shard) => {
+                        let state = &mut pending[index];
+                        state.shards.push(shard);
+                        state.offset += len;
+                        imported_bytes += len;
+                        if reduced {
+                            // The first large allocation failure marks the WDDM capacity edge.
+                            // Keep the recovered tail but do not create a long run of tiny external
+                            // allocations trying to consume the final few pages.
+                            limit_error = Some(
+                                "driver capacity reached after a reduced tail shard".to_string(),
+                            );
+                        }
+                        break;
+                    }
+                    Err(err) => {
+                        let state = &pending[index];
+                        let half = (len / 2) / state.quantum * state.quantum;
+                        let smaller = if half >= minimum && half < len {
+                            Some(half)
+                        } else if minimum < len {
+                            Some(minimum)
+                        } else {
+                            None
+                        };
+                        if let Some(smaller) = smaller {
+                            len = smaller;
+                            reduced = true;
+                            continue;
+                        }
+                        limit_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            if limit_error.is_some() {
+                break;
+            }
+        }
+
+        let total_logical: usize = pending.iter().map(|state| state.logical_len).sum();
+        let total_imported: usize = pending
+            .iter()
+            .map(|state| state.offset.min(state.logical_len))
+            .sum();
+        if let Some(err) = limit_error {
+            tracing::warn!(
+                "[infr] host DMA import reached the driver limit at {:.2}/{:.2} GiB ({err}); remaining RAM uses the arena's direct/staged upload fallback",
+                total_imported as f64 / (1u64 << 30) as f64,
+                total_logical as f64 / (1u64 << 30) as f64,
+            );
+        } else if policy_limit_reached {
+            tracing::info!(
+                "[infr] host DMA import capped at {:.2}/{:.2} GiB by the NVIDIA Windows safety limit; remaining RAM uses the arena's direct/staged upload fallback",
+                total_imported as f64 / (1u64 << 30) as f64,
+                total_logical as f64 / (1u64 << 30) as f64,
+            );
+        }
+
+        let mut imported = Vec::new();
+        for (index, state) in pending.into_iter().enumerate() {
+            let imported_len = state.offset.min(state.logical_len);
+            let imported_blocks = imported_len / state.block_bytes;
+            let total_blocks = state.logical_len / state.block_bytes;
+            tracing::info!(
+                "[infr] host DMA arena {index}: {:.2}/{:.2} GiB, {imported_blocks}/{total_blocks} blocks ({:.1}%)",
+                imported_len as f64 / (1u64 << 30) as f64,
+                state.logical_len as f64 / (1u64 << 30) as f64,
+                imported_len as f64 * 100.0 / state.logical_len as f64,
+            );
+            if state.shards.is_empty() {
+                continue;
+            }
+            imported.push(ImportedHostAllocation {
+                base: state.owner.as_ptr() as usize,
+                logical_len: state.logical_len,
+                imported_len,
+                shards: state.shards,
+            });
+        }
+        tracing::info!(
+            "[infr] host DMA import total: {:.2}/{:.2} GiB across {}/{} arena(s)",
+            total_imported as f64 / (1u64 << 30) as f64,
+            total_logical as f64 / (1u64 << 30) as f64,
+            imported.len(),
+            arena_count,
+        );
+        imported
+    }
+
+    fn try_import_host_shard(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        owner: Arc<AlignedHostBuffer>,
+        offset: usize,
+        len: usize,
+    ) -> Result<ImportedHostShard> {
+        if self.cfg.kernels.vulkan.decode_gpu_resident_copy != Some(false)
+            && self.shared.caps.buffer_device_address
+        {
+            match self.try_import_host_shard_with_address(
+                ext,
+                Arc::clone(&owner),
+                offset,
+                len,
+                true,
+            ) {
+                Ok(shard) => return Ok(shard),
+                Err(error) => {
+                    tracing::debug!(%error, "GPU-copy host alias unavailable; retaining ordinary DMA import")
+                }
+            }
+        }
+        self.try_import_host_shard_with_address(ext, owner, offset, len, false)
+    }
+
+    fn try_import_host_shard_with_address(
+        &self,
+        ext: &ash::ext::external_memory_host::Device,
+        owner: Arc<AlignedHostBuffer>,
+        offset: usize,
+        len: usize,
+        device_address: bool,
+    ) -> Result<ImportedHostShard> {
+        let device = &self.shared.device;
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        if device_address {
+            usage |=
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
+        let mut info = vk::BufferCreateInfo::default()
+            .push_next(&mut external)
+            .size(len as u64)
+            .usage(usage);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
+        let buffer = unsafe { device.create_buffer(&info, None) }
+            .map_err(|e| be(format!("create imported-host buffer: {e}")))?;
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        if requirements.size > len as u64 {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(be(format!(
+                "imported-host shard is {len} bytes but Vulkan requires {}",
+                requirements.size,
+            )));
+        }
+        let host_ptr = unsafe { owner.as_ptr().add(offset) };
+        let mut host_properties = vk::MemoryHostPointerPropertiesEXT::default();
+        let result = unsafe {
+            (ext.fp().get_memory_host_pointer_properties_ext)(
+                device.handle(),
+                handle_type,
+                host_ptr.cast(),
+                &mut host_properties,
+            )
+        };
+        if result != vk::Result::SUCCESS {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(be(format!(
+                "get imported-host pointer properties at offset {offset}: {result}"
+            )));
+        }
+        let memory_properties = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        let compatible = requirements.memory_type_bits & host_properties.memory_type_bits;
+        let memory_type_index = (0..memory_properties.memory_type_count)
+            .find(|&index| {
+                compatible & (1u32 << index) != 0
+                    && memory_properties.memory_types[index as usize]
+                        .property_flags
+                        .contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+            })
+            .ok_or_else(|| {
+                unsafe { device.destroy_buffer(buffer, None) };
+                be(format!(
+                    "no coherent memory type for imported host pointer at offset {offset}"
+                ))
+            })?;
+        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+            .handle_type(handle_type)
+            .host_pointer(host_ptr.cast());
+        let mut address_flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocation = vk::MemoryAllocateInfo::default()
+            .push_next(&mut import)
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index);
+        if device_address {
+            allocation = allocation.push_next(&mut address_flags);
+        }
+        let memory = unsafe { device.allocate_memory(&allocation, None) }.map_err(|e| {
+            unsafe { device.destroy_buffer(buffer, None) };
+            be(format!("import host shard {offset}..{}: {e}", offset + len,))
+        })?;
+        if let Err(e) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return Err(be(format!("bind imported-host shard at {offset}: {e}")));
+        }
+        let own_addr = device_address.then(|| unsafe {
+            device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
+        let imported: Arc<dyn Buffer> = Arc::new(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::ImportedHost {
+                memory,
+                owner,
+                host_ptr,
+            },
+            size: len,
+            mem_size: requirements.size,
+            location: MemoryLocation::CpuToGpu,
+            sub_offset: 0,
+            own_addr,
+            act_bytes: 0,
+        });
+        Ok(ImportedHostShard {
+            offset,
+            len,
+            buffer: imported,
+        })
+    }
+
+    /// The int8 cooperative-matrix GEMM tier is usable on this device: the hardware enumerates the
+    /// SINT8 16x16x16 config, the caller opted in (`INFR_I8_COOPMAT=1`), AND this driver was MEASURED
+    /// to lay its accumulator fragment out the way the kernel reads it (see
+    /// [`Self::verify_i8_coopmat_layout`]). The adapter's dispatch gate reads exactly this.
+    pub(crate) fn i8_coopmat_ready(&self) -> bool {
+        self.shared.i8cm_layout_ok.get() == Some(&true)
+    }
+
+    /// Known-answer check of this driver's int8 coopmat accumulator fragment layout, run once at
+    /// init when the i8 coopmat tier is opted in — and the ONLY thing standing between a driver
+    /// that lays that fragment out differently and silently wrong GEMM results.
+    ///
+    /// `native_gemm_i8cm_q8_0.comp` applies its per-block descale IN-FRAGMENT, reading `csub[i]` as
+    /// matrix element `(2*i + (lane>>4), lane&15)`. `KHR_cooperative_matrix` fixes that mapping per
+    /// IMPLEMENTATION, not across implementations: it was derived empirically on RADV/RDNA3 and no
+    /// other device here has ever run it. So the tier is only armed once this device has multiplied
+    /// two known matrices and read the product back through that same mapping — anything else
+    /// leaves the tier OFF with a loud error, which is the one behaviour that cannot produce
+    /// plausible wrong numbers on hardware nobody can test.
+    ///
+    /// Does nothing (and costs nothing) unless the tier is both enumerated and opted into, so the
+    /// default run pays no init dispatch.
+    fn verify_i8_coopmat_layout(&self) {
+        if !(self.shared.caps.i8_coopmat() && self.cfg.kernels.vulkan.i8_coopmat) {
+            return; // tier unreachable this run — nothing to arm, nothing to check
+        }
+        match self.run_i8_coopmat_layout_probe() {
+            Ok(out) => match crate::caps::check_i8_coopmat_layout(&out) {
+                Ok(()) => {
+                    let _ = self.shared.i8cm_layout_ok.set(true);
+                    tracing::info!(
+                        "[infr] int8 coopmat: accumulator fragment layout verified on this driver \
+                         — INFR_I8_COOPMAT tier armed"
+                    );
+                }
+                Err(why) => {
+                    let _ = self.shared.i8cm_layout_ok.set(false);
+                    tracing::error!(
+                        "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): {why}. The GEMM \
+                         would return plausible wrong numbers on this driver, so the tier stays \
+                         off and the dp4a/coopmat-f16 tiers run instead."
+                    );
+                }
+            },
+            Err(e) => {
+                let _ = self.shared.i8cm_layout_ok.set(false);
+                tracing::error!(
+                    "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): the accumulator \
+                     layout probe could not run on this device ({e}) — the tier stays off."
+                );
+            }
+        }
+    }
+
+    /// Dispatch `coopmat_i8_layout.comp` once and return its readback (see
+    /// [`crate::caps::check_i8_coopmat_layout`] for what the words mean). Built through the
+    /// FALLIBLE kernel path and torn down immediately: a driver that refuses the pipeline for this
+    /// coopmat config is answering the probe's question, not crashing the process.
+    fn run_i8_coopmat_layout_probe(&self) -> Result<Vec<i32>> {
+        let k = crate::ops::try_make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            "coopmat_i8_layout",
+            crate::gemm::coopmat_i8_layout_spv(),
+            3,
+            0,
+            // The kernel this probes is dispatched at a pinned subgroup 32, and its lane->element
+            // arithmetic only holds there; pin the probe identically.
+            crate::ops::SubgroupContract::Fixed(32),
+            self.shared.push_descriptor.is_some(),
+            self.shared.max_push_constants,
+        )?;
+        let run = || -> Result<Vec<i32>> {
+            let (a, b) = crate::caps::frag_probe_inputs();
+            let abuf = self.alloc(a.len(), BufferUsage::Staging)?;
+            let bbuf = self.alloc(b.len(), BufferUsage::Staging)?;
+            self.upload(abuf.as_ref(), bytemuck::cast_slice(&a))?;
+            self.upload(bbuf.as_ref(), bytemuck::cast_slice(&b))?;
+            // Zero-initialised (the `alloc` calloc contract) — which is what makes an element the
+            // device never writes detectable as a mismatch rather than as stale VRAM.
+            let out = self.alloc(crate::caps::FRAG_PROBE_WORDS * 4, BufferUsage::Readback)?;
+            let vk_bufs = [
+                as_vk_buf(abuf.as_ref())?.buffer,
+                as_vk_buf(bbuf.as_ref())?.buffer,
+                as_vk_buf(out.as_ref())?.buffer,
+            ];
+            let binding = self.eager_bind(&k, &vk_bufs)?;
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                binding.bind(shared, cmd, k.pipeline_layout);
+                shared.device.cmd_dispatch(cmd, 1, 1, 1);
+            })?;
+            let mut bytes = vec![0u8; crate::caps::FRAG_PROBE_WORDS * 4];
+            self.download(out.as_ref(), &mut bytes)?;
+            Ok(bytemuck::cast_slice(&bytes).to_vec())
+        };
+        let res = run();
+        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        res
+    }
+
+    /// The submit splitter's current cap — see `VulkanShared::submit_dispatch_cap`. `0` =
+    /// unlimited. Automatic mode changes this only during its bounded startup calibration.
+    pub(crate) fn submit_dispatch_cap(&self) -> usize {
+        self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn begin_submit_tune_round(&self, token_row_paged_moe: bool) -> SubmitTuneRound {
+        self.shared.begin_submit_tune_round(token_row_paged_moe)
+    }
+
+    /// Persistent decode is recorded once and cannot follow a cap that changes during startup.
+    /// Keep its established platform default in automatic mode; explicit overrides still apply
+    /// exactly. Static/paged execution uses the independently calibrated current cap above.
+    pub(crate) fn replay_submit_dispatch_cap(&self) -> usize {
+        self.shared.replay_submit_dispatch_cap()
+    }
+
+    /// The submit splitter's cap as it stands NOW, for reporting (`infr bench`'s result line).
+    /// `0` = unlimited. During the bounded startup calibration this is the cap currently sampled;
+    /// afterwards it is immutable and directly comparable across benchmark runs.
+    pub fn submit_cap_now(&self) -> usize {
+        self.submit_dispatch_cap()
+    }
+
+    /// Begin a "loading weights" progress bar covering `total_bytes` (pass `None` for an
+    /// indeterminate byte spinner when the total isn't known up front). Every subsequent
+    /// `BufferUsage::Weights` allocation advances it automatically — the ticking lives in `alloc`,
+    /// so a model loader cannot forget it; it only has to open the scope once. The returned guard
+    /// finishes and clears the bar on drop, so the bar's lifetime is the loader's scope.
+    fn weight_progress_scope(&self, total_bytes: Option<u64>) -> WeightProgress {
+        // Weights are read by 64-bit device address and sub-allocate from the BDA arena
+        // (`bda_weight_alloc`, opened lazily on the first `Weights` alloc); there is no separate
+        // up-front SSBO reservation or ReBAR direct-write path to arm here. The upload path is the
+        // reused, pipelined staging ring (`upload_staged_ring`) on every device.
+        let pb = infr_core::progress::bar(
+            total_bytes,
+            "loading weights",
+            infr_core::progress::Unit::Bytes,
+        );
+        *self.shared.weight_pb.lock().unwrap() = Some(pb);
+        WeightProgress {
+            shared: self.shared.clone(),
+            vram_log: self.cfg.prof.vram,
+        }
+    }
+
+    /// Install this model's paged-MoE session (see `pager::MoePagerSession`), sized but with no
+    /// tensors registered yet. The seam calls this after fixed allocations and immediately
+    /// registers every queued placeholder before graph construction. Replaces any previous
+    /// session (there is only ever one loaded model per process today).
+    pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
+        // Stop a prior model's producer before replacing the pager state it owns.
+        *self.decode_prefetch.lock().unwrap() = None;
+        *self.shared.session_transfer_plan.write().unwrap() = None;
+        let session = crate::pager::MoePagerSession::new(self, layout)?;
+        *self.moe_pager.lock().unwrap() = Some(session);
+        if self.cfg.paging.expert_prefetch {
+            if let Some(executor) = self.background_expert_transfer_executor() {
+                match adapter::DecodePrefetchScheduler::spawn(
+                    Arc::clone(&self.moe_pager),
+                    executor,
+                ) {
+                    Ok(scheduler) => {
+                        *self.decode_prefetch.lock().unwrap() = Some(scheduler);
+                        tracing::info!(
+                            "[infr] next-layer expert prefetch enabled on the transfer queue"
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        "[infr] could not start the expert prefetch worker ({error}); continuing without prefetch"
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish and release the temporary weight-upload ring before a caller measures live device
+    /// room for a steady-state arena. Idempotent: the weight-progress guard may call it again.
+    pub fn finish_resident_uploads(&self) -> Result<()> {
+        self.shared.drain_staging_ring()
+    }
+
+    /// Allocate device-local dedicated buffers used only as a physical load-time reservation.
+    /// Chunking avoids both the device's single-allocation limit and one multi-GiB allocation.
+    pub(crate) fn alloc_load_vram_reservation(&self, bytes: u64) -> Result<Vec<Box<dyn Buffer>>> {
+        const CHUNK: u64 = 256 * 1024 * 1024;
+        let mut remaining = bytes;
+        let mut buffers = Vec::with_capacity(remaining.div_ceil(CHUNK) as usize);
+        while remaining > 0 {
+            let chunk = remaining.min(CHUNK);
+            let size = usize::try_from(chunk)
+                .map_err(|_| be("load-time VRAM reservation exceeds addressable size"))?;
+            let buffer = self.make_buf_ex(
+                size,
+                MemoryLocation::GpuOnly,
+                "session-runtime-reserve",
+                true,
+                false,
+            )?;
+            buffers.push(Box::new(buffer) as Box<dyn Buffer>);
+            remaining -= chunk;
+        }
+        Ok(buffers)
+    }
+
+    /// Error-path twin of `Backend::finish_weight_load`; harmless when no reservation is live.
+    pub fn release_moe_load_reservation(&self) {
+        let bytes = self
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_or(0, crate::pager::MoePagerSession::release_load_reservation);
+        if bytes > 0 {
+            tracing::info!(
+                "[infr] released {:.2} GiB of load-time VRAM for runtime workspace",
+                bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
+    }
+
+    /// Register one paged layer's role tensor with the session `init_moe_pager` already installed
+    /// — called by the seam's cold-load finalizer for tensors skipped during weight upload.
+    /// Panics if no session is installed (a caller bug: `init_moe_pager` must run first); errors
+    /// if the layout has no pool matching the tensor's (role, per-expert bytes).
+    pub fn register_paged_expert(
+        &self,
+        role: crate::pager::Role,
+        buf_id: usize,
+        source: crate::pager::ExpertSource,
+        n_expert: usize,
+    ) -> Result<()> {
+        self.moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("register_paged_expert called before init_moe_pager")
+            .register(role, buf_id, source, n_expert)
+    }
+
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
+    pub fn print_moe_pager_stats(&self) {
+        if self.cfg().paging.stats {
+            self.with_unified_gate(|| {
+                if let Some(session) = self.moe_pager.lock().unwrap().as_ref() {
+                    session.print_stats_with_owner(self);
+                }
+            });
+            return;
+        }
+        if let Some(s) = self.moe_pager.lock().unwrap().as_ref() {
+            s.print_stats_if_enabled();
+        }
+    }
+
+    /// Locked access to the paged-MoE session for the adapter's `execute_static` — `pub(crate)`
+    /// (only `adapter.rs` reaches into this); see `pager.rs`'s module doc for why this lives
+    /// outside the `Graph`/`Bindings` seam instead of a per-op flag.
+    pub(crate) fn moe_pager(&self) -> &crate::pager::MoePagerCell {
+        &self.moe_pager
+    }
+
+    pub(crate) fn decode_prefetch_scheduler(
+        &self,
+    ) -> &Mutex<Option<adapter::DecodePrefetchScheduler>> {
+        &self.decode_prefetch
+    }
+
+    fn quiesce_decode_prefetch_for_vram_claim(&self) -> Result<bool> {
+        self.decode_prefetch
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_or(Ok(false), adapter::DecodePrefetchScheduler::cancel_active)
+    }
+
+    /// Install this model's dense layer-streaming session (see `pager::DensePagerSession`) —
+    /// `init_moe_pager`'s dense twin, same call-order contract (BEFORE the seam's weight-load
+    /// closure binds the first placeholder, so `Backend::dense_paged` already reads true).
+    pub fn init_dense_pager(&self, layout: crate::pager::DensePagerLayout) -> Result<()> {
+        let session = crate::pager::DensePagerSession::new(self, layout)?;
+        *self.dense_pager.lock().unwrap() = Some(session);
+        Ok(())
+    }
+
+    /// Register one streamed dense block with the session `init_dense_pager` installed — called
+    /// from the seam's weight-load closure instead of uploading the block's full bytes. Panics if
+    /// no session is installed (a caller bug: `init_dense_pager` must run first).
+    pub fn register_dense_stream(
+        &self,
+        pool: usize,
+        buf_id: usize,
+        source: crate::pager::DenseSource,
+    ) -> Result<()> {
+        self.dense_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("register_dense_stream called before init_dense_pager")
+            .register(pool, buf_id, source)
+    }
+
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no dense-streamed model is loaded.
+    pub fn print_dense_pager_stats(&self) {
+        if let Some(s) = self.dense_pager.lock().unwrap().as_ref() {
+            s.print_stats_if_enabled();
+        }
+    }
+
+    /// [`Self::moe_pager`]'s dense twin — locked access for the adapter's `execute_static`.
+    pub(crate) fn dense_pager(&self) -> &crate::pager::DensePagerCell {
+        &self.dense_pager
+    }
+
+    // ── internal helpers ──────────────────────────────────────────────────────
+
+    /// Create a `vk::Buffer` + gpu-allocator sub-allocation of the requested size/location.
+    /// Device-local VRAM: total heap size and currently-available bytes. `available` comes from
+    /// VK_EXT_memory_budget (live, accounts for other processes + our own allocations) when the
+    /// extension is present; otherwise it falls back to the total heap size (best effort).
+    /// NOTE: the extension's `heapBudget` is a CEILING (how much this process may use in total),
+    /// not free bytes — live free = `heapBudget - heapUsage`. Reporting the raw budget here once
+    /// made `available` sit ~constant while we allocated GBs, which let the VRAM guard sail past
+    /// a 53 GiB KV cache into VK_ERROR_DEVICE_LOST.
+    pub fn vram(&self) -> VramInfo {
+        vram_info(&self.shared)
+    }
+
+    /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it.
+    /// This is the smaller of live physical room and the configured/automatic per-backend target,
+    /// after any explicit `device.vram_reserve` has been held aside. With both explicit knobs unset,
+    /// the automatic profile retains 1 GiB of current free VRAM or caps the backend at total VRAM
+    /// minus 2 GiB.
+    ///
+    /// Sizing math must budget against this, not against `vram().available` — the guard enforces
+    /// `used + want <= total - GUARD_HEADROOM`, so the last 256 MiB of "free" VRAM is reserved and
+    /// can never be handed out. A context/placement decision that plans into it produces a session
+    /// the allocator then refuses mid-prefill, which is the worst possible place to find out
+    /// (observed on gemma-4-31B UD-Q5_K_XL: a clamped-but-exact 22610-token window died on a 2 MiB
+    /// activation alloc at 23.86 GiB in use against a 23.73 GiB budget).
+    ///
+    /// Exact when the driver reports a live budget (VK_EXT_memory_budget, so `available` already
+    /// nets out everything held); on the fallback path `available` is the whole heap, so this is
+    /// the room only before this backend has allocated — which is when placement runs.
+    pub fn alloc_room(&self) -> u64 {
+        let vram = self.vram();
+        let tracked_used = self.shared.budget_used();
+        let room = infr_core::budget::unified_vram_room_for_profile(
+            vram.total,
+            backend_physical_alloc_room(vram, tracked_used),
+            tracked_used,
+            self.cfg.device.vram_budget,
+            self.cfg.device.vram_reserve,
+            self.cfg.device.auto_profile,
+        );
+        let explicit_limit =
+            self.cfg.device.vram_budget.is_some() || self.cfg.device.vram_reserve.is_some();
+        automatic_device_vram_budget_cap(
+            vram.total,
+            self.shared.device_arch,
+            self.cfg.device.auto_profile,
+            explicit_limit,
+            cfg!(target_os = "windows"),
+        )
+        .map_or(room, |cap| room.min(cap.saturating_sub(tracked_used)))
+    }
+
+    /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
+    /// that would exceed the budget. Over-committing does not fail cleanly on GPUs — the driver
+    /// accepts the allocation and then evicts, which on a discrete card means reading weights back
+    /// across PCIe (measured: a 41 GiB device-local run on a 24 GiB 7900 XTX quietly placed 18 GiB
+    /// in GTT) and can end in a device-lost (TDR) mid-inference. The only safe failure point is
+    /// here, at allocation time (mirrors the Metal backend's working-set guard).
+    ///
+    /// The budget comes from [`vram_info`], which counts device-local heaps on a discrete card and
+    /// EVERY heap on a unified-memory part (where they are one pool of DDR — see its doc). Uses the
+    /// LIVE per-heap budget when VK_EXT_memory_budget is present (it accounts for other processes
+    /// and everything we already hold); otherwise falls back to this backend's tracked bytes
+    /// against the total heap. `GUARD_HEADROOM` absorbs allocation slop (alignment, gpu-allocator
+    /// block rounding) and driver-internal allocations. `INFR_NO_VRAM_GUARD=1` disables the check
+    /// (restoring the old fail-late behavior).
+    ///
+    /// Sub-MiB allocations skip the check only under the historical implicit policy (no
+    /// `vram_budget`/`vram_reserve`). An explicit unified limit checks every allocation so a tail
+    /// of small buffers cannot collectively cross the caller's hard cap.
+    fn check_vram_budget(&self, want: u64) -> Result<()> {
+        const CHECK_MIN: u64 = 1 << 20; // 1 MiB
+        let unified_limit = self.cfg.device.vram_budget.is_some()
+            || self.cfg.device.vram_reserve.is_some()
+            || self.shared.unified_ram.is_some()
+            || infr_core::test_resource::active().is_some();
+        if (want < CHECK_MIN && !unified_limit) || self.cfg.kernels.vulkan.no_vram_guard {
+            return Ok(());
+        }
+        // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
+        // the VRAM-first KV spill can never disagree (the guard errors iff the probe says it won't
+        // fit). Only build the detailed error — and re-query the driver for its fields — on failure.
+        if self.vram_budget_fits(want) {
+            return Ok(());
+        }
+        let v = raw_vram_info(&self.shared);
+        let global_used = if v.live {
+            v.total.saturating_sub(v.available)
+        } else {
+            self.shared.budget_used()
+        };
+        let process_used = self.shared.budget_used();
+        let physical_budget = v.total.saturating_sub(GUARD_HEADROOM).saturating_sub(
+            self.cfg
+                .device
+                .vram_reserve
+                .map_or(0, |spec| spec.resolve(v.total)),
+        );
+        let configured_budget = self
+            .cfg
+            .device
+            .vram_budget
+            .map(|spec| spec.resolve(v.total).min(v.total));
+        Err(be(format!(
+            "{} budget exceeded: {} requested with {} physical / {} backend bytes already in use; \
+                 {} remains under the unified limit (physical cap {}, configured cap {}, shared RAM cap {}). \
+                 Refusing to over-commit: exceeding it doesn't fail \
+                 cleanly — the driver evicts (weights get read back over the bus) or the device is \
+                 lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
+                 quantized model, close other GPU processes, or run on the CPU backend \
+                 (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
+            if v.uma { "Unified-memory" } else { "VRAM" },
+            fmt_bytes(want),
+            fmt_bytes(global_used),
+            fmt_bytes(process_used),
+            fmt_bytes(self.alloc_room()),
+            fmt_bytes(physical_budget),
+            configured_budget.map_or_else(|| "unlimited".to_owned(), fmt_bytes),
+            self.shared
+                .unified_ram
+                .as_ref()
+                .and_then(|ram| ram.limit)
+                .map_or_else(|| "not applicable".to_owned(), fmt_bytes),
+        )))
+    }
+
+    /// Non-erroring budget probe: would a device-local allocation of `want` bytes fit under the SAME
+    /// budget [`check_vram_budget`](Self::check_vram_budget) enforces? The VRAM-first KV-overflow
+    /// path (`make_alloc`'s `KvCache` arm with `INFR_KV_OVERFLOW`) needs "would this fit?" to choose
+    /// VRAM vs host placement, not "error if not" — but it must agree with the guard to the byte, so
+    /// this and the guard share `GUARD_HEADROOM` and the same `used`/`budget` math. A `true` here
+    /// means `check_vram_budget(want)` returns `Ok` (the guard errors iff this returns `false`);
+    /// unlike the guard it ignores `INFR_NO_VRAM_GUARD` and the sub-MiB skip — it is a placement
+    /// decision, not a safety gate, so it always reports the honest budget answer.
+    fn vram_budget_fits(&self, want: u64) -> bool {
+        want <= self.alloc_room()
+    }
+
+    /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
+    fn find_memory_type(&self, type_bits: u32, props: vk::MemoryPropertyFlags) -> Option<u32> {
+        let mp = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        (0..mp.memory_type_count).find(|&i| {
+            (type_bits & (1 << i)) != 0
+                && mp.memory_types[i as usize].property_flags.contains(props)
+        })
+    }
+
+    /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty`. The
+    /// UNIFIED-MEMORY overflow spill (`spilled == true` — the non-device-local heap of a UMA part),
+    /// the sole caller today. See [`Backing::Vram`]. (`spilled == false` is still threaded for the
+    /// budget-accounting split described below, in case a device-local mapped caller returns.)
+    ///
+    /// The caller owns `buffer` and must destroy it if this returns `Err`. Budget-guarded and
+    /// charged to `device_used` like any other allocation UNLESS `spilled` (a UMA-overflow buffer
+    /// lives off the device-local heap and is deliberately not counted against it).
+    ///
+    /// `device_address` must mirror the buffer's `SHADER_DEVICE_ADDRESS` usage: when the buffer was
+    /// created with that usage (a paged-MoE `alloc_arena_bda` / resident-BDA `bda_weight_alloc`
+    /// block that spilled onto the UMA overflow heap), its backing memory MUST carry the
+    /// `DEVICE_ADDRESS` alloc flag too, or binding it violates
+    /// VUID-VkMemoryAllocateInfo-flags-03331 (validation error / a bogus 64-bit `device_addr()`).
+    /// This is the manual mirror of the flag gpu-allocator sets on its own path (it was built with
+    /// `buffer_device_address: true`). Every non-device_address caller passes `false`.
+    fn alloc_vram_mapped(
+        &self,
+        buffer: vk::Buffer,
+        size: usize,
+        requirements: &vk::MemoryRequirements,
+        ty: u32,
+        spilled: bool,
+        device_address: bool,
+        budget_check: bool,
+    ) -> Result<VkBuffer> {
+        // The KV-overflow path (`alloc_kv_host`) places bytes in SYSTEM RAM across PCIe, not VRAM,
+        // so it opts out of the device-local budget guard entirely (`budget_check == false`). The
+        // UMA spill keeps it: on a unified part every heap IS the same DDR pool and the guard
+        // budgets against all of them.
+        if budget_check {
+            self.check_vram_budget(requirements.size)?;
+        }
+
+        let mut flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(ty);
+        if device_address {
+            alloc_info = alloc_info.push_next(&mut flags_info);
+        }
+        let memory = unsafe { self.shared.device.allocate_memory(&alloc_info, None) }
+            .map_err(|e| be(format!("rebar allocate_memory({}): {e}", requirements.size)))?;
+
+        let ptr = match unsafe {
+            self.shared
+                .device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p as *mut u8,
+            Err(e) => {
+                unsafe { self.shared.device.free_memory(memory, None) };
+                return Err(be(format!("rebar map_memory: {e}")));
+            }
+        };
+
+        if let Err(e) = unsafe { self.shared.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.shared.device.unmap_memory(memory);
+                self.shared.device.free_memory(memory, None);
+            }
+            return Err(be(format!("rebar bind_buffer_memory: {e}")));
+        }
+
+        // Charge the device-local budget tally — UNLESS this is a UMA/host spill, which lives off
+        // the device-local heap and must not count against it (balanced in `VkBuffer::drop`).
+        if !spilled {
+            self.shared
+                .device_used
+                .fetch_add(requirements.size, Ordering::Relaxed);
+        }
+        self.shared.charge_owned_ram(requirements.size);
+
+        // Mirror `make_buf_ex`'s own-address computation: `device_address` here means the caller
+        // already added `SHADER_DEVICE_ADDRESS` to the buffer's usage AND (just above) chained the
+        // matching `DEVICE_ADDRESS` memory-allocate flag, so the query is valid.
+        let own_addr = device_address.then(|| unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
+
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::Vram {
+                memory,
+                ptr,
+                spilled,
+            },
+            // Logical size = what the caller asked for; `requirements.size` only rounds it up for
+            // alignment, and `fill_buf`/`upload` must not touch past the logical extent.
+            size,
+            mem_size: requirements.size,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+            own_addr,
+            act_bytes: 0,
+        })
+    }
+
+    fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
+        self.make_buf_ex(size, location, label, false, false)
+    }
+
+    /// Allocate one KV-cache buffer in SYSTEM RAM (host-visible, non-device-local heap) WITH a
+    /// device address — the opt-in `INFR_KV_OVERFLOW` path. The KV read seam is 100%
+    /// `bufferDeviceAddress` (issue #74: `attn_partial`/`attention_kv`/dequant read K/V only
+    /// through `k_addr`/`v_addr` pointers), so a KV buffer whose bytes live off-device is read by
+    /// attention over PCIe with NO shader change; only the store→read barrier's inert bound
+    /// descriptors still bind the same buffer, which is valid on any heap. Same bytes, different
+    /// heap ⇒ bit-identical logits to a VRAM KV cache, at PCIe bandwidth.
+    ///
+    /// This is SYSTEM RAM, not VRAM, so it does NOT go through the device-local budget guard
+    /// (`budget_check == false`) and is NOT charged to `device_used` (`spilled == true`) — leaving
+    /// the VRAM guard to protect only the weights + activations that live on-device. Requires
+    /// `host_overflow_type` (present on RDNA3 = the GTT host-visible type); the caller has already
+    /// checked the flag, so a missing type here is a hard error rather than a silent VRAM fallback.
+    fn alloc_kv_host(&self, size: usize) -> Result<VkBuffer> {
+        let ty =
+            self.shared.host_overflow_type.ok_or_else(|| {
+                be("INFR_KV_OVERFLOW set but this device exposes no host-visible non-device-local \
+                memory type to place the KV cache in — unset it to run in VRAM".to_string())
+            })?;
+        // KV buffers are addressed by device address (issue #74), so this buffer needs the
+        // SHADER_DEVICE_ADDRESS usage exactly like the VRAM KV path (`make_buf_ex(.., true)`).
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        // 4-byte-rounded create size (`fill_span`) — matches `make_buf_ex`; identity for any
+        // 4-aligned `size` (all current KV buffers), keeps device-local zero-init in-bounds.
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(fill_span(size))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
+            .map_err(|e| be(format!("create_buffer(kv-host): {e}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        if requirements.memory_type_bits & (1 << ty) == 0 {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(be(
+                "INFR_KV_OVERFLOW: the host-visible overflow memory type is not compatible with a \
+                 KV storage buffer on this device"
+                    .to_string(),
+            ));
+        }
+        // Spills stay outside the device-local tally; UMA still charges and guards their shared
+        // host RAM. On Err, `alloc_vram_mapped` leaves the buffer to us.
+        self.alloc_vram_mapped(
+            buffer,
+            size,
+            &requirements,
+            ty,
+            true,
+            true,
+            self.shared.caps.unified_memory,
+        )
+        .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })
+    }
+
+    /// Allocate the paged-MoE expert arena as a `bufferDeviceAddress` buffer and return it with its
+    /// 64-bit `VkDeviceAddress`. Unlike a plain SSBO arena (capped at `maxStorageBufferRange`), the
+    /// paged expert kernels read this through a `GL_EXT_buffer_reference` pointer, so it may be as
+    /// large as VRAM allows. Always a dedicated GpuOnly allocation, budget-guarded like any weight;
+    /// the `SHADER_DEVICE_ADDRESS` usage + the allocator's DEVICE_ADDRESS memory flag are what let
+    /// `get_buffer_device_address` succeed.
+    pub fn alloc_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
+        let buf = self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "moe-arena", true, true)?;
+        // `make_buf_ex(device_address=true)` already queried + stored this handle's address in
+        // `own_addr` — reuse it rather than issuing a second identical `get_buffer_device_address`.
+        let addr = buf
+            .own_addr
+            .expect("moe-arena built with device_address=true carries an own_addr");
+        Ok((Box::new(buf) as Box<dyn Buffer>, addr))
+    }
+
+    /// Allocate an arena from ordinary device-local memory, explicitly avoiding HOST_VISIBLE
+    /// memory types when the device exposes a private VRAM type. Unlike `MemoryLocation::GpuOnly`
+    /// this makes the RDNA2 fallback deterministic instead of depending on allocator type order.
+    pub(crate) fn alloc_device_local_arena_bda(
+        &self,
+        bytes: usize,
+    ) -> Result<(Box<dyn Buffer>, u64)> {
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut info = vk::BufferCreateInfo::default()
+            .size(fill_span(bytes))
+            .usage(usage);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
+        let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+            .map_err(|error| be(format!("create_buffer(device-arena): {error}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        let properties = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        let memory_type = (0..properties.memory_type_count).find(|&index| {
+            requirements.memory_type_bits & (1 << index) != 0
+                && properties.memory_types[index as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                && !properties.memory_types[index as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        });
+        let Some(memory_type) = memory_type else {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            // UMA devices legitimately have no private type. Their mapped device-local memory is
+            // the same physical RAM, so the established allocator path is the correct fallback.
+            return self.alloc_arena_bda(bytes);
+        };
+        if let Err(error) = self.check_vram_budget(requirements.size) {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(error);
+        }
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut flags);
+        let memory = match unsafe { self.shared.device.allocate_memory(&allocation, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(be(format!(
+                    "allocate ordinary device-local arena memory ({} bytes): {error}",
+                    requirements.size
+                )));
+            }
+        };
+        if let Err(error) = unsafe { self.shared.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.shared.device.free_memory(memory, None);
+                self.shared.device.destroy_buffer(buffer, None);
+            }
+            return Err(be(format!("bind ordinary device-local arena: {error}")));
+        }
+        self.shared
+            .device_used
+            .fetch_add(requirements.size, Ordering::Relaxed);
+        self.shared.charge_owned_ram(requirements.size);
+        let address = unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        };
+        let arena = VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::Device { memory },
+            size: bytes,
+            mem_size: requirements.size,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+            own_addr: Some(address),
+            act_bytes: 0,
+        };
+        Ok((Box::new(arena), address))
+    }
+
+    /// Allocate the paged-MoE arena in DEVICE_LOCAL, HOST_VISIBLE ReBAR memory.
+    ///
+    /// The arena remains the same bounded VRAM cache used by decode and reinterpreted as
+    /// resident layers plus two streaming lanes during prefill. Mapping that VRAM into the CPU
+    /// address space does not create a second physical payload: it only lets the CPU push bytes
+    /// from the unique ordinary-RAM expert store directly into the final cache/LRU destination.
+    /// Requiring DEVICE_LOCAL here is intentional. Falling back to a host-visible system-memory
+    /// heap would silently recreate the full GPU-visible HostWeights mirror this path removes.
+    pub fn alloc_mapped_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
+        self.alloc_mapped_arena_bda_inner(bytes, false)
+    }
+
+    pub(crate) fn alloc_mapped_predicate(&self, bytes: usize) -> Result<Box<dyn Buffer>> {
+        self.alloc_mapped_arena_bda_inner(bytes, true)
+            .map(|(buffer, _)| buffer)
+    }
+
+    fn alloc_mapped_arena_bda_inner(
+        &self,
+        bytes: usize,
+        predicate: bool,
+    ) -> Result<(Box<dyn Buffer>, u64)> {
+        let mut usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        if predicate {
+            if self.shared.conditional_rendering.is_none() {
+                return Err(be("mapped predicate requires conditional rendering"));
+            }
+            usage |= vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT;
+        }
+        let queue_families = self.shared.dedicated_transfer_families();
+        let mut info = vk::BufferCreateInfo::default()
+            .size(fill_span(bytes))
+            .usage(usage);
+        if let Some(families) = queue_families.as_ref() {
+            info = info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(families);
+        } else {
+            info = info.sharing_mode(vk::SharingMode::EXCLUSIVE);
+        }
+        let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+            .map_err(|e| be(format!("create_buffer(moe-arena-rebar): {e}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
+            | vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(ty) = self.find_memory_type(requirements.memory_type_bits, want) else {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(be(
+                "paged MoE CPU-push needs DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT ReBAR memory; \
+                 this device exposes no compatible memory type",
+            ));
+        };
+        let buf = self
+            .alloc_vram_mapped(buffer, bytes, &requirements, ty, false, true, true)
+            .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })?;
+        let addr = buf
+            .own_addr
+            .expect("mapped MoE arena built with device_address=true carries an own_addr");
+        tracing::info!(
+            "[infr] paged-MoE arena: {} ReBAR VRAM (DEVICE_LOCAL|HOST_VISIBLE), one CPU mapping, no mirror",
+            fmt_bytes(requirements.size),
+        );
+        Ok((Box::new(buf) as Box<dyn Buffer>, addr))
+    }
+
+    /// Create the one elastic VRAM arena shared by this backend's paged experts and auxiliary
+    /// engines. Repeated calls return the same pool and reject contradictory capacities.
+    pub fn init_unified_vram(&self, bytes: usize) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+        let mut cell = self.unified_pool.lock().unwrap();
+        if let Some(pool) = cell.as_ref() {
+            if pool.stats().capacity_bytes != bytes {
+                return Err(be(format!(
+                    "unified VRAM arena is already {} bytes; cannot reinitialize it as {bytes} bytes",
+                    pool.stats().capacity_bytes,
+                )));
+            }
+            return Ok(Arc::clone(pool));
+        }
+        let pool = crate::unified::UnifiedVramPool::new(self, bytes)?;
+        *cell = Some(Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    /// Expert-aware initializer: physical shard boundaries are placed between slots so the
+    /// driver allocation cap never strands an unusable tail smaller than the next slot.
+    fn plan_unified_vram_for_expert_slots(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<crate::unified::ExpertArenaLayout> {
+        const WINDOWS_MAX_SHARD: usize = 3 * 1024 * 1024 * 1024;
+        let driver_max = usize::try_from(self.shared.max_mem_alloc_size)
+            .unwrap_or(usize::MAX)
+            .max(256);
+        let platform_max = if cfg!(target_os = "windows") {
+            WINDOWS_MAX_SHARD.min(driver_max)
+        } else {
+            driver_max
+        };
+        crate::unified::ExpertArenaLayout::build(
+            specs,
+            platform_max,
+            usize::try_from(dynamic_state_reserve_bytes)
+                .map_err(|_| be("dynamic-state reserve exceeds the host address space"))?,
+            usize::try_from(dynamic_state_max_allocation_bytes)
+                .map_err(|_| be("dynamic-state allocation exceeds the host address space"))?,
+            usize::try_from(prefill_min_lane_bytes)
+                .map_err(|_| be("minimum Prefill lane exceeds the host address space"))?,
+            usize::try_from(runtime_reserve_bytes)
+                .map_err(|_| be("runtime reserve exceeds the host address space"))?,
+        )
+    }
+
+    /// Validate an expert-aware arena geometry without allocating device memory. Startup uses this
+    /// after every pool-external owner is resident to choose the tallest Prefill chunk that fits
+    /// the measured remainder; the selected layout is then materialized exactly once below.
+    pub fn validate_moe_unified_vram(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<usize> {
+        Ok(self
+            .plan_unified_vram_for_expert_slots(
+                specs,
+                dynamic_state_reserve_bytes,
+                dynamic_state_max_allocation_bytes,
+                prefill_min_lane_bytes,
+                runtime_reserve_bytes,
+            )?
+            .total_bytes())
+    }
+
+    pub(crate) fn init_unified_vram_for_expert_slots(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<Arc<crate::unified::UnifiedVramPool>> {
+        let layout = self.plan_unified_vram_for_expert_slots(
+            specs,
+            dynamic_state_reserve_bytes,
+            dynamic_state_max_allocation_bytes,
+            prefill_min_lane_bytes,
+            runtime_reserve_bytes,
+        )?;
+        let expected = layout.total_bytes();
+        let mut cell = self.unified_pool.lock().unwrap();
+        if let Some(pool) = cell.as_ref() {
+            let same_layout = pool.stats().capacity_bytes == expected
+                && pool
+                    .expert_layout()
+                    .is_some_and(|existing| existing == &layout);
+            if !same_layout {
+                return Err(be(format!(
+                    "unified VRAM arena is already {} bytes with different corridors; expert plan requires {expected} bytes",
+                    pool.stats().capacity_bytes,
+                )));
+            }
+            return Ok(Arc::clone(pool));
+        }
+        let pool = crate::unified::UnifiedVramPool::new_for_experts(self, layout)?;
+        *cell = Some(Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    /// Materialize an otherwise-empty MoE unified arena before the pager session is installed.
+    /// The seam uses this as a real allocation probe. The selected mapped or ordinary device-local
+    /// backing can consume a driver-dependent amount of heap budget beyond its logical byte size.
+    /// A successful probe stays installed and is reused byte-for-byte by [`init_moe_pager`].
+    pub fn prepare_moe_unified_vram(
+        &self,
+        specs: &[(usize, usize, usize)],
+        dynamic_state_reserve_bytes: u64,
+        dynamic_state_max_allocation_bytes: u64,
+        prefill_min_lane_bytes: u64,
+        runtime_reserve_bytes: u64,
+    ) -> Result<usize> {
+        let pool = self.init_unified_vram_for_expert_slots(
+            specs,
+            dynamic_state_reserve_bytes,
+            dynamic_state_max_allocation_bytes,
+            prefill_min_lane_bytes,
+            runtime_reserve_bytes,
+        )?;
+        Ok(pool.stats().capacity_bytes)
+    }
+
+    /// Drop a prepared MoE arena after a placement probe found that it leaves too little live
+    /// room. This is deliberately valid only before the pager has leased a single range; once a
+    /// session exists, changing its physical slot space would invalidate every BDA/LUT address.
+    pub fn discard_empty_moe_unified_vram(&self) -> Result<usize> {
+        let mut cell = self.unified_pool.lock().unwrap();
+        let Some(pool) = cell.as_ref() else {
+            return Ok(0);
+        };
+        let stats = pool.stats();
+        if stats.free_bytes != stats.capacity_bytes || Arc::strong_count(pool) != 1 {
+            return Err(be(
+                "cannot resize unified VRAM after the pager has leased or retained its arena",
+            ));
+        }
+        let bytes = stats.capacity_bytes;
+        let pool = cell.take().expect("checked above");
+        drop(cell);
+        drop(pool);
+        Ok(bytes)
+    }
+
+    pub fn unified_vram(&self) -> Option<Arc<crate::unified::UnifiedVramPool>> {
+        self.unified_pool.lock().unwrap().clone()
+    }
+
+    /// Derive a second execution backend over the same Vulkan device, queue, MoE pager and elastic
+    /// arena. It owns independent graph/weight allocator cursors but no second device or VRAM pool.
+    pub fn fork_embedding_client(&self) -> Result<Self> {
+        self.fork_auxiliary_client(UnifiedClient::Embedding, "Embedding")
+    }
+
+    /// Derive a vision execution client over the primary model's device, pager and unified arena.
+    /// Vision weights and runtime are separate ownership classes, so they can be released as one
+    /// temporary workload without disturbing the LLM's persistent state.
+    pub fn fork_vision_client(&self) -> Result<Self> {
+        self.fork_auxiliary_client(UnifiedClient::Vision, "Vision")
+    }
+
+    fn fork_auxiliary_client(&self, client: UnifiedClient, label: &str) -> Result<Self> {
+        if self.unified_vram().is_none() {
+            return Err(be(format!(
+                "cannot fork a unified {label} backend before the MoE arena is initialized"
+            )));
+        }
+        let runtime_phase = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let unified_phase_id = self.unified_phases.register(&runtime_phase);
+        let auxiliary_runtime_reaper =
+            AuxiliaryRuntimeReaper::spawn(&runtime_phase, &self.unified_exec)?;
+        Ok(Self {
+            decode_prefetch: Mutex::new(None),
+            cpu_miss: std::sync::OnceLock::new(),
+            moe_pager: Arc::clone(&self.moe_pager),
+            session_finalization_deferred: Arc::clone(&self.session_finalization_deferred),
+            dense_pager: Mutex::new(None),
+            runtime_phase,
+            bda_weight_arena: Mutex::new(None),
+            iq2s_grid: self.iq2s_grid.clone(),
+            iq3s_grid: self.iq3s_grid.clone(),
+            unified_pool: Arc::clone(&self.unified_pool),
+            unified_exec: Arc::clone(&self.unified_exec),
+            unified_phases: Arc::clone(&self.unified_phases),
+            unified_phase_id,
+            auxiliary_runtime_reaper: Some(auxiliary_runtime_reaper),
+            unified_client: Some(client),
+            cfg: Arc::clone(&self.cfg),
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    /// Drop this auxiliary client's retained graph workspace after its request finishes. Weight
+    /// handles remain caller-owned and can be dropped immediately afterwards; the primary LLM
+    /// restores the vacated expert slots when it next enters the shared execution gate.
+    pub fn release_auxiliary_runtime(&self) -> Result<()> {
+        if self.unified_client.is_none() {
+            return Err(be("the primary LLM backend is not an auxiliary client"));
+        }
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
+            self.runtime_phase.lock().unwrap().release_phase();
+            Ok(())
+        })
+    }
+
+    /// Drop the primary LLM's retained Decode high-water workspace after an active batch cohort
+    /// shrinks. Consecutive tokens with the same cohort keep their phase arena; a lane departure is
+    /// a safe boundary at which the next, smaller graph can rebuild once and return the remainder
+    /// to the Expert filler.
+    pub fn release_primary_runtime_after_cohort_shrink(&self) {
+        debug_assert!(
+            self.unified_client.is_none(),
+            "only the primary LLM owns the decode cohort"
+        );
+        let result = self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
+            self.runtime_phase.lock().unwrap().release_phase();
+            if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                session.restore_released_unified_slots();
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not release primary runtime after cohort shrink");
+        }
+    }
+
+    /// Hold optional Host DMA imports until a caller has materialized a batch of persistent KV
+    /// slots. The ordinary one-session path never enables this gate.
+    pub fn defer_session_finalization(&self, deferred: bool) {
+        self.session_finalization_deferred
+            .store(deferred, Ordering::Release);
+    }
+
+    /// Complete a previously deferred session-finalization boundary.
+    pub fn finish_deferred_session_allocations(&self) -> Result<()> {
+        self.defer_session_finalization(false);
+        <Self as Backend>::finish_session_allocations(self)
+    }
+
+    fn unified_sub_buffer(
+        &self,
+        handle: Arc<crate::unified::UnifiedAllocationHandle>,
+        size: usize,
+    ) -> Result<VkBuffer> {
+        let range = handle.range();
+        if size > range.len || range.offset.saturating_add(range.len) > handle.shard_bytes() {
+            return Err(be("unified VRAM allocation is outside its physical shard"));
+        }
+        let physical = as_vk_buf(handle.buffer())?;
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer: physical.buffer,
+            backing: Backing::UnifiedSub(handle),
+            size,
+            mem_size: 0,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: range.offset,
+            own_addr: None,
+            act_bytes: 0,
+        })
+    }
+
+    fn alloc_unified_buffer(
+        &self,
+        size: usize,
+        class: crate::unified::UnifiedVramClass,
+    ) -> Result<VkBuffer> {
+        self.with_unified_exclusive_result(|| self.alloc_unified_buffer_locked(size, class))
+    }
+
+    fn alloc_unified_buffer_locked(
+        &self,
+        size: usize,
+        class: crate::unified::UnifiedVramClass,
+    ) -> Result<VkBuffer> {
+        self.handoff_gpu_decode()?;
+        let pool = self
+            .unified_vram()
+            .ok_or_else(|| be("unified VRAM arena has not been initialized"))?;
+        if pool.expert_layout().is_some() {
+            if class == crate::unified::UnifiedVramClass::Expert {
+                return Err(be(
+                    "expert-aware unified VRAM slots must be claimed from the frozen slot directory",
+                ));
+            }
+            let protected = self.protected_unified_experts();
+            let mut plan = self
+                .unified_phases
+                .claim_with_reclaim(self.unified_phase_id, || {
+                    pool.plan_owner_claim(&[size], class, &protected)
+                })?;
+            if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
+                // The worker may have changed LRU residency before it was stopped. Physical arena
+                // ownership is unchanged, but recomputing keeps relocation/victim choice based on
+                // the final pager state that this transaction will commit.
+                let protected = self.protected_unified_experts();
+                plan = self
+                    .unified_phases
+                    .claim_with_reclaim(self.unified_phase_id, || {
+                        pool.plan_owner_claim(&[size], class, &protected)
+                    })?;
+            }
+            let mut handles = self.commit_unified_claim_locked(&pool, plan)?;
+            let handle = handles
+                .pop()
+                .ok_or_else(|| be("unified VRAM single-range claim returned no allocation"))?;
+            debug_assert!(handles.is_empty());
+            return self.unified_sub_buffer(handle, size);
+        }
+        let handle = self
+            .unified_phases
+            .claim_with_reclaim(self.unified_phase_id, || {
+                pool.allocate(size, class).ok_or_else(|| {
+                    let stats = pool.stats();
+                    be(format!(
+                "unified VRAM arena cannot fit {size} {class:?} bytes ({} free, largest range {})",
+                stats.free_bytes, stats.largest_free_bytes,
+            ))
+                })
+            })?;
+        self.unified_sub_buffer(handle, size)
+    }
+
+    fn commit_unified_claim_locked(
+        &self,
+        pool: &Arc<crate::unified::UnifiedVramPool>,
+        plan: crate::unified::UnifiedClaimPlan,
+    ) -> Result<Vec<Arc<crate::unified::UnifiedAllocationHandle>>> {
+        let mut pager = self.moe_pager.lock().unwrap();
+        if let Some(session) = pager.as_mut() {
+            return session.commit_unified_claim(self, plan);
+        }
+        if !plan.victims().is_empty() {
+            return Err(be(
+                "unified VRAM claim needs Expert filler retirement before the MoE pager exists",
+            ));
+        }
+        pool.commit_claim(plan)
+    }
+
+    fn protected_unified_experts(&self) -> Vec<crate::unified::ExpertSlotId> {
+        self.moe_pager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(crate::pager::MoePagerSession::protected_expert_slots)
+            .unwrap_or_default()
+    }
+
+    /// Run `f` while no other graph can submit commands that reference the elastic arena. Calls
+    /// nested from graph lowering reuse the outer lease; calls made by model loading or another
+    /// request acquire it normally. This is deliberately exclusive rather than an upgradable read
+    /// lock: scratch allocation may have to evict cold expert slots before recording can proceed.
+    fn with_unified_gate<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.unified_vram().is_none() {
+            return f();
+        }
+        let owner = Arc::as_ptr(&self.unified_exec) as usize;
+        let current = UNIFIED_EXEC_OWNER.with(Cell::get);
+        if current == owner {
+            return f();
+        }
+        assert_eq!(
+            current, 0,
+            "one thread cannot enter two unrelated unified VRAM execution gates"
+        );
+        let _exclusive = self.unified_exec.write().unwrap();
+        let _scope = UnifiedExecScope::enter(owner);
+        f()
+    }
+
+    fn handoff_gpu_decode(&self) -> Result<()> {
+        if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+            session.handoff_gpu_decode(self)?;
+        }
+        Ok(())
+    }
+
+    // Execute-local recorders and pending transfers have drained before this boundary.
+    // Export only completed payloads; abandoned COPYING slots must not survive a retry.
+    fn recover_decode_execution(&self, result: Result<()>) -> Result<()> {
+        let Err(error) = result else { return Ok(()) };
+        let cleanup = adapter::cancel_decode_prefetch(self).and_then(|()| {
+            if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                session.finish_gpu_decode_forward();
+                session.handoff_gpu_decode(self)?;
+            }
+            Ok(())
+        });
+        match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(be(format!(
+                "{error} (GPU Decode recovery also failed: {cleanup})"
+            ))),
+        }
+    }
+
+    fn activate_unified_phase(&self) -> Result<()> {
+        if self.unified_vram().is_none() {
+            return Ok(());
+        }
+        let changed =
+            self.unified_phases.state.lock().unwrap().active != Some(self.unified_phase_id);
+        if changed && self.unified_client.is_some() {
+            self.handoff_gpu_decode()?;
+        }
+        let client_changed = self.unified_phases.activate(self.unified_phase_id);
+        if client_changed && self.unified_client.is_none() {
+            if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                session.restore_released_unified_slots();
+            }
+        }
+        Ok(())
+    }
+
+    fn with_unified_exclusive_result<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_unified_gate(|| {
+            self.activate_unified_phase()?;
+            f()
+        })
+    }
+
+    // Non-fallible scope entry is retained for existing internal queue-ownership tests.
+    #[cfg(test)]
+    fn with_unified_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.with_unified_gate(|| {
+            self.activate_unified_phase().unwrap();
+            f()
+        })
+    }
+
+    pub(crate) fn alloc_unified(
+        &self,
+        size: usize,
+        class: crate::unified::UnifiedVramClass,
+    ) -> Result<Box<dyn Buffer>> {
+        Ok(Box::new(self.alloc_unified_buffer(size, class)?) as Box<dyn Buffer>)
+    }
+
+    fn make_segmented_kv(&self, spec: SegmentedKvSpec) -> Result<VkSegmentedKvBuffer> {
+        if spec.logical_bytes == 0
+            || spec.segment_bytes == 0
+            || spec.segment_elements == 0
+            || spec.max_segments == 0
+        {
+            return Err(be(format!(
+                "segmented KV needs non-zero logical bytes, segment bytes and segment count; got {spec:?}"
+            )));
+        }
+        let table_bytes = spec
+            .max_segments
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| be("segmented KV address-table size overflow"))?;
+        let table = self.make_buf(table_bytes, MemoryLocation::CpuToGpu, "kv-segment-table")?;
+        self.fill_buf(&table, 0)?;
+        Ok(VkSegmentedKvBuffer {
+            shared: Arc::clone(&self.shared),
+            spec,
+            table,
+            segments: Mutex::new(Vec::new()),
+            reservation: Mutex::new(None),
+        })
+    }
+
+    fn ensure_segmented_kv_inner(&self, buffer: &VkSegmentedKvBuffer, wanted: usize) -> Result<()> {
+        self.ensure_segmented_kv_batch_inner(&[buffer], wanted)
+    }
+
+    fn ensure_segmented_kv_batch_inner(
+        &self,
+        buffers: &[&VkSegmentedKvBuffer],
+        wanted: usize,
+    ) -> Result<()> {
+        let mut identities = Vec::with_capacity(buffers.len());
+        for buffer in buffers {
+            if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+                return Err(be(
+                    "segmented KV buffer belongs to a different Vulkan backend/device",
+                ));
+            }
+            if wanted > buffer.spec.max_segments {
+                return Err(be(format!(
+                    "segmented KV requested {wanted} segments, but its logical extent allows only {}",
+                    buffer.spec.max_segments
+                )));
+            }
+            let identity = std::ptr::from_ref(*buffer) as usize;
+            if identities.contains(&identity) {
+                return Err(be(
+                    "segmented KV growth transaction contains the same buffer twice",
+                ));
+            }
+            identities.push(identity);
+        }
+
+        self.with_unified_exclusive_result(|| {
+            let mut locked = Vec::with_capacity(buffers.len());
+            for buffer in buffers {
+                locked.push(buffer.segments.lock().unwrap());
+            }
+            let mut requests = Vec::new();
+            for (buffer_idx, (buffer, segments)) in buffers.iter().zip(&locked).enumerate() {
+                for index in segments.len()..wanted {
+                    requests.push((buffer_idx, index, buffer.spec.segment_bytes));
+                }
+            }
+            if requests.is_empty() {
+                return Ok(());
+            }
+
+            self.handoff_gpu_decode()?;
+
+            let pool = self
+                .unified_vram()
+                .ok_or_else(|| be("segmented KV lost its unified VRAM arena"))?;
+            if pool.expert_layout().is_some() {
+                // Prefill may temporarily borrow uncommitted coordinates from the frozen KV
+                // corridor. Growing a slot is a serial phase boundary: retire that transient ring
+                // first, then claim the slot's original exact ranges. The next Prefill execute
+                // rebuilds its ring around every now-live KV segment.
+                let released = self
+                    .moe_pager
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .is_some_and(crate::pager::MoePagerSession::enter_decode);
+                if released {
+                    tracing::debug!(
+                        requested_ranges = requests.len(),
+                        "released Prefill KV loan before segmented-cache growth"
+                    );
+                }
+            }
+            let sizes: Vec<_> = requests.iter().map(|&(_, _, bytes)| bytes).collect();
+            let handles = if pool.expert_layout().is_some() {
+                let protected = self.protected_unified_experts();
+                let mut reservations = buffers
+                    .iter()
+                    .map(|buffer| buffer.reservation.lock().unwrap())
+                    .collect::<Vec<_>>();
+                let mut reserve_sizes = Vec::new();
+                let mut reserve_starts = Vec::new();
+                for (buffer_idx, (buffer, reservation)) in
+                    buffers.iter().zip(&reservations).enumerate()
+                {
+                    if reservation.is_some() {
+                        continue;
+                    }
+                    if !locked[buffer_idx].is_empty() {
+                        return Err(be(
+                            "segmented KV has committed ranges without a frozen physical layout",
+                        ));
+                    }
+                    let start = reserve_sizes.len();
+                    reserve_sizes.extend(std::iter::repeat_n(
+                        buffer.spec.segment_bytes,
+                        buffer.spec.max_segments,
+                    ));
+                    reserve_starts.push((buffer_idx, start));
+                }
+                if !reserve_sizes.is_empty() {
+                    let owner = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.reserve_kv_layout(&reserve_sizes, &protected)
+                        })?;
+                    debug_assert_eq!(owner.ranges().len(), reserve_sizes.len());
+                    for (buffer_idx, start) in reserve_starts {
+                        *reservations[buffer_idx] = Some(SegmentedKvReservation {
+                            owner: Arc::clone(&owner),
+                            start,
+                        });
+                    }
+                }
+
+                let exact_ranges = requests
+                    .iter()
+                    .map(|&(buffer_idx, index, bytes)| {
+                        let reservation = reservations[buffer_idx].as_ref().ok_or_else(|| {
+                            be("segmented KV buffer has no frozen physical layout")
+                        })?;
+                        let range = *reservation
+                            .owner
+                            .ranges()
+                            .get(reservation.start + index)
+                            .ok_or_else(|| be("segmented KV reservation index is out of range"))?;
+                        if range.requested_len != bytes {
+                            return Err(be(
+                                "segmented KV reservation byte size differs from its buffer spec",
+                            ));
+                        }
+                        Ok(range)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut plan =
+                    self.unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &exact_ranges,
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
+                if !plan.victims().is_empty() && self.quiesce_decode_prefetch_for_vram_claim()? {
+                    let protected = self.protected_unified_experts();
+                    plan = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_exact_owner_claim(
+                                &exact_ranges,
+                                crate::unified::UnifiedVramClass::KvCache,
+                                &protected,
+                            )
+                        })?;
+                }
+                debug_assert_eq!(plan.len(), sizes.len());
+                self.commit_unified_claim_locked(&pool, plan)?
+            } else {
+                // GPU-only allocator tests may initialize a generic unified pool without a MoE
+                // slot directory. Hold every lease locally so any later failure rolls the whole
+                // unpublished batch back.
+                sizes
+                    .iter()
+                    .map(|&bytes| {
+                        self.unified_phases
+                            .claim_with_reclaim(self.unified_phase_id, || {
+                                pool.allocate(bytes, crate::unified::UnifiedVramClass::KvCache)
+                                    .ok_or_else(|| {
+                                        be("generic unified VRAM cannot fit segmented KV batch")
+                                    })
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            if handles.len() != requests.len() {
+                return Err(be(
+                    "segmented KV arena transaction returned the wrong allocation count",
+                ));
+            }
+
+            let mut pending = Vec::with_capacity(requests.len());
+            for ((buffer_idx, index, bytes), handle) in requests.into_iter().zip(handles) {
+                let segment = self.unified_sub_buffer(handle, bytes)?;
+                let addr = segment
+                    .device_addr()
+                    .ok_or_else(|| be("segmented KV physical segment has no device address"))?;
+                let table_ptr = buffers[buffer_idx]
+                    .table
+                    .mapped_ptr()
+                    .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+                pending.push((buffer_idx, index, table_ptr, addr, segment));
+            }
+
+            // Publication is deliberately last: before this loop every allocation and every table
+            // mapping has been validated, so callers observe either the old depth or the complete
+            // new all-layer depth, never a half-grown session.
+            for &(_, index, table_ptr, addr, _) in &pending {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        addr.to_ne_bytes().as_ptr(),
+                        table_ptr.add(index * std::mem::size_of::<u64>()),
+                        std::mem::size_of::<u64>(),
+                    );
+                }
+            }
+            for (buffer_idx, index, _, _, segment) in pending {
+                debug_assert_eq!(locked[buffer_idx].len(), index);
+                locked[buffer_idx].push(segment);
+            }
+            Ok(())
+        })
+    }
+
+    /// Maximum VkBuffer byte capacity used by resident-weight layouts (not a model-total cap).
+    pub fn resident_weight_allocation_limit(&self) -> u64 {
+        self.shared.resident_weight_block_cap
+    }
+
+    /// Pure geometry check, including padding, the device block cap and the <4 GiB tensor limit.
+    /// False does not rule out a paged model whose fixed/placeholder allocation sizes are smaller.
+    /// Driver errors are deliberately left to `resident_weight_allocation_bytes`, never hidden here.
+    pub fn resident_weight_allocations_supported(&self, sizes: &[usize]) -> bool {
+        weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )
+        .is_ok()
+    }
+
+    /// Query the exact dedicated-memory requirement for the same packed layout used by begin.
+    /// Creates only temporary unbound VkBuffer objects: no memory allocations, fills or submits.
+    pub fn resident_weight_allocation_bytes(&self, sizes: &[usize]) -> Result<u64> {
+        let layout = weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )?;
+        let mut total = 0u64;
+        for block in &layout.blocks {
+            let bytes = usize::try_from(block.capacity_bytes)
+                .map_err(|_| be("resident weight block capacity exceeds host address space"))?;
+            let info = vk::BufferCreateInfo::default()
+                .size(fill_span(bytes))
+                .usage(allocation_buffer_usage(true))
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.shared.device.create_buffer(&info, None) }
+                .map_err(|e| be(format!("resident weight planning create_buffer: {e}")))?;
+            let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+            // Destroy before the checked addition too, so an overflow cannot leak the probe.
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            total = total
+                .checked_add(requirements.size)
+                .ok_or_else(|| be("resident weight allocation byte total overflow"))?;
+        }
+        Ok(total)
+    }
+
+    fn prepare_weight_allocation_batch(
+        &self,
+        sizes: &[usize],
+    ) -> Result<VulkanWeightAllocationBatch<'_>> {
+        if let Some(error) = self.shared.queue_submit_failure() {
+            return Err(be(format!(
+                "cannot prepare resident weights on an unusable queue ({error})"
+            )));
+        }
+        let mut guard = self.bda_weight_arena.lock().unwrap();
+        if guard.as_ref().is_some_and(|a| a.active_plan.is_some()) {
+            return Err(be("a resident weight allocation batch is already active"));
+        }
+        let layout = weight_layout::WeightLayout::build(
+            sizes,
+            self.shared.resident_weight_alignment,
+            self.shared.resident_weight_block_cap,
+        )?;
+        let mut blocks = Vec::with_capacity(layout.blocks.len());
+        // Do not publish anything, including an empty arena, until EVERY allocation succeeds.
+        // A failure drops the local blocks normally, restoring the physical accounting as well.
+        for block in &layout.blocks {
+            let bytes = usize::try_from(block.capacity_bytes)
+                .map_err(|_| be("resident weight block capacity exceeds host address space"))?;
+            let buf = self.make_buf_ex(
+                bytes,
+                MemoryLocation::GpuOnly,
+                "resident-bda-packed",
+                true,
+                true,
+            )?;
+            let base_addr = buf
+                .own_addr
+                .expect("packed resident block has a device address");
+            blocks.push(BdaArenaBlock {
+                handle: Arc::new(BdaBlockHandle { buf, base_addr }),
+                size: block.capacity_bytes,
+                // Packed blocks have no fallback tail, even before all views are consumed.
+                cursor: block.capacity_bytes,
+                requested_bytes: block.requested_bytes,
+            });
+        }
+        let token = Arc::new(());
+        guard
+            .get_or_insert_with(BdaWeightArena::default)
+            .active_plan = Some(BdaWeightPlan {
+            token: Arc::clone(&token),
+            layout,
+            blocks,
+            consumed: 0,
+        });
+        Ok(VulkanWeightAllocationBatch {
+            backend: self,
+            token,
+            finished: false,
+        })
+    }
+
+    /// Arena-owned resident weight totals. Includes all prepared active-batch blocks, excludes
+    /// unified auxiliary weights and blocks retained solely by subviews after a batch rollback.
+    pub fn resident_weight_allocation_stats(&self) -> ResidentWeightAllocationStats {
+        let guard = self.bda_weight_arena.lock().unwrap();
+        let mut stats = ResidentWeightAllocationStats::default();
+        if let Some(arena) = guard.as_ref() {
+            for block in arena
+                .blocks
+                .iter()
+                .chain(arena.active_plan.iter().flat_map(|p| p.blocks.iter()))
+            {
+                stats.requested_bytes += block.requested_bytes;
+                stats.padded_bytes += block.cursor;
+                stats.capacity_bytes += block.size;
+                stats.physical_allocation_bytes += block.handle.physical_allocation_bytes();
+                stats.block_count += 1;
+            }
+        }
+        stats
+    }
+
+    /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
+    /// [`BdaWeightArena`]). Bump-allocates within the current block at [`BDA_WEIGHT_ALIGN`]; when the
+    /// request doesn't fit the current block's remainder, opens a fresh dedicated block (never
+    /// splitting a tensor across two blocks). Returns a `VkBuffer` that shares the
+    /// block's single `vk::Buffer` handle (`Backing::BdaSub`) with `sub_offset` set to this tensor's
+    /// offset within it — see that variant's doc for why the handle must never be bound as a
+    /// descriptor at its full range.
+    fn bda_weight_alloc(&self, size: usize) -> Result<VkBuffer> {
+        let mut guard = self.bda_weight_arena.lock().unwrap();
+        if let Some(plan) = guard.as_mut().and_then(|a| a.active_plan.as_mut()) {
+            let placement = plan.layout.expected(plan.consumed, size)?;
+            let handle = Arc::clone(&plan.blocks[placement.block].handle);
+            plan.consumed += 1;
+            return Ok(VkBuffer {
+                shared: Arc::clone(&self.shared),
+                buffer: handle.buf.buffer,
+                backing: Backing::BdaSub(handle),
+                size,
+                mem_size: 0,
+                location: MemoryLocation::GpuOnly,
+                sub_offset: placement.offset as usize,
+                own_addr: None,
+                act_bytes: 0,
+            });
+        }
+        // Load-time guard for the BYTE half of the addressing invariant (see
+        // [`BDA_ADDRESSING_UNIT_MAX`] / [`BdaWeightArena`]): a single arena tensor at or above 4 GiB
+        // would wrap the u32 intra-unit byte offsets the STREAMED kernels apply, silently reading
+        // the wrong weights. Reject it LOUDLY here rather than let it corrupt output in-kernel. This
+        // is distinct from the `max_mem_alloc_size` block error below (a device-allocation limit) —
+        // this is an addressing limit that a bigger device or heap does NOT lift. The ELEMENT half
+        // of the invariant (< 4 Gi elements, the binding cap for sub-byte quants) needs shape+dtype
+        // and is enforced at the geometry chokepoints (`expert_stride_bytes`, the loader seam).
+        if size as u64 >= BDA_ADDRESSING_UNIT_MAX {
+            return Err(be(format!(
+                "resident-BDA weight tensor ({size} bytes) exceeds the u32 addressing unit \
+                 ({BDA_ADDRESSING_UNIT_MAX} bytes / 4 GiB) — intra-tensor offsets are u32; a single \
+                 tensor this large needs a wider addressing scheme, not a bigger allocation"
+            )));
+        }
+        let want = (size as u64).max(1).next_multiple_of(BDA_WEIGHT_ALIGN);
+        let arena = guard.get_or_insert_with(BdaWeightArena::default);
+
+        // First-fit over ALL open blocks, not just the last: a big tensor opens an exact-size
+        // (fully consumed) block, so last-block-only would strand every earlier block's tail and
+        // open a fresh `BDA_BLOCK_MIN` block for EACH tiny tensor that follows a big one — ~64 MiB
+        // stranded per norm gamma, GiBs across a model's layers (caught live: Qwen3-30B-A3B
+        // tripped the VRAM guard flag-on while fitting comfortably flag-off).
+        for b in arena.blocks.iter_mut() {
+            let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
+            if off + want <= b.size {
+                b.cursor = off + want;
+                b.requested_bytes += size as u64;
+                return Ok(VkBuffer {
+                    shared: Arc::clone(&self.shared),
+                    buffer: b.handle.buf.buffer,
+                    backing: Backing::BdaSub(Arc::clone(&b.handle)),
+                    size,
+                    mem_size: 0,
+                    location: MemoryLocation::GpuOnly,
+                    sub_offset: off as usize,
+                    // `device_addr()` derives a `BdaSub`'s address from the block's `base_addr` +
+                    // `sub_offset` — no own address needed here.
+                    own_addr: None,
+                    act_bytes: 0,
+                });
+            }
+        }
+
+        // No existing tail fits. Small-tensor blocks grow 64 -> 128 -> 256 MiB as the model fills
+        // the arena, which sharply reduces block-tail fragmentation on tensor-rich models. A
+        // tensor larger than the current floor still gets an exact-size block and does not advance
+        // the floor. Every block remains capped at `max_mem_alloc_size`; a tensor bigger than that
+        // cap cannot be split and is rejected below.
+        let floor = arena.next_block_floor;
+        let (block_bytes, next_floor) =
+            bda_block_geometry(want, floor, self.shared.max_mem_alloc_size);
+        if want > block_bytes {
+            return Err(be(format!(
+                "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({} bytes) \
+                 — cannot fit in a single arena block",
+                self.shared.max_mem_alloc_size
+            )));
+        }
+        let block_buf = self.make_buf_ex(
+            block_bytes as usize,
+            MemoryLocation::GpuOnly,
+            "resident-bda",
+            true,
+            true,
+        )?;
+        let buffer = block_buf.buffer;
+        // `make_buf_ex(device_address=true)` already stored the block's address in `own_addr`;
+        // reuse it instead of a second identical `get_buffer_device_address`.
+        let base_addr = block_buf
+            .own_addr
+            .expect("resident-bda block built with device_address=true carries an own_addr");
+        arena.next_block_floor = next_floor;
+        let handle = Arc::new(BdaBlockHandle {
+            buf: block_buf,
+            base_addr,
+        });
+        arena.blocks.push(BdaArenaBlock {
+            handle: Arc::clone(&handle),
+            size: block_bytes,
+            cursor: want,
+            requested_bytes: size as u64,
+        });
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::BdaSub(handle),
+            size,
+            mem_size: 0,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+            own_addr: None,
+            act_bytes: 0,
+        })
+    }
+
+    /// Test-support hook: sub-allocate a resident-BDA weight tensor via [`Self::bda_weight_alloc`]
+    /// directly — the same "construct the arena alloc directly" approach
+    /// `resident_bda_weight_arena_roundtrip` (this module's own `#[cfg(test)]`) uses, exposed as
+    /// `pub` so an external `tests/*.rs` integration binary (which only links the crate's public
+    /// API, never its private items) can build a buffer whose `device_addr()` reports `Some` and
+    /// drive dispatch routing on it. Boxed as `Box<dyn Buffer>` since [`VkBuffer`] itself is
+    /// private.
+    pub fn bda_weight_alloc_for_test(&self, size: usize) -> Result<Box<dyn Buffer>> {
+        self.bda_weight_alloc(size)
+            .map(|b| Box::new(b) as Box<dyn Buffer>)
+    }
+
+    /// Allocate backing memory with bounded recovery from transient WDDM pressure. The successful
+    /// fast path is still one allocator call; only a driver OOM drains/retries and may retire idle
+    /// Host DMA aliases.
+    fn allocate_buffer_memory_recovering(
+        &self,
+        label: &str,
+        requested_size: usize,
+        requirements: vk::MemoryRequirements,
+        location: MemoryLocation,
+        scheme: AllocationScheme,
+    ) -> Result<Allocation> {
+        let allocate_once = || {
+            self.shared
+                .allocator
+                .lock()
+                .unwrap()
+                .allocate(&AllocationCreateDesc {
+                    name: label,
+                    requirements,
+                    location,
+                    linear: true,
+                    allocation_scheme: scheme,
+                })
+        };
+        let mut attempts = 1usize;
+        let mut last = match allocate_once() {
+            Ok(allocation) => return Ok(allocation),
+            Err(error) if retryable_allocation_error(&error) => error,
+            Err(error) => {
+                return Err(be(format!(
+                    "gpu_allocator::allocate({label}, requested={}, allocation={}, location={location:?}): {error}",
+                    fmt_bytes(requested_size as u64),
+                    fmt_bytes(requirements.size),
+                )))
+            }
+        };
+
+        // WDDM may reject a new allocation while completed work and external-host aliases still
+        // consume its accounting window. Serialize this recovery with submitters, then first give
+        // ordinary retirement a chance to settle before sacrificing any Host DMA coverage.
+        let _queue = self.shared.queue_access.lock().unwrap();
+        for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
+            tracing::warn!(
+                "[infr] Vulkan allocation {label} ({}, {location:?}) hit {last}; draining queued work and retrying after {delay_ms} ms",
+                fmt_bytes(requirements.size),
+            );
+            self.shared
+                .drain_queue_for_submit_retry()
+                .map_err(|error| {
+                    be(format!(
+                        "Vulkan allocation {label} OOM recovery could not drain queued work: {error}"
+                    ))
+                })?;
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match allocate_once() {
+                Ok(allocation) => {
+                    tracing::warn!(
+                        "[infr] Vulkan allocation {label} ({}, {location:?}) recovered after {attempts} attempts",
+                        fmt_bytes(requirements.size),
+                    );
+                    return Ok(allocation);
+                }
+                Err(error) if retryable_allocation_error(&error) => last = error,
+                Err(error) => {
+                    return Err(be(format!(
+                        "gpu_allocator::allocate({label}, allocation={}, location={location:?}) failed on recovery attempt {attempts}: {error}",
+                        fmt_bytes(requirements.size),
+                    )))
+                }
+            }
+        }
+
+        // Imported RAM remains the source of truth after its Vulkan alias is retired. Future
+        // transfers through that tail transparently take the existing staged/direct fallback.
+        for delay_ms in MEMORY_OOM_POST_SHED_DELAYS_MS {
+            self.shared
+                .drain_queue_for_submit_retry()
+                .map_err(|error| {
+                    be(format!(
+                        "Vulkan allocation {label} OOM recovery could not drain queued work: {error}"
+                    ))
+                })?;
+            let released = self.shared.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+            if released == 0 {
+                tracing::warn!(
+                    "[infr] Vulkan allocation {label} ({}, {location:?}) still failed and no idle Host DMA tail mapping can be released",
+                    fmt_bytes(requirements.size),
+                );
+                break;
+            }
+            tracing::warn!(
+                "[infr] Vulkan allocation {label} ({}, {location:?}) still failed; released {} of idle Host DMA mappings and will retry after {delay_ms} ms",
+                fmt_bytes(requirements.size),
+                fmt_bytes(released as u64),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            attempts += 1;
+            match allocate_once() {
+                Ok(allocation) => {
+                    tracing::warn!(
+                        "[infr] Vulkan allocation {label} ({}, {location:?}) recovered after {attempts} attempts",
+                        fmt_bytes(requirements.size),
+                    );
+                    return Ok(allocation);
+                }
+                Err(error) if retryable_allocation_error(&error) => last = error,
+                Err(error) => {
+                    return Err(be(format!(
+                        "gpu_allocator::allocate({label}, allocation={}, location={location:?}) failed on recovery attempt {attempts}: {error}",
+                        fmt_bytes(requirements.size),
+                    )))
+                }
+            }
+        }
+
+        Err(be(format!(
+            "gpu_allocator::allocate({label}, requested={}, allocation={}, location={location:?}) failed after {attempts} attempts: {last}",
+            fmt_bytes(requested_size as u64),
+            fmt_bytes(requirements.size),
+        )))
+    }
+
+    /// [`make_buf`](Self::make_buf) with an explicit dedicated-allocation override. Post-load
+    /// memory hygiene: `force_dedicated` bypasses gpu-allocator's general (sub-allocating)
+    /// memory blocks entirely, so a TRANSIENT buffer frees its `VkDeviceMemory` fully on drop.
+    /// Without it, sub-block transients grow general blocks the allocator then RETAINS: the
+    /// vendored gpu-allocator (0.27) frees an emptied general block only while another general
+    /// block exists in the same memory type (`active_general_blocks > 1` in its `free()`), and
+    /// exposes no purge/trim API — so the last 64 MiB host-visible block (and a 256 MiB
+    /// device-local one) would sit empty in the ReBAR heap for the whole session. Used by the
+    /// weight-upload staging path below; never on a per-token path (a dedicated allocation costs
+    /// a `vkAllocateMemory`, fine once per tensor at load, wrong per token).
+    fn make_buf_ex(
+        &self,
+        size: usize,
+        location: MemoryLocation,
+        label: &str,
+        force_dedicated: bool,
+        device_address: bool,
+    ) -> Result<VkBuffer> {
+        // `device_address` (the paged-MoE / resident-BDA arena blocks): add SHADER_DEVICE_ADDRESS
+        // so the buffer can be handed to a shader as a 64-bit pointer. Its backing memory needs the
+        // matching DEVICE_ADDRESS alloc flag — gpu-allocator sets it (built with
+        // `buffer_device_address: true`) on the pooled path below, and the UMA-overflow spill passes
+        // it through to `alloc_vram_mapped` explicitly.
+        let mut usage = allocation_buffer_usage(device_address);
+        if self.shared.conditional_rendering.is_some() && label == "readback" {
+            usage |= vk::BufferUsageFlags::CONDITIONAL_RENDERING_EXT;
+        }
+        // Created at the 4-byte-rounded size (`fill_span`) so the device-local zero-init can cover
+        // the whole logical extent — see `fill_span`. Identity for any 4-aligned `size` (all current
+        // tensors), so `requirements.size`/the address are unchanged on every live path.
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(fill_span(size))
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
+            .map_err(|e| be(format!("create_buffer: {e}")))?;
+
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+
+        // Large buffers (KV cache, big weights) get a DEDICATED exact-size VkDeviceMemory; otherwise
+        // they sub-allocate into gpu-allocator's 256 MiB blocks and waste the remainder (e.g. 3×67 MiB
+        // KV buffers per block leave ~55 MiB unused — ~0.7 GiB across a long-context KV cache). Small/
+        // transient buffers stay sub-allocated (cheap, pooled).
+        const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
+        let scheme = if force_dedicated || requirements.size >= DEDICATED_MIN {
+            AllocationScheme::DedicatedBuffer(buffer)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
+        // UMA staging/readback consumes the same physical pool as GPU weights and runtime.
+        // Discrete devices retain the device-local-only guard.
+        if location == MemoryLocation::GpuOnly || self.shared.unified_ram.is_some() {
+            if let Err(e) = self.check_vram_budget(requirements.size) {
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        }
+
+        // ── UMA spill: device-local heap full, put this on the other heap ─────────────────────
+        // UNIFIED-MEMORY PARTS ONLY (`uma_overflow_type` is `None` on every discrete GPU, so a
+        // dGPU never even evaluates this — it falls straight through to gpu-allocator exactly as
+        // before). Once the synthetic device-local heap is full, gpu-allocator would keep resolving
+        // GpuOnly to it and RADV would keep saying yes, right up until the kernel can't validate
+        // the buffer list and the SUBMIT dies. Place the overflow on the non-device-local heap
+        // instead: same DDR, same bandwidth on an APU. See `probe_host_visible_non_device_local_type`.
+        if location == MemoryLocation::GpuOnly {
+            if let Some(ty) = self.shared.uma_overflow_type {
+                // Leave the device-local heap a little slack rather than filling it to the last
+                // byte: the driver makes its own internal allocations there (descriptor pools,
+                // pipeline/shader memory, the command buffers themselves), and a heap with zero
+                // room is how the "not enough memory for command submission" failure starts.
+                const UMA_SPILL_MARGIN: u64 = 256 * 1024 * 1024;
+                let dl_avail = device_local_room(&self.shared);
+                let fits_device_local =
+                    dl_avail >= requirements.size.saturating_add(UMA_SPILL_MARGIN);
+                if !fits_device_local && requirements.memory_type_bits & (1 << ty) != 0 {
+                    // Both heaps are out if this fails, so report it rather than retrying on the
+                    // device-local heap we just established has no room (that path would recurse
+                    // straight back to here, and RADV would accept the allocation anyway and hand
+                    // the failure to the next submit as a device-lost — the exact thing this
+                    // spill exists to prevent).
+                    return match self.alloc_vram_mapped(
+                        buffer,
+                        size,
+                        &requirements,
+                        ty,
+                        true,
+                        device_address,
+                        // budget_check=false: the identical `check_vram_budget(requirements.size)`
+                        // at the top of `make_buf_ex` already ran for this GpuOnly buffer — don't
+                        // repeat it (and its memory-property driver round-trip) here.
+                        false,
+                    ) {
+                        Ok(b) => Ok(b),
+                        Err(e) => {
+                            // `alloc_vram_mapped` leaves the buffer to us on failure.
+                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                            Err(be(format!(
+                                "unified memory exhausted: {} for {label} did not fit the \
+                                 device-local heap ({} free) and the overflow heap rejected it \
+                                 too ({e})",
+                                fmt_bytes(requirements.size),
+                                fmt_bytes(dl_avail),
+                            )))
+                        }
+                    };
+                }
+            }
+        }
+
+        let allocation = match self.allocate_buffer_memory_recovering(
+            label,
+            size,
+            requirements,
+            location,
+            scheme,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // Clean up the buffer we created if every allocation attempt fails.
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
+        };
+
+        if let Err(e) = unsafe {
+            self.shared
+                .device
+                .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+        } {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            let cleanup = self.shared.allocator.lock().unwrap().free(allocation);
+            return Err(be(match cleanup {
+                Ok(()) => format!("bind_buffer_memory: {e}"),
+                Err(cleanup) => {
+                    format!("bind_buffer_memory: {e} (allocation cleanup also failed: {cleanup})")
+                }
+            }));
+        }
+
+        // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
+        if location == MemoryLocation::GpuOnly {
+            self.shared
+                .device_used
+                .fetch_add(allocation.size(), Ordering::Relaxed);
+        }
+        self.shared.charge_owned_ram(allocation.size());
+
+        // `device_address` callers added `SHADER_DEVICE_ADDRESS` to the buffer's usage above; the
+        // allocator itself was built with `buffer_device_address: true` (see `VulkanShared::new`),
+        // so every block it hands back — pooled sub-allocation or dedicated alike — already carries
+        // the matching memory-allocate flag and the query below is valid without any extra plumbing.
+        let own_addr = device_address.then(|| unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
+
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::Pooled(ManuallyDrop::new(allocation)),
+            size,
+            mem_size: requirements.size,
+            location,
+            sub_offset: 0,
+            own_addr,
+            act_bytes: 0,
+        })
+    }
+
+    /// Fill a buffer with the repeated byte `byte` (0x00 = zero-init, 0xFF = poison). Host-visible
+    /// buffers are memset through the mapped pointer (no submit); device-local buffers use
+    /// `vkCmdFillBuffer` via a one-shot submit. Every OTHER `VkBuffer` owns a distinct `vk::Buffer`
+    /// handle addressing its region from offset 0 (plain `WeightArena` buffers included), so filling
+    /// `[0, size)` of the handle is correct; a resident-BDA sub-tensor (`Backing::BdaSub`) instead
+    /// shares its block's ONE big handle, so the fill must start at `buf.sub_offset` or it would
+    /// clobber whatever tensor happens to sit at the block's byte 0.
+    fn fill_buf(&self, buf: &VkBuffer, byte: u8) -> Result<()> {
+        if let Some(ptr) = buf
+            .mapped_ptr()
+            .filter(|_| !matches!(&buf.backing, Backing::UnifiedSub(_)))
+        {
+            unsafe { std::ptr::write_bytes(ptr, byte, buf.size) };
+        } else {
+            let word = u32::from_ne_bytes([byte; 4]);
+            let size = fill_span(buf.size); // round UP to a 4-byte multiple: cover the whole extent
+            if size > 0 {
+                let vkbuf = buf.buffer;
+                let off = buf.sub_offset as u64;
+                let shared = Arc::clone(&self.shared);
+                self.one_shot(move |cmd| unsafe {
+                    shared.device.cmd_fill_buffer(cmd, vkbuf, off, size, word);
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Claim all ranges as one allocator transaction, without initializing their contents.
+    fn alloc_uninit_batch_inner(
+        &self,
+        sizes: &[usize],
+        usage: BufferUsage,
+    ) -> Result<Vec<VkBuffer>> {
+        if adapter::preparing_commands() && !sizes.is_empty() {
+            return Err(be("command preparation requires retained batch workspace"));
+        }
+        let buffers = if sizes.is_empty() {
+            Vec::new()
+        } else if let (Some(class), Some(pool)) =
+            (self.unified_class_for_usage(usage), self.unified_vram())
+        {
+            if pool.expert_layout().is_some() {
+                self.with_unified_exclusive_result(|| {
+                    self.handoff_gpu_decode()?;
+                    let protected = self.protected_unified_experts();
+                    let mut plan = self
+                        .unified_phases
+                        .claim_with_reclaim(self.unified_phase_id, || {
+                            pool.plan_owner_claim(sizes, class, &protected)
+                        })?;
+                    if !plan.victims().is_empty()
+                        && self.quiesce_decode_prefetch_for_vram_claim()?
+                    {
+                        let protected = self.protected_unified_experts();
+                        plan = self
+                            .unified_phases
+                            .claim_with_reclaim(self.unified_phase_id, || {
+                                pool.plan_owner_claim(sizes, class, &protected)
+                            })?;
+                    }
+                    let handles = self.commit_unified_claim_locked(&pool, plan)?;
+                    if handles.len() != sizes.len() {
+                        return Err(be(
+                            "unified runtime transaction returned the wrong allocation count",
+                        ));
+                    }
+                    handles
+                        .into_iter()
+                        .zip(sizes.iter().copied())
+                        .map(|(handle, bytes)| {
+                            let mut buf = self.unified_sub_buffer(handle, bytes)?;
+                            if usage == BufferUsage::Weights {
+                                if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                                    pb.inc(bytes as u64);
+                                }
+                            } else if class == crate::unified::UnifiedVramClass::LlmRuntime {
+                                self.account_llm_runtime(&mut buf, bytes);
+                            }
+                            Ok(buf)
+                        })
+                        .collect::<Result<_>>()
+                })?
+            } else {
+                sizes
+                    .iter()
+                    .map(|&bytes| self.make_alloc(bytes, usage))
+                    .collect::<Result<_>>()?
+            }
+        } else {
+            sizes
+                .iter()
+                .map(|&bytes| self.make_alloc(bytes, usage))
+                .collect::<Result<_>>()?
+        };
+        Ok(buffers)
+    }
+
+    /// Allocate a batch whose complete contents will immediately be overwritten. Unified-arena
+    /// clients claim every range in one transaction, without paying for a redundant device fill.
+    pub fn alloc_uninit_batch(
+        &self,
+        sizes: &[usize],
+        usage: BufferUsage,
+    ) -> Result<Vec<Box<dyn Buffer>>> {
+        Ok(self
+            .alloc_uninit_batch_inner(sizes, usage)?
+            .into_iter()
+            .map(|buffer| Box::new(buffer) as Box<dyn Buffer>)
+            .collect())
+    }
+
+    /// Allocate `sizes.len()` buffers and zero-init them with at most one device submission.
+    pub fn alloc_zeroed_batch(
+        &self,
+        sizes: &[usize],
+        usage: BufferUsage,
+    ) -> Result<Vec<Box<dyn Buffer>>> {
+        let bufs = self.alloc_uninit_batch_inner(sizes, usage)?;
+        let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
+        for buf in &bufs {
+            if let Some(ptr) = buf
+                .mapped_ptr()
+                .filter(|_| !matches!(&buf.backing, Backing::UnifiedSub(_)))
+            {
+                unsafe { std::ptr::write_bytes(ptr, 0u8, buf.size) };
+            } else {
+                let size = fill_span(buf.size); // round UP to a 4-byte multiple: cover the whole extent
+                if size > 0 {
+                    dev.push((buf.buffer, buf.sub_offset as u64, size));
+                }
+            }
+        }
+        if !dev.is_empty() {
+            let shared = Arc::clone(&self.shared);
+            self.one_shot(move |cmd| unsafe {
+                for (b, off, size) in dev {
+                    shared.device.cmd_fill_buffer(cmd, b, off, size, 0);
+                }
+            })?;
+        }
+        Ok(bufs
+            .into_iter()
+            .map(|b| Box::new(b) as Box<dyn Buffer>)
+            .collect())
+    }
+
+    /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
+    /// progress bar. Zero/poison filling is applied by the callers.
+    fn unified_class_for_usage(
+        &self,
+        usage: BufferUsage,
+    ) -> Option<crate::unified::UnifiedVramClass> {
+        match (self.unified_client, usage) {
+            (Some(UnifiedClient::Embedding), BufferUsage::Weights) => {
+                Some(crate::unified::UnifiedVramClass::EmbeddingWeights)
+            }
+            (Some(UnifiedClient::Embedding), BufferUsage::Activations) => {
+                Some(crate::unified::UnifiedVramClass::EmbeddingRuntime)
+            }
+            (Some(UnifiedClient::Vision), BufferUsage::Weights) => {
+                Some(crate::unified::UnifiedVramClass::VisionWeights)
+            }
+            (Some(UnifiedClient::Vision), BufferUsage::Activations) => {
+                Some(crate::unified::UnifiedVramClass::VisionRuntime)
+            }
+            (None, BufferUsage::Activations) if self.unified_vram().is_some() => {
+                Some(crate::unified::UnifiedVramClass::LlmRuntime)
+            }
+            _ => None,
+        }
+    }
+
+    fn account_llm_runtime(&self, buf: &mut VkBuffer, bytes: usize) {
+        buf.act_bytes = bytes as u64;
+        let live = self
+            .shared
+            .act_live
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            + bytes as u64;
+        self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
+    }
+
+    fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        if adapter::preparing_commands() {
+            return Err(be("command preparation requires retained workspace"));
+        }
+        let unified_class = self.unified_class_for_usage(usage);
+        if let Some(class) = unified_class {
+            let mut buf = self.alloc_unified_buffer(bytes, class)?;
+            if usage == BufferUsage::Weights {
+                if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                    pb.inc(bytes as u64);
+                }
+            } else if class == crate::unified::UnifiedVramClass::LlmRuntime {
+                // Preserve the primary LLM activation high-water signal after moving those bytes
+                // into the mapped elastic arena. Auxiliary runtime must not contaminate it.
+                self.account_llm_runtime(&mut buf, bytes);
+            }
+            return Ok(buf);
+        }
+        // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
+        // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
+        // other `BufferUsage` takes the gpu-allocator path in `make_buf` below.
+        if usage == BufferUsage::Weights {
+            let buf = self.bda_weight_alloc(bytes)?;
+            if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+            return Ok(buf);
+        }
+        // KV cache: slice 0 of the u64/BDA migration (issue #74) — allocation-only enablement, NO
+        // kernel reads this address yet (every attention/store/dequant dispatch still binds these
+        // buffers exactly as before `vkb`). Unlike `Weights`, this is deliberately NOT an arena
+        // sub-allocation: each `kbufs[l]`/`vbufs[l]` (and its fork/checkpoint/MTP-draft twins)
+        // stays its OWN dedicated-or-pooled buffer object via the ordinary `make_buf_ex` path — the
+        // per-layer/per-side structure is unchanged, it just gains `SHADER_DEVICE_ADDRESS` usage +
+        // an `own_addr`. Smallest blast radius: only KV buffers get an address, not every
+        // `Activations` scratch/partial/logits allocation in the engine.
+        if usage == BufferUsage::KvCache {
+            // Opt-in overflow (issue: KV-in-system-RAM), VRAM-FIRST: keep this KV buffer resident in
+            // device-local VRAM while it fits the guard's budget; once VRAM is full, place it — and,
+            // since the budget only shrinks as later buffers land, every subsequent one — in host RAM,
+            // read by attention over PCIe via its device address (the read seam is 100% BDA — see
+            // `alloc_kv_host`). This bounds PCIe cost to the overflow tail instead of paying it on the
+            // whole cache; whole-host (slice-1 behavior) is now just the case where nothing fits.
+            // Off by default ⇒ unchanged device-local VRAM KV.
+            if kv_overflow_enabled(&self.cfg) {
+                // Probe agrees with the guard to the byte (both key off `vram_budget_fits`), so a
+                // `true` here means the VRAM alloc's own guard will pass. Guard against the rounding
+                // slop between the requested `bytes` and the allocation's aligned size at the exact
+                // budget edge by treating a VRAM alloc failure as "spill it" rather than propagating —
+                // the whole point of overflow mode is to degrade to host, never to hard-error.
+                //
+                // `INFR_KV_OVERFLOW_VRAM_MB` (diagnostic) additionally caps CUMULATIVE KV-in-VRAM
+                // bytes: it forces a partial (or, at 0, whole-host) spill on a model that would
+                // otherwise fit entirely, so the mix path is exercisable on small models and the
+                // whole-host case is reproducible apples-to-apples for benchmarking. It gates ONLY
+                // this KV placement — never the real guard (`vram_budget_fits`/`check_vram_budget`),
+                // which keeps protecting weights + activations against true VRAM.
+                let cap_ok = self
+                    .shared
+                    .kv_spill
+                    .admits(kv_overflow_vram_cap(&self.cfg), bytes as u64);
+                if cap_ok && self.vram_budget_fits(bytes as u64) {
+                    if let Ok(buf) =
+                        self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true)
+                    {
+                        self.shared.kv_spill.record_vram(bytes as u64);
+                        return Ok(buf);
+                    }
+                }
+                let buf = self.alloc_kv_host(bytes)?;
+                self.shared.kv_spill.record_host(bytes as u64);
+                return Ok(buf);
+            }
+            return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
+        }
+        let (location, label) = match usage {
+            BufferUsage::Weights => unreachable!("Weights routed to bda_weight_alloc above"),
+            BufferUsage::KvCache => unreachable!("KvCache routed to make_buf_ex above"),
+            BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
+            BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
+            BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
+            // GpuToCpu = HOST_VISIBLE|HOST_CACHED system RAM — the point of the class is NOT
+            // living in VRAM.
+            BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
+        };
+        let mut buf = self.make_buf(bytes, location, label)?;
+        // Advance the weight-load progress bar for host-weights too (the single funnel every
+        // weight upload passes through, so no loader can forget to account for a tensor).
+        if matches!(usage, BufferUsage::HostWeights) {
+            if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+        }
+        // Charge the live-activation tally and raise the high-water mark (see
+        // `VulkanShared::act_live`). The logical `bytes`, not the allocation's aligned size: this
+        // measures what the seam's reserve is trying to predict, which is asked for in logical
+        // bytes. Released by `VkBuffer::drop` through the `act_bytes` set here.
+        if usage == BufferUsage::Activations {
+            buf.act_bytes = bytes as u64;
+            let live = self
+                .shared
+                .act_live
+                .fetch_add(bytes as u64, Ordering::Relaxed)
+                + bytes as u64;
+            self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
+        }
+        Ok(buf)
+    }
+
+    /// Copy `src` into device-local `dst_buf` through the REUSED staging ring (see [`StagingRing`])
+    /// — the weight-load path on a device without ReBAR.
+    ///
+    /// The tensor is chunked across fixed-size slots. For each chunk we wait only on the fence of
+    /// the slot we are about to REUSE (not on the queue as a whole), memcpy into it, and submit its
+    /// copy. With `RING_SLOTS` slots in flight the host's memcpy for chunk N+1 overlaps the DMA of
+    /// chunk N, instead of the old `queue_wait_idle`-after-every-tensor lockstep.
+    ///
+    /// Uploads are not awaited here; [`WeightProgress::drop`] drains the ring, which happens long
+    /// before any forward is submitted.
+    ///
+    /// `dst_base` is added to every chunk's destination offset — `0` for an ordinary weight buffer
+    /// (the tensor owns `dst_buf` outright, so its region starts at byte 0), or a resident-BDA
+    /// sub-tensor's `sub_offset` when `dst_buf` is actually a whole arena BLOCK shared with other
+    /// tensors (see [`Backing::BdaSub`]) — without it every such tensor would land at the block's
+    /// byte 0 and overwrite whatever the previous tensor wrote there.
+    fn upload_staged_ring(&self, dst_buf: vk::Buffer, dst_base: u64, src: &[u8]) -> Result<()> {
+        self.with_unified_exclusive_result(|| {
+            self.upload_staged_ring_locked(dst_buf, dst_base, src)
+        })
+    }
+
+    fn upload_staged_ring_locked(
+        &self,
+        dst_buf: vk::Buffer,
+        dst_base: u64,
+        src: &[u8],
+    ) -> Result<()> {
+        let device = &self.shared.device;
+        let mut guard = self
+            .shared
+            .staging_ring
+            .lock()
+            .map_err(|_| be("staging-ring upload: ring mutex is poisoned"))?;
+        if let Some(error) = self.shared.queue_submit_failure() {
+            return Err(be(format!(
+                "staging-ring upload: queue is unusable ({error})"
+            )));
+        }
+        if guard.is_none() {
+            *guard = Some(self.make_staging_ring()?);
+        }
+        let ring = guard.as_mut().expect("just built");
+
+        let mut off = 0usize;
+        while off < src.len() {
+            let n = (src.len() - off).min(RING_SLOT_BYTES);
+            let i = ring.next;
+            ring.next = (ring.next + 1) % RING_SLOTS;
+
+            // Reuse of a slot is the ONLY place we block: wait for its previous copy to land.
+            if ring.busy[i] {
+                unsafe { device.wait_for_fences(&[ring.fences[i]], true, u64::MAX) }
+                    .map_err(|e| be(format!("staging ring wait_for_fences: {e}")))?;
+                ring.busy[i] = false;
+            }
+            unsafe { device.reset_fences(&[ring.fences[i]]) }
+                .map_err(|e| be(format!("staging ring reset_fences: {e}")))?;
+
+            let ptr = ring.bufs[i]
+                .mapped_ptr()
+                .ok_or_else(|| be("staging ring slot is not mapped"))?;
+            copy_to_mapped(&src[off..off + n], ptr);
+
+            let cmd = ring.cmds[i];
+            unsafe {
+                device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| be(format!("staging ring reset_command_buffer: {e}")))?;
+                device
+                    .begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| be(format!("staging ring begin_command_buffer: {e}")))?;
+                device.cmd_copy_buffer(
+                    cmd,
+                    ring.bufs[i].buffer,
+                    dst_buf,
+                    &[vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: dst_base + off as u64,
+                        size: n as u64,
+                    }],
+                );
+                device
+                    .end_command_buffer(cmd)
+                    .map_err(|e| be(format!("staging ring end_command_buffer: {e}")))?;
+
+                let cmds = [cmd];
+                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                self.shared
+                    .queue_submit_recovering(
+                        &[submit],
+                        ring.fences[i],
+                        None,
+                        "staging-ring queue_submit",
+                    )
+                    .map_err(|e| be(format!("staging ring queue_submit: {e}")))?;
+            }
+            ring.busy[i] = true;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// Allocate the staging ring's slots, command buffers and fences — ONCE per load.
+    fn make_staging_ring(&self) -> Result<StagingRing> {
+        let device = &self.shared.device;
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
+        let cmds = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(RING_SLOTS as u32),
+            )
+        }
+        .map_err(|e| be(format!("staging ring allocate_command_buffers: {e}")))?;
+
+        let mut bufs = Vec::with_capacity(RING_SLOTS);
+        let mut fences = Vec::with_capacity(RING_SLOTS);
+        let cleanup_raw = |fences: &mut Vec<vk::Fence>| unsafe {
+            for fence in fences.drain(..) {
+                device.destroy_fence(fence, None);
+            }
+            device.free_command_buffers(pool, &cmds);
+        };
+        for _ in 0..RING_SLOTS {
+            match self.make_buf(RING_SLOT_BYTES, MemoryLocation::CpuToGpu, "upload_staging") {
+                Ok(buffer) => bufs.push(buffer),
+                Err(error) => {
+                    cleanup_raw(&mut fences);
+                    return Err(error);
+                }
+            }
+            match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                Ok(fence) => fences.push(fence),
+                Err(error) => {
+                    cleanup_raw(&mut fences);
+                    return Err(be(format!("staging ring create_fence: {error}")));
+                }
+            }
+        }
+        Ok(StagingRing {
+            bufs,
+            cmds,
+            fences,
+            busy: vec![false; RING_SLOTS],
+            next: 0,
+            retained_weight_blocks: Vec::new(),
+        })
+    }
+
+    fn residency_probe_one_shot(
+        &self,
+        context: &str,
+        shed_host_dma: bool,
+        f: impl FnOnce(vk::CommandBuffer),
+    ) -> Result<()> {
+        let device = &self.shared.device;
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|error| be(format!("{context}: allocate command buffer: {error}")))?[0];
+        let _command = OneShotCommand { device, pool, cmd };
+
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|error| be(format!("{context}: begin command buffer: {error}")))?;
+        f(cmd);
+        unsafe { device.end_command_buffer(cmd) }
+            .map_err(|error| be(format!("{context}: end command buffer: {error}")))?;
+
+        let commands = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&commands);
+        self.shared
+            .queue_submit_residency_probe(&[submit], context, shed_host_dma)
+            .map_err(|error| be(format!("{context}: {error}")))?;
+        self.shared
+            .queue_wait_idle_serialized()
+            .map_err(|error| be(format!("{context}: queue wait: {error}")))
+    }
+
+    pub(crate) fn materialize_unified_arena(&self, shards: &[(vk::Buffer, u64)]) -> Result<()> {
+        if shards.is_empty() {
+            return Err(be("unified arena materialization needs physical shards"));
+        }
+        let shared = Arc::clone(&self.shared);
+        self.residency_probe_one_shot(
+            "unified-arena materialization",
+            false,
+            move |command| unsafe {
+                for &(buffer, bytes) in shards {
+                    shared.device.cmd_fill_buffer(command, buffer, 0, bytes, 0);
+                }
+            },
+        )
+    }
+
+    pub(crate) fn verify_unified_arena_residency(
+        &self,
+        shards: &[(vk::Buffer, u64)],
+    ) -> Result<()> {
+        if shards.is_empty() {
+            return Err(be(
+                "unified arena residency verification needs physical shards",
+            ));
+        }
+        let sink = self.make_buf(
+            shards.len() * std::mem::size_of::<u32>(),
+            MemoryLocation::GpuToCpu,
+            "unified_residency_probe",
+        )?;
+        let sink_buffer = sink.buffer;
+        let shared = Arc::clone(&self.shared);
+        self.residency_probe_one_shot(
+            "final unified-arena residency verification",
+            true,
+            move |command| unsafe {
+                for (index, &(buffer, _)) in shards.iter().enumerate() {
+                    shared.device.cmd_copy_buffer(
+                        command,
+                        buffer,
+                        sink_buffer,
+                        &[vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset: (index * std::mem::size_of::<u32>()) as u64,
+                            size: std::mem::size_of::<u32>() as u64,
+                        }],
+                    );
+                }
+            },
+        )
+    }
+
+    /// Record a single command into a one-shot command buffer, submit it to the
+    /// compute queue, and block until idle.
+    ///
+    /// The closure receives the command buffer handle to record into.
+    /// The execution gate also excludes graph recording on this pool. The pool mutex alone
+    /// cannot protect against a Recorder that released it after allocating its command buffer.
+    fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        self.with_unified_exclusive_result(|| self.one_shot_locked(f))
+    }
+
+    fn one_shot_locked(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        let device = &self.shared.device;
+        // Vulkan command-pool access is externally synchronized. Keep this guard until
+        // `OneShotCommand` frees the command buffer on every success/error path.
+        let pool_guard = self.shared.cmd_pool.lock().unwrap();
+        let pool = *pool_guard;
+
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|e| be(format!("allocate_command_buffers: {e}")))?[0];
+        let _command = OneShotCommand { device, pool, cmd };
+
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|e| be(format!("begin_command_buffer: {e}")))?;
+
+        f(cmd);
+
+        unsafe { device.end_command_buffer(cmd) }
+            .map_err(|e| be(format!("end_command_buffer: {e}")))?;
+
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        self.shared
+            .queue_submit_recovering(&[submit], vk::Fence::null(), None, "one-shot queue_submit")
+            .map_err(|e| be(format!("queue_submit: {e}")))?;
+
+        self.shared
+            .queue_wait_idle_serialized()
+            .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
+
+        Ok(())
+    }
+}
+
+// ── Backend impl ──────────────────────────────────────────────────────────────
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Backend for VulkanBackend {
+    fn name(&self) -> &str {
+        "vulkan"
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.shared.caps.clone()
+    }
+
+    fn begin_weight_allocation_batch(
+        &self,
+        sizes: &[usize],
+    ) -> Result<Option<Box<dyn WeightAllocationBatch + '_>>> {
+        // Vision/embedding clients allocate weights from the shared elastic unified arena.
+        // Reserving separate BDA blocks here would bypass that allocator's ownership/budgeting.
+        if self.unified_client.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(self.prepare_weight_allocation_batch(sizes)?)))
+    }
+
+    fn weight_progress(
+        &self,
+        total_bytes: Option<u64>,
+    ) -> Box<dyn infr_core::backend::ProgressScope> {
+        Box::new(self.weight_progress_scope(total_bytes))
+    }
+
+    fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // calloc contract: zero-init so recycled/uninitialized VRAM can't leak into a read-before-write.
+        let buf = self.make_alloc(bytes, usage)?;
+        self.fill_buf(&buf, 0x00)?;
+        Ok(Box::new(buf))
+    }
+
+    fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
+        // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
+        // `debug.poison_uninit` (`INFR_POISON_UNINIT=1`) forces the poison in release too — for
+        // hunting layout-sensitive read-before-write bugs whose output shifts with unrelated code
+        // changes.
+        //
+        // KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so
+        // the reasoning lives here rather than behind a citation). One read site —
+        // the line below — and a YAGNI sweep flagged it as scaffolding. It stays: it costs one
+        // branch on an allocation path that runs at load, nothing at all when unset, and it is the
+        // only way to reproduce a read-before-write bug in a RELEASE build, where the debug poison
+        // is compiled out and the symptom moves with unrelated code. YAGNI is about unused
+        // abstraction; this is used, just rarely. Do not delete it for being one line.
+        let buf = self.make_alloc(bytes, usage)?;
+        #[cfg(debug_assertions)]
+        self.fill_buf(&buf, 0xFF)?;
+        #[cfg(not(debug_assertions))]
+        if self.cfg.debug.poison_uninit {
+            self.fill_buf(&buf, 0xFF)?;
+        }
+        Ok(Box::new(buf))
+    }
+
+    fn alloc_segmented_kv(&self, spec: SegmentedKvSpec) -> Result<Option<Box<dyn Buffer>>> {
+        // The lightweight address table is a persistent session allocation and may be created
+        // before the unified arena is finalized. Physical segments are still impossible to commit
+        // until `ensure_segmented_kv*`, which validates and claims from the installed arena.
+        Ok(Some(Box::new(self.make_segmented_kv(spec)?)))
+    }
+
+    fn segmented_kv_available(&self) -> bool {
+        self.unified_vram().is_some()
+    }
+
+    fn ensure_segmented_kv(&self, buffer: &dyn Buffer, segments: usize) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("ensure_segmented_kv received a flat or foreign buffer"))?;
+        self.ensure_segmented_kv_inner(segmented, segments)
+    }
+
+    fn ensure_segmented_kv_batch(&self, buffers: &[&dyn Buffer], segments: usize) -> Result<()> {
+        let segmented = buffers
+            .iter()
+            .map(|buffer| {
+                as_segmented_kv(*buffer).ok_or_else(|| {
+                    be("ensure_segmented_kv_batch received a flat or foreign buffer")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.ensure_segmented_kv_batch_inner(&segmented, segments)
+    }
+
+    fn clear_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("clear_segmented_kv received a flat or foreign buffer"))?;
+        let segments = segmented.segments.lock().unwrap();
+        for segment in segments.iter() {
+            self.fill_buf(segment, 0)?;
+        }
+        Ok(())
+    }
+
+    fn buffer_committed_bytes(&self, buffer: &dyn Buffer) -> Result<usize> {
+        if let Some(segmented) = as_segmented_kv(buffer) {
+            return segmented
+                .committed()
+                .checked_mul(segmented.spec.segment_bytes)
+                .ok_or_else(|| be("segmented KV committed byte count overflow"));
+        }
+        Ok(as_vk_buf(buffer)?.size)
+    }
+
+    fn download_range(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        if let Some(segmented) = as_segmented_kv(src) {
+            let segments = segmented.segments.lock().unwrap();
+            let committed = segments
+                .len()
+                .checked_mul(segmented.spec.segment_bytes)
+                .ok_or_else(|| be("segmented KV committed byte count overflow"))?;
+            let end = offset
+                .checked_add(dst.len())
+                .ok_or_else(|| be("download_range offset overflow"))?;
+            if end > committed {
+                return Err(be(format!(
+                    "download_range: byte range {offset}..{end} exceeds segmented KV committed size {committed}"
+                )));
+            }
+            let mut logical = offset;
+            let mut written = 0usize;
+            while written < dst.len() {
+                let index = logical / segmented.spec.segment_bytes;
+                let within = logical % segmented.spec.segment_bytes;
+                let n = (segmented.spec.segment_bytes - within).min(dst.len() - written);
+                self.download_range(&segments[index], within, &mut dst[written..written + n])?;
+                logical += n;
+                written += n;
+            }
+            return Ok(());
+        }
+
+        let vk_src = as_vk_buf(src)?;
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| be("download_range offset overflow"))?;
+        check_extent("download_range", "out of", end, vk_src.size)?;
+        // A unified-arena mapping is the CPU-write ReBAR path. Reading it in the opposite
+        // direction is extremely slow on discrete AMD GPUs (tens of MiB/s), so bulk session
+        // spill must use the copy engine into cached readback memory even though a pointer exists.
+        // Ordinary host/readback buffers retain their direct mapped fast path.
+        if !matches!(&vk_src.backing, Backing::UnifiedSub(_)) {
+            if let Some(ptr) = vk_src.mapped_ptr() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ptr.add(offset) as *const u8,
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                    )
+                };
+                return Ok(());
+            }
+        }
+        let staging = self.make_buf(
+            dst.len(),
+            MemoryLocation::GpuToCpu,
+            "download_range_staging",
+        )?;
+        let src_buf = vk_src.buffer;
+        let stg_buf = staging.buffer;
+        let src_off = vk_src
+            .sub_offset
+            .checked_add(offset)
+            .ok_or_else(|| be("download_range source offset overflow"))?
+            as u64;
+        let size = dst.len() as u64;
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: src_off,
+                dst_offset: 0,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, src_buf, stg_buf, &[region])
+            };
+        })?;
+        let ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("readback staging is not mapped"))? as *const u8;
+        unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+        Ok(())
+    }
+
+    fn upload_range(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        if let Some(segmented) = as_segmented_kv(dst) {
+            let segments = segmented.segments.lock().unwrap();
+            let committed = segments
+                .len()
+                .checked_mul(segmented.spec.segment_bytes)
+                .ok_or_else(|| be("segmented KV committed byte count overflow"))?;
+            let end = offset
+                .checked_add(src.len())
+                .ok_or_else(|| be("upload_range offset overflow"))?;
+            if end > committed {
+                return Err(be(format!(
+                    "upload_range: byte range {offset}..{end} exceeds segmented KV committed size {committed}"
+                )));
+            }
+            let mut logical = offset;
+            let mut read = 0usize;
+            while read < src.len() {
+                let index = logical / segmented.spec.segment_bytes;
+                let within = logical % segmented.spec.segment_bytes;
+                let n = (segmented.spec.segment_bytes - within).min(src.len() - read);
+                self.upload_range(&segments[index], within, &src[read..read + n])?;
+                logical += n;
+                read += n;
+            }
+            return Ok(());
+        }
+
+        let vk_dst = as_vk_buf(dst)?;
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| be("upload_range offset overflow"))?;
+        check_extent("upload_range", "into", end, vk_dst.size)?;
+        if let Some(ptr) = vk_dst.mapped_ptr() {
+            copy_to_mapped(src, unsafe { ptr.add(offset) });
+            return Ok(());
+        }
+        if self.shared.weight_pb.lock().unwrap().is_some() {
+            let dst_off = vk_dst
+                .sub_offset
+                .checked_add(offset)
+                .ok_or_else(|| be("upload_range destination offset overflow"))?
+                as u64;
+            return self.upload_staged_ring(vk_dst.buffer, dst_off, src);
+        }
+        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_range_staging")?;
+        let stg_ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("staging buffer is not mapped"))?;
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
+        let stg_buf = staging.buffer;
+        let dst_buf = vk_dst.buffer;
+        let dst_off = vk_dst
+            .sub_offset
+            .checked_add(offset)
+            .ok_or_else(|| be("upload_range destination offset overflow"))?
+            as u64;
+        let size = src.len() as u64;
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: dst_off,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
+            };
+        })?;
+        Ok(())
+    }
+
+    fn trim_segmented_kv(&self, buffer: &dyn Buffer, keep: usize) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("trim_segmented_kv received a flat or foreign buffer"))?;
+        if !Arc::ptr_eq(&segmented.shared, &self.shared) {
+            return Err(be(
+                "segmented KV trim belongs to a different backend/device",
+            ));
+        }
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
+            let mut segments = segmented.segments.lock().unwrap();
+            if keep > segments.len() {
+                return Err(be("segmented KV trim cannot grow the committed prefix"));
+            }
+            let ptr = segmented
+                .table
+                .mapped_ptr()
+                .ok_or_else(|| be("KV address table is not host-visible"))?;
+            let offset = keep * std::mem::size_of::<u64>();
+            unsafe {
+                std::ptr::write_bytes(ptr.add(offset), 0, segmented.table.size - offset);
+            }
+            // Keep the reservation: future growth must reuse the same frozen coordinates.
+            segments.truncate(keep);
+            Ok(())
+        })
+    }
+
+    fn release_segmented_kv(&self, buffer: &dyn Buffer) -> Result<()> {
+        let segmented = as_segmented_kv(buffer)
+            .ok_or_else(|| be("release_segmented_kv received a flat or foreign buffer"))?;
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
+            let table_ptr = segmented
+                .table
+                .mapped_ptr()
+                .ok_or_else(|| be("segmented KV address table is not host-visible"))?;
+            unsafe {
+                std::ptr::write_bytes(table_ptr, 0, segmented.table.size);
+            }
+            segmented.segments.lock().unwrap().clear();
+            *segmented.reservation.lock().unwrap() = None;
+            Ok(())
+        })
+    }
+
+    /// Copy `src` (host slice) into `dst` (device buffer).
+    ///
+    /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
+    /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
+    fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        if as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some() {
+            return self.copy_buffer_ranges(&[(src, 0, dst, 0, bytes)]);
+        }
+        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+        // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
+        // An oversize `bytes` here is a `vkCmdCopyBuffer` region that runs off the end of the source
+        // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
+        // silent clobber of whatever sub-tensor happens to sit next in the arena block.
+        check_extent("copy_buffer", "out of", bytes, s.size)?;
+        check_extent("copy_buffer", "into", bytes, d.size)?;
+        let (sb, db) = (s.buffer, d.buffer);
+        // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
+        // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
+        // its block's `vk::Buffer` and lives at its offset within it (see `Backing::BdaSub`), so
+        // fold each side's `sub_offset` in the same way `upload`/`download`/`fill_buf` do.
+        let (src_off, dst_off) = (s.sub_offset as u64, d.sub_offset as u64);
+        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
+        self.one_shot(move |cmd| unsafe {
+            let region = vk::BufferCopy {
+                src_offset: src_off,
+                dst_offset: dst_off,
+                size: bytes as u64,
+            };
+            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
+        })
+    }
+
+    fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        if copies
+            .iter()
+            .any(|&(src, dst, _)| as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some())
+        {
+            let ranges: Vec<_> = copies
+                .iter()
+                .map(|&(src, dst, bytes)| (src, 0, dst, 0, bytes))
+                .collect();
+            return self.copy_buffer_ranges(&ranges);
+        }
+        let mut prepared = Vec::with_capacity(copies.len());
+        for &(src, dst, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            check_extent("copy_buffers", "out of", bytes, s.size)?;
+            check_extent("copy_buffers", "into", bytes, d.size)?;
+            prepared.push((
+                s.buffer,
+                d.buffer,
+                s.sub_offset as u64,
+                d.sub_offset as u64,
+                bytes as u64,
+            ));
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (src, dst, src_offset, dst_offset, size) in prepared {
+                self.shared.device.cmd_copy_buffer(
+                    cmd,
+                    src,
+                    dst,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    }],
+                );
+            }
+        })
+    }
+
+    fn copy_kv_prefixes(
+        &self,
+        copies: &[(&dyn Buffer, &dyn Buffer, infr_core::tensor::DType, usize)],
+    ) -> Result<()> {
+        use infr_core::tensor::DType;
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.with_unified_exclusive_result(|| {
+            let mut virtual_buffers: Vec<_> = copies
+                .iter()
+                .flat_map(|&(src, dst, _, _)| [src, dst])
+                .filter_map(as_segmented_kv)
+                .collect();
+            virtual_buffers.sort_unstable_by_key(|b| std::ptr::from_ref(*b) as usize);
+            virtual_buffers.dedup_by_key(|b| std::ptr::from_ref(*b) as usize);
+            for buffer in &virtual_buffers {
+                if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+                    return Err(be("KV prefix belongs to a different Vulkan backend/device"));
+                }
+            }
+            let locked: Vec<_> = virtual_buffers
+                .iter()
+                .map(|buffer| buffer.segments.lock().unwrap())
+                .collect();
+            let storage_bytes = |dtype, elements: usize| -> Result<usize> {
+                let (block_elements, block_bytes) = infr_core::decode_spec::block_layout(dtype);
+                if !elements.is_multiple_of(block_elements) {
+                    return Err(be("unaligned KV prefix format"));
+                }
+                (elements / block_elements)
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| be("KV prefix size overflow"))
+            };
+            let endpoint = |buffer: &dyn Buffer, dtype, element: usize| -> Result<_> {
+                if let Some(segmented) = as_segmented_kv(buffer) {
+                    let index = virtual_buffers
+                        .binary_search_by_key(&(std::ptr::from_ref(segmented) as usize), |b| {
+                            std::ptr::from_ref(*b) as usize
+                        })
+                        .expect("locked KV prefix buffer");
+                    let capacity = segmented.spec.segment_elements;
+                    let segment = locked[index]
+                        .get(element / capacity)
+                        .ok_or_else(|| be("KV prefix exceeds committed segments"))?;
+                    check_extent(
+                        "KV prefix segment",
+                        "into",
+                        storage_bytes(dtype, capacity)?,
+                        segment.size,
+                    )?;
+                    Ok((
+                        segment.buffer,
+                        segment.sub_offset,
+                        element % capacity,
+                        capacity,
+                    ))
+                } else {
+                    let flat = as_vk_buf(buffer)?;
+                    let (block_elements, block_bytes) = infr_core::decode_spec::block_layout(dtype);
+                    let capacity = (flat.size / block_bytes)
+                        .checked_mul(block_elements)
+                        .ok_or_else(|| be("KV prefix capacity overflow"))?;
+                    Ok((flat.buffer, flat.sub_offset, element, capacity))
+                }
+            };
+            let mut prepared = Vec::new();
+            for &(src, dst, dtype, elements) in copies {
+                let bytes = storage_bytes(dtype, elements)?;
+                check_extent("KV prefix", "out of", bytes, src.len_bytes())?;
+                check_extent("KV prefix", "into", bytes, dst.len_bytes())?;
+                if std::ptr::eq(src, dst) {
+                    continue;
+                }
+                let mut offset = 0;
+                while offset < elements {
+                    let (sb, so, se, sc) = endpoint(src, dtype, offset)?;
+                    let (db, doff, de, dc) = endpoint(dst, dtype, offset)?;
+                    let count = (elements - offset).min(sc - se).min(dc - de);
+                    if dtype == DType::Q8_0 {
+                        // Vulkan Q8 is planar within EACH physical segment: codes, then scales.
+                        // A byte prefix would leave the scales uninitialized, including those
+                        // beyond the logical byte extent of a partially used final segment.
+                        prepared.push((sb, db, so + se, doff + de, count));
+                        let scale_bytes = count / 32 * 2;
+                        prepared.push((
+                            sb,
+                            db,
+                            so + sc + se / 32 * 2,
+                            doff + dc + de / 32 * 2,
+                            scale_bytes,
+                        ));
+                    } else {
+                        let (block_elements, block_bytes) =
+                            infr_core::decode_spec::block_layout(dtype);
+                        prepared.push((
+                            sb,
+                            db,
+                            so + se / block_elements * block_bytes,
+                            doff + de / block_elements * block_bytes,
+                            count / block_elements * block_bytes,
+                        ));
+                    }
+                    offset += count;
+                }
+            }
+            self.one_shot(move |cmd| unsafe {
+                for (src, dst, src_offset, dst_offset, size) in prepared {
+                    self.shared.device.cmd_copy_buffer(
+                        cmd,
+                        src,
+                        dst,
+                        &[vk::BufferCopy {
+                            src_offset: src_offset as u64,
+                            dst_offset: dst_offset as u64,
+                            size: size as u64,
+                        }],
+                    );
+                }
+            })
+        })
+    }
+
+    fn copy_buffer_ranges(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        if copies.iter().any(|&(src, _, dst, _, _)| {
+            as_segmented_kv(src).is_some() || as_segmented_kv(dst).is_some()
+        }) {
+            return self.with_unified_exclusive_result(|| {
+                let mut virtual_buffers: Vec<_> = copies
+                    .iter()
+                    .flat_map(|&(src, _, dst, _, _)| [src, dst])
+                    .filter_map(as_segmented_kv)
+                    .collect();
+                virtual_buffers.sort_unstable_by_key(|b| std::ptr::from_ref(*b) as usize);
+                virtual_buffers.dedup_by_key(|b| std::ptr::from_ref(*b) as usize);
+                for buffer in &virtual_buffers {
+                    if !Arc::ptr_eq(&buffer.shared, &self.shared) {
+                        return Err(be(
+                            "segmented KV copy belongs to a different Vulkan backend/device",
+                        ));
+                    }
+                }
+                // Hold each buffer once, under the execution gate, through completion. This also
+                // supports copying disjoint ranges within one segmented buffer without deadlock.
+                let locked: Vec<_> = virtual_buffers
+                    .iter()
+                    .map(|buffer| buffer.segments.lock().unwrap())
+                    .collect();
+                let physical = |buffer: &dyn Buffer,
+                                offset: usize|
+                 -> Result<(vk::Buffer, u64, usize)> {
+                    if let Some(segmented) = as_segmented_kv(buffer) {
+                        let index = virtual_buffers
+                            .binary_search_by_key(&(std::ptr::from_ref(segmented) as usize), |b| {
+                                std::ptr::from_ref(*b) as usize
+                            })
+                            .expect("locked segmented copy buffer");
+                        let within = offset % segmented.spec.segment_bytes;
+                        let segment = locked[index]
+                            .get(offset / segmented.spec.segment_bytes)
+                            .ok_or_else(|| {
+                                be("copy_buffer_ranges exceeds committed segmented KV")
+                            })?;
+                        Ok((
+                            segment.buffer,
+                            (segment.sub_offset + within) as u64,
+                            segment.size - within,
+                        ))
+                    } else {
+                        let flat = as_vk_buf(buffer)?;
+                        Ok((
+                            flat.buffer,
+                            (flat.sub_offset + offset) as u64,
+                            flat.size - offset,
+                        ))
+                    }
+                };
+                let mut prepared = Vec::with_capacity(copies.len());
+                for &(src, src_offset, dst, dst_offset, bytes) in copies {
+                    let src_end = src_offset
+                        .checked_add(bytes)
+                        .ok_or_else(|| be("copy_buffer_ranges source range overflow"))?;
+                    let dst_end = dst_offset
+                        .checked_add(bytes)
+                        .ok_or_else(|| be("copy_buffer_ranges destination range overflow"))?;
+                    check_extent("copy_buffer_ranges", "out of", src_end, src.len_bytes())?;
+                    check_extent("copy_buffer_ranges", "into", dst_end, dst.len_bytes())?;
+                    let mut copied = 0;
+                    while copied < bytes {
+                        let (sb, so, sn) = physical(src, src_offset + copied)?;
+                        let (db, doff, dn) = physical(dst, dst_offset + copied)?;
+                        let count = (bytes - copied).min(sn).min(dn);
+                        prepared.push((sb, db, so, doff, count as u64));
+                        copied += count;
+                    }
+                }
+                self.one_shot(move |cmd| unsafe {
+                    for (src, dst, src_offset, dst_offset, size) in prepared {
+                        self.shared.device.cmd_copy_buffer(
+                            cmd,
+                            src,
+                            dst,
+                            &[vk::BufferCopy {
+                                src_offset,
+                                dst_offset,
+                                size,
+                            }],
+                        );
+                    }
+                })
+            });
+        }
+        let mut prepared = Vec::with_capacity(copies.len());
+        for &(src, src_offset, dst, dst_offset, bytes) in copies {
+            let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+            let src_end = src_offset
+                .checked_add(bytes)
+                .ok_or_else(|| be("copy_buffer_ranges source range overflow"))?;
+            let dst_end = dst_offset
+                .checked_add(bytes)
+                .ok_or_else(|| be("copy_buffer_ranges destination range overflow"))?;
+            check_extent("copy_buffer_ranges", "out of", src_end, s.size)?;
+            check_extent("copy_buffer_ranges", "into", dst_end, d.size)?;
+            prepared.push((
+                s.buffer,
+                d.buffer,
+                s.sub_offset as u64 + src_offset as u64,
+                d.sub_offset as u64 + dst_offset as u64,
+                bytes as u64,
+            ));
+        }
+        self.one_shot(move |cmd| unsafe {
+            for (src, dst, src_offset, dst_offset, size) in prepared {
+                self.shared.device.cmd_copy_buffer(
+                    cmd,
+                    src,
+                    dst,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    }],
+                );
+            }
+        })
+    }
+
+    /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
+    /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
+    fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
+        let vk_dst = as_vk_buf(dst)?;
+        // Same guard as `download`/`copy_buffer`, same wording — this one is the original, the
+        // helper just stops the three from drifting apart again.
+        check_extent("upload", "into", src.len(), vk_dst.size)?;
+
+        // ── Direct write: any PERSISTENTLY MAPPED destination ─────────────────────────────────
+        // Host-visible staging/readback buffers, AND a UMA overflow-spill buffer (`Backing::Vram`):
+        // the host writes straight through the mapped pointer. One pass over the bytes, no staging
+        // buffer, no `vkCmdCopyBuffer`, no queue stall. The memory is HOST_COHERENT so no explicit
+        // flush is needed, and the host writes are made visible to the device by the implicit
+        // host-write domain operation that `vkQueueSubmit` performs.
+        if let Some(ptr) = vk_dst.mapped_ptr() {
+            copy_to_mapped(src, ptr);
+            return Ok(());
+        }
+
+        // ── Staged write: device-local destination with no host mapping ───────────────────────
+        // During a weight load this goes through the REUSED, pipelined staging ring; anywhere else
+        // (and for a tensor larger than the ring's slot on a non-load path) it is a single
+        // synchronous copy.
+        if self.shared.weight_pb.lock().unwrap().is_some() {
+            return self.upload_staged_ring(vk_dst.buffer, vk_dst.sub_offset as u64, src);
+        }
+
+        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
+        let stg_ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("staging buffer is not mapped"))?;
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
+
+        let stg_buf = staging.buffer;
+        let dst_buf = vk_dst.buffer;
+        // `dst.sub_offset` — 0 for every ordinary buffer; a resident-BDA sub-tensor's offset within
+        // its block's shared `vk::Buffer` otherwise (see `Backing::BdaSub`).
+        let dst_off = vk_dst.sub_offset as u64;
+        let size = src.len() as u64;
+        // Clone the Arc so the closure is independent of `self`.
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: dst_off,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
+            };
+        })?;
+        // `staging` is dropped here → frees vk::Buffer + gpu-allocator sub-allocation.
+        Ok(())
+    }
+
+    /// Copy `src` (device buffer) into `dst` (host slice).
+    ///
+    /// If `src` is host-visible (persistently mapped — `Readback`/`GpuToCpu` OR `Staging`/CpuToGpu),
+    /// reads STRAIGHT from the mapped pointer: zero submit/sync. Only a truly device-local
+    /// (`GpuOnly`, unmapped) source copies via a temporary readback staging buffer + submit + wait.
+    ///
+    /// Covering CpuToGpu here matters on the hot decode loop: the record-once replay binds the
+    /// device sampler's id output to a `Staging` buffer (`dec_ids_buf`, dual-purposed as the next
+    /// iteration's on-device embed-gather input), and the per-token fallback / E2B path reads that
+    /// id back every step. The old `GpuToCpu`-only check bounced it through a staging alloc +
+    /// one_shot copy + `queue_wait_idle` PER TOKEN — the exact per-token full-sync cost `read_pos0`
+    /// already dodges for `positions`. The mapped read carries the same contract the `GpuToCpu`
+    /// path always had: the caller must have completed the GPU work that wrote `src` (every decode
+    /// site does — `execute`/`replay` end in `queue_wait_idle`; the buffers are HOST_COHERENT so
+    /// the write is visible with no explicit invalidate).
+    fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
+        let vk_src = as_vk_buf(src)?;
+        // The mirror of `upload`'s guard, and it is the one with TEETH: the mapped fast path below
+        // is a raw `copy_nonoverlapping` of `dst.len()` bytes out of the mapping, so an oversize
+        // `dst` is an out-of-bounds READ — undefined behaviour that hands the caller whatever
+        // happens to follow the buffer (another tensor, another allocation) instead of failing.
+        // The staging path's failure is tamer but still wrong: a `vkCmdCopyBuffer` whose `size`
+        // overruns the source.
+        check_extent("download", "out of", dst.len(), vk_src.size)?;
+
+        if let Some(ptr) = vk_src.mapped_ptr() {
+            // Host-visible (Readback or Staging): direct read from the persistently-mapped pointer.
+            unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), dst.len()) };
+        } else {
+            // Readback path: device-local → staging → host.
+            let staging = self.make_buf(dst.len(), MemoryLocation::GpuToCpu, "download_staging")?;
+
+            let src_buf = vk_src.buffer;
+            let stg_buf = staging.buffer;
+            // `src.sub_offset` — see `upload`'s `dst_off`; a resident-BDA sub-tensor reads from its
+            // offset within the block's shared `vk::Buffer`, not from byte 0.
+            let src_off = vk_src.sub_offset as u64;
+            let size = dst.len() as u64;
+            let shared = Arc::clone(&self.shared);
+            self.one_shot(move |cmd| {
+                let region = vk::BufferCopy {
+                    src_offset: src_off,
+                    dst_offset: 0,
+                    size,
+                };
+                unsafe {
+                    shared
+                        .device
+                        .cmd_copy_buffer(cmd, src_buf, stg_buf, &[region])
+                };
+            })?;
+
+            // GPU→staging transfer is complete (queue_wait_idle returned).
+            let ptr = staging
+                .mapped_ptr()
+                .ok_or_else(|| be("readback staging is not mapped"))?
+                as *const u8;
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+            // `staging` dropped here.
+        }
+        Ok(())
+    }
+
+    /// VRAM-first KV-overflow placement banner (see `make_alloc`'s `KvCache` arm). One shot after the
+    /// runner's KV loop: how many KV buffers stayed resident in VRAM vs spilled to system RAM, so the
+    /// partial split is visible. All-resident (nothing spilled) and all-spilled (slice-1 whole-host)
+    /// are both reported. Nothing printed with the flag off or when no KV was allocated.
+    fn kv_overflow_report(&self) {
+        if !kv_overflow_enabled(&self.cfg) {
+            return;
+        }
+        if let Some(line) = spill_report_line(self.shared.kv_spill.counts(), &KV_SPILL, fmt_bytes) {
+            tracing::info!("{line}");
+        }
+    }
+
+    /// The dyn-`Backend` spelling of [`alloc_room`](Self::alloc_room) — always `Some` here, because
+    /// this backend has a real allocation guard to report. What makes it worth reaching for through
+    /// the trait: read AFTER the weights are resident it prices the arena's block tails, the
+    /// retained upload staging and the driver's own memory as FACT, where every pre-load estimate
+    /// of the same bytes is a model (measured on gemma-4-31B UD-Q5_K_XL: the weight footprint alone
+    /// is 2.2% under what the arena commits, and 187 MiB of driver-side memory exists that no
+    /// footprint has a term for).
+    fn device_alloc_room(&self) -> Option<u64> {
+        Some(self.alloc_room())
+    }
+
+    fn device_elastic_activation_room(&self) -> Option<u64> {
+        self.unified_vram().map(|pool| {
+            let stats = pool.stats();
+            stats
+                .free_bytes
+                .saturating_add(stats.class_bytes(crate::unified::UnifiedVramClass::Expert))
+                .saturating_add(stats.class_bytes(crate::unified::UnifiedVramClass::LlmRuntime))
+                as u64
+        })
+    }
+
+    fn activation_peak(&self) -> Option<u64> {
+        Some(self.shared.act_peak.load(Ordering::Relaxed))
+    }
+
+    fn release_transient_runtime(&self) {
+        let result = self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
+            self.runtime_phase.lock().unwrap().release_phase();
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error, "could not release transient runtime");
+        }
+    }
+
+    fn register_idle_reclaimer(&self, reclaimer: Weak<dyn IdleResourceReclaimer>) {
+        if matches!(self.unified_client, Some(UnifiedClient::Embedding)) {
+            self.unified_phases
+                .register_idle_reclaimer(self.unified_phase_id, reclaimer);
+        }
+    }
+
+    fn prepare_prefill(&self, candidates: &[(usize, u64)]) -> Result<Option<usize>> {
+        if !self.cfg().paging.moe_layer_stream {
+            return Ok(None);
+        }
+        self.with_unified_exclusive_result(|| {
+            self.handoff_gpu_decode()?;
+            adapter::cancel_decode_prefetch(self)?;
+            self.runtime_phase.lock().unwrap().release_phase();
+            self.unified_phases
+                .claim_with_reclaim(self.unified_phase_id, || {
+                    let mut guard = self.moe_pager().lock().unwrap();
+                    let Some(session) = guard.as_mut() else {
+                        return Ok(None);
+                    };
+                    session.plan_prefill(candidates).map(Some)
+                })
+        })
+    }
+
+    fn supports_async_compile(&self) -> bool {
+        // Compile only clones/inspects the graph; preparation memoizes graph-only CPU metadata.
+        true
+    }
+
+    fn supports_execution_lookahead(&self) -> bool {
+        adapter::command_recording_supported(self)
+    }
+
+    fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
+        adapter::compile(self, graph)
+    }
+
+    fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        self.with_unified_exclusive_result(|| {
+            let result = adapter::execute(self, plan, bindings);
+            let result = self.recover_decode_execution(result);
+            if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                if result.is_err() {
+                    self.runtime_phase.lock().unwrap().release_phase();
+                }
+                reaper.arm();
+            }
+            result
+        })
+    }
+
+    fn execute_with_lookahead(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        self.with_unified_exclusive_result(|| {
+            let result = adapter::execute_with_lookahead(self, plan, bindings, next);
+            let result = self.recover_decode_execution(result);
+            if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                if result.is_err() {
+                    self.runtime_phase.lock().unwrap().release_phase();
+                }
+                reaper.arm();
+            }
+            result
+        })
+    }
+
+    fn execute_staged(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        // Share the same drained panic boundary even when there is no future token.
+        let future = next.map(|(plan, bindings, _)| [ExecutionStage::new(plan, bindings)]);
+        let lookahead = future
+            .as_ref()
+            .zip(next)
+            .map(|(stages, (_, _, positions))| {
+                infr_core::backend::ExecutionLookahead::new(stages, positions)
+            });
+        self.execute_staged_lookahead(stages, input_ready, lookahead)
+    }
+
+    fn execute_staged_lookahead(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<infr_core::backend::ExecutionLookahead<'_>>,
+    ) -> Result<()> {
+        if stages.is_empty() {
+            return Ok(());
+        }
+        let outcome = self.with_unified_exclusive_result(|| {
+            // Drain stage-owned work during unwind, but release the outer lease before the
+            // panic crosses it. A caller callback must not poison unrelated later requests.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let result = adapter::stages::execute_lookahead(self, stages, input_ready, next);
+                let result = self.recover_decode_execution(result);
+                if let Some(reaper) = &self.auxiliary_runtime_reaper {
+                    if result.is_err() {
+                        self.runtime_phase.lock().unwrap().release_phase();
+                    }
+                    reaper.arm();
+                }
+                result
+            }));
+            if outcome.is_err() {
+                let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.recover_decode_execution(Err(be("staged forward panicked")))
+                }));
+                if cleanup.is_err() {
+                    tracing::error!("staged Decode panic recovery also panicked");
+                }
+            }
+            Ok(outcome)
+        })?;
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// See `Backend::max_decode_chain`. Persistent decode keeps the established platform cap
+    /// because its command buffers are recorded once and cannot be rebuilt while static submits
+    /// run through their finite startup calibration.
+    fn max_decode_chain(&self) -> usize {
+        if self.replay_submit_dispatch_cap() == 0 {
+            usize::MAX
+        } else {
+            1
+        }
+    }
+
+    fn execute_chain(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        self.with_unified_exclusive_result(|| adapter::execute_chain(self, plan, bindings, n))
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.shared
+            .device_wait_idle_serialized()
+            .map_err(|e| be(format!("device_wait_idle: {e}")))
+    }
+
+    fn moe_paged(&self) -> bool {
+        self.moe_pager.lock().unwrap().is_some()
+    }
+
+    fn finish_weight_load(&self) -> Result<()> {
+        self.release_moe_load_reservation();
+        // The weight-load bar is still open — `infr_llama`'s session-init block owns the guard that
+        // clears it, and this is called inside that block. Hand it to the preload: for a paged model
+        // those are the bytes that stand in for the expert banks the loader only registered, and
+        // without this the bar sits still for the longest phase of the load. Cloned up front (a
+        // `ProgressBar` is an `Arc` over its state) so the ticking never reaches for the mutex the
+        // pager session is already held through.
+        let progress = self.shared.weight_pb.lock().unwrap().clone();
+        let (blocks, bytes) = self
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(Ok((0, 0)), |s| s.preload_host_tier(progress.as_ref()))?;
+        if blocks > 0 {
+            tracing::info!(
+                "[infr] bounded MoE RAM preload complete: {blocks} blocks / {:.2} GiB",
+                bytes as f64 / (1u64 << 30) as f64,
+            );
+        }
+        Ok(())
+    }
+
+    fn finish_session_allocations(&self) -> Result<()> {
+        if self.session_finalization_deferred.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let sources = self
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(crate::pager::MoePagerSession::take_transfer_sources)
+            .unwrap_or_default();
+        if !sources.is_empty() {
+            // Warmup can execute before host aliases are finalized. A session-wide GPU owner
+            // must not retain that provisional, all-CPU source directory or its workspace.
+            self.with_unified_exclusive_result(|| {
+                self.handoff_gpu_decode()?;
+                if let Some(session) = self.moe_pager.lock().unwrap().as_mut() {
+                    session.gpu_decode_owner = None;
+                }
+                self.runtime_phase.lock().unwrap().release_phase();
+                Ok(())
+            })?;
+            let plan = Arc::new(self.build_session_transfer_plan(sources));
+            self.moe_pager
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("MoE pager disappeared during session finalization")
+                .install_transfer_plan(Arc::clone(&plan));
+            *self.shared.session_transfer_plan.write().unwrap() = Some(Arc::downgrade(&plan));
+        }
+        if let Some(pool) = self.unified_vram() {
+            pool.verify_final_residency(self)?;
+        }
+        Ok(())
+    }
+
+    fn dense_paged(&self) -> bool {
+        self.dense_pager.lock().unwrap().is_some()
+    }
+
+    /// DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): one eager dispatch of
+    /// `dg_eb_sample` + a synchronous wait (`Recorder::finish`) — this isn't part of a cached
+    /// [`Plan`], it runs once per denoise step right after that step's forward `execute()`, on
+    /// the same `logits` buffer the forward just wrote (still GPU-resident).
+    fn eb_sample_reduce(
+        &self,
+        logits: &dyn Buffer,
+        u: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        temp_inv: f32,
+        argmax_out: &dyn Buffer,
+        entropy_out: &dyn Buffer,
+        sampled_out: &dyn Buffer,
+    ) -> Result<bool> {
+        let rec = self.recorder()?;
+        rec.dg_eb_sample(
+            logits,
+            u,
+            argmax_out,
+            entropy_out,
+            sampled_out,
+            rows,
+            dim,
+            temp_inv,
+        );
+        rec.finish()?;
+        Ok(true)
+    }
+}
+
+// ── VK_NV_cooperative_matrix2 structs (ash 0.38 has no bindings for this extension) ──────────────
+// Field order, types and `sType` values transcribed from the locally installed
+// /usr/include/vulkan/vulkan_core.h. `#[repr(C)]` and the field ORDER are the driver ABI — do not
+// reorder. Nothing here is ever chained unless the device advertises the extension (see
+// `probe_coopmat2`), because chaining a struct a driver does not know is undefined behaviour.
+
+const ST_COOPMAT2_FEATURES_NV: i32 = 1_000_593_000;
+const ST_COOPMAT2_FLEXIBLE_DIMENSIONS_NV: i32 = 1_000_593_001;
+const ST_COOPMAT2_PROPERTIES_NV: i32 = 1_000_593_002;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Coopmat2FeaturesNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope: vk::Bool32,
+    flexible_dimensions: vk::Bool32,
+    reductions: vk::Bool32,
+    conversions: vk::Bool32,
+    per_element_operations: vk::Bool32,
+    tensor_addressing: vk::Bool32,
+    block_loads: vk::Bool32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Coopmat2PropertiesNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    workgroup_scope_max_workgroup_size: u32,
+    flexible_dimensions_max_dimension: u32,
+    workgroup_scope_reserved_shared_memory: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CoopmatFlexibleDimensionsNv {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    m_granularity: u32,
+    n_granularity: u32,
+    k_granularity: u32,
+    a_type: vk::ComponentTypeKHR,
+    b_type: vk::ComponentTypeKHR,
+    c_type: vk::ComponentTypeKHR,
+    result_type: vk::ComponentTypeKHR,
+    saturating_accumulation: vk::Bool32,
+    scope: vk::ScopeKHR,
+    workgroup_invocations: u32,
+}
+
+type PfnGetCoopmatFlexibleDimensionsNv = unsafe extern "system" fn(
+    vk::PhysicalDevice,
+    *mut u32,
+    *mut CoopmatFlexibleDimensionsNv,
+) -> vk::Result;
+
+/// Probe `VK_NV_cooperative_matrix2` into the facts [`crate::caps::check_coopmat2_support`] decides
+/// over. Pure query, no policy: every early return leaves the corresponding fact at its "not
+/// established" value (`has_ext` false, `flexible_dimensions_reported` false), which is what makes
+/// the gate refuse.
+///
+/// NOT VALIDATED against a device that PASSES the gate. The only device on this machine advertising
+/// the extension is lavapipe (the software rasterizer), and it is refused; the discrete RX 7900 XTX
+/// on RADV does not advertise it at all, so this function returns at the first line there. What has
+/// been run here is the extension-absent path and lavapipe's extension-present path — never a
+/// successful one.
+fn probe_coopmat2(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    has_ext: &dyn Fn(&CStr) -> bool,
+    buffer_device_address: bool,
+) -> crate::caps::Coopmat2Probe {
+    let mut probe = crate::caps::Coopmat2Probe {
+        buffer_device_address,
+        ..Default::default()
+    };
+    if !has_ext(c"VK_NV_cooperative_matrix2") {
+        return probe;
+    }
+    probe.has_ext = true;
+
+    // Feature bits. ash cannot `push_next` a struct it has no `Extends` impl for, so splice it in
+    // as the chain head by raw pointer — `p_next` is a public field in ash 0.38.
+    let mut feats = Coopmat2FeaturesNv {
+        s_type: vk::StructureType::from_raw(ST_COOPMAT2_FEATURES_NV),
+        p_next: std::ptr::null_mut(),
+        workgroup_scope: vk::FALSE,
+        flexible_dimensions: vk::FALSE,
+        reductions: vk::FALSE,
+        conversions: vk::FALSE,
+        per_element_operations: vk::FALSE,
+        tensor_addressing: vk::FALSE,
+        block_loads: vk::FALSE,
+    };
+    let mut feat2 = vk::PhysicalDeviceFeatures2::default();
+    feats.p_next = feat2.p_next;
+    feat2.p_next = std::ptr::addr_of_mut!(feats).cast();
+    unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+    probe.workgroup_scope = feats.workgroup_scope != 0;
+    probe.flexible_dimensions = feats.flexible_dimensions != 0;
+    probe.reductions = feats.reductions != 0;
+    probe.conversions = feats.conversions != 0;
+    probe.per_element_operations = feats.per_element_operations != 0;
+    probe.tensor_addressing = feats.tensor_addressing != 0;
+    probe.block_loads = feats.block_loads != 0;
+
+    let mut cm2_props = Coopmat2PropertiesNv {
+        s_type: vk::StructureType::from_raw(ST_COOPMAT2_PROPERTIES_NV),
+        p_next: std::ptr::null_mut(),
+        workgroup_scope_max_workgroup_size: 0,
+        flexible_dimensions_max_dimension: 0,
+        workgroup_scope_reserved_shared_memory: 0,
+    };
+    let mut props2 = vk::PhysicalDeviceProperties2::default();
+    cm2_props.p_next = props2.p_next;
+    props2.p_next = std::ptr::addr_of_mut!(cm2_props).cast();
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+    probe.flexible_dimensions_max_dimension = cm2_props.flexible_dimensions_max_dimension;
+
+    // The flexible-dimension shape list, through a `vkGetInstanceProcAddr` lookup because ash has
+    // no wrapper. A missing entry point or a failed call leaves `flexible_dimensions_reported`
+    // false, i.e. UNKNOWN, and the gate refuses rather than reading an empty list as agreement.
+    let Some(raw) = (unsafe {
+        entry.get_instance_proc_addr(
+            instance.handle(),
+            c"vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV".as_ptr(),
+        )
+    }) else {
+        return probe;
+    };
+    let get_dims: PfnGetCoopmatFlexibleDimensionsNv = unsafe { std::mem::transmute(raw) };
+    let mut count = 0u32;
+    if unsafe { get_dims(physical_device, &mut count, std::ptr::null_mut()) } != vk::Result::SUCCESS
+    {
+        return probe;
+    }
+    let mut list = vec![
+        CoopmatFlexibleDimensionsNv {
+            s_type: vk::StructureType::from_raw(ST_COOPMAT2_FLEXIBLE_DIMENSIONS_NV),
+            p_next: std::ptr::null_mut(),
+            m_granularity: 0,
+            n_granularity: 0,
+            k_granularity: 0,
+            a_type: vk::ComponentTypeKHR::FLOAT16,
+            b_type: vk::ComponentTypeKHR::FLOAT16,
+            c_type: vk::ComponentTypeKHR::FLOAT16,
+            result_type: vk::ComponentTypeKHR::FLOAT16,
+            saturating_accumulation: vk::FALSE,
+            scope: vk::ScopeKHR::WORKGROUP,
+            workgroup_invocations: 0,
+        };
+        count as usize
+    ];
+    if count > 0
+        && unsafe { get_dims(physical_device, &mut count, list.as_mut_ptr()) }
+            != vk::Result::SUCCESS
+    {
+        return probe;
+    }
+    list.truncate(count as usize);
+    probe.flexible_dimensions_reported = true;
+    probe.flexible_dimensions_list = list
+        .iter()
+        .map(|d| crate::caps::FlexibleDimension {
+            m_granularity: d.m_granularity,
+            n_granularity: d.n_granularity,
+            k_granularity: d.k_granularity,
+            a_type: d.a_type,
+            b_type: d.b_type,
+            c_type: d.c_type,
+            result_type: d.result_type,
+            saturating_accumulation: d.saturating_accumulation != 0,
+            scope: d.scope,
+            workgroup_invocations: d.workgroup_invocations,
+        })
+        .collect();
+    probe
+}
+
+/// Read the device facts [`crate::caps`]'s decisions are stated over — the PROBE half of the
+/// capability split. No policy here: every field is a straight copy of a Vulkan query result.
+///
+/// Each chained property struct is guarded by the thing that makes chaining it legal — the core
+/// version that promoted it, or the extension that defines it. Chaining a struct the driver does
+/// not know is undefined behaviour (same rule as the `VK_AMD_shader_core_properties` guard in
+/// `new`), and a driver that ignores a struct leaves it at ash's `Default`, which for
+/// `DriverId` is `AMD_PROPRIETARY` and NOT a safe "unknown" — hence `driver_id_reported`.
+fn probe_device_facts(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    has_ext: &dyn Fn(&CStr) -> bool,
+) -> crate::caps::DeviceProbe {
+    let base = unsafe { instance.get_physical_device_properties(physical_device) };
+    let (major, minor) = (
+        vk::api_version_major(base.api_version),
+        vk::api_version_minor(base.api_version),
+    );
+    let at_least = |want_minor: u32| major > 1 || (major == 1 && minor >= want_minor);
+    // Core 1.2 (promoted from VK_KHR_driver_properties).
+    let want_driver = at_least(2) || has_ext(c"VK_KHR_driver_properties");
+    // Core 1.3 (promoted from VK_EXT_subgroup_size_control / VK_KHR_shader_integer_dot_product).
+    let want_sgctl = at_least(3) || has_ext(c"VK_EXT_subgroup_size_control");
+    let want_intdot = at_least(3) || has_ext(c"VK_KHR_shader_integer_dot_product");
+    let want_amd_core = has_ext(c"VK_AMD_shader_core_properties");
+    let want_nv_sm = has_ext(c"VK_NV_shader_sm_builtins");
+
+    let mut driver = vk::PhysicalDeviceDriverProperties::default();
+    let mut sgctl = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+    let mut intdot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let want_amd_core2 = has_ext(c"VK_AMD_shader_core_properties2");
+
+    let mut amd_core = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+    let mut amd_core2 = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
+    let mut nv_sm = vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default();
+    if want_driver {
+        props2 = props2.push_next(&mut driver);
+    }
+    if want_sgctl {
+        props2 = props2.push_next(&mut sgctl);
+    }
+    if want_intdot {
+        props2 = props2.push_next(&mut intdot);
+    }
+    if want_amd_core {
+        props2 = props2.push_next(&mut amd_core);
+    }
+    if want_amd_core2 {
+        props2 = props2.push_next(&mut amd_core2);
+    }
+    if want_nv_sm {
+        props2 = props2.push_next(&mut nv_sm);
+    }
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+
+    crate::caps::DeviceProbe {
+        vendor_id: base.vendor_id,
+        driver_id: driver.driver_id,
+        driver_id_reported: want_driver,
+        integrated: base.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+        subgroup_min: if want_sgctl {
+            sgctl.min_subgroup_size
+        } else {
+            0
+        },
+        subgroup_max: if want_sgctl {
+            sgctl.max_subgroup_size
+        } else {
+            0
+        },
+        device_id: base.device_id,
+        wavefronts_per_simd: amd_core.wavefronts_per_simd,
+        has_amd_shader_core: want_amd_core,
+        shader_engine_count: amd_core.shader_engine_count,
+        shader_arrays_per_engine_count: amd_core.shader_arrays_per_engine_count,
+        compute_units_per_shader_array: amd_core.compute_units_per_shader_array,
+        has_amd_shader_core2: want_amd_core2,
+        active_compute_unit_count: amd_core2.active_compute_unit_count,
+        has_integer_dot: want_intdot,
+        dot4x8_signed_accelerated: intdot.integer_dot_product4x8_bit_packed_signed_accelerated != 0,
+        dot4x8_mixed_accelerated: intdot
+            .integer_dot_product4x8_bit_packed_mixed_signedness_accelerated
+            != 0,
+        has_coopmat_ext: has_ext(c"VK_KHR_cooperative_matrix"),
+        has_nv_sm_builtins: want_nv_sm,
+        warps_per_sm: nv_sm.shader_warps_per_sm,
+        sm_count: nv_sm.shader_sm_count,
+    }
+}
+
+/// Probe exactly the capability gate used by the hd256 FlashAttention path without constructing a
+/// logical device. Device enumeration is already a cold control-plane operation, so querying the
+/// feature bit and cooperative-matrix table here keeps offline memory planning honest without
+/// creating a second Vulkan backend.
+fn probe_flash_attention_hd256(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    has_ext: &dyn Fn(&CStr) -> bool,
+    f16_enabled: bool,
+    coopmat_enabled: bool,
+) -> bool {
+    if !f16_enabled
+        || !coopmat_enabled
+        || !has_ext(c"VK_KHR_cooperative_matrix")
+        || unsafe { instance.get_physical_device_properties(physical_device) }
+            .limits
+            .max_compute_shared_memory_size
+            < FLASH_HD256_BM16_SHARED
+    {
+        return false;
+    }
+
+    let mut f16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+    let mut coopmat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut f16)
+        .push_next(&mut coopmat);
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    if f16.shader_float16 == 0 || coopmat.cooperative_matrix == 0 {
+        return false;
+    }
+
+    let loader = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+    let Ok(configs) =
+        (unsafe { loader.get_physical_device_cooperative_matrix_properties(physical_device) })
+    else {
+        return false;
+    };
+    let probe = probe_device_facts(instance, physical_device, has_ext);
+    let trust = crate::caps::coopmat_trust(&probe, crate::caps::device_architecture(&probe));
+    let f16_component = vk::ComponentTypeKHR::FLOAT16;
+    configs.iter().any(|cfg| {
+        let shape = (cfg.m_size, cfg.n_size, cfg.k_size);
+        shape == infr_core::COOPMAT_TILE_16
+            && cfg.a_type == f16_component
+            && cfg.b_type == f16_component
+            && crate::caps::coopmat_shape_trusted(trust, shape)
+    })
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+fn compute_subgroup_operations(
+    stages: vk::ShaderStageFlags,
+    operations: vk::SubgroupFeatureFlags,
+) -> vk::SubgroupFeatureFlags {
+    if stages.contains(vk::ShaderStageFlags::COMPUTE) {
+        operations
+    } else {
+        vk::SubgroupFeatureFlags::empty()
+    }
+}
+
+#[cfg(test)]
+fn shader_clock_test_opt_in(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn attention_splits_reject_invalid_configs_before_vulkan_initialization() {
+        for key in ["flash_splits", "pv_splits"] {
+            for splits in [0, 9, usize::MAX] {
+                let mut cfg = Config::default();
+                if key == "flash_splits" {
+                    cfg.kernels.vulkan.flash_splits = Some(splits);
+                } else {
+                    cfg.kernels.vulkan.pv_splits = Some(splits);
+                }
+                for device in [None, Some(usize::MAX)] {
+                    let result = VulkanBackend::new_selected(device, Arc::new(cfg.clone()));
+                    let err = match result {
+                        Ok(_) => panic!("invalid {key}={splits} was accepted"),
+                        Err(err) => err.to_string(),
+                    };
+                    assert!(err.contains(&format!("kernels.vulkan.{key}")), "{err}");
+                    assert!(err.contains("1..=8"), "{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owner_subgroup_operations_require_reported_compute_support() {
+        let basic = vk::SubgroupFeatureFlags::BASIC;
+        let scan = basic | vk::SubgroupFeatureFlags::ARITHMETIC;
+        for stages in [
+            vk::ShaderStageFlags::empty(),
+            vk::ShaderStageFlags::FRAGMENT,
+        ] {
+            assert!(super::compute_subgroup_operations(stages, scan).is_empty());
+        }
+        assert_eq!(
+            super::compute_subgroup_operations(vk::ShaderStageFlags::COMPUTE, basic),
+            basic
+        );
+        assert_eq!(
+            super::compute_subgroup_operations(vk::ShaderStageFlags::COMPUTE, scan),
+            scan
+        );
+    }
+
+    #[test]
+    fn shader_clock_test_opt_in_requires_exact_one() {
+        use std::ffi::OsStr;
+
+        assert!(super::shader_clock_test_opt_in(Some(OsStr::new("1"))));
+        assert!(!super::shader_clock_test_opt_in(None));
+        for value in ["", "0", "true", "yes", "01", " 1", "1 "] {
+            assert!(!super::shader_clock_test_opt_in(Some(OsStr::new(value))));
+        }
+    }
+
+    use super::*;
+    use infr_core::Backend;
+
+    #[test]
+    fn paged_grid_buffer_auto_is_device_and_shape_scoped() {
+        for measured_device in [false, true] {
+            for (k, n, rows) in [
+                (2560, 640, 1),
+                (2560, 640, 2),
+                (2560, 640, 3),
+                (2560, 640, 0),
+                (2560, 640, 4),
+                (2560, 640, 2048),
+                (768, 640, 1),
+                (2560, 641, 1),
+            ] {
+                assert_eq!(
+                    use_paged_grid_buffer(None, measured_device, k, n, rows),
+                    measured_device && k == 2560 && n == 640 && (1..=3).contains(&rows)
+                );
+                assert!(!use_paged_grid_buffer(
+                    Some(false),
+                    measured_device,
+                    k,
+                    n,
+                    rows
+                ));
+                assert!(use_paged_grid_buffer(
+                    Some(true),
+                    measured_device,
+                    k,
+                    n,
+                    rows
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn down_overlap_auto_keeps_unmeasured_cohorts_on_the_original_path() {
+        for measured_device in [false, true] {
+            for rows in 0..=4 {
+                for context in [0, 30000, 131071, 131072, 150000] {
+                    assert_eq!(
+                        use_decode_down_overlap(None, measured_device, rows, context),
+                        measured_device && matches!(rows, 2 | 3) && context >= 131072
+                    );
+                    assert!(!use_decode_down_overlap(
+                        Some(false),
+                        measured_device,
+                        rows,
+                        context
+                    ));
+                    assert!(use_decode_down_overlap(
+                        Some(true),
+                        measured_device,
+                        rows,
+                        context
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn early_ffn_submit_auto_is_decode_and_measured_device_scoped() {
+        for measured in [false, true] {
+            for rows in 1..=8 {
+                for decode_rows in [None, Some(1), Some(2), Some(3), Some(4)] {
+                    for verify in [false, true] {
+                        assert_eq!(
+                            use_small_decode_policy(None, measured, rows, decode_rows, verify),
+                            measured && rows <= 3 && decode_rows == Some(rows) && !verify
+                        );
+                        assert!(!use_small_decode_policy(
+                            Some(false),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                        assert!(use_small_decode_policy(
+                            Some(true),
+                            measured,
+                            rows,
+                            decode_rows,
+                            verify
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_scan_auto_keeps_unmeasured_shapes_on_the_original_path() {
+        for measured in [false, true] {
+            for rows in [0, 1, 2, 3, 4, 4096] {
+                for top in [0, 1, 511, 512] {
+                    for parallel in [false, true] {
+                        assert_eq!(
+                            use_qsa_topk_scan(None, measured, rows, top, parallel),
+                            measured && parallel && rows == 1 && top == 512
+                        );
+                        assert!(!use_qsa_topk_scan(
+                            Some(false),
+                            measured,
+                            rows,
+                            top,
+                            parallel
+                        ));
+                        assert!(use_qsa_topk_scan(Some(true), measured, rows, top, parallel));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_xe1_automatic_vram_caps_are_architecture_scoped() {
+        const GIB: u64 = 1 << 30;
+        let total = 16 * GIB;
+
+        assert_eq!(
+            automatic_device_vram_budget_cap(
+                total,
+                crate::caps::DeviceArch::IntelXe1,
+                infr_core::config::AutoProfile::Conservative,
+                false,
+                true,
+            ),
+            Some(12 * GIB),
+        );
+        assert_eq!(
+            automatic_device_vram_budget_cap(
+                total,
+                crate::caps::DeviceArch::IntelXe1,
+                infr_core::config::AutoProfile::Aggressive,
+                false,
+                true,
+            ),
+            Some(total * 85 / 100),
+        );
+
+        for (arch, explicit, windows) in [
+            (crate::caps::DeviceArch::AmdRdna3, false, true),
+            (crate::caps::DeviceArch::IntelXe2, false, true),
+            (crate::caps::DeviceArch::IntelXe1, true, true),
+            (crate::caps::DeviceArch::IntelXe1, false, false),
+        ] {
+            assert_eq!(
+                automatic_device_vram_budget_cap(
+                    total,
+                    arch,
+                    infr_core::config::AutoProfile::Conservative,
+                    explicit,
+                    windows,
+                ),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn default_device_prefers_the_largest_discrete_gpu() {
+        let gib = 1u64 << 30;
+        let devices = [
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 2 * gib),
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 24 * gib),
+            (vk::PhysicalDeviceType::INTEGRATED_GPU, 64 * gib),
+        ];
+        assert_eq!(preferred_device_index(&devices), 1);
+
+        let tied = [
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 24 * gib),
+            (vk::PhysicalDeviceType::DISCRETE_GPU, 24 * gib),
+        ];
+        assert_eq!(preferred_device_index(&tied), 0);
+
+        let integrated_only = [(vk::PhysicalDeviceType::INTEGRATED_GPU, 64 * gib)];
+        assert_eq!(preferred_device_index(&integrated_only), 0);
+    }
+
+    #[test]
+    fn windows_nvidia_discrete_vram_excludes_the_bar_alias_heap() {
+        let gib = 1u64 << 30;
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 3,
+            ..Default::default()
+        };
+        mp.memory_heaps[0] = vk::MemoryHeap {
+            size: 32 * gib,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+        mp.memory_heaps[1] = vk::MemoryHeap {
+            size: 64 * gib,
+            flags: vk::MemoryHeapFlags::empty(),
+        };
+        mp.memory_heaps[2] = vk::MemoryHeap {
+            size: 16 * gib,
+            flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
+        };
+
+        assert!(uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_NVIDIA,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            true,
+        ));
+        assert!(!uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_AMD,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            true,
+        ));
+        assert!(!uses_largest_device_local_heap_only(
+            crate::caps::VENDOR_NVIDIA,
+            vk::PhysicalDeviceType::DISCRETE_GPU,
+            false,
+        ));
+
+        assert_eq!(physical_vram_heap_mask(&mp, false, true), 0b001);
+        assert_eq!(physical_vram_heap_mask(&mp, false, false), 0b101);
+        assert_eq!(physical_vram_heap_mask(&mp, true, true), 0b111);
+    }
+
+    fn submit_sample(gpu_ns: u64, dispatches: usize) -> SubmitRoundStats {
+        SubmitRoundStats {
+            gpu_ns,
+            dispatches,
+            submits: 1,
+            max_submit_ns: gpu_ns,
+        }
+    }
+
+    fn submit_policy(profile: infr_core::config::AutoProfile) -> SubmitAutoPolicy {
+        SubmitAutoPolicy::new(SubmitAutoSettings::for_profile(profile))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn amd_windows_vram_keepalive_starts_only_on_the_fixed_submit_driver_branch() {
+        let mut probe = crate::caps::DeviceProbe {
+            driver_id: vk::DriverId::AMD_PROPRIETARY,
+            driver_id_reported: true,
+            ..Default::default()
+        };
+        assert!(!needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::AmdRdna3,
+            vk::make_api_version(0, 2, 0, 388),
+        ));
+        assert!(needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::AmdRdna3,
+            AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER,
+        ));
+        assert!(!needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::Other,
+            AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER,
+        ));
+        probe.driver_id = vk::DriverId::MESA_RADV;
+        assert!(!needs_amd_windows_vram_keepalive(
+            &probe,
+            crate::caps::DeviceArch::AmdRdna3,
+            AMD_WINDOWS_VRAM_KEEPALIVE_MIN_DRIVER,
+        ));
+    }
+
+    #[test]
+    fn unified_phase_registry_switches_only_between_distinct_clients() {
+        let primary = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let registry = UnifiedPhaseRegistry::new(&primary);
+
+        assert!(registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
+        assert!(!registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
+
+        let auxiliary = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let auxiliary_id = registry.register(&auxiliary);
+        assert!(registry.activate(auxiliary_id));
+        assert!(!registry.activate(auxiliary_id));
+        assert!(registry.activate(UnifiedPhaseRegistry::PRIMARY_ID));
+    }
+
+    struct RuntimeDropBuffer(Arc<AtomicUsize>);
+
+    impl Buffer for RuntimeDropBuffer {
+        fn len_bytes(&self) -> usize {
+            64
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for RuntimeDropBuffer {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counted_runtime() -> (Arc<Mutex<adapter::RuntimePhaseArena>>, Arc<AtomicUsize>) {
+        let arena = Arc::new(Mutex::new(adapter::RuntimePhaseArena::default()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        arena
+            .lock()
+            .unwrap()
+            .install_test_workspace(Box::new(RuntimeDropBuffer(Arc::clone(&drops))));
+        (arena, drops)
+    }
+
+    fn expire_runtime_after(reaper: &AuxiliaryRuntimeReaper, delay: Duration) {
+        let (state, changed) = &*reaper.state;
+        state.lock().unwrap().deadline = Some(Instant::now() + delay);
+        changed.notify_one();
+    }
+
+    fn wait_for_runtime_release(drops: &AtomicUsize) {
+        let limit = Instant::now() + Duration::from_secs(2);
+        while drops.load(Ordering::SeqCst) == 0 && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unified_phase_registry_retains_all_three_workspaces() {
+        let (primary, primary_drops) = counted_runtime();
+        let (embedding, embedding_drops) = counted_runtime();
+        let (vision, vision_drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let embedding_id = registry.register(&embedding);
+        let vision_id = registry.register(&vision);
+        let primary_id = UnifiedPhaseRegistry::PRIMARY_ID;
+        for id in [
+            primary_id,
+            embedding_id,
+            primary_id,
+            vision_id,
+            embedding_id,
+            primary_id,
+        ] {
+            registry.activate(id);
+        }
+        for drops in [&primary_drops, &embedding_drops, &vision_drops] {
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        drop(vision);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.reclaim_candidates(primary_id).len(), 1);
+    }
+
+    #[test]
+    fn unified_workspace_pressure_reclaims_auxiliary_before_primary() {
+        let (primary, primary_drops) = counted_runtime();
+        let (embedding, embedding_drops) = counted_runtime();
+        let (vision, vision_drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let current = registry.register(&embedding);
+        registry.register(&vision);
+        assert_eq!(registry.claim_with_reclaim(current, || Ok(7)).unwrap(), 7);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 0);
+        let claim = || {
+            if vision_drops.load(Ordering::SeqCst) == 1 {
+                Ok(9)
+            } else {
+                Err(be("no room"))
+            }
+        };
+        assert_eq!(registry.claim_with_reclaim(current, claim).unwrap(), 9);
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(embedding_drops.load(Ordering::SeqCst), 0);
+        assert!(registry
+            .claim_with_reclaim::<()>(current, || Err(be("still no room")))
+            .is_err());
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            embedding_drops.load(Ordering::SeqCst),
+            0,
+            "current workspace must never be reclaimed"
+        );
+    }
+
+    struct TestIdleReclaimer<F>(F);
+
+    impl<F: Fn() -> bool + Send + Sync> IdleResourceReclaimer for TestIdleReclaimer<F> {
+        fn try_reclaim_idle(&self) -> bool {
+            (self.0)()
+        }
+    }
+
+    fn test_idle_reclaimer(
+        f: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Arc<dyn IdleResourceReclaimer> {
+        Arc::new(TestIdleReclaimer(f))
+    }
+
+    #[test]
+    fn unified_embedding_pressure_keeps_successful_claims_unchanged() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let reclaimer =
+            test_idle_reclaimer(|| panic!("successful allocation must not evict weights"));
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        assert_eq!(registry.claim_with_reclaim(1, || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_frees_real_allocator_ranges_without_dropping_kv() {
+        use crate::unified::{UnifiedRangePool, UnifiedVramClass as Class};
+        let pool = UnifiedRangePool::new([4096]).unwrap();
+        let weights = Arc::new(Mutex::new(Some(
+            pool.allocate(3072, 256, Class::EmbeddingWeights).unwrap(),
+        )));
+        let kv = pool.allocate(512, 256, Class::KvCache).unwrap();
+        assert!(pool.allocate(1024, 256, Class::LlmRuntime).is_none());
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let callback_weights = Arc::clone(&weights);
+        let reclaimer = test_idle_reclaimer(move || {
+            let Ok(mut weights) = callback_weights.try_lock() else {
+                return false;
+            };
+            weights.take().is_some()
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let runtime = registry
+            .claim_with_reclaim(1, || {
+                pool.allocate(1024, 256, Class::LlmRuntime)
+                    .ok_or_else(|| be("no room"))
+            })
+            .unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.class_bytes(Class::EmbeddingWeights), 0);
+        assert_eq!(stats.class_bytes(Class::KvCache), 512);
+        assert_eq!(stats.class_bytes(Class::LlmRuntime), 1024);
+        drop(runtime);
+        drop(kv);
+        assert_eq!(pool.stats().free_bytes, 4096);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_runs_only_after_runtime_recovery_fails() {
+        let (primary, _) = counted_runtime();
+        let (runtime, drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let owner = registry.register(&runtime);
+        let released = Arc::new(AtomicBool::new(false));
+        let callback_released = Arc::clone(&released);
+        let callback_drops = Arc::clone(&drops);
+        let reclaimer = test_idle_reclaimer(move || {
+            assert_eq!(callback_drops.load(Ordering::SeqCst), 1);
+            callback_released.store(true, Ordering::SeqCst);
+            true
+        });
+        registry.register_idle_reclaimer(owner, Arc::downgrade(&reclaimer));
+        let attempts = AtomicUsize::new(0);
+        let result = registry.claim_with_reclaim(1, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            if released.load(Ordering::SeqCst) {
+                Ok(9)
+            } else {
+                Err(be("no room"))
+            }
+        });
+        assert_eq!(result.unwrap(), 9);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_keeps_weights_if_runtime_recovery_succeeds() {
+        let (primary, _) = counted_runtime();
+        let (runtime, drops) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let owner = registry.register(&runtime);
+        let reclaimer = test_idle_reclaimer(|| panic!("runtime alone satisfied the allocation"));
+        registry.register_idle_reclaimer(owner, Arc::downgrade(&reclaimer));
+        assert_eq!(
+            registry
+                .claim_with_reclaim(1, || {
+                    if drops.load(Ordering::SeqCst) == 1 {
+                        Ok(9)
+                    } else {
+                        Err(be("no room"))
+                    }
+                })
+                .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn unified_embedding_pressure_excludes_the_allocating_client() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let reclaimer = test_idle_reclaimer(|| panic!("current client's weights must stay pinned"));
+        registry.register_idle_reclaimer(1, Arc::downgrade(&reclaimer));
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || Err(be("no room")))
+            .is_err());
+    }
+
+    #[test]
+    fn unified_embedding_pressure_skips_busy_and_expired_callbacks() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let reclaimer = test_idle_reclaimer(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let expired = test_idle_reclaimer(|| panic!("expired callback"));
+        registry.register_idle_reclaimer(3, Arc::downgrade(&expired));
+        drop(expired);
+        let attempts = AtomicUsize::new(0);
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(be("no room"))
+            })
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.state.lock().unwrap().idle_reclaimers.len(), 1);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_retries_once_per_release_and_stops_after_success() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let released = Arc::new(AtomicUsize::new(0));
+        let callback_released = Arc::clone(&released);
+        let first = test_idle_reclaimer(move || {
+            callback_released.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let second = test_idle_reclaimer(|| panic!("stop after the first successful retry"));
+        registry.register_idle_reclaimer(2, Arc::downgrade(&first));
+        registry.register_idle_reclaimer(3, Arc::downgrade(&second));
+        let attempts = AtomicUsize::new(0);
+        assert_eq!(
+            registry
+                .claim_with_reclaim(1, || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if released.load(Ordering::SeqCst) != 0 {
+                        Ok(9)
+                    } else {
+                        Err(be("no room"))
+                    }
+                })
+                .unwrap(),
+            9
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unified_embedding_pressure_calls_back_without_holding_the_registry_lock() {
+        let (primary, _) = counted_runtime();
+        let registry = UnifiedPhaseRegistry::new(&primary);
+        let callback_registry = Arc::clone(&registry);
+        let reclaimer = test_idle_reclaimer(move || {
+            callback_registry.activate(1);
+            true
+        });
+        registry.register_idle_reclaimer(2, Arc::downgrade(&reclaimer));
+        let attempts = AtomicUsize::new(0);
+        assert!(registry
+            .claim_with_reclaim::<()>(1, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(be("still no room"))
+            })
+            .is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        drop(reclaimer);
+        assert!(registry.idle_reclaim_candidates(1).is_empty());
+    }
+
+    #[test]
+    fn auxiliary_runtime_deadline_is_five_seconds_and_refreshes() {
+        let (arena, drops) = counted_runtime();
+        let gate = Arc::new(RwLock::new(()));
+        let reaper = AuxiliaryRuntimeReaper::spawn(&arena, &gate).unwrap();
+        let before = Instant::now();
+        reaper.arm();
+        let first = reaper.state.0.lock().unwrap().deadline.unwrap();
+        assert!(first >= before + Duration::from_secs(5));
+        let deadline = AuxiliaryRuntimeDeadline {
+            deadline: Some(first),
+            stop: false,
+        };
+        assert!(!deadline.expired(first - Duration::from_nanos(1)));
+        assert!(deadline.expired(first));
+        reaper.arm();
+        assert!(reaper.state.0.lock().unwrap().deadline.unwrap() >= first);
+        drop(reaper);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn auxiliary_runtime_reaper_waits_for_gate_and_new_execute_refreshes_deadline() {
+        let (arena, drops) = counted_runtime();
+        let gate = Arc::new(RwLock::new(()));
+        let reaper = AuxiliaryRuntimeReaper::spawn(&arena, &gate).unwrap();
+        let exclusive = gate.write().unwrap();
+        expire_runtime_after(&reaper, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "in-flight commands retain their buffers"
+        );
+        reaper.arm();
+        drop(exclusive);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a new execute cancels stale expiry"
+        );
+        expire_runtime_after(&reaper, Duration::ZERO);
+        wait_for_runtime_release(&drops);
+    }
+
+    #[test]
+    fn auxiliary_runtime_reapers_are_independent_and_do_not_own_backends() {
+        let (embedding, embedding_drops) = counted_runtime();
+        let (vision, vision_drops) = counted_runtime();
+        let gate = Arc::new(RwLock::new(()));
+        let embedding_reaper = AuxiliaryRuntimeReaper::spawn(&embedding, &gate).unwrap();
+        let vision_reaper = AuxiliaryRuntimeReaper::spawn(&vision, &gate).unwrap();
+        assert_eq!(Arc::strong_count(&embedding), 1);
+        assert_eq!(Arc::strong_count(&gate), 1);
+        vision_reaper.arm();
+        expire_runtime_after(&embedding_reaper, Duration::ZERO);
+        wait_for_runtime_release(&embedding_drops);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 0);
+        drop(vision);
+        assert_eq!(vision_drops.load(Ordering::SeqCst), 1);
+        expire_runtime_after(&vision_reaper, Duration::ZERO);
+        drop(vision_reaper);
+        drop(embedding_reaper);
+    }
+
+    #[test]
+    fn automatic_paged_decode_uses_platform_cap_without_changing_explicit_overrides() {
+        assert_eq!(static_submit_mode(false, false, true, 31), (0, false));
+        assert_eq!(static_submit_mode(false, true, true, 31), (128, false));
+        assert_eq!(static_submit_mode(false, false, false, 31), (31, true));
+        assert_eq!(static_submit_mode(true, false, true, 37), (37, true));
+        assert_eq!(static_submit_mode(true, false, true, 0), (0, true));
+    }
+
+    #[test]
+    fn submit_auto_profiles_use_reduced_time_budgets() {
+        use infr_core::config::AutoProfile;
+        assert_eq!(
+            SubmitAutoSettings::for_profile(AutoProfile::Conservative).budget_ns,
+            150_000_000
+        );
+        assert_eq!(
+            SubmitAutoSettings::for_profile(AutoProfile::Aggressive).budget_ns,
+            300_000_000
+        );
+    }
+
+    #[test]
+    fn submit_auto_policy_samples_then_grows_geometrically() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        let sample = submit_sample(16_000_000, 160); // 100 us/dispatch, far below budget
+
+        let first = policy.observe_round(sample, 1);
+        assert_eq!((first.cap, first.stop), (16, None));
+        let second = policy.observe_round(sample, 1);
+        assert_eq!((second.cap, second.stop), (32, None));
+
+        assert_eq!(policy.observe_round(sample, 1).cap, 32);
+        let fourth = policy.observe_round(sample, 1);
+        assert_eq!((fourth.cap, fourth.stop), (64, None));
+    }
+
+    #[test]
+    fn submit_auto_policy_freezes_when_cap_stops_splitting() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        let sample = submit_sample(2_000_000, 12);
+        assert_eq!(policy.observe_round(sample, 0).stop, None);
+        let done = policy.observe_round(sample, 0);
+        assert_eq!(done.cap, AUTO_SUBMIT_INITIAL_CAP);
+        assert_eq!(done.stop, Some(SubmitTuneStop::NoSplit));
+    }
+
+    #[test]
+    fn aggressive_submit_auto_policy_explores_past_small_startup_graphs() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Aggressive);
+        let sample = submit_sample(2_000_000, 12);
+        let mut update = SubmitTuneUpdate {
+            cap: policy.cap,
+            stop: None,
+        };
+        for _ in 0..10 {
+            update = policy.observe_round(sample, 0);
+            if update.stop.is_some() {
+                break;
+            }
+        }
+        assert_eq!(update.cap, AGGRESSIVE_SUBMIT_EXPLORE_CAP);
+        assert_eq!(update.stop, Some(SubmitTuneStop::NoSplit));
+    }
+
+    #[test]
+    fn submit_auto_policy_tightens_immediately_on_over_budget_submit() {
+        for profile in [
+            infr_core::config::AutoProfile::Conservative,
+            infr_core::config::AutoProfile::Aggressive,
+        ] {
+            let mut policy = submit_policy(profile);
+            policy.cap = 64;
+            let done = policy.observe_round(submit_sample(policy.settings.budget_ns * 2, 64), 1);
+            assert_eq!(done.cap, 32);
+            assert_eq!(done.stop, Some(SubmitTuneStop::Budget));
+        }
+    }
+
+    #[test]
+    fn submit_auto_policy_has_a_finite_calibration_window() {
+        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
+        let sample = submit_sample(1_000, 1_000);
+        let mut done = None;
+        for _ in 0..AUTO_SUBMIT_MAX_ROUNDS {
+            let update = policy.observe_round(sample, 1);
+            if update.stop.is_some() {
+                done = Some(update);
+                break;
+            }
+        }
+        let done = done.expect("the tuner must stop at its fixed round limit");
+        assert_eq!(done.stop, Some(SubmitTuneStop::RoundLimit));
+        assert_eq!(policy.total_rounds, AUTO_SUBMIT_MAX_ROUNDS);
+    }
+
+    #[test]
+    fn fallback_vram_room_subtracts_tracked_allocations() {
+        const GIB: u64 = 1 << 30;
+        let fallback = VramInfo {
+            total: 16 * GIB,
+            available: 16 * GIB,
+            live: false,
+            uma: false,
+        };
+        assert_eq!(
+            backend_physical_alloc_room(fallback, 5 * GIB),
+            fallback.alloc_room() - 5 * GIB
+        );
+
+        let live = VramInfo {
+            available: 9 * GIB,
+            live: true,
+            ..fallback
+        };
+        assert_eq!(
+            backend_physical_alloc_room(live, 5 * GIB),
+            live.alloc_room(),
+            "a live heap budget already nets out tracked allocations"
+        );
+    }
+
+    #[test]
+    fn unified_ram_budget_caps_heap_sums_and_counts_overflow_once() {
+        const GIB: u64 = 1 << 30;
+        let ram = UnifiedRamBudget {
+            limit: Some(19 * GIB),
+            used: AtomicU64::new(0),
+        };
+        // Device-local weights plus overflow/staging all spend the same physical RAM.
+        ram.charge(8 * GIB);
+        ram.charge(3 * GIB);
+        for live in [false, true] {
+            let raw = VramInfo {
+                total: 48 * GIB,
+                available: 32 * GIB,
+                live,
+                uma: true,
+            };
+            let snapshot = ram.snapshot(raw, Some(28 * GIB));
+            assert!(snapshot.live);
+            assert_eq!(snapshot.available, 8 * GIB);
+            assert_eq!(
+                backend_physical_alloc_room(snapshot, 11 * GIB),
+                8 * GIB - GUARD_HEADROOM,
+                "the planner and allocator must not subtract the same UMA bytes twice"
+            );
+        }
+        ram.release(3 * GIB);
+        let raw = VramInfo {
+            total: 48 * GIB,
+            available: 32 * GIB,
+            live: true,
+            uma: true,
+        };
+        assert_eq!(ram.snapshot(raw, Some(28 * GIB)).available, 11 * GIB);
+        ram.release(8 * GIB);
+        assert_eq!(ram.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unified_ram_budget_preserves_frozen_target_and_driver_pressure() {
+        const GIB: u64 = 1 << 30;
+        let ram = UnifiedRamBudget {
+            limit: Some(19 * GIB),
+            used: AtomicU64::new(11 * GIB),
+        };
+        let raw = VramInfo {
+            total: 48 * GIB,
+            available: 32 * GIB,
+            live: true,
+            uma: true,
+        };
+        assert_eq!(
+            ram.snapshot(raw, Some(2 * GIB)).available,
+            8 * GIB,
+            "live host availability must not rewrite a frozen total-process target"
+        );
+        assert_eq!(
+            ram.snapshot(
+                VramInfo {
+                    available: GIB,
+                    ..raw
+                },
+                None
+            )
+            .available,
+            GIB
+        );
+        ram.charge(20 * GIB);
+        assert_eq!(ram.snapshot(raw, None).available, 0);
+
+        let unknown = UnifiedRamBudget {
+            limit: None,
+            used: AtomicU64::new(11 * GIB),
+        };
+        assert_eq!(
+            unknown.snapshot(raw, Some(2 * GIB)).available,
+            2 * GIB,
+            "live host availability remains the fallback when no startup target resolved"
+        );
+        assert_eq!(
+            unknown
+                .snapshot(VramInfo { live: false, ..raw }, None)
+                .available,
+            21 * GIB
+        );
+        assert_eq!(unknown.snapshot(raw, None).available, 32 * GIB);
+    }
+
+    #[test]
+    fn unified_ram_budget_ignores_transient_load_time_host_collapse() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let ram = UnifiedRamBudget {
+            limit: Some(50 * GIB + 154 * MIB),
+            used: AtomicU64::new(27 * GIB + 20 * MIB),
+        };
+        let raw = VramInfo {
+            total: 31 * GIB + 912 * MIB,
+            available: 19 * GIB + 760 * MIB,
+            live: true,
+            uma: true,
+        };
+        assert_eq!(
+            ram.snapshot(raw, Some(91 * MIB)).available,
+            raw.available,
+            "the driver heap, not transient Windows available RAM, is limiting here"
+        );
+    }
+
+    #[test]
+    #[ignore = "uses small Vulkan buffers with emulated UMA accounting; requires an idle GPU"]
+    fn unified_ram_budget_real_buffers_release_and_alias_once() {
+        const MIB: usize = 1 << 20;
+        let mut config = Config::default();
+        config.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(0));
+        config.kernels.vulkan.gemv.id_grid_buffer = Some(false);
+        let mut backend = VulkanBackend::new_with(Arc::new(config)).unwrap();
+        // No live buffers may predate the synthetic counter. Each owned VkBuffer retains Shared,
+        // so unique ownership here also verifies that there is nothing to charge retroactively.
+        let shared = Arc::get_mut(&mut backend.shared).expect("no live startup buffers");
+        shared.caps.unified_memory = true;
+        shared.unified_ram = Some(UnifiedRamBudget {
+            limit: Some((512 * MIB) as u64),
+            used: AtomicU64::new(0),
+        });
+        let tracking = Arc::clone(&backend.shared);
+        let weights = backend.alloc_uninit(4 * MIB, BufferUsage::Weights).unwrap();
+        let after_weights = tracking.budget_used();
+        assert!(after_weights >= (4 * MIB) as u64);
+        let staging = backend.alloc_uninit(4 * MIB, BufferUsage::Staging).unwrap();
+        assert!(tracking.budget_used() >= after_weights + (4 * MIB) as u64);
+        if backend.shared.host_overflow_type.is_some() {
+            let device_local = tracking.device_used.load(Ordering::Relaxed);
+            let before = tracking.budget_used();
+            let overflow = backend.alloc_kv_host(4 * MIB).unwrap();
+            assert!(tracking.budget_used() >= before + (4 * MIB) as u64);
+            assert_eq!(tracking.device_used.load(Ordering::Relaxed), device_local);
+            drop(overflow);
+            assert_eq!(tracking.budget_used(), before);
+        }
+        assert!(backend.check_vram_budget((512 * MIB) as u64).is_err());
+        let pool = backend.init_unified_vram(8 * MIB).unwrap();
+        let before_views = tracking.budget_used();
+        let a = backend
+            .alloc_unified(MIB, crate::unified::UnifiedVramClass::Expert)
+            .unwrap();
+        let b = backend
+            .alloc_unified(MIB, crate::unified::UnifiedVramClass::LlmRuntime)
+            .unwrap();
+        assert_eq!(
+            tracking.budget_used(),
+            before_views,
+            "views must not charge their parent again"
+        );
+        drop(a);
+        drop(b);
+        assert_eq!(tracking.budget_used(), before_views);
+        drop(pool);
+        drop(weights);
+        drop(staging);
+        drop(backend);
+        assert_eq!(
+            tracking.budget_used(),
+            0,
+            "all owned allocations must be released exactly once"
+        );
+    }
+
+    #[test]
+    fn only_queue_submit_memory_pressure_is_retryable() {
+        assert!(retryable_queue_submit_error(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+        ));
+        assert!(retryable_queue_submit_error(
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+        ));
+        assert!(!retryable_queue_submit_error(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!retryable_queue_submit_error(vk::Result::ERROR_UNKNOWN));
+    }
+
+    #[test]
+    fn only_driver_allocation_oom_is_retryable() {
+        assert!(retryable_allocation_error(
+            &gpu_allocator::AllocationError::OutOfMemory
+        ));
+        assert!(!retryable_allocation_error(
+            &gpu_allocator::AllocationError::NoCompatibleMemoryTypeFound
+        ));
+        assert!(!retryable_allocation_error(
+            &gpu_allocator::AllocationError::InvalidAllocationCreateDesc
+        ));
+    }
+
+    #[test]
+    fn host_import_selector_spreads_a_finite_budget_proportionally() {
+        const GIB: usize = 1 << 30;
+        let totals = [23 * GIB, 12 * GIB, 10 * GIB];
+        let mut imported = [0usize; 3];
+
+        // Fourteen ordinary 2-GiB shards plus the recovered 1-GiB tail model the measured
+        // 29-GiB Windows limit. The old arena-at-a-time order produced [23, 6, 0].
+        for shard in (0..15).map(|index| if index == 14 { GIB } else { 2 * GIB }) {
+            let progress: Vec<_> = imported.into_iter().zip(totals).collect();
+            let index = proportional_import_index(&progress).expect("an arena still needs import");
+            imported[index] += shard.min(totals[index] - imported[index]);
+        }
+
+        assert_eq!(imported.iter().sum::<usize>(), 29 * GIB);
+        for (&got, &total) in imported.iter().zip(&totals) {
+            let fraction = got as f64 / total as f64;
+            assert!(
+                (0.55..=0.75).contains(&fraction),
+                "arena coverage {got}/{total} is not proportional: {imported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_import_selector_breaks_equal_fraction_ties_by_arena_size() {
+        assert_eq!(
+            proportional_import_index(&[(0, 10), (0, 30), (0, 20)]),
+            Some(1)
+        );
+        assert_eq!(
+            proportional_import_index(&[(5, 10), (15, 30), (10, 20)]),
+            Some(1)
+        );
+        assert_eq!(proportional_import_index(&[(10, 10), (30, 30)]), None);
+    }
+
+    /// A `Buffer` impl that is NOT a `VkBuffer` — stands in for what the multi-backend paths can
+    /// actually hand a Vulkan op (another backend's buffer, or a `TpBuffer`/`EpBuffer` wrapper).
+    struct ForeignBuffer {
+        size: usize,
+    }
+    impl Buffer for ForeignBuffer {
+        fn len_bytes(&self) -> usize {
+            self.size
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// `as_vk_buf` must REJECT a buffer this backend did not allocate. Before the checked downcast
+    /// it reinterpreted any `&dyn Buffer`'s data pointer as a `VkBuffer` — a foreign struct's
+    /// leading bytes became a `vk::Buffer` handle and offsets, which then went to the driver. Since
+    /// `infr multi` hosts several backends in one process (and the MTP draft path can mix them),
+    /// this is a reachable mis-route, and it must be an `Error::Backend` rather than memory
+    /// corruption. Needs no GPU: the downcast is pure type identity.
+    #[test]
+    fn as_vk_buf_rejects_a_foreign_buffer() {
+        let foreign = ForeignBuffer { size: 4096 };
+        let err = as_vk_buf(&foreign).map(|_| ());
+        match err {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("not allocated by this VulkanBackend") && msg.contains("4096"),
+                    "error should say the buffer is foreign and report what it could see: {msg}"
+                );
+            }
+            Ok(()) => panic!("a non-VkBuffer must not downcast to &VkBuffer"),
+        }
+    }
+
+    /// Finding #2: the device-local zero-init fill must cover the WHOLE logical extent, not the old
+    /// `size / 4 * 4` truncation that left the trailing 1-3 bytes of a non-multiple-of-4 buffer
+    /// holding recycled VRAM. `fill_span` rounds UP to the 4-byte multiple `vkCmdFillBuffer` needs,
+    /// and the buffer is CREATED at that same span so the fill stays in-bounds.
+    #[test]
+    fn fill_span_covers_the_whole_buffer() {
+        // 4-aligned sizes are unchanged (identity) — every current tensor, so the fill is
+        // byte-for-byte what it was.
+        for aligned in [0usize, 4, 8, 64, 4096] {
+            assert_eq!(
+                fill_span(aligned),
+                aligned as u64,
+                "4-aligned size is identity"
+            );
+        }
+        // Non-multiple-of-4 sizes round UP and FULLY cover the logical extent (never truncate).
+        for size in [1usize, 2, 3, 5, 6, 7, 13, 4095] {
+            let span = fill_span(size);
+            assert!(
+                span >= size as u64,
+                "fill must reach the last byte of size {size}"
+            );
+            assert!(
+                span - size as u64 <= 3,
+                "rounds up by at most 3 bytes (size {size})"
+            );
+            assert_eq!(
+                span % 4,
+                0,
+                "vkCmdFillBuffer size must be a 4-byte multiple"
+            );
+            // The key regression guard: the OLD truncation would drop the tail.
+            assert!(
+                span > (size / 4 * 4) as u64,
+                "must not truncate the tail of size {size}"
+            );
+        }
+    }
+
+    /// The transfer bounds guard shared by `upload`/`download`/`copy_buffer` (no GPU needed — this
+    /// is why the check is a free function over two `usize`s instead of inline in each method).
+    ///
+    /// `download` used to have NO guard at all: it `copy_nonoverlapping`'d `dst.len()` bytes out of
+    /// the source's mapping, so an oversize host slice read past the end of the buffer. `copy_buffer`
+    /// checked neither side. The boundary that matters is `bytes == size` — a full-buffer transfer is
+    /// legal and every real caller sits exactly there.
+    #[test]
+    fn check_extent_rejects_only_out_of_bounds_transfers() {
+        // In-bounds, including the exact-fit and empty edges: never an error.
+        for bytes in [0usize, 1, 31, 32] {
+            assert!(
+                check_extent("download", "out of", bytes, 32).is_ok(),
+                "{bytes} bytes out of a 32-byte buffer is in bounds"
+            );
+        }
+        // One past the end, and the pathological ask.
+        assert!(check_extent("download", "out of", 33, 32).is_err());
+        assert!(check_extent("copy_buffer", "into", usize::MAX, 32).is_err());
+        // A zero-length buffer accepts only a zero-length transfer.
+        assert!(check_extent("upload", "into", 0, 0).is_ok());
+        assert!(check_extent("upload", "into", 1, 0).is_err());
+        // The message keeps `upload`'s long-standing wording (it is the template the other two
+        // callers were written to match), so a failure reads the same whichever path raised it.
+        let msg = check_extent("upload", "into", 64, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("upload: 64 bytes into a 32-byte buffer"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    /// `INFR_DEV` index resolution (no GPU needed). Now the SINGLE device-selection env, it can hold
+    /// `metal`/`cpu` — the Vulkan reader must TOLERATE those (fall back to the discrete default,
+    /// `None`) rather than hard-erroring — while still hard-erroring on an out-of-range/garbage
+    /// Vulkan index (typo protection preserved).
+    #[test]
+    fn infr_dev_index_tolerates_non_vulkan_specs() {
+        let names: Vec<String> = vec!["Vulkan0=A".into(), "Vulkan1=B".into()];
+        // Unset / empty → discrete default.
+        assert_eq!(resolve_infr_dev_index(None, &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some(""), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("  "), &names).unwrap(), None);
+        // metal / cpu (case-insensitive) → tolerated, discrete default (NOT an error).
+        assert_eq!(resolve_infr_dev_index(Some("metal"), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("cpu"), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("Metal"), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("CPU"), &names).unwrap(), None);
+        // Valid Vulkan indices (VulkanN / bare N), case-insensitive.
+        assert_eq!(
+            resolve_infr_dev_index(Some("Vulkan0"), &names).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_infr_dev_index(Some("vulkan1"), &names).unwrap(),
+            Some(1)
+        );
+        assert_eq!(resolve_infr_dev_index(Some("1"), &names).unwrap(), Some(1));
+        // Out-of-range → HARD ERROR (typo protection).
+        assert!(resolve_infr_dev_index(Some("Vulkan99"), &names).is_err());
+        // Unparseable Vulkan spec → HARD ERROR.
+        assert!(resolve_infr_dev_index(Some("VulkanX"), &names).is_err());
+    }
+
+    /// A `Config` built as a VALUE reaches `pick_default_device` (S5a): `device.dev` is threaded in
+    /// as a parameter, so the two consumers of the one raw string (`infr-cli`'s `parse_dev_spec`
+    /// and this crate's index resolver, §10.8) each keep their own parse and neither reads the
+    /// environment. No GPU needed — this pins the plumbing, `dev_from_config_selects_the_device`
+    /// below pins the effect.
+    #[test]
+    fn config_device_dev_feeds_the_index_resolver() {
+        let names: Vec<String> = vec!["Vulkan0=A".into(), "Vulkan1=B".into()];
+        let spec = |v: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.device.dev = v.map(str::to_string);
+            resolve_infr_dev_index(cfg.device.dev.as_deref(), &names)
+        };
+        assert_eq!(spec(None).unwrap(), None, "unset ⇒ the discrete default");
+        assert_eq!(spec(Some("Vulkan1")).unwrap(), Some(1));
+        assert_eq!(
+            spec(Some("metal")).unwrap(),
+            None,
+            "tolerated, not an error"
+        );
+        assert!(spec(Some("Vulkan99")).is_err(), "typo protection preserved");
+    }
+
+    /// `kernels.vulkan.pipeline_cache_disk = false` (`INFR_NO_PIPELINE_CACHE`) must suppress DISK
+    /// persistence — the whole knob — while the default keeps it. Driven through the field, not the
+    /// environment (R7); no GPU needed since the constructor only reads properties + `$HOME`.
+    #[test]
+    fn pipeline_cache_disk_flag_gates_persistence() {
+        let props = vk::PhysicalDeviceProperties::default();
+        assert!(
+            crate::pcache::PcachePersist::new(&props, false).is_none(),
+            "cleared `pipeline_cache_disk` must disable on-disk persistence"
+        );
+        // The default is ON; it can still be `None` when there is no cache dir (no `HOME`/
+        // `XDG_CACHE_HOME`), which is not this knob's doing — assert only the knob's direction.
+        let has_cache_dir =
+            std::env::var_os("XDG_CACHE_HOME").is_some() || std::env::var_os("HOME").is_some();
+        assert_eq!(
+            crate::pcache::PcachePersist::new(&props, true).is_some(),
+            has_cache_dir,
+            "with the flag set, persistence is on iff a cache dir exists"
+        );
+    }
+
+    /// §5.2, on real hardware: the capability MASKERS are configuration, `Capabilities` stays a
+    /// probe result. Clearing `kernels.vulkan.f16` must drop `caps.f16` AND `caps.f16_coopmat()`
+    /// (f16 is a coopmat prerequisite — the AND `INFR_NO_F16` has always implied); clearing
+    /// `coopmat` alone must drop the coopmat tiers while LEAVING `caps.f16` up; clearing `i8_dot`
+    /// must drop `caps.i8_dot` alone. Each backend is built from a VALUE — no env, no `EnvGuard`,
+    /// no ordering hazard (R7).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_masks_the_capability_probe() {
+        let build = |f: &dyn Fn(&mut Config)| {
+            let mut cfg = Config::default();
+            f(&mut cfg);
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let base = build(&|_| {});
+        let (f16, cm, i8dot) = {
+            let c = base.caps();
+            (c.f16, c.f16_coopmat(), c.i8_dot)
+        };
+        drop(base);
+        println!("baseline caps: f16={f16} f16cm={cm} i8dot={i8dot}");
+
+        let no_f16 = build(&|c| c.kernels.vulkan.f16 = false);
+        assert!(!no_f16.caps().f16, "`f16 = false` must clear caps.f16");
+        assert!(
+            !no_f16.caps().f16_coopmat(),
+            "f16 is a coopmat prerequisite: clearing it must drop coopmat too"
+        );
+        drop(no_f16);
+
+        let no_cm = build(&|c| c.kernels.vulkan.coopmat = false);
+        assert!(
+            !no_cm.caps().f16_coopmat(),
+            "`coopmat = false` must drop the f16 coopmat tier"
+        );
+        assert_eq!(
+            no_cm.caps().f16,
+            f16,
+            "`coopmat = false` must NOT touch plain f16"
+        );
+        drop(no_cm);
+
+        let no_i8 = build(&|c| c.kernels.vulkan.i8_dot = false);
+        assert!(
+            !no_i8.caps().i8_dot,
+            "`i8_dot = false` must clear caps.i8_dot"
+        );
+        assert_eq!(no_i8.caps().f16, f16, "i8_dot must not perturb f16");
+    }
+
+    /// `device.subgroup_pref` (`INFR_SG`) reaches `caps.sg_pref`, and a value the kernel set has no
+    /// builds for is still refused LOUDLY — the policy moved to the consumer (R5) but did not
+    /// vanish. `16` is only pinnable where the device's subgroup range admits it; on RADV wave32
+    /// the documented fallback to 32 applies, so assert the reachable outcome rather than the
+    /// request.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_subgroup_pref_drives_sg_pref() {
+        let build = |sg: Option<u32>| {
+            let mut cfg = Config::default();
+            cfg.device.subgroup_pref = sg;
+            VulkanBackend::new_with(Arc::new(cfg))
+        };
+        let be32 = build(Some(32)).expect("sg_pref 32 is always pinnable");
+        assert_eq!(be32.caps().sg_pref, 32);
+        let (min, max) = (be32.caps().subgroup_min, be32.caps().subgroup_max);
+        drop(be32);
+
+        let be16 = build(Some(16)).expect("sg_pref 16 request");
+        let want16 = min <= 16 && 16 <= max;
+        assert_eq!(
+            be16.caps().sg_pref,
+            if want16 { 16 } else { 32 },
+            "a 16 request is honored iff the range [{min}, {max}] can pin it, else it falls back"
+        );
+        drop(be16);
+
+        let msg = match build(Some(17)) {
+            Ok(_) => panic!("subgroup_pref 17 must be refused: no subgroup-17 kernel builds exist"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("must be 16 or 32") && msg.contains("INFR_SG"),
+            "the loud rejection kept its wording: {msg}"
+        );
+    }
+
+    /// `kernels.vulkan.push_desc = false` (`INFR_NO_PUSH_DESC`) forces the pooled-classic
+    /// descriptor path even where `VK_KHR_push_descriptor` exists — the loader must be absent, so
+    /// the extension is genuinely not enabled on the logical device (a faithful simulation, not a
+    /// flag flip). Skips itself on a device that has no push descriptors to drop.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_push_desc_forces_the_pooled_fallback() {
+        let build = |on: bool| {
+            let mut cfg = Config::default();
+            cfg.kernels.vulkan.push_desc = on;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let dflt = build(true);
+        let available = dflt.shared.push_descriptor.is_some();
+        drop(dflt);
+        if !available {
+            eprintln!("skip: this device does not expose VK_KHR_push_descriptor");
+            return;
+        }
+        assert!(
+            build(false).shared.push_descriptor.is_none(),
+            "`push_desc = false` must drop the push-descriptor loader"
+        );
+    }
+
+    /// `kernels.vulkan.no_vram_guard` (`INFR_NO_VRAM_GUARD`) — a SANCTIONED negative field (§4).
+    /// Set, it turns the alloc-time budget check into a no-op; clear, an ask several times the
+    /// device's capacity is refused. Drives `check_vram_budget` directly, so it asserts the guard
+    /// itself and allocates nothing.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_no_vram_guard_disables_the_budget_check() {
+        let build = |off: bool| {
+            let mut cfg = Config::default();
+            cfg.kernels.vulkan.no_vram_guard = off;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let guarded = build(false);
+        let huge = guarded.vram().total.saturating_mul(4);
+        assert!(
+            guarded.check_vram_budget(huge).is_err(),
+            "the guard must refuse {huge} bytes on a device with {} total",
+            guarded.vram().total
+        );
+        // The sub-MiB skip is unconditional and unchanged.
+        assert!(guarded.check_vram_budget(1024).is_ok());
+        drop(guarded);
+
+        let unguarded = build(true);
+        assert!(
+            unguarded.check_vram_budget(huge).is_ok(),
+            "`no_vram_guard = true` must make the check a no-op"
+        );
+    }
+
+    /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) bypasses automatic calibration, with
+    /// `0` meaning "never split" and a positive number remaining fixed.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_submit_dispatches_overrides_the_splitter_cap() {
+        let build = |n: Option<usize>| {
+            let mut cfg = Config::default();
+            cfg.device.submit_dispatches = n;
+            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
+        };
+        let dflt = build(None);
+        let integrated = dflt.caps().integrated;
+        assert_eq!(
+            dflt.submit_dispatch_cap(),
+            if dflt.shared.submit_tune_active.load(Ordering::Acquire) {
+                AUTO_SUBMIT_INITIAL_CAP
+            } else {
+                infr_core::initial_submit_dispatch_cap(integrated)
+            }
+        );
+        assert_eq!(
+            dflt.replay_submit_dispatch_cap(),
+            infr_core::initial_submit_dispatch_cap(integrated)
+        );
+        drop(dflt);
+        let fixed = build(Some(7));
+        assert_eq!(fixed.submit_dispatch_cap(), 7);
+        assert!(!fixed.shared.submit_tune_active.load(Ordering::Acquire));
+        drop(fixed);
+
+        let disabled = build(Some(0));
+        assert_eq!(disabled.submit_dispatch_cap(), 0, "0 = no split");
+        assert!(!disabled.shared.submit_tune_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn staging_drain_serializes_wait_cleanup_and_empty_observers() {
+        use std::sync::mpsc;
+        let slot = Mutex::new(Some(()));
+        let cleaned = AtomicBool::new(false);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let slot_ref = &slot;
+            let cleaned_ref = &cleaned;
+            let first = scope.spawn(move || {
+                drain_staging_resource(
+                    slot_ref,
+                    |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    },
+                    |_| cleaned_ref.store(true, Ordering::Release),
+                )
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // A ring taken out before the wait would leave this lock available: the original bug.
+            assert!(
+                slot.try_lock().is_err(),
+                "drain must keep the mutex through the fence wait"
+            );
+            let second = scope.spawn(|| {
+                drain_staging_resource(
+                    &slot,
+                    |_| panic!("second drainer must observe completed cleanup"),
+                    |_| panic!("resource cleaned twice"),
+                )
+                .unwrap();
+                assert!(cleaned.load(Ordering::Acquire));
+            });
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap(), Ok(()));
+            second.join().unwrap();
+        });
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn staging_drain_wait_error_retains_sources_and_destinations_until_retry() {
+        let source = Arc::new(());
+        let destination = Arc::new(());
+        let source_weak = Arc::downgrade(&source);
+        let destination_weak = Arc::downgrade(&destination);
+        let slot = Mutex::new(Some((source, destination)));
+        assert_eq!(
+            drain_staging_resource(&slot, |_| Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY), drop),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        );
+        assert!(slot.lock().unwrap().is_some());
+        assert!(source_weak.upgrade().is_some());
+        assert!(destination_weak.upgrade().is_some());
+        assert_eq!(drain_staging_resource(&slot, |_| Ok(()), drop), Ok(()));
+        assert!(source_weak.upgrade().is_none());
+        assert!(destination_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn staging_drain_device_loss_cleans_up_but_remains_an_error() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let slot = Mutex::new(Some(resource));
+        assert_eq!(
+            drain_staging_resource(&slot, |_| Err(vk::Result::ERROR_DEVICE_LOST), drop),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert!(slot.lock().unwrap().is_none());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn staging_drain_poisoned_mutex_returns_error_without_cleanup_or_panic() {
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let slot = Mutex::new(Some(resource));
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = slot.lock().unwrap();
+                    panic!("inject poisoned staging state");
+                })
+                .join()
+                .is_err());
+        });
+        assert_eq!(
+            drain_staging_resource(
+                &slot,
+                |_| panic!("poisoned state must not be trusted"),
+                |_| panic!("pending resource must be retained")
+            ),
+            Err(vk::Result::ERROR_UNKNOWN)
+        );
+        assert!(weak.upgrade().is_some());
+        assert!(slot.lock().unwrap_err().into_inner().is_some());
+    }
+
+    #[test]
+    fn resident_bda_block_floor_grows_only_for_small_tensor_blocks() {
+        const MIB: u64 = 1024 * 1024;
+        let max = 4 * 1024 * MIB;
+
+        let (first, floor) = bda_block_geometry(MIB, BDA_BLOCK_MIN, max);
+        assert_eq!((first, floor), (64 * MIB, 128 * MIB));
+        let (second, floor) = bda_block_geometry(MIB, floor, max);
+        assert_eq!((second, floor), (128 * MIB, 256 * MIB));
+        let (third, floor) = bda_block_geometry(MIB, floor, max);
+        assert_eq!((third, floor), (256 * MIB, 256 * MIB));
+
+        let (large, unchanged) = bda_block_geometry(300 * MIB, 128 * MIB, max);
+        assert_eq!(large, 300 * MIB, "large tensors keep exact-size blocks");
+        assert_eq!(
+            unchanged,
+            128 * MIB,
+            "large tensors do not advance the floor"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_roundtrip_and_finish() {
+        let be = VulkanBackend::new().unwrap();
+        let before = be.resident_weight_allocation_stats();
+        let sizes = [1000usize, 4096, 300_000];
+        assert!(be.resident_weight_allocations_supported(&sizes));
+        if let Ok(oversize) = usize::try_from(be.resident_weight_allocation_limit() + 1) {
+            assert!(!be.resident_weight_allocations_supported(&[oversize]));
+        }
+        let budget_before_query = be.shared.budget_used();
+        let planned_bytes = be.resident_weight_allocation_bytes(&sizes).unwrap();
+        assert_eq!(be.resident_weight_allocation_bytes(&[]).unwrap(), 0);
+        assert_eq!(
+            be.shared.budget_used(),
+            budget_before_query,
+            "planning must not allocate memory"
+        );
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        let mut batch = (&be as &dyn Backend)
+            .begin_weight_allocation_batch(&sizes)
+            .unwrap()
+            .unwrap();
+        assert!(be.begin_weight_allocation_batch(&[]).is_err());
+        let prepared = be.resident_weight_allocation_stats();
+        assert_eq!(
+            prepared.physical_allocation_bytes - before.physical_allocation_bytes,
+            planned_bytes
+        );
+        assert_eq!(prepared.block_count, before.block_count + 1);
+        assert_eq!(prepared.requested_bytes - before.requested_bytes, 305_096);
+        assert_eq!(
+            prepared.capacity_bytes - before.capacity_bytes,
+            prepared.padded_bytes - before.padded_bytes
+        );
+        assert!(
+            prepared.physical_allocation_bytes - before.physical_allocation_bytes
+                >= prepared.capacity_bytes - before.capacity_bytes
+        );
+        let mut buffers = Vec::new();
+        for (index, &size) in sizes.iter().enumerate() {
+            let buf = be.alloc(size, BufferUsage::Weights).unwrap();
+            let view = as_vk_buf(buf.as_ref()).unwrap();
+            assert_eq!(
+                view.sub_offset as u64 % be.shared.resident_weight_alignment,
+                0
+            );
+            assert_eq!(
+                buf.device_addr().unwrap(),
+                match &view.backing {
+                    Backing::BdaSub(block) => block.base_addr + view.sub_offset as u64,
+                    _ => panic!("expected packed BDA view"),
+                }
+            );
+            be.upload(buf.as_ref(), &vec![(index + 1) as u8; size])
+                .unwrap();
+            buffers.push(buf);
+        }
+        assert!(
+            be.alloc(1, BufferUsage::Weights).is_err(),
+            "exhaustion must not fallback"
+        );
+        batch.finish().unwrap();
+        batch.finish().unwrap();
+        assert_eq!(be.resident_weight_allocation_stats(), prepared);
+        // A finished guard can remain alive while another batch starts; dropping it is harmless.
+        let next = be.begin_weight_allocation_batch(&[]).unwrap().unwrap();
+        drop(batch);
+        assert!(be.alloc(1, BufferUsage::Weights).is_err());
+        drop(next);
+        for (index, buf) in buffers.iter().enumerate() {
+            let mut bytes = vec![0; sizes[index]];
+            be.download(buf.as_ref(), &mut bytes).unwrap();
+            assert_eq!(bytes, vec![(index + 1) as u8; sizes[index]]);
+        }
+        // Non-batched callers resume their normal allocation path after finish/drop.
+        be.alloc(128, BufferUsage::Weights).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_rollback_and_unexpected_allocation() {
+        let be = VulkanBackend::new().unwrap();
+        let old = be.alloc(64, BufferUsage::Weights).unwrap();
+        be.upload(old.as_ref(), &[17; 64]).unwrap();
+        let before = be.resident_weight_allocation_stats();
+        let physical_before = be.shared.budget_used();
+        // Early exit before consuming any view releases the complete reservation.
+        drop(be.begin_weight_allocation_batch(&[4096]).unwrap().unwrap());
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        assert_eq!(be.shared.budget_used(), physical_before);
+        let mut batch = be
+            .begin_weight_allocation_batch(&[1000, 2048])
+            .unwrap()
+            .unwrap();
+        let prepared = be.resident_weight_allocation_stats();
+        assert!(be.alloc(2048, BufferUsage::Weights).is_err());
+        assert!(batch.finish().is_err());
+        // Non-weight allocations do not consume or bypass the active weight sequence.
+        be.alloc(16, BufferUsage::Activations).unwrap();
+        let escaped = be.alloc(1000, BufferUsage::Weights).unwrap();
+        be.upload(escaped.as_ref(), &[53; 1000]).unwrap();
+        assert!(batch.finish().is_err());
+        assert_eq!(be.resident_weight_allocation_stats(), prepared);
+        drop(batch);
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        // The dropped batch's subview still owns its block. A later normal allocation must not
+        // reuse that range or invalidate old blocks, even if an old arena tail can satisfy it.
+        let ordinary = be.alloc(1000, BufferUsage::Weights).unwrap();
+        be.upload(ordinary.as_ref(), &[91; 1000]).unwrap();
+        let mut bytes = [0; 1000];
+        be.download(escaped.as_ref(), &mut bytes).unwrap();
+        assert_eq!(bytes, [53; 1000]);
+        let mut old_bytes = [0; 64];
+        be.download(old.as_ref(), &mut old_bytes).unwrap();
+        assert_eq!(old_bytes, [17; 64]);
+        // Mismatches leave the expected cursor unchanged, so a caller may recover and finish.
+        let mut retry = be.begin_weight_allocation_batch(&[32]).unwrap().unwrap();
+        assert!(be.alloc(64, BufferUsage::Weights).is_err());
+        be.alloc(32, BufferUsage::Weights).unwrap();
+        retry.finish().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_close_drains_uploads_before_progress_drop() {
+        for finish in [false, true] {
+            let be = VulkanBackend::new().unwrap();
+            let before = be.resident_weight_allocation_stats();
+            // Match loader declaration order: batch drops before buffers, progress drops last.
+            let progress = be.weight_progress(Some(8192));
+            let mut buffers = Vec::new();
+            let mut batch = be
+                .begin_weight_allocation_batch(&[4096, 4096])
+                .unwrap()
+                .unwrap();
+            let first = be.bda_weight_alloc(4096).unwrap();
+            let block = match &first.backing {
+                Backing::BdaSub(block) => Arc::downgrade(block),
+                _ => panic!("expected packed weight subview"),
+            };
+            // Call the async path directly so mapped/UMA devices exercise pending copies too.
+            be.upload_staged_ring(first.buffer, first.sub_offset as u64, &[41; 4096])
+                .unwrap();
+            buffers.push(first);
+            if finish {
+                let second = be.bda_weight_alloc(4096).unwrap();
+                be.upload_staged_ring(second.buffer, second.sub_offset as u64, &[83; 4096])
+                    .unwrap();
+                buffers.push(second);
+            }
+            assert!(be
+                .shared
+                .staging_ring
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|ring| ring.busy.iter().any(|&busy| busy)));
+            if finish {
+                batch.finish().unwrap();
+            }
+            drop(batch);
+            assert!(be.shared.staging_ring.lock().unwrap().is_none());
+            assert!(
+                be.shared.weight_pb.lock().unwrap().is_some(),
+                "progress still alive"
+            );
+            if !finish {
+                assert_eq!(be.resident_weight_allocation_stats(), before);
+            }
+            // The escaped view is safe to read and then free before progress finally drains.
+            let mut bytes = [0; 4096];
+            be.download(&buffers[0], &mut bytes).unwrap();
+            assert_eq!(bytes, [41; 4096]);
+            if finish {
+                be.download(&buffers[1], &mut bytes).unwrap();
+                assert_eq!(bytes, [83; 4096]);
+            }
+            drop(buffers);
+            assert_eq!(
+                block.upgrade().is_some(),
+                finish,
+                "only successful finish retains the arena's block reference"
+            );
+            drop(progress);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_descriptor_compute_uses_distinct_offsets() {
+        let be = VulkanBackend::new().unwrap();
+        let mut batch = be
+            .begin_weight_allocation_batch(&[16, 16, 16])
+            .unwrap()
+            .unwrap();
+        let a = be.alloc(16, BufferUsage::Weights).unwrap();
+        let b = be.alloc(16, BufferUsage::Weights).unwrap();
+        let y = be.alloc(16, BufferUsage::Weights).unwrap();
+        be.upload(a.as_ref(), bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0]))
+            .unwrap();
+        be.upload(
+            b.as_ref(),
+            bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]),
+        )
+        .unwrap();
+        batch.finish().unwrap();
+        let recorder = Recorder::new(&be).unwrap();
+        recorder.add(a.as_ref(), b.as_ref(), y.as_ref(), 4);
+        recorder.finish().unwrap();
+        let mut values = [0.0f32; 4];
+        be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [11.0, 22.0, 33.0, 44.0]);
+        // Re-read both inputs after the output write in the same physical buffer.
+        be.download(a.as_ref(), bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [1.0, 2.0, 3.0, 4.0]);
+        be.download(b.as_ref(), bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[ignore = "requires a Vulkan GPU with roughly half its supported block cap free"]
+    fn packed_resident_weights_descriptor_compute_large_offsets() {
+        let be = VulkanBackend::new().unwrap();
+        let cap = be.shared.resident_weight_block_cap;
+        let alignment = be.shared.resident_weight_alignment;
+        // Exercise >1 GiB offsets on a 2 GiB-cap device, and >2 GiB on a 4 GiB-cap device.
+        // Honor the real device cap and reserve all three aligned payload spans in the same block.
+        let prefix_bytes =
+            ((cap / 2).next_multiple_of(alignment) + 256).next_multiple_of(alignment);
+        let payload_padded_bytes = 3 * 16u64.next_multiple_of(alignment);
+        let capacity_bytes = prefix_bytes + payload_padded_bytes;
+        assert!(
+            capacity_bytes <= cap,
+            "large-offset test must fit the supported block cap"
+        );
+        eprintln!(
+            "packed resident large offsets: supported_block_cap={cap} alignment={alignment} \
+             prefix_bytes={prefix_bytes} payload_padded_bytes={payload_padded_bytes} \
+             capacity_bytes={capacity_bytes}"
+        );
+        let prefix_size = usize::try_from(prefix_bytes).unwrap();
+        let before = be.resident_weight_allocation_stats();
+        let mut batch = be
+            .begin_weight_allocation_batch(&[prefix_size, 16, 16, 16])
+            .unwrap()
+            .unwrap();
+        // Deliberately use the raw uninitialized allocator for the prefix: Backend::alloc_uninit
+        // poisons the entire range in debug builds. Never fill/upload/read this large view.
+        let prefix = be.bda_weight_alloc(prefix_size).unwrap();
+        let a = be.bda_weight_alloc(16).unwrap();
+        let b = be.bda_weight_alloc(16).unwrap();
+        let y = be.bda_weight_alloc(16).unwrap();
+        assert_eq!(prefix.buffer, a.buffer);
+        assert_eq!(a.sub_offset as u64, prefix_bytes);
+        assert_eq!(a.buffer, b.buffer);
+        assert_eq!(b.buffer, y.buffer);
+        for view in [&a, &b, &y] {
+            assert!(view.sub_offset as u64 > cap / 2);
+            assert_eq!(
+                view.device_addr().unwrap(),
+                prefix.device_addr().unwrap() + view.sub_offset as u64
+            );
+        }
+        assert_eq!(
+            be.resident_weight_allocation_stats().block_count,
+            before.block_count + 1
+        );
+        be.upload(&a, bytemuck::cast_slice(&[1.0f32, 2.0, 3.0, 4.0]))
+            .unwrap();
+        be.upload(&b, bytemuck::cast_slice(&[10.0f32, 20.0, 30.0, 40.0]))
+            .unwrap();
+        batch.finish().unwrap();
+        // Recorder::add binds actual STORAGE_BUFFER descriptors with each view's large offset.
+        // The block base remains u64 for BDA; descriptor/copy offsets remain VkDeviceSize.
+        let recorder = Recorder::new(&be).unwrap();
+        recorder.add(&a, &b, &y, 4);
+        recorder.finish().unwrap();
+        let mut values = [0.0f32; 4];
+        be.download(&y, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [11.0, 22.0, 33.0, 44.0]);
+        be.download(&a, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [1.0, 2.0, 3.0, 4.0]);
+        be.download(&b, bytemuck::cast_slice_mut(&mut values))
+            .unwrap();
+        assert_eq!(values, [10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_prepare_failure_is_transactional() {
+        const MIB: usize = 1024 * 1024;
+        let mut config = Config::default();
+        config.device.vram_budget = Some(infr_core::SizeSpec::Bytes((6 * MIB) as u64));
+        config.device.vram_reserve = Some(infr_core::SizeSpec::Bytes(0));
+        config.kernels.vulkan.no_vram_guard = false;
+        config.kernels.vulkan.gemv.id_grid_buffer = Some(false);
+        let mut be = VulkanBackend::new_with(Arc::new(config)).unwrap();
+        Arc::get_mut(&mut be.shared)
+            .expect("no live startup buffers")
+            .resident_weight_block_cap = (4 * MIB) as u64;
+        let before = be.resident_weight_allocation_stats();
+        let bytes_before = be.shared.budget_used();
+        let epoch_before = be.shared.resource_epoch.load(Ordering::Acquire);
+        // First physical block fits; the explicit budget rejects the second before allocation.
+        assert!(be
+            .begin_weight_allocation_batch(&[4 * MIB, 4 * MIB])
+            .is_err());
+        assert_eq!(be.resident_weight_allocation_stats(), before);
+        assert_eq!(be.shared.budget_used(), bytes_before);
+        assert!(
+            be.shared.resource_epoch.load(Ordering::Acquire) > epoch_before,
+            "a prepared first block must have been dropped on second-block failure"
+        );
+        assert!(
+            be.bda_weight_arena.lock().unwrap().is_none(),
+            "no partial plan published"
+        );
+        let mut retry = be.begin_weight_allocation_batch(&[16]).unwrap().unwrap();
+        be.bda_weight_alloc(16).unwrap();
+        retry.finish().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn packed_resident_weights_skip_unified_auxiliary_clients() {
+        let be = VulkanBackend::new().unwrap();
+        let unified = be.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let vision = be.fork_vision_client().unwrap();
+        let embedding = be.fork_embedding_client().unwrap();
+        let mut auxiliary_weights = Vec::new();
+        for (index, client) in [&vision, &embedding].into_iter().enumerate() {
+            assert!(client
+                .begin_weight_allocation_batch(&[64])
+                .unwrap()
+                .is_none());
+            let buf = client.alloc(64, BufferUsage::Weights).unwrap();
+            assert!(matches!(
+                &as_vk_buf(buf.as_ref()).unwrap().backing,
+                Backing::UnifiedSub(_)
+            ));
+            assert_eq!(client.resident_weight_allocation_stats().block_count, 0);
+            client
+                .upload(buf.as_ref(), &[(index + 23) as u8; 64])
+                .unwrap();
+            auxiliary_weights.push(buf);
+        }
+        let unified_before = unified.stats();
+        let resident_before = be.resident_weight_allocation_stats();
+        let batch = be
+            .begin_weight_allocation_batch(&[1000, 4096])
+            .unwrap()
+            .unwrap();
+        let escaped = be.alloc(1000, BufferUsage::Weights).unwrap();
+        be.upload(escaped.as_ref(), &[77; 1000]).unwrap();
+        drop(batch); // Leave one allocation unconsumed and keep the other subview alive.
+        assert_eq!(unified.stats(), unified_before);
+        assert_eq!(be.resident_weight_allocation_stats(), resident_before);
+        for (index, client) in [&vision, &embedding].into_iter().enumerate() {
+            let mut bytes = [0; 64];
+            client
+                .download(auxiliary_weights[index].as_ref(), &mut bytes)
+                .unwrap();
+            assert_eq!(bytes, [(index + 23) as u8; 64]);
+        }
+        let mut bytes = [0; 1000];
+        be.download(escaped.as_ref(), &mut bytes).unwrap();
+        assert_eq!(bytes, [77; 1000]);
+        assert_eq!(unified.stats(), unified_before);
+    }
+
+    /// Resident-BDA weight arena: sub-allocate three odd-sized weight buffers directly from
+    /// `bda_weight_alloc`, and verify:
+    ///   * every sub-tensor reports `Some(device_addr)`,
+    ///   * addresses are 256-byte aligned and strictly increasing within the (single, since the
+    ///     three sizes together are far under `BDA_BLOCK_MIN`) block,
+    ///   * distinct byte patterns uploaded to each round-trip intact — proving the `sub_offset`
+    ///     plumbing on both `upload` (staged one-shot path, no weight-load scope open) and
+    ///     `download`,
+    ///   * a plain `Activations` alloc through the ordinary `Backend::alloc` path still reports
+    ///     `device_addr() == None` — only `Weights` allocs route through `bda_weight_alloc`.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn resident_bda_weight_arena_roundtrip() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let sizes = [1000usize, 4096, 300_000];
+        let mut addrs = Vec::new();
+        let mut bufs = Vec::new();
+        for (bi, &sz) in sizes.iter().enumerate() {
+            let data: Vec<u8> = (0..sz)
+                .map(|i| (i as u8).wrapping_add(bi as u8 * 53))
+                .collect();
+            let buf = be.bda_weight_alloc(sz).expect("bda_weight_alloc");
+            let addr = buf
+                .device_addr()
+                .expect("resident-BDA sub-tensor must report Some(device_addr)");
+            assert_eq!(
+                addr % 256,
+                0,
+                "sub-tensor {bi} device_addr {addr:#x} is not 256-byte aligned"
+            );
+            if let Some(&prev) = addrs.last() {
+                assert!(
+                    addr > prev,
+                    "sub-tensor {bi} device_addr {addr:#x} did not increase past the previous \
+                     tensor's {prev:#x}"
+                );
+            }
+            addrs.push(addr);
+
+            be.upload(&buf, &data).expect("upload");
+            let mut back = vec![0u8; sz];
+            be.download(&buf, &mut back).expect("download");
+            assert_eq!(
+                back, data,
+                "sub-tensor {bi} (size {sz}) round-trip mismatch"
+            );
+            bufs.push(buf);
+        }
+        // All three coexist in distinct byte ranges of the same block — re-check the first after
+        // the later uploads landed, proving they didn't overlap/clobber it.
+        let mut back0 = vec![0u8; sizes[0]];
+        be.download(&bufs[0], &mut back0).expect("re-download");
+        assert_eq!(
+            back0[1], 1u8,
+            "first sub-tensor corrupted by later resident-BDA allocs"
+        );
+
+        // A plain Activations alloc is unaffected by any of this — never routed through
+        // `bda_weight_alloc`, so it must report no device address.
+        let act = be
+            .alloc(64, BufferUsage::Activations)
+            .expect("Activations alloc");
+        assert!(
+            act.device_addr().is_none(),
+            "an ordinary Activations buffer must not report a device_addr"
+        );
+    }
+
+    /// Unified arena views share one physical device-arena shard, retain independent offsets and
+    /// return their ranges when the final buffer handle drops.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn unified_vram_suballocation_roundtrip_and_release() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let pool = be
+            .init_unified_vram(8 * 1024 * 1024)
+            .expect("init unified VRAM");
+        let a = be
+            .alloc_unified(1000, crate::unified::UnifiedVramClass::Expert)
+            .expect("expert view");
+        let b = be
+            .alloc_unified(300_000, crate::unified::UnifiedVramClass::EmbeddingWeights)
+            .expect("embedding view");
+        assert_ne!(a.device_addr(), b.device_addr());
+        let bytes: Vec<u8> = (0..b.len_bytes())
+            .map(|i| (i as u8).wrapping_mul(31))
+            .collect();
+        be.upload(b.as_ref(), &bytes).expect("unified upload");
+        pool.verify_final_residency(&be)
+            .expect("final residency verification");
+        pool.verify_final_residency(&be)
+            .expect("idempotent final residency verification");
+        let mut back = vec![0; bytes.len()];
+        be.download(b.as_ref(), &mut back)
+            .expect("unified download");
+        assert_eq!(back, bytes);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::Expert),
+            1024,
+        );
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::EmbeddingWeights),
+            300_032,
+        );
+        drop(a);
+        drop(b);
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn auxiliary_workspaces_coexist_reuse_and_expire_on_gpu() {
+        use crate::unified::UnifiedVramClass as Class;
+        use infr_core::graph::{Graph, Op};
+        use infr_core::{DType, TensorDesc};
+
+        let primary = VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let embedding = primary.fork_embedding_client().unwrap();
+        let vision = primary.fork_vision_client().unwrap();
+        let primary_scratch = primary.alloc_unified(4096, Class::LlmRuntime).unwrap();
+        primary
+            .runtime_phase
+            .lock()
+            .unwrap()
+            .install_test_workspace(primary_scratch);
+        let embedding_weights = embedding.alloc_uninit(4096, BufferUsage::Weights).unwrap();
+        let vision_weights = vision.alloc_uninit(4096, BufferUsage::Weights).unwrap();
+        let execute = |backend: &VulkanBackend, n: usize, seed: f32| {
+            let mut graph = Graph::new();
+            let desc = TensorDesc::new(vec![n], DType::F32);
+            let input = graph.input(desc.clone());
+            let scratch = graph.internal(desc.clone());
+            let output = graph.output(desc);
+            // Partial writes must clear stale high-water rows before every cached execute.
+            graph.push(Op::Copy {
+                src: input,
+                src_off: 0,
+                dst: scratch,
+                dst_off: 0,
+                n: (n / 2) as u32,
+            });
+            graph.push(Op::Scale {
+                x: scratch,
+                dst: output,
+                s: 2.0,
+                n: n as u32,
+            });
+            let input_buffer = backend.alloc(n * 4, BufferUsage::Staging).unwrap();
+            let output_buffer = backend.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let values = vec![seed; n];
+            backend
+                .upload(input_buffer.as_ref(), bytemuck::cast_slice(&values))
+                .unwrap();
+            let plan = backend.compile(&graph).unwrap();
+            let mut bindings = Bindings::new();
+            bindings.bind(input, input_buffer.as_ref());
+            bindings.bind(output, output_buffer.as_ref());
+            backend.execute(plan.as_ref(), &bindings).unwrap();
+            let mut actual = vec![0f32; n];
+            backend
+                .download(
+                    output_buffer.as_ref(),
+                    bytemuck::cast_slice_mut(&mut actual),
+                )
+                .unwrap();
+            for (index, &value) in actual.iter().enumerate() {
+                assert_eq!(value, if index < n / 2 { seed * 2.0 } else { 0.0 });
+            }
+        };
+        for n in [65, 256, 64, 1024, 3, 1024] {
+            execute(&embedding, n, 1.25);
+            execute(&vision, n + 2, -0.75);
+            primary.with_unified_exclusive(|| ());
+            let stats = pool.stats();
+            assert!(stats.class_bytes(Class::EmbeddingRuntime) > 0);
+            assert!(stats.class_bytes(Class::VisionRuntime) > 0);
+            assert_eq!(stats.class_bytes(Class::LlmRuntime), 4096);
+        }
+        let retained = pool.stats();
+        let embedding_address = embedding
+            .runtime_phase
+            .lock()
+            .unwrap()
+            .scratch_test_address();
+        execute(&embedding, 1024, 3.0);
+        assert_eq!(
+            embedding
+                .runtime_phase
+                .lock()
+                .unwrap()
+                .scratch_test_address(),
+            embedding_address
+        );
+        assert_eq!(pool.stats().allocated_bytes, retained.allocated_bytes);
+        let deadline = Instant::now() + AUXILIARY_RUNTIME_IDLE + Duration::from_secs(2);
+        loop {
+            let stats = pool.stats();
+            if stats.class_bytes(Class::EmbeddingRuntime) == 0
+                && stats.class_bytes(Class::VisionRuntime) == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "auxiliary runtime did not expire: {stats:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.stats().class_bytes(Class::EmbeddingWeights), 4096);
+        assert_eq!(pool.stats().class_bytes(Class::VisionWeights), 4096);
+        assert_eq!(pool.stats().class_bytes(Class::LlmRuntime), 4096);
+        execute(&vision, 65, 2.0);
+        vision.release_auxiliary_runtime().unwrap();
+        assert_eq!(pool.stats().class_bytes(Class::VisionRuntime), 0);
+        drop(embedding_weights);
+        drop(vision_weights);
+        primary.runtime_phase.lock().unwrap().release_phase();
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn auxiliary_workspace_pressure_reclaims_real_unified_ranges() {
+        use crate::unified::UnifiedVramClass as Class;
+        let primary = VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(1024 * 1024).unwrap();
+        let embedding = primary.fork_embedding_client().unwrap();
+        let vision = primary.fork_vision_client().unwrap();
+        for (backend, class, bytes) in [
+            (&primary, Class::LlmRuntime, 200_000),
+            (&embedding, Class::EmbeddingRuntime, 200_000),
+            (&vision, Class::VisionRuntime, 250_000),
+        ] {
+            let scratch = backend.alloc_unified(bytes, class).unwrap();
+            backend
+                .runtime_phase
+                .lock()
+                .unwrap()
+                .install_test_workspace(scratch);
+        }
+        let weights = embedding
+            .alloc_uninit(600_000, BufferUsage::Weights)
+            .unwrap();
+        assert_eq!(pool.stats().class_bytes(Class::VisionRuntime), 0);
+        assert!(pool.stats().class_bytes(Class::LlmRuntime) > 0);
+        assert!(pool.stats().class_bytes(Class::EmbeddingRuntime) > 0);
+        assert!(embedding
+            .alloc_uninit(2 * 1024 * 1024, BufferUsage::Weights)
+            .is_err());
+        assert_eq!(pool.stats().class_bytes(Class::LlmRuntime), 0);
+        assert!(pool.stats().class_bytes(Class::EmbeddingRuntime) > 0);
+        drop(weights);
+        embedding.release_auxiliary_runtime().unwrap();
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn staged_state_upload_waits_for_primary_recording_and_allows_nested_copies() {
+        use std::sync::mpsc;
+        let primary = VulkanBackend::new().unwrap();
+        primary.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let auxiliary = primary.fork_vision_client().unwrap();
+        let destination = primary
+            .make_buf(4096, MemoryLocation::GpuOnly, "test-unmapped-state")
+            .unwrap();
+        assert!(destination.mapped_ptr().is_none());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            primary.with_unified_exclusive(|| {
+                let recorder = crate::recorder::Recorder::new(&primary).unwrap();
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    auxiliary.upload(&destination, &[19; 4096]).unwrap();
+                    finished_tx.send(()).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(finished_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err());
+                recorder.finish().unwrap();
+                // Graph lowering also invokes one-shot copies under the same lease.
+                primary.one_shot(|_| {}).unwrap();
+            });
+        });
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut bytes = [0; 4096];
+        primary.download(&destination, &mut bytes).unwrap();
+        assert_eq!(bytes, [19; 4096]);
+    }
+
+    /// Segmented KV keeps its graph-visible logical extent while committing only the requested
+    /// physical segments from the elastic arena. Address-table entries are populated once and all
+    /// KV-class bytes return to the arena with the virtual buffer.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kv_prefix_copy_preserves_planar_q8_scales_and_partial_segments() {
+        use infr_core::tensor::DType;
+        let be = VulkanBackend::new().expect("Vulkan GPU required");
+        be.init_unified_vram(8 * 1024 * 1024).unwrap();
+        let make = |segment_elements, max_segments| {
+            be.alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 1536 / 32 * 34,
+                segment_bytes: segment_elements / 32 * 34,
+                segment_elements,
+                max_segments,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let src = make(1024, 2);
+        let dst = make(512, 3);
+        be.ensure_segmented_kv(src.as_ref(), 2).unwrap();
+        be.ensure_segmented_kv(dst.as_ref(), 3).unwrap();
+        {
+            let segments = as_segmented_kv(src.as_ref())
+                .unwrap()
+                .segments
+                .lock()
+                .unwrap();
+            for (index, segment) in segments.iter().enumerate() {
+                let mut data = vec![0; 1088];
+                for (i, value) in data[..1024].iter_mut().enumerate() {
+                    *value = ((index * 1024 + i) % 127) as u8;
+                }
+                for scale in data[1024..].chunks_exact_mut(2) {
+                    scale.copy_from_slice(&[0, 60]);
+                }
+                be.upload(segment, &data).unwrap();
+            }
+        }
+        {
+            let segments = as_segmented_kv(dst.as_ref())
+                .unwrap()
+                .segments
+                .lock()
+                .unwrap();
+            for segment in segments.iter() {
+                be.upload(segment, &vec![0xa5; 544]).unwrap();
+            }
+        }
+        be.copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 1280)])
+            .unwrap();
+        {
+            let segments = as_segmented_kv(dst.as_ref())
+                .unwrap()
+                .segments
+                .lock()
+                .unwrap();
+            for (index, segment) in segments.iter().enumerate() {
+                let mut data = vec![0; 544];
+                be.download(segment, &mut data).unwrap();
+                for (i, &value) in data[..512].iter().enumerate() {
+                    let global = index * 512 + i;
+                    assert_eq!(
+                        value,
+                        if global < 1280 {
+                            (global % 127) as u8
+                        } else {
+                            0xa5
+                        }
+                    );
+                }
+                for (block, scale) in data[512..].chunks_exact(2).enumerate() {
+                    assert_eq!(
+                        scale,
+                        if index * 512 + block * 32 < 1280 {
+                            &[0, 60]
+                        } else {
+                            &[0xa5, 0xa5]
+                        }
+                    );
+                }
+            }
+        }
+        let flat = be.alloc(1632, BufferUsage::KvCache).unwrap();
+        be.copy_kv_prefixes(&[(src.as_ref(), flat.as_ref(), DType::Q8_0, 1280)])
+            .unwrap();
+        be.copy_kv_prefixes(&[(flat.as_ref(), dst.as_ref(), DType::Q8_0, 1280)])
+            .unwrap();
+        let mut scales = vec![0; 80];
+        be.download_range(flat.as_ref(), 1536, &mut scales).unwrap();
+        assert!(scales.chunks_exact(2).all(|scale| scale == [0, 60]));
+        assert!(be
+            .copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 1537)])
+            .is_err());
+        assert!(be
+            .copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 31)])
+            .is_err());
+        be.copy_kv_prefixes(&[(src.as_ref(), dst.as_ref(), DType::Q8_0, 0)])
+            .unwrap();
+        for (dtype, elements, bytes, capacity) in [
+            (DType::Q8_0, 32, 34, 36),
+            (DType::Q4_0, 32, 18, 72),
+            (DType::F16, 15, 30, 128),
+            (DType::F32, 7, 28, 128),
+        ] {
+            let source = be.alloc(capacity, BufferUsage::KvCache).unwrap();
+            let target = be.alloc(capacity, BufferUsage::KvCache).unwrap();
+            let payload: Vec<_> = (0..capacity).map(|i| i as u8).collect();
+            be.upload(source.as_ref(), &payload).unwrap();
+            be.upload(target.as_ref(), &vec![0xa5; capacity]).unwrap();
+            be.copy_kv_prefixes(&[(source.as_ref(), target.as_ref(), dtype, elements)])
+                .unwrap();
+            let mut actual = vec![0; capacity];
+            be.download(target.as_ref(), &mut actual).unwrap();
+            assert_eq!(&actual[..bytes], &payload[..bytes]);
+            assert!(actual[bytes..].iter().all(|&value| value == 0xa5));
+            be.copy_kv_prefixes(&[(target.as_ref(), target.as_ref(), dtype, elements)])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn segmented_kv_device_copy_splits_both_endpoints() {
+        let be = VulkanBackend::new().expect("Vulkan GPU required");
+        const MIB: usize = 1024 * 1024;
+        be.init_unified_vram(8 * MIB).unwrap();
+        let make = |segment_bytes| {
+            be.alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 4 * segment_bytes,
+                segment_bytes,
+                segment_elements: segment_bytes / 2,
+                max_segments: 4,
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let src = make(MIB);
+        let dst = make(MIB / 2);
+        be.ensure_segmented_kv_batch(&[src.as_ref(), dst.as_ref()], 2)
+            .unwrap();
+        let payload: Vec<_> = (0..100).map(|i| (i as u8).wrapping_mul(29)).collect();
+        be.upload_range(src.as_ref(), MIB - 32, &payload).unwrap();
+        be.copy_buffer_ranges(&[(src.as_ref(), MIB - 32, dst.as_ref(), MIB / 2 - 48, 100)])
+            .unwrap();
+        let mut restored = vec![0; 100];
+        be.download_range(dst.as_ref(), MIB / 2 - 48, &mut restored)
+            .unwrap();
+        assert_eq!(restored, payload);
+
+        let flat = be.alloc(100, BufferUsage::KvCache).unwrap();
+        be.copy_buffer_ranges(&[(dst.as_ref(), MIB / 2 - 48, flat.as_ref(), 0, 100)])
+            .unwrap();
+        be.copy_buffers(&[(flat.as_ref(), dst.as_ref(), 100)])
+            .unwrap();
+        be.copy_buffer(dst.as_ref(), flat.as_ref(), 100).unwrap();
+        be.download(flat.as_ref(), &mut restored).unwrap();
+        assert_eq!(restored, payload);
+        be.copy_buffer_ranges(&[(dst.as_ref(), 0, dst.as_ref(), 1024, 100)])
+            .unwrap();
+        be.download_range(dst.as_ref(), 1024, &mut restored)
+            .unwrap();
+        assert_eq!(restored, payload);
+
+        // Neither a logical tail nor an uncommitted segment may be used as backing storage.
+        assert!(be.copy_buffer(src.as_ref(), dst.as_ref(), 2 * MIB).is_err());
+        assert!(be
+            .copy_buffer_ranges(&[(src.as_ref(), usize::MAX, dst.as_ref(), 0, 4)])
+            .is_err());
+        assert!(be
+            .copy_buffer_ranges(&[(src.as_ref(), 0, dst.as_ref(), 4 * MIB, 4)])
+            .is_err());
+        be.copy_buffer_ranges(&[(dst.as_ref(), MIB, dst.as_ref(), MIB, 0)])
+            .unwrap();
+        be.download_range(dst.as_ref(), 1024, &mut restored)
+            .unwrap();
+        assert_eq!(
+            restored, payload,
+            "invalid copies must not partially execute"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn segmented_kv_commits_and_releases_elastic_ranges() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        const MIB: usize = 1024 * 1024;
+        let pool = be.init_unified_vram(8 * MIB).expect("init unified VRAM");
+        let virtual_kv = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 4 * MIB,
+                segment_bytes: MIB,
+                segment_elements: MIB / 2,
+                max_segments: 4,
+            })
+            .expect("allocate segmented KV")
+            .expect("Vulkan supports segmented KV");
+        let virtual_kv_small = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 2 * MIB,
+                segment_bytes: MIB / 2,
+                segment_elements: MIB / 4,
+                max_segments: 4,
+            })
+            .expect("allocate second segmented KV")
+            .expect("Vulkan supports segmented KV");
+        assert_eq!(virtual_kv.len_bytes(), 4 * MIB);
+        let segmented = as_segmented_kv(virtual_kv.as_ref()).expect("segmented downcast");
+        let segmented_small =
+            as_segmented_kv(virtual_kv_small.as_ref()).expect("second segmented downcast");
+        assert_eq!(segmented.committed(), 0);
+
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 1)
+            .expect("commit one initial segment");
+        be.ensure_segmented_kv_batch(&[virtual_kv.as_ref(), virtual_kv_small.as_ref()], 2)
+            .expect("grow both KV planes in one transaction");
+        assert_eq!(segmented.committed(), 2);
+        assert_eq!(segmented_small.committed(), 2);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            3 * MIB
+        );
+        let ptr = segmented
+            .table_buffer()
+            .mapped_ptr()
+            .expect("table mapping") as *const u64;
+        let addresses = unsafe { std::slice::from_raw_parts(ptr, 4) };
+        assert_ne!(addresses[0], 0);
+        assert_ne!(addresses[1], 0);
+        assert_ne!(addresses[0], addresses[1]);
+        assert_eq!(addresses[2], 0);
+        let small_ptr = segmented_small
+            .table_buffer()
+            .mapped_ptr()
+            .expect("second table mapping") as *const u64;
+        let small_addresses = unsafe { std::slice::from_raw_parts(small_ptr, 4) };
+        assert_ne!(small_addresses[0], 0);
+        assert_ne!(small_addresses[1], 0);
+        assert_ne!(small_addresses[0], small_addresses[1]);
+        assert_eq!(small_addresses[2], 0);
+
+        assert_eq!(
+            be.buffer_committed_bytes(virtual_kv.as_ref())
+                .expect("inspect committed bytes"),
+            2 * MIB
+        );
+        let offset = MIB - 31;
+        let payload = (0..97)
+            .map(|index| (index as u8).wrapping_mul(29))
+            .collect::<Vec<_>>();
+        be.upload_range(virtual_kv.as_ref(), offset, &payload)
+            .expect("upload across a segment boundary");
+        let mut restored = vec![0u8; payload.len()];
+        be.download_range(virtual_kv.as_ref(), offset, &mut restored)
+            .expect("download across a segment boundary");
+        assert_eq!(restored, payload);
+
+        let first_address = addresses[0];
+        be.trim_segmented_kv(virtual_kv.as_ref(), 1).unwrap();
+        assert_eq!(segmented.committed(), 1);
+        assert_eq!(addresses[0], first_address);
+        assert_eq!(addresses[1], 0);
+        assert!(be.trim_segmented_kv(virtual_kv.as_ref(), 2).is_err());
+        let mut prefix = vec![0; 31];
+        be.download_range(virtual_kv.as_ref(), offset, &mut prefix)
+            .unwrap();
+        assert_eq!(prefix, payload[..31]);
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 2).unwrap();
+        assert_eq!(addresses[0], first_address);
+        assert_ne!(addresses[1], 0);
+
+        be.release_segmented_kv(virtual_kv.as_ref())
+            .expect("release committed KV segments");
+        assert_eq!(segmented.committed(), 0);
+        assert!(addresses.iter().all(|&address| address == 0));
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            MIB
+        );
+        be.ensure_segmented_kv(virtual_kv.as_ref(), 2)
+            .expect("recommit released KV segments");
+        assert_eq!(segmented.committed(), 2);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            3 * MIB
+        );
+
+        drop(virtual_kv);
+        drop(virtual_kv_small);
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::KvCache),
+            0
+        );
+    }
+
+    /// A module allocation may evict cold expert slots, then either execution-phase transition
+    /// returns every released byte to the expert cache before using its slot topology.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn unified_vram_loans_and_restores_expert_slots() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        const SLOT: usize = 1024 * 1024;
+        const SLOTS: usize = 16;
+        be.init_moe_pager(crate::pager::MoePagerLayout {
+            load_reserve_bytes: 0,
+            n_blocks: 32,
+            pools: vec![crate::pager::MoePoolSpec {
+                slot_bytes: SLOT,
+                n_slots: SLOTS,
+                min_enabled_slots: 8,
+            }],
+            host_tier: None,
+            host_store_io: None,
+            dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
+            runtime_reserve_bytes: 0,
+            host_chunks: vec![crate::pager::MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: SLOT,
+            }],
+            prefill_target_lanes: 1,
+            prefill_cache_bytes: (SLOT * SLOTS) as u64,
+        })
+        .expect("init pager");
+        let pool = be.unified_vram().expect("unified pool");
+        assert_eq!(
+            pool.stats()
+                .class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * SLOTS,
+        );
+        let embedding_backend = be.fork_embedding_client().expect("embedding fork");
+        let embedding = embedding_backend
+            .alloc_uninit(SLOT * 2 + SLOT / 2, BufferUsage::Weights)
+            .expect("loan expert slots for embedding weights");
+        let runtime = embedding_backend
+            .alloc_uninit(SLOT / 2, BufferUsage::Activations)
+            .expect("use remaining loaned range for embedding runtime");
+        let during = pool.stats();
+        assert_eq!(
+            during.class_bytes(crate::unified::UnifiedVramClass::EmbeddingWeights),
+            SLOT * 2 + SLOT / 2,
+        );
+        assert_eq!(
+            during.class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * (SLOTS - 3),
+        );
+        assert_eq!(
+            during.class_bytes(crate::unified::UnifiedVramClass::EmbeddingRuntime),
+            SLOT / 2,
+        );
+        drop(embedding);
+        drop(runtime);
+        be.moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("pager")
+            .enter_decode();
+        let restored = pool.stats();
+        assert_eq!(
+            restored.class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * SLOTS,
+        );
+        assert_eq!(restored.free_bytes, 0);
+
+        let embedding = embedding_backend
+            .alloc_uninit(SLOT * 2 + SLOT / 2, BufferUsage::Weights)
+            .expect("loan expert slots before Prefill");
+        drop(embedding);
+        let error = be
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("pager")
+            .enter_prefill_layer(&be)
+            .expect_err("the synthetic pager has no registered Prefill banks");
+        assert!(error
+            .to_string()
+            .contains("cannot build a prefill layout without expert banks"));
+        let restored = pool.stats();
+        assert_eq!(
+            restored.class_bytes(crate::unified::UnifiedVramClass::Expert),
+            SLOT * SLOTS,
+        );
+        assert_eq!(restored.free_bytes, 0);
+    }
+
+    /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a
+    /// `BufferUsage::KvCache` allocation (the exact usage class `infr-llama`'s `kbufs[l]`/
+    /// `vbufs[l]`, their `fork()`/MTP-checkpoint/MTP-draft twins all route through as of this
+    /// slice) must report `Some(device_addr)`. `kbufs` itself is `pub(super)` inside
+    /// `infr_llama::seam` (invisible to any integration test), so this exercises the mechanism
+    /// those call sites share rather than a live model session — exactly the "allocator seam
+    /// only, zero behavioral change" scope of this slice (no kernel reads this address yet).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kv_cache_buffer_reports_device_addr() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        // Two independent buffers, mirroring a K/V pair for one layer. UNLIKE the resident-weight
+        // BDA arena, KV buffers are deliberately NOT consolidated into one shared block in this
+        // slice (see `make_alloc`'s `KvCache` arm) — each stays its own dedicated-or-pooled
+        // object, so their addresses must be distinct, non-null VkDeviceAddress values.
+        let kbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
+        let vbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
+        let kaddr = kbuf
+            .device_addr()
+            .expect("kbuf must report Some(device_addr)");
+        let vaddr = vbuf
+            .device_addr()
+            .expect("vbuf must report Some(device_addr)");
+        assert_ne!(
+            kaddr, 0,
+            "device_addr must be a real (non-null) VkDeviceAddress"
+        );
+        assert_ne!(
+            vaddr, 0,
+            "device_addr must be a real (non-null) VkDeviceAddress"
+        );
+        assert_ne!(
+            kaddr, vaddr,
+            "K and V buffers must be independent objects, not shared/aliased"
+        );
+
+        // The buffer is still an ordinary bound-descriptor-usable SSBO — upload/download work
+        // exactly as before (zero behavioral change to the actual KV read/write path; this slice
+        // only adds the address, no kernel forks on it yet).
+        let data: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        be.upload(kbuf.as_ref(), &data).expect("upload");
+        let mut back = vec![0u8; 4096];
+        be.download(kbuf.as_ref(), &mut back).expect("download");
+        assert_eq!(
+            back, data,
+            "KvCache buffer upload/download round-trip mismatch"
+        );
+
+        // A plain Activations alloc must still report no address — smallest blast radius: only
+        // KvCache buffers gain one, not every scratch/partial/logits allocation in the engine.
+        let act = be
+            .alloc(64, BufferUsage::Activations)
+            .expect("Activations alloc");
+        assert!(
+            act.device_addr().is_none(),
+            "an ordinary Activations buffer must not report a device_addr"
+        );
+    }
+
+    /// Dropping the backend must actually drop `VulkanShared` (device, allocator, weight arena —
+    /// i.e. free the VRAM) even after a paged-MoE session was installed. The session's arena/LUT/
+    /// HostWeights buffers each hold an `Arc<VulkanShared>` clone, so parking the session ON
+    /// `VulkanShared` formed an Arc cycle that leaked the whole device (~23 GiB after the Scout
+    /// paged test) until process exit — every later model load in the same process then hit the
+    /// VRAM budget guard with "N GiB already in use" (the cpu_backend gpu_ suite flake).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn backend_drop_frees_device_after_moe_pager() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        be.init_moe_pager(crate::pager::MoePagerLayout {
+            load_reserve_bytes: 0,
+            n_blocks: 4,
+            pools: vec![crate::pager::MoePoolSpec {
+                slot_bytes: 4096,
+                n_slots: 2,
+                min_enabled_slots: 1,
+            }],
+            host_tier: None,
+            host_store_io: None,
+            dynamic_state_reserve_bytes: 0,
+            dynamic_state_max_allocation_bytes: 0,
+            prefill_min_lane_bytes: 0,
+            runtime_reserve_bytes: 0,
+            host_chunks: vec![crate::pager::MoeHostChunkSpec {
+                base_offset: 0,
+                bytes: 4096,
+            }],
+            prefill_target_lanes: 2,
+            prefill_cache_bytes: 8192,
+        })
+        .expect("init_moe_pager");
+        let weak = Arc::downgrade(&be.shared);
+        drop(be);
+        assert!(
+            weak.upgrade().is_none(),
+            "VulkanShared leaked after dropping the backend (Arc cycle via the paged-MoE session)"
+        );
+    }
+
+    /// GPU f32 matmul correctness: compares `VulkanBackend::matmul_f32` against a CPU
+    /// reference; asserts max relative error < 1e-3.
+    ///
+    /// Run with: `cargo test -p infr-vulkan -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn test_matmul_f32() {
+        let backend = VulkanBackend::new().expect("VulkanBackend::new failed");
+        let caps = backend.capabilities();
+        println!("device: {}", caps.name);
+
+        let (m, k, n) = (32usize, 32usize, 32usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.01).collect();
+
+        // CPU reference
+        let mut c_ref = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    sum += a[i * k + kk] * b[kk * n + j];
+                }
+                c_ref[i * n + j] = sum;
+            }
+        }
+
+        let c_gpu = backend
+            .matmul_f32(&a, &b, m, k, n)
+            .expect("matmul_f32 failed");
+
+        let max_abs = c_gpu
+            .iter()
+            .zip(c_ref.iter())
+            .map(|(g, r)| (*g - r).abs())
+            .fold(0.0f32, f32::max);
+        let max_ref = c_ref.iter().map(|r| r.abs()).fold(0.0f32, f32::max);
+        let rel_err = if max_ref > 1e-6 {
+            max_abs / max_ref
+        } else {
+            max_abs
+        };
+
+        println!("matmul {m}×{k}×{n}: max_rel_err = {rel_err:.2e}");
+        assert!(rel_err < 1e-3, "matmul rel error too large: {rel_err:.2e}");
+        println!("matmul GPU test PASS");
+    }
+
+    /// End-to-end roundtrip: init → alloc (device-local) → upload → download → assert.
+    ///
+    /// Marked `#[ignore]` so CI without a GPU passes; run manually with:
+    /// ```text
+    /// cargo test -p infr-vulkan -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn roundtrip_upload_download() {
+        let backend = VulkanBackend::new().expect("VulkanBackend::new failed");
+
+        let caps = backend.capabilities();
+        println!("=== Capabilities ===\n{caps:#?}\n");
+
+        const N: usize = 1024;
+        // Pattern: bytes 0x00..0xFF repeating.
+        let pattern: Vec<u8> = (0..N).map(|i| (i % 256) as u8).collect();
+
+        // Alloc a device-local buffer (exercises the staging copy path).
+        let buf = backend
+            .alloc(N, BufferUsage::Weights)
+            .expect("alloc Weights buffer");
+
+        backend
+            .upload(buf.as_ref(), &pattern)
+            .expect("upload host→device");
+
+        let mut got = vec![0u8; N];
+        backend
+            .download(buf.as_ref(), &mut got)
+            .expect("download device→host");
+
+        assert_eq!(pattern, got, "roundtrip data mismatch at 1024 bytes");
+
+        backend.sync().expect("sync");
+
+        println!("roundtrip OK — {N} bytes match");
+    }
+}
+
+// qwen35 (Qwen3.5) SSM kernels: the GPU conv1d+SiLU and gated-DeltaNet recurrence must match the CPU
+// reference. Self-skip without a GPU (so CI passes, runs locally with a device).
+#[cfg(test)]
+mod ssm_tests {
+    use super::*;
+    use infr_core::backend::{Buffer, BufferUsage};
+
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+    fn softplus(x: f32) -> f32 {
+        x.max(0.0) + (-x.abs()).exp().ln_1p()
+    }
+    fn det(n: usize, seed: f32) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 * 0.137 + seed).sin()).collect()
+    }
+    fn dev(be: &VulkanBackend, data: &[f32]) -> Box<dyn Buffer> {
+        let b = be
+            .alloc((data.len() * 4).max(4), BufferUsage::Activations)
+            .unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        b
+    }
+    fn read(be: &VulkanBackend, buf: &dyn Buffer, n: usize) -> Vec<f32> {
+        let mut bytes = vec![0u8; n * 4];
+        be.download(buf, &mut bytes).unwrap();
+        bytemuck::cast_slice(&bytes).to_vec()
+    }
+    fn maxerr(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn softcap_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let (n, cap) = (100usize, 30.0f32);
+        let x = det(n, 0.5);
+        let out_cpu: Vec<f32> = x.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        let xb = dev(&be, &x);
+        let ob = be.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.softcap(xb.as_ref(), ob.as_ref(), cap, n);
+        rec.finish().unwrap();
+        let out_gpu = read(&be, ob.as_ref(), n);
+        let e = maxerr(&out_cpu, &out_gpu);
+        assert!(e < 1e-4, "softcap err {e}");
+    }
+
+    #[test]
+    fn deltanet_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let (nv, nk, kd, vd) = (4usize, 2usize, 8usize, 8usize);
+        let eps = 1e-6f32;
+        let q = det(nk * kd, 0.1);
+        let k = det(nk * kd, 0.7);
+        let v = det(nv * vd, 1.3);
+        let blog = det(nv, 2.0);
+        let alpha = det(nv, 0.5);
+        let acoef: Vec<f32> = (0..nv).map(|i| -(0.2 + 0.1 * i as f32)).collect();
+        let dtbias = det(nv, -0.3);
+        let state0 = det(nv * kd * vd, 0.05);
+
+        // CPU reference (mirrors shaders/deltanet.comp + the qwen35 CPU mixer).
+        let qscale = 1.0 / (kd as f32).sqrt();
+        let mut s = state0.clone();
+        let mut out_cpu = vec![0f32; nv * vd];
+        for h in 0..nv {
+            let khid = h % nk;
+            let mut qh = q[khid * kd..khid * kd + kd].to_vec();
+            let mut kh = k[khid * kd..khid * kd + kd].to_vec();
+            let qn = (qh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+            let kn = (kh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+            for x in qh.iter_mut() {
+                *x = *x / qn * qscale;
+            }
+            for x in kh.iter_mut() {
+                *x /= kn;
+            }
+            let beta = sigmoid(blog[h]);
+            let decay = (acoef[h] * softplus(alpha[h] + dtbias[h])).exp();
+            let sb = h * kd * vd;
+            for d in 0..vd {
+                let mut kvv = 0.0;
+                for kk in 0..kd {
+                    let sv = s[sb + kk * vd + d] * decay;
+                    s[sb + kk * vd + d] = sv;
+                    kvv += kh[kk] * sv;
+                }
+                let delta = (v[h * vd + d] - kvv) * beta;
+                let mut o = 0.0;
+                for kk in 0..kd {
+                    let sv = s[sb + kk * vd + d] + kh[kk] * delta;
+                    s[sb + kk * vd + d] = sv;
+                    o += qh[kk] * sv;
+                }
+                out_cpu[h * vd + d] = o;
+            }
+        }
+
+        let (qb, kb, vb) = (dev(&be, &q), dev(&be, &k), dev(&be, &v));
+        let (bb, ab) = (dev(&be, &blog), dev(&be, &alpha));
+        let (acb, dtb) = (dev(&be, &acoef), dev(&be, &dtbias));
+        let sbuf = dev(&be, &state0);
+        let ob = be.alloc(nv * vd * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.deltanet(
+            qb.as_ref(),
+            kb.as_ref(),
+            vb.as_ref(),
+            bb.as_ref(),
+            ab.as_ref(),
+            acb.as_ref(),
+            dtb.as_ref(),
+            sbuf.as_ref(),
+            ob.as_ref(),
+            1, // rows: single-token bespoke path
+            nv,
+            nk,
+            kd,
+            vd,
+            eps,
+        );
+        rec.finish().unwrap();
+        let out_gpu = read(&be, ob.as_ref(), nv * vd);
+        let s_gpu = read(&be, sbuf.as_ref(), nv * kd * vd);
+        assert!(
+            maxerr(&out_cpu, &out_gpu) < 1e-4,
+            "deltanet out err {}",
+            maxerr(&out_cpu, &out_gpu)
+        );
+        assert!(
+            maxerr(&s, &s_gpu) < 1e-4,
+            "deltanet state err {}",
+            maxerr(&s, &s_gpu)
+        );
+    }
+
+    #[test]
+    fn conv1d_silu_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let (cc, kconv) = (40usize, 4usize);
+        let qkv = det(cc, 0.2);
+        let w = det(cc * kconv, 1.1);
+        let state0 = det((kconv - 1) * cc, 0.3);
+
+        // CPU reference (mirrors shaders/conv1d_silu.comp).
+        let mut st = state0.clone();
+        let mut out_cpu = vec![0f32; cc];
+        let km1 = kconv - 1;
+        for ch in 0..cc {
+            let mut acc = 0.0;
+            for k in 0..km1 {
+                acc += st[k * cc + ch] * w[ch * kconv + k];
+            }
+            acc += qkv[ch] * w[ch * kconv + km1];
+            out_cpu[ch] = acc * sigmoid(acc);
+            for k in 0..km1 - 1 {
+                st[k * cc + ch] = st[(k + 1) * cc + ch];
+            }
+            st[(km1 - 1) * cc + ch] = qkv[ch];
+        }
+
+        let xb = dev(&be, &qkv);
+        // `rec.conv1d_silu` resolves the weight's own BDA device address (resident-BDA — see that
+        // fn's doc), so `wb` must be a real `BufferUsage::Weights` allocation, not a plain
+        // activation buffer (which has no `device_addr()`).
+        let wb = be.upload_weight(&w).unwrap();
+        let sbuf = dev(&be, &state0);
+        let ob = be.alloc(cc * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu(
+            xb.as_ref(),
+            wb.as_ref(),
+            sbuf.as_ref(),
+            ob.as_ref(),
+            1, // rows: single-token bespoke path
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let out_gpu = read(&be, ob.as_ref(), cc);
+        let s_gpu = read(&be, sbuf.as_ref(), (kconv - 1) * cc);
+        assert!(
+            maxerr(&out_cpu, &out_gpu) < 1e-5,
+            "conv out err {}",
+            maxerr(&out_cpu, &out_gpu)
+        );
+        assert!(
+            maxerr(&st, &s_gpu) < 1e-5,
+            "conv state err {}",
+            maxerr(&st, &s_gpu)
+        );
+    }
+}

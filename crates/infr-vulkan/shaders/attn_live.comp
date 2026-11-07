@@ -1,0 +1,31 @@
+#version 460
+// Record-once replay prologue for the self-chunking split-K decode attention: ONE thread reads the
+// live kv_len from the params SSBO, computes the SAME adaptive chunk policy as attn_partial's
+// SELF_CHUNK path (~32 chunks/head, 64..512, floored by the baked min chunk), and writes the
+// partial pass's INDIRECT dispatch args (work_heads·live workgroups — no dead workgroups at shallow kv,
+// no re-record at deep kv) plus the live-chunk count the combine loops over.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint work_heads;
+    uint min_chunk;
+    uint max_chunk;
+    uint window;
+} pc;
+
+layout(binding = 0) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 1) writeonly buffer IA { uint gx; uint gy; uint gz; uint live; };
+
+void main() {
+    uint kv = max(p_kvlen, 1u);
+    // Sliding-window (gemma): only the window's span is attended, so chunk THAT (matching
+    // attn_partial's SELF_CHUNK decomposition, which offsets its chunk grid by the window start).
+    uint lo = (pc.window > 0u && kv > pc.window) ? kv - pc.window : 0u;
+    uint span = kv - lo;
+    uint chunkv = max(pc.min_chunk, min(max(span / 32u, 64u), pc.max_chunk));
+    uint lv = (span + chunkv - 1u) / chunkv;
+    gx = pc.work_heads * lv;
+    gy = 1u;
+    gz = 1u;
+    live = lv;
+}

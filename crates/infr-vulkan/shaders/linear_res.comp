@@ -1,0 +1,43 @@
+#version 460
+// f16-weight GEMV with fused residual: y = residual + x·Wᵀ. Cooperative-over-K; dispatch rows*out_f.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA: the weight is read through a 64-bit buffer_reference into the resident arena
+// (base = arena_lo/arena_hi) instead of a bound SSBO — see native_gemv.comp's header for the
+// campaign rationale.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint arena_lo; uint arena_hi;
+} pc;
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer ArenaW { float16_t v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+layout(binding = 2) readonly buffer RB { float res[]; };   // [rows, out] residual
+layout(binding = 3) buffer YB { float y[]; };              // [rows, out]
+
+shared float red[64];
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.out_f) { return; }
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += float(WV(wbase + i)) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = res[unit] + red[0]; }
+}

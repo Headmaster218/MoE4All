@@ -1,0 +1,38 @@
+#version 460
+// Flash-attention split-K combine: merge the n_splits partials (Os_s, m_s, l_s) per (query row,
+// head) into the final O. global m = max_s m_s; O = Σ_s exp(m_s-m)·Os_s; l = Σ_s exp(m_s-m)·l_s;
+// out = O/l. One workgroup per (row, head); thread d owns output element d. Plain rescale-sum (no
+// coopmat, no cross-workgroup writes) — each output is computed by one workgroup reading disjoint
+// partial slices, so no race (unlike the deleted split-K flash whose combine raced on RADV).
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint mpad; uint nh; uint hd; uint n_splits; } pc;
+layout(binding = 0) readonly buffer POB { float po[]; }; // [n_splits, mpad, nh, hd]
+layout(binding = 1) readonly buffer PMB { float pm[]; }; // [n_splits, mpad, nh]
+layout(binding = 2) readonly buffer PLB { float pl[]; }; // [n_splits, mpad, nh]
+layout(binding = 3) writeonly buffer OB  { float o[]; }; // [mpad, nh*hd]
+
+void main() {
+    uint unit = gl_WorkGroupID.x;     // row*nh + head
+    uint row = unit / pc.nh;
+    uint h = unit % pc.nh;
+    uint d = gl_LocalInvocationID.x;
+    if (d >= pc.hd) { return; }
+
+    // global max + per-split weights (n_splits small; each thread recomputes — cheap)
+    float m = -1e30;
+    for (uint s = 0u; s < pc.n_splits; s++) {
+        m = max(m, pm[(s * pc.mpad + row) * pc.nh + h]);
+    }
+    float acc = 0.0;
+    float l = 0.0;
+    for (uint s = 0u; s < pc.n_splits; s++) {
+        float ms = pm[(s * pc.mpad + row) * pc.nh + h];
+        float w = exp(ms - m);
+        acc += w * po[((s * pc.mpad + row) * pc.nh + h) * pc.hd + d];
+        l += w * pl[(s * pc.mpad + row) * pc.nh + h];
+    }
+    o[row * (pc.nh * pc.hd) + h * pc.hd + d] = (l > 0.0) ? acc / l : 0.0;
+}

@@ -1,0 +1,195 @@
+#version 460
+// Reassociation-tolerant subgroup+NUM_ROWS variant of native_gemv_id_multi: the id-indexed multi-slot
+// decode GEMV (y = x·W[ids[slot]]ᵀ over all n_used routed experts) rebuilt on the wave32 +
+// subgroupAdd + NR-rows/workgroup structure from native_gemv_sg (NO shared reduce, NO barrier). Each
+// wave keeps 32×NR weight-load requests in flight — the extra MLP the shallow low-out_f MoE expert
+// down-projection grid (Q6_K, out_f≈2048 — the LARGEST subgroup win of all the decode shapes) needs to
+// saturate DRAM, which the 64-thread tree-reduce id kernel leaves on the table. The id addressing is
+// unchanged (weight base = ids[slot_global]*stride + o*in_f); only the K-reduction is reassociated.
+//
+// NOT bit-identical to native_gemv_id_multi: wave32 lane partitioning + the subgroupAdd reduction tree
+// REORDER the float accumulation vs the 64-thread shared tree-reduce (a valid different summation
+// order, ULP-level per element — same class as the blessed int8 mmv path). Gated to the Q6_K
+// projection band ONLY in the recorder (see native_sg_choice / native_id_sg_choice). -DNR=N selects
+// rows/workgroup. Requires requiredSubgroupSize=SG.
+//
+// -DSG=16|32 (default 32): pinned subgroup width — one subgroup per workgroup, lanes stride SG
+// sub-blocks, subgroupAdd spans SG lanes (same reduction, different summation order — already
+// blessed reassociation-tolerant). SG=16 = the Intel build (see caps.sg_pref); the SG=32 SPIR-V is
+// bit-identical to the pre-SG code.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef SG
+#define SG 32
+#endif
+layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
+
+// `rows`: total dispatched-should-be workgroup count is rows*n_used*ceil(out_f/NR) — needed ONLY
+// to bound-check the flat index against a padding workgroup from a possibly-2-D dispatch grid.
+// Resident-BDA: the stacked role tensor lives at arena_lo/arena_hi; `stride` is the per-expert
+// BYTE stride. -DPAGED instead appends slot_bytes and repurposes `stride` as the layer's LUT-window
+// base, exactly like native_gemv_id_multi.comp. No bound weight SSBO exists in either build.
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask; uint row_mask_bank;
+#ifdef SHARED_Q8
+    uint shared_lo; uint shared_hi; uint routed_used;
+#endif
+} pc;
+#else
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi;
+} pc;
+#endif
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+layout(binding = 2) readonly buffer IDB { uint ids[]; };
+#ifdef PAGED
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
+layout(binding = 4) buffer YB { float y_buf[]; };
+#else
+layout(binding = 3) buffer YB { float y_buf[]; };
+#endif
+
+#ifdef PAGED
+uint active_mask_for_row(uint row) {
+    if (pc.row_mask_bank == 0u) { return pc.active_mask; }
+#ifdef SHARED_Q8
+    uint routed_used = pc.routed_used;
+#else
+    uint routed_used = pc.n_used;
+#endif
+    uint mask_base = pc.rows * routed_used + (pc.row_mask_bank - 1u) * pc.rows;
+    return ids[mask_base + row];
+}
+#endif
+
+#ifndef NR
+#define NR 2
+#endif
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+#ifdef SHARED_Q8
+void dqblk_shared_q8(uint gstart, out float v[32]) {
+    uint bd = (gstart / 32u) * 34u;
+    float d = f16tof32(ru16(bd));
+    uint qoff = bd + 2u;
+    uint qwb = qoff >> 2u;
+    uint qsh = (qoff & 3u) << 3u;
+    uvec4 qA = NW4(qwb); uvec4 qB = NW4(qwb + 4u);
+    if (qsh == 0u) {
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            int q4 = int((w8 < 4u) ? qA[w8] : qB[w8 - 4u]);
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    } else {
+        uint qtail = NW(qwb + 8u);
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            uint qcur = (w8 < 4u) ? qA[w8] : qB[w8 - 4u];
+            uint w1 = w8 + 1u;
+            uint qnxt = (w1 < 4u) ? qA[w1] : ((w1 < 8u) ? qB[w1 - 4u] : qtail);
+            int q4 = int((qcur >> qsh) | (qnxt << (32u - qsh)));
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    }
+}
+
+float dqsub_shared_q8(uint gstart, uint xoff) {
+    float v[32];
+    dqblk_shared_q8(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+#endif
+
+// Dot one 32-elem sub-block of weights (decoded once) against the matching activation run.
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    uint og = (pc.out_f + uint(NR) - 1u) / uint(NR); // output-row groups per (row, slot)
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // `slot_global` drives an ids[] read below, so reject padding before grid-codebook staging.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.n_used * og) { return; }
+    uint slot_global = unit / og;                    // (row, slot) flattened — see native_gemv_id_multi
+    uint o0 = (unit - slot_global * og) * uint(NR);  // first output row this workgroup owns
+    uint row = slot_global / pc.n_used;
+    uint slot = slot_global - row * pc.n_used;
+#ifdef PAGED
+    if ((active_mask_for_row(row) & (1u << slot)) == 0u) { return; }
+#endif
+#ifdef SHARED_Q8
+    bool is_shared = slot == pc.routed_used;
+    if (!is_shared) { GRID_INIT; }
+#else
+    GRID_INIT;
+#endif
+    // Grid-codebook builds stage their table into shared memory above. NR amortizes that staging
+    // across output rows; bounds/mask rejects and fixed-Q8 workgroups do not need it at all.
+    uint lane = gl_SubgroupInvocationID; // 0..SG-1
+    // wexp keeps only the small within-expert element offset (0 — the pointer IS the expert base).
+#ifdef PAGED
+    // Layer-local expert id -> frozen LUT-window slot -> 64-bit arena byte address. This is the
+    // same lookup as the tree paged kernel; only the K reduction / NR output grouping differs.
+#ifdef SHARED_Q8
+    if (is_shared) {
+        w_addr = arena_base(pc.shared_lo, pc.shared_hi);
+    } else {
+        uint routed_slot = row * pc.routed_used + slot;
+        w_addr = arena_base(lut[pc.stride + ids[routed_slot]].x,
+                            lut[pc.stride + ids[routed_slot]].y);
+    }
+#else
+    w_addr = arena_base(lut[pc.stride + ids[slot_global]].x, lut[pc.stride + ids[slot_global]].y);
+#endif
+#else
+    // Resident expert base BYTE address straight from `ids`; `pc.stride` is the expert stride.
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
+#endif
+    uint wexp = 0u;
+    uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
+    uint nsub = pc.in_f / 32u;
+    float acc[NR];
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }
+    for (uint s = lane; s < nsub; s += uint(SG)) {
+        uint xoff = xbase + s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+#ifdef SHARED_Q8
+                acc[rr] += is_shared
+                    ? dqsub_shared_q8(wexp + o * pc.in_f + s * 32u, xoff)
+                    : dqsub(wexp + o * pc.in_f + s * 32u, xoff);
+#else
+                acc[rr] += dqsub(wexp + o * pc.in_f + s * 32u, xoff);
+#endif
+            }
+        }
+    }
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+        float sum = subgroupAdd(acc[rr]);
+        uint o = o0 + rr;
+        if (lane == 0u && o < pc.out_f) {
+            y_buf[slot_global * pc.out_f + o] = sum;
+        }
+    }
+}

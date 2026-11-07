@@ -1,0 +1,141 @@
+#version 460
+// GPU stochastic sampling: temperature + top-k + top-p (nucleus) over `n` vocab logits → token id,
+// matching the host `sample_logits`. The top-k is a radix N-ary select on order-preserving float→uint
+// keys (ggml's approach): 8 passes of 4-bit buckets counted in shared memory pin the k-th largest
+// value (the threshold) — NO per-lane sorted arrays, so nothing spills to VRAM scratch (the trap the
+// naive version hit). Then gather the ≥threshold values into shared, sort the ≤k of them, softmax
+// with temperature, apply the nucleus cutoff, and inverse-CDF sample with the host-drawn uniform `u`.
+// Only the token id reads back. Host gate: 2 ≤ top_k ≤ KMAX (greedy uses argmax; larger → host).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint n;
+    uint top_k;
+    float temp;
+    float top_p;
+    float u;
+} pc;
+layout(binding = 0) readonly buffer LB { float logits[]; };
+layout(binding = 1) writeonly buffer OB { uint out_id[]; };
+
+#define BLOCK 256u
+#define KMAX 64u
+
+shared uint bucket[16];
+shared uint sh_sel;
+shared uint sh_krem;
+shared uint gcnt;
+shared uint geqcnt;
+shared float gval[KMAX];
+shared uint gidx[KMAX];
+
+// Order-preserving float→uint: larger float ⇒ larger uint (ggml f2ui).
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    if ((y & 0x80000000u) != 0u) { y = ~y; } else { y |= 0x80000000u; }
+    return y;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint k = pc.top_k;
+
+    // Phase A: radix N-ary select for the k-th largest key (MSB-first, 4 bits/pass).
+    uint prefix = 0u;
+    uint krem = k;
+    for (uint level = 0u; level < 8u; level++) {
+        uint shift = 28u - 4u * level;
+        uint himask = (shift + 4u >= 32u) ? 0u : (0xFFFFFFFFu << (shift + 4u));
+        uint pfix = prefix & himask;
+        if (tid < 16u) { bucket[tid] = 0u; }
+        barrier();
+        for (uint i = tid; i < pc.n; i += BLOCK) {
+            uint key = f2ui(logits[i]);
+            if ((key & himask) == pfix) {
+                atomicAdd(bucket[(key >> shift) & 0xFu], 1u);
+            }
+        }
+        barrier();
+        if (tid == 0u) {
+            uint cum = 0u;
+            uint sel = 0u;
+            uint kr = krem;
+            for (int b = 15; b >= 0; b--) {
+                uint c = bucket[uint(b)];
+                if (cum + c >= krem) { sel = uint(b); kr = krem - cum; break; }
+                cum += c;
+            }
+            sh_sel = sel;
+            sh_krem = kr;
+        }
+        barrier();
+        prefix |= (sh_sel << shift);
+        krem = sh_krem;
+    }
+    uint thresh = prefix; // key of the k-th largest value
+
+    // Phase B: gather the TRUE top-k. Values with key STRICTLY > thresh are all retained (there are
+    // < k of them, since thresh is the k-th largest key); the remaining slots are then filled with
+    // key == thresh values. All key-equal values are numerically equal (f2ui is a bijection on the
+    // float bit pattern), so any choice among the threshold ties is a valid top-k — but WHICH tied
+    // indices land in the retained set is nondeterministic (atomic order). The old single-pass
+    // "gather ≥thresh, cap at k" could let equal-to-threshold values race into the low slots and
+    // evict a strictly-greater logit to slot ≥ k (dropped) → not the true top-k.
+    if (tid == 0u) { gcnt = 0u; geqcnt = 0u; }
+    barrier();
+    for (uint i = tid; i < pc.n; i += BLOCK) { // pass 1: strictly greater — always fits (< k)
+        if (f2ui(logits[i]) > thresh) {
+            uint slot = atomicAdd(gcnt, 1u);
+            if (slot < k) { gval[slot] = logits[i]; gidx[slot] = i; }
+        }
+    }
+    barrier();
+    uint ngt = min(gcnt, k);
+    for (uint i = tid; i < pc.n; i += BLOCK) { // pass 2: equal to threshold — fill remaining slots
+        if (f2ui(logits[i]) == thresh) {
+            uint slot = ngt + atomicAdd(geqcnt, 1u);
+            if (slot < k) { gval[slot] = logits[i]; gidx[slot] = i; }
+        }
+    }
+    barrier();
+
+    // Phase C (single lane): sort the ≤k candidates, softmax+temp, nucleus, inverse-CDF sample.
+    if (tid == 0u) {
+        uint m = min(gcnt + geqcnt, k);
+        for (uint a = 1u; a < m; a++) {
+            float vv = gval[a];
+            uint ii = gidx[a];
+            uint b = a;
+            while (b > 0u && gval[b - 1u] < vv) {
+                gval[b] = gval[b - 1u];
+                gidx[b] = gidx[b - 1u];
+                b--;
+            }
+            gval[b] = vv;
+            gidx[b] = ii;
+        }
+        float maxl = gval[0];
+        float sum = 0.0;
+        for (uint j = 0u; j < m; j++) {
+            float p = exp((gval[j] - maxl) / pc.temp);
+            gval[j] = p; // reuse gval to hold probabilities
+            sum += p;
+        }
+        for (uint j = 0u; j < m; j++) { gval[j] /= sum; }
+        float cum = 0.0;
+        uint cutoff = m;
+        for (uint j = 0u; j < m; j++) {
+            cum += gval[j];
+            if (cum >= pc.top_p) { cutoff = j + 1u; break; }
+        }
+        float total = 0.0;
+        for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
+        float r = pc.u * total;
+        uint tok = gidx[cutoff - 1u];
+        float acc = 0.0;
+        for (uint j = 0u; j < cutoff; j++) {
+            acc += gval[j];
+            if (r <= acc) { tok = gidx[j]; break; }
+        }
+        out_id[0] = tok;
+    }
+}

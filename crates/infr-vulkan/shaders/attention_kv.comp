@@ -1,0 +1,214 @@
+#version 460
+// Causal GQA attention over an f16 KV cache, tiled online softmax. One workgroup per (token, head).
+// q/k/v f16, o f32. hd <= 512 (thread t owns output dims t, t+64, …, t+7*64 that fall < hd).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; uint cap;
+#ifdef KV_BDA
+    // -DKV_BDA build: K/V cache base device addresses, uvec2-split (avoids 8-byte push align) — see
+    // kv_addr.glsl. K binding 1 / V binding 2 disappear; those descriptor slots go unused (filler).
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
+} pc;
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#endif
+layout(binding = 0) readonly buffer QB { float16_t q[]; };
+// PLANAR Q8_0 KV cache (per-side, -DKQ8 / -DVQ8): codes int8[cap] then scales f16[cap/32] (see
+// store_q8). Read as `uint` words; per element = one byte code (from a u32 word) + the block's f16
+// scale (scales region at word cap/4). K and V pick their dtype independently → four variants.
+// Dequant element `idx`: code byte = word idx/4, lane idx%4 (sign-extended); block = idx/32, scale at
+// scale-word cap/4 + block/2, half block&1.
+// -DKV_BDA overlays each read onto a 64-bit device-address load (kv_word/kv_half) with NO bound SSBO.
+#ifdef KQ8
+#ifdef KV_BDA
+float dq8k(uint idx) {
+    int c = bitfieldExtract(int(kv_word(k_addr, idx >> 2u)), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(kv_word(k_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u] * float(c);
+}
+#else
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+float dq8k(uint idx) {
+    int c = bitfieldExtract(int(ku[idx >> 2u]), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u] * float(c);
+}
+#endif
+#define KREAD(i) dq8k(i)
+#else
+#ifdef KV_BDA
+#define KREAD(i) kv_half(k_addr, i)
+#else
+layout(binding = 1) readonly buffer KB { float16_t k[]; };
+#define KREAD(i) float(k[i])
+#endif
+#endif
+#ifdef VQ8
+#ifdef KV_BDA
+float dq8v(uint idx) {
+    int c = bitfieldExtract(int(kv_word(v_addr, idx >> 2u)), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(kv_word(v_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u] * float(c);
+}
+#else
+layout(binding = 2) readonly buffer VB { uint vu[]; };
+float dq8v(uint idx) {
+    int c = bitfieldExtract(int(vu[idx >> 2u]), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u] * float(c);
+}
+#endif
+#define VREAD(i) dq8v(i)
+#else
+#ifdef KV_BDA
+#define VREAD(i) kv_half(v_addr, i)
+#else
+layout(binding = 2) readonly buffer VB { float16_t v[]; };
+#define VREAD(i) float(v[i])
+#endif
+#endif
+#ifdef USE_PARAMS
+// Record-once decode: pos_offset comes from a host-updated params SSBO so the buffer can be replayed.
+// `o` moves to binding 4 (params takes binding 3) so the recorder's reads|writes split is output-last.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 4) buffer OB { float o[]; };
+#elif defined(SINKS)
+// -DSINKS build (`attention_kv_sinks`): per-head attention-sink logits `[nh]` at binding 3, `o`
+// last at 4. One extra logit per head that joins the softmax MAX and DENOMINATOR and contributes
+// no value — deepseek4's `attn_sinks`, see `Op::Attention::sinks`. Only the plain f16-KV static
+// build carries it (no Q8/BDA/params twins): the adapter routes a sinks op here and refuses the
+// shapes this build can't serve rather than silently dropping the sink.
+layout(binding = 3) readonly buffer SB { float sink[]; };
+layout(binding = 4) buffer OB { float o[]; };
+#else
+layout(binding = 3) buffer OB { float o[]; };
+#endif
+
+const uint TILE = 1024u;
+shared float q_sh[512];
+shared float sc[1024];
+shared float red[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+#ifdef KV_BDA
+    // Wave-uniform K/V cache base pointers, set ONCE (see kv_addr.glsl). Every KREAD/VREAD below
+    // adds a u32 element offset to these before the uint64_t cast → saddr scalar-base loads.
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
+    uint unit = gl_WorkGroupID.x;
+    if (unit >= pc.q_len * pc.nh) { return; }
+    uint ti = unit / pc.nh;
+    uint h = unit % pc.nh;
+#ifdef USE_PARAMS
+    uint pos_offset = p_pos;
+#else
+    uint pos_offset = pc.pos_offset;
+#endif
+    uint qpos = pos_offset + ti;
+    uint kvlen = qpos + 1u;
+    // Sliding-window attention: attend only keys j with j > qpos - window (j >= lo). 0 = full causal.
+    uint lo = (pc.window > 0u && qpos + 1u > pc.window) ? (qpos + 1u - pc.window) : 0u;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint hd = pc.hd;
+    // SWA ring cache: row capacity = cap / row width. Key/value POSITION j lives at row j % rcap —
+    // the ring only ever recycles rows whose positions the sliding-window mask (lo) already
+    // excludes, so this is exact. On a full-context cache j < kv_len <= rcap: identity.
+    uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
+    // scale > 0 → caller-supplied (gemma4 uses 1.0, QK-norm controls magnitude); else 1/√hd default.
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
+
+    uint qbase = (ti * pc.nh + h) * hd;
+    for (uint d = t; d < hd; d += 64u) { q_sh[d] = float(q[qbase + d]); }
+    barrier();
+
+    float m = -3.0e38;
+    float l = 0.0;
+    // Up to 8 output dims per thread (t + c*64), covering hd up to 512 (gemma4 full layers).
+    float acc[8];
+    for (uint c = 0u; c < 8u; c++) { acc[c] = 0.0; }
+
+    // Start at the window's tile: skip tiles entirely below `lo` (fully masked). This guarantees
+    // every processed tile has ≥1 in-window key, so `mnew` is finite and masked keys get exp→0
+    // (a fully-masked tile would leave mnew at the -3e38 sentinel → exp(0)=1, corrupting the sum).
+    for (uint ts = (lo / TILE) * TILE; ts < kvlen; ts += TILE) {
+        uint te = min(ts + TILE, kvlen);
+        float lmax = -3.0e38;
+        for (uint j = ts + t; j < te; j += 64u) {
+            float s;
+            if (j < lo) {
+                s = -3.0e38; // outside the sliding window → masked (exp → 0)
+            } else {
+                uint jr = (rcap > 0u) ? (j % rcap) : j;
+                uint kbase = (jr * pc.nkv + kvh) * hd;
+                float dotv = 0.0;
+                for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * KREAD(kbase + d); }
+                s = dotv * scale;
+            }
+            sc[j - ts] = s;
+            lmax = max(lmax, s);
+        }
+        red[t] = lmax;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] = max(red[t], red[t + stride]); }
+            barrier();
+        }
+        float mnew = max(m, red[0]);
+        barrier();
+
+        float lsum = 0.0;
+        for (uint j = ts + t; j < te; j += 64u) {
+            float p = exp(sc[j - ts] - mnew);
+            sc[j - ts] = p;
+            lsum += p;
+        }
+        red[t] = lsum;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] += red[t + stride]; }
+            barrier();
+        }
+        float tsum = red[0];
+
+        float corr = exp(m - mnew);
+        l = l * corr + tsum;
+        m = mnew;
+        for (uint c = 0u; c < 8u; c++) {
+            uint d = t + c * 64u;
+            if (d < hd) {
+                float a = 0.0;
+                for (uint j = ts; j < te; j++) {
+                    uint jr = (rcap > 0u) ? (j % rcap) : j;
+                    a += sc[j - ts] * VREAD((jr * pc.nkv + kvh) * hd + d);
+                }
+                acc[c] = acc[c] * corr + a;
+            }
+        }
+        barrier();
+    }
+
+    uint obase = (ti * pc.nh + h) * hd;
+#ifdef SINKS
+    // Fold the sink into the finished (m, l) the same way the tile loop folds each new tile: it
+    // joins the max, the running sum is rescaled by exp(m - mfin), and the sink's own exp is added
+    // to the DENOMINATOR only. Algebraically identical to ggml's single-pass
+    // `max = MAX(max, sk[h]); sum += expf(sk[h] - max)`, and the acc rescale is what keeps the
+    // numerators on the new max.
+    float sk_h = sink[h];
+    float mfin = max(m, sk_h);
+    float scorr = exp(m - mfin);
+    l = l * scorr + exp(sk_h - mfin);
+    for (uint c = 0u; c < 8u; c++) { acc[c] *= scorr; }
+#endif
+    float inv = 1.0 / l;
+    for (uint c = 0u; c < 8u; c++) {
+        uint d = t + c * 64u;
+        if (d < hd) { o[obase + d] = acc[c] * inv; }
+    }
+}

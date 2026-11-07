@@ -1,0 +1,57 @@
+#version 460
+// Quantize KV activations into a TurboQuant cache (-DTURBO2/3/4). One thread owns a 128-element block:
+// L2-normalize → forward WHT → nearest centroid → pack; store norm = grp_norm/‖recon‖ (ports the CPU
+// crate::turbo::quantize_block). SRC_F16 = f16 K source; f32 V otherwise. Writes at element off.
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; uint off; } pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
+layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
+layout(binding = 1) writeonly buffer CB { uint8_t cb[]; };
+#include "turbo_common.glsl"
+
+void wf16(uint bo, float x) {
+    uint16_t hbits = float16BitsToUint16(float16_t(x));
+    cb[bo] = uint8_t(hbits & uint16_t(0xFFu));
+    cb[bo + 1u] = uint8_t(hbits >> 8);
+}
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    if (blk * 128u >= pc.n) { return; }
+    float x[128];
+    float nsq = 0.0;
+    for (uint j = 0u; j < 128u; j++) { x[j] = float(src[blk * 128u + j]); nsq += x[j] * x[j]; }
+    float grp_norm = sqrt(nsq);
+    float inv = grp_norm > 1e-10 ? 1.0 / grp_norm : 0.0;
+    for (uint j = 0u; j < 128u; j++) x[j] *= inv;
+    fwht(x);
+
+    uint bb = block_bytes();
+    uint bo = (pc.off / 128u + blk) * bb;
+    for (uint b = 2u; b < bb; b++) cb[bo + b] = uint8_t(0u); // clear qs/signs (packed via OR)
+    float recon_sq = 0.0;
+    for (uint j = 0u; j < 128u; j++) {
+        int idx = nearest_cent(x[j]);
+        recon_sq += CENT[idx] * CENT[idx];
+#if defined(TURBO2)
+        cb[bo + 2u + j / 4u] |= uint8_t(idx << ((j % 4u) * 2u));
+#elif defined(TURBO3)
+        cb[bo + 2u + j / 4u] |= uint8_t((idx & 0x3) << ((j % 4u) * 2u));
+        if ((idx & 0x4) != 0) cb[bo + 34u + j / 8u] |= uint8_t(1u << (j % 8u));
+#elif defined(TURBO4)
+        cb[bo + 2u + j / 2u] |= uint8_t(idx << ((j % 2u) * 4u));
+#endif
+    }
+    float recon_norm = sqrt(recon_sq);
+    float corrected = recon_norm > 1e-10 ? grp_norm / recon_norm : grp_norm;
+    wf16(bo, corrected);
+}

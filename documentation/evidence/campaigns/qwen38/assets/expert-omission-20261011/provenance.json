@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "run_id": "real-single-xhigh-20261011-v2",
+  "run_date": "2026-10-11",
+  "timezone": "Asia/Shanghai",
+  "evidence": {
+    "capture": "measured",
+    "omission_analysis": "simulation",
+    "speedup": "not measured",
+    "downstream_quality": "not measured"
+  },
+  "started_at": "2026-10-11T08:33:01.315Z",
+  "finished_at": "2026-10-11T08:39:59.390Z",
+  "source_head": "83fef5cedfad6af64ec259a22cc9bc61427caa38",
+  "dirty_diagnostic_build": true,
+  "source_patch_sha256": "2f3e076d54d2874ac10d96de73f2c2fccc4398f35e463584109482cf8464b33b",
+  "executable_sha256": "663d0f877a00d706310b4f59023084cec48d83a0fee32494bd145b3052fdbe25",
+  "runner_sha256": "163b29382d1eb92e5236fc2db777e46f3b08185308b89069914d3f612c15c6c5",
+  "model": "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64",
+  "model_sha256": null,
+  "settings": {
+    "device": "RX 7900 XTX / Vulkan1",
+    "driver": "AMD Windows 2.0.395",
+    "parallel": 1,
+    "context_limit": 65536,
+    "ubatch": 4096,
+    "vram_budget": "24g",
+    "vram_reserve": 0,
+    "ram_budget": "48g",
+    "submit_dispatches": 256,
+    "mtp": false,
+    "expert_prefetch": false,
+    "cpu_miss_threads": 0,
+    "kv_k": "q8_0",
+    "kv_v": "q8_0",
+    "ssd_kv_writes": false,
+    "reasoning_effort": "xhigh",
+    "sampling": "model default",
+    "seed": 1
+  },
+  "usage": {
+    "prompt_tokens": 19050,
+    "completion_tokens": 10000,
+    "total_tokens": 29050,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "finish_reason": "length",
+  "validation": {
+    "snapshots": 1872,
+    "expert_vectors": 18720,
+    "maximum_hc_error": 0.000001212197874522758,
+    "maximum_accumulation_error": 1.8475432095321764e-7,
+    "raw_snapshot_bytes": 1304328590,
+    "layers": 48,
+    "snapshots_per_layer": 39
+  },
+  "sampling": {
+    "warmup_eligible_forwards": 64,
+    "stride": 256,
+    "configured_limit_per_layer": 40,
+    "capture_index": "Per-layer eligible forward counter, not absolute KV position or confirmed global token id"
+  },
+  "source_prompt_files": [
+    {
+      "file": "crates/infr-core/src/pager.rs",
+      "first": 1,
+      "last": 650,
+      "sha256": "4edce1ceb1b2b97f43537cc262898d88c7b701bda5ab0222233f2750446677c7"
+    },
+    {
+      "file": "crates/infr-vulkan/src/unified.rs",
+      "first": 1,
+      "last": 500,
+      "sha256": "f11864c3bcebcab672d5f38af4a2742c28ffcf55c84a256a462e614506dc0527"
+    },
+    {
+      "file": "crates/infr-vulkan/shaders/moe_topk.comp",
+      "first": 1,
+      "last": null,
+      "sha256": "0229a2768ae958f8e6308c5f9e483b8d5464a7f8e2ad5860ce63e9cdec37eca0"
+    },
+    {
+      "file": "crates/infr-vulkan/shaders/moe_accumulate.comp",
+      "first": 1,
+      "last": null,
+      "sha256": "12817d0acdf89be2d3c44ba6fe3a554c2fd4973b52c93a006e1f048bc857d7bb"
+    },
+    {
+      "file": "crates/infr-vulkan/shaders/qwen_hc_inject.comp",
+      "first": 1,
+      "last": null,
+      "sha256": "b16c13dfcd2709779c4a213696ea67930b0e551cbd056c6425c4dd383fa9d0e6"
+    }
+  ],
+  "local_only": [
+    "Raw expert vectors",
+    "Source patch and diagnostic source snapshot",
+    "Prompt and generated reasoning/text",
+    "Server logs",
+    "analysis-renorm.json with full per-sample rows"
+  ],
+  "limitations": [
+    "Single real prompt, correlated observations, no held-out runs.",
+    "Normal paged reference, not GPU-resident autonomous decode; readbacks perturb scheduling.",
+    "Frozen-input local deletion does not measure recurrent rollout, final quality or latency benefit.",
+    "Published snapshot references contain only basenames; raw vectors are not included."
+  ],
+  "original_analysis_sha256": {
+    "analysis-renorm.json": "0c7532c71ae1333ad1c6cb9419ef58e145e5602d8c00c3f0dbdccfbbef522947",
+    "strategy-grid.json": "0aa609d00dfe6e3c60a8115d5fe453106ae8130068b629ac9a6b8a5cff587a31",
+    "summary.json": "c6f9875b0ae107ae68f3edc09a3c199be12516e1edb661342f961272edd587e4",
+    "normalization-comparison.json": "4611f9bf1a5ac02fcbb6640d895a2f181b0c3343aa18bb073f281f9ccd513e0a",
+    "strategy-grid.csv": "a710bef35299b809ee90f73a69d3d81772e03ed161c2a0f93ceb75fd49d8dc8b"
+  },
+  "published_data_sha256": {
+    "fast-mode-screen.json": "08b9abfb2b24c4ddc43557d5bc17c57f01143524a6a3dcb3fdd416a3b474b24a",
+    "strategy-grid.json": "5ef2e6a242169bef95651db3448485d56bb75e2f5272b9b59452367d1cc4c3f3",
+    "summary.json": "28bc0c5b95088b6695207ce7cb6e61ca756e47b0d6d4fb50d638846de2803553",
+    "normalization-comparison.json": "499b92c48aaaa6d9bd1d7895ec693176f56f952142cf98477101a494d5bcf8cd",
+    "strategy-grid.csv": "a710bef35299b809ee90f73a69d3d81772e03ed161c2a0f93ceb75fd49d8dc8b"
+  }
+}

@@ -1,0 +1,16 @@
+#version 460
+// Broadcast multiply: dst[i] = x[i] * vec[i % n] — a length-`n` vector scaling every one of the
+// `rows` rows (diffusion-gemma's router input scale). The multiplicative twin of `add_bias`.
+// One thread per element (`total = rows*n`).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; uint total; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer VB { float vec_[]; };
+layout(binding = 2) buffer DB { float dst[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.total) { return; }
+    dst[i] = x[i] * vec_[i % pc.n];
+}

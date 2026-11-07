@@ -1,0 +1,253 @@
+#version 460
+// PROBE (B7 slice 2) — `attn_partial.comp`'s hd==128 QK loop with a PARAMETERIZED reduction width.
+// Nothing in production dispatches this; the only caller is tests/attn_dsplit_probe.rs.
+//
+// WHY: the shipped kernel gives all 32 lanes of a wave ONE key and reduces that key's 128-dim dot
+// with a full `subgroupAdd` — 5 reduction steps, exactly ONE key in flight per wave. Call that
+// reduction width `d_split = 32`. The declined LDS-K-tile probe (B7 slice 1) was the opposite
+// extreme, `d_split = 1` (one whole dot per thread, no cross-lane op at all), and lost 2.7x.
+// llama.cpp runs this exact shape (hsk=hsv=128, n_rows=1, f16 KV) on RDNA3 at `d_split = 8` —
+// `get_fa_tuning_params_scalar` computes `min(min(subgroup_size, 8), D_lsb/4)` — i.e. 8 lanes
+// cooperate on one key and FOUR keys are in flight per wave. This shader makes that width a
+// build-time constant so {1,2,4,8,16,32} can be swept against the shipped kernel.
+//
+// EVERYTHING ELSE IS THE SHIPPED KERNEL: same workgroup→(head, chunk) grid, same chunk policy, same
+// pm/pl/pacc layout (so pass 2 is the same `attn_combine` dispatch byte for byte), same P·V pass
+// (each lane already owns a dim-vec4 — coalesced and reduction-free, nothing to fix there). The
+// reduction width is the ONLY variable, which is what makes this A/B directly against
+// `attn_partial_bda`.
+//
+// SPECIALIZED HARD (the fallback for everything else is attn_partial): hd == 128, rows == 1
+// (decode), f16 K and V read by device address (the -DKV_BDA shape, always on here), causal,
+// window == 0, no canvas, no Q8/mainline-quant KV, no ring cache (cap must be 0 → row j is at row
+// j). Mirrors the specialization attn_ktile.comp asserts; the host method asserts it too.
+//
+// ── LANE MAPPING (getting this wrong turns the experiment into a coalescing measurement) ────────
+// At width W a wave splits into NQ = 32/W lane groups of W lanes:
+//     dl = lane % W   dim-lane inside the group   kl = lane / W   which key the group is on
+// Lane (kl, dl) holds the q vec4s at head-dim vec4 indices {i*W + dl : i in 0..NQ}, and for its
+// key reads the K vec4s at the SAME indices. So for a fixed i, the W lanes of a group read W
+// CONSECUTIVE vec4s = 16*W contiguous bytes, and the wave's load is NQ such segments (one per key
+// in flight). W=32 → one 512-byte segment, exactly today's read. W=8 → four 128-byte segments,
+// each a whole cache line and 128-byte aligned (key rows are nkv*128 B apart, the kv-head offset is
+// a multiple of 512 B). This is llama.cpp's `d * D_split + d_tid` interleave, not a per-lane
+// contiguous BLOCK: a block split would give each lane 16*NQ contiguous bytes but scatter the wave
+// across NQ*W separate pieces at every load.
+//
+// The 4-key software pipeline of the shipped loop is preserved as "at most 4 K vec4 loads in flight
+// per lane": at W >= 8 (NQ <= 4) a lane issues all PIPE*NQ = 4 loads before any dependent
+// reduction (PIPE = 4/NQ unrolled key-group steps, so 4 keys per wave per iteration — identical to
+// today at W=32); at W < 8 one key-group step already needs NQ > 4 loads, so those are issued in
+// batches of 4 into one accumulator.
+//
+// Every index into qreg[] is a COMPILE-TIME constant (constant-bound loops over build-time counts).
+// A runtime index spills qreg to scratch and re-reads it on EVERY key — attn_partial.comp's header
+// documents that exact regression for its old `qreg[nq++]`.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef DSW
+#define DSW 32 // reduction width: lanes cooperating on ONE key's 128-dim dot (1,2,4,8,16,32)
+#endif
+#ifndef DWG
+#define DWG 64 // workgroup threads (64 = shipped, 2 waves; 128 = llama.cpp's 4-wave workgroup)
+#endif
+
+#define NQ (32 / DSW)     // head-dim vec4s per lane == key groups per wave
+#if DSW >= 8
+#define PIPE (DSW / 8)    // unrolled key-group steps → PIPE*NQ == 4 loads in flight per lane
+#else
+#define PIPE 1
+#endif
+#define KPW (PIPE * NQ)   // keys per WAVE per main-loop iteration (== max(4, NQ))
+#define NSG (DWG / 32)    // waves per workgroup (requiredSubgroupSize is 32 — asserted host-side)
+#define SC_MAX 512        // max supported `chunk` (the shipped ATTN_SPLIT.max_chunk)
+
+layout(local_size_x = DWG, local_size_y = 1, local_size_z = 1) in;
+
+// Push layout is EXACTLY attn_partial.comp's -DKV_BDA block (60 B) so the recorder's existing
+// packing is reused verbatim. window/rows/cap are the specialization's zeros (asserted host-side).
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;
+    uint pos; uint rows;
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+} pc;
+#include "kv_addr.glsl"
+
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [1, nh, hd] as vec4
+layout(binding = 1) readonly buffer KB { uint ku_inert[]; }; // INERT (hazard edge only, never read)
+layout(binding = 2) readonly buffer VB { uint vu_inert[]; }; // INERT
+layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
+layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
+layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
+
+shared float sc[SC_MAX];  // per-key score, then exp weight
+shared float red[DWG];    // workgroup max / sum tree
+shared vec4 vsh[DWG];     // P·V partials, [DWG/32 key groups][32 dim-vec4s]
+
+// f16 K/V vec4 by device address: one f16vec4 (8 B) = two adjacent u32 words = ONE KV2 b64 read
+// with a saddr scalar base (identical to attn_partial.comp's kread4/vread4).
+vec4 kread4(uint i4) {
+    uvec2 w = KV2(k_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+vec4 vread4(uint i4) {
+    uvec2 w = KV2(v_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(128.0);
+
+    // Same workgroup → (query head, chunk) decomposition as attn_partial (the g heads sharing a
+    // kv-head/chunk stay CONSECUTIVE so their K/V re-read hits L2) → the grid is identical.
+    uint g = pc.nh / pc.nkv;
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
+    uint qpos1 = pc.pos + 1u;   // rows == 1: the single query row's causal end
+    uint j0 = c * pc.chunk;     // window == 0, no canvas → the chunk grid base is 0
+    uint j1 = min(j0 + pc.chunk, qpos1);
+
+    uint sg = gl_SubgroupID;             // 0..NSG-1
+    uint lane = gl_SubgroupInvocationID;  // 0..31
+    uint dl = lane % uint(DSW);           // dim-lane within this key's group
+    uint kl = lane / uint(DSW);           // which of the NQ concurrent keys this lane serves
+    uint kb = pc.nkv * 32u;               // K/V row stride in vec4 (one key, all kv heads)
+    uint kh = kvh * 32u + dl;             // this kv head's vec4 base + the lane's dim offset
+
+    // Loop-invariant q vec4s, in registers. Constant-bound loop → every qreg index is a literal.
+    vec4 qreg[NQ];
+    uint qbase = h * 32u;
+    [[unroll]] for (uint i = 0u; i < uint(NQ); i++) {
+        qreg[i] = vec4(q4[qbase + i * uint(DSW) + dl]);
+    }
+
+    float lmax = -3.0e38;
+    uint j = j0 + sg;   // this wave's base key; the wave covers j + kl*NSG for kl in 0..NQ
+#if NQ <= 4
+    // W >= 8: PIPE key-group steps unrolled, all PIPE*NQ == 4 loads issued before the dependent
+    // clustered reductions. At W=32 (NQ=1, PIPE=4) this IS the shipped 4-key pipeline.
+    for (; j + uint((KPW - 1) * NSG) < j1; j += uint(KPW * NSG)) {
+        uint rb[PIPE];
+        vec4 a[KPW];
+        [[unroll]] for (uint u = 0u; u < uint(PIPE); u++) {
+            rb[u] = (j + (u * uint(NQ) + kl) * uint(NSG)) * kb + kh;
+        }
+        [[unroll]] for (uint u = 0u; u < uint(PIPE); u++) {
+            [[unroll]] for (uint i = 0u; i < uint(NQ); i++) {
+                a[u * uint(NQ) + i] = kread4(rb[u] + i * uint(DSW));
+            }
+        }
+        [[unroll]] for (uint u = 0u; u < uint(PIPE); u++) {
+            float part = 0.0;
+            [[unroll]] for (uint i = 0u; i < uint(NQ); i++) {
+                part += dot(qreg[i], a[u * uint(NQ) + i]);
+            }
+            float d = subgroupClusteredAdd(part, uint(DSW)) * scale;
+            if (dl == 0u) { sc[j + (u * uint(NQ) + kl) * uint(NSG) - j0] = d; }
+            lmax = max(lmax, d);
+        }
+    }
+#else
+    // W < 8: one key-group step already needs NQ > 4 loads per lane, so issue them in batches of 4
+    // into a single accumulator — same 4-loads-in-flight budget, no NQ-deep register array.
+    for (; j + uint((KPW - 1) * NSG) < j1; j += uint(KPW * NSG)) {
+        uint rb = (j + kl * uint(NSG)) * kb + kh;
+        float part = 0.0;
+        [[unroll]] for (uint b = 0u; b < uint(NQ); b += 4u) {
+            vec4 a0 = kread4(rb + (b + 0u) * uint(DSW));
+            vec4 a1 = kread4(rb + (b + 1u) * uint(DSW));
+            vec4 a2 = kread4(rb + (b + 2u) * uint(DSW));
+            vec4 a3 = kread4(rb + (b + 3u) * uint(DSW));
+            part += dot(qreg[b], a0) + dot(qreg[b + 1u], a1)
+                  + dot(qreg[b + 2u], a2) + dot(qreg[b + 3u], a3);
+        }
+        float d = subgroupClusteredAdd(part, uint(DSW)) * scale;
+        if (dl == 0u) { sc[j + kl * uint(NSG) - j0] = d; }
+        lmax = max(lmax, d);
+    }
+#endif
+    // Tail: NQ keys per wave step, MASKED rather than peeled — `ok` is uniform within a cluster
+    // (it depends only on kl), so the clustered reduction stays in uniform control flow. An
+    // out-of-range lane reads key j0 instead (always in bounds) and discards the result.
+    for (; j < j1; j += uint(NQ * NSG)) {
+        uint key = j + kl * uint(NSG);
+        bool ok = key < j1;
+        uint rb = (ok ? key : j0) * kb + kh;
+        float part = 0.0;
+        [[unroll]] for (uint i = 0u; i < uint(NQ); i++) {
+            part += dot(qreg[i], kread4(rb + i * uint(DSW)));
+        }
+        float d = subgroupClusteredAdd(part, uint(DSW)) * scale;
+        if (ok) {
+            if (dl == 0u) { sc[key - j0] = d; }
+            lmax = max(lmax, d);
+        }
+    }
+
+    red[t] = lmax;
+    barrier();
+    for (uint s = uint(DWG) / 2u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] = max(red[t], red[t + s]); }
+        barrier();
+    }
+    float m = red[0];
+    barrier();
+
+    float lsum = 0.0;
+    for (uint jj = j0 + t; jj < j1; jj += uint(DWG)) {
+        float p = exp(sc[jj - j0] - m);
+        sc[jj - j0] = p;
+        lsum += p;
+    }
+    red[t] = lsum;
+    barrier();
+    for (uint s = uint(DWG) / 2u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    float l = red[0];
+
+    // P·V: UNCHANGED from attn_partial's hd4<=32 arm — each lane owns dim-vec4 `lane`, the waves
+    // split the key range, one wide coalesced V load per key, 2-key software pipeline, partials
+    // summed through `vsh`. The only generalization is NSG key groups instead of a hard-coded 2
+    // (attn_ktile.comp's identical shape), which is what lets DWG be a second axis.
+    uint dim = t & 31u;
+    uint grp = t >> 5u;
+    vec4 acc = vec4(0.0);
+    uint jv = j0 + grp;
+    for (; jv + uint(NSG) < j1; jv += 2u * uint(NSG)) {
+        vec4 b0 = vread4(jv * kb + kvh * 32u + dim);
+        vec4 b1 = vread4((jv + uint(NSG)) * kb + kvh * 32u + dim);
+        acc += sc[jv - j0] * b0;
+        acc += sc[jv + uint(NSG) - j0] * b1;
+    }
+    for (; jv < j1; jv += uint(NSG)) {
+        acc += sc[jv - j0] * vread4(jv * kb + kvh * 32u + dim);
+    }
+    if (grp > 0u) { vsh[t] = acc; }
+    barrier();
+    if (grp == 0u) {
+        for (uint gg = 1u; gg < uint(NSG); gg++) { acc += vsh[gg * 32u + dim]; }
+        uint pbase = (h * pc.n_chunks + c) * 128u;
+        pacc[pbase + 4u * dim] = acc.x;
+        pacc[pbase + 4u * dim + 1u] = acc.y;
+        pacc[pbase + 4u * dim + 2u] = acc.z;
+        pacc[pbase + 4u * dim + 3u] = acc.w;
+    }
+    if (t == 0u) {
+        pm[h * pc.n_chunks + c] = m;
+        pl[h * pc.n_chunks + c] = l;
+    }
+}

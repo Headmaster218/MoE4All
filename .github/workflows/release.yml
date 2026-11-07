@@ -1,0 +1,193 @@
+name: Publish Verified Release
+
+on:
+  push:
+    tags:
+      - 'release-*'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  locate:
+    name: Locate exact-SHA validation artifacts
+    runs-on: ubuntu-26.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      validation-run-id: ${{ steps.validation.outputs.run-id }}
+      artifact-source: ${{ steps.validation.outputs.source }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve and validate release version
+        id: version
+        run: |
+          version=$(python3 scripts/release_ci.py version)
+          if [[ "$GITHUB_REF_NAME" != "release-$version" ]]; then
+            echo "Tag '$GITHUB_REF_NAME' does not match Cargo version 'release-$version'." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Find successful validation for this commit
+        id: validation
+        uses: actions/github-script@v8
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        with:
+          script: |
+            const required = new Set([
+              `MoE4All-Windows-x86_64-v${process.env.VERSION}`,
+              `MoE4All-Linux-x86_64-v${process.env.VERSION}`,
+              `MoE4All-macOS-arm64-v${process.env.VERSION}`,
+            ]);
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'release-validation.yml',
+              status: 'success',
+              head_sha: context.sha,
+              per_page: 100,
+            });
+            for (const run of response.data.workflow_runs) {
+              if (run.head_sha !== context.sha || run.conclusion !== 'success') continue;
+              const artifacts = await github.paginate(
+                github.rest.actions.listWorkflowRunArtifacts,
+                { owner: context.repo.owner, repo: context.repo.repo, run_id: run.id, per_page: 100 },
+              );
+              const live = new Set(artifacts.filter(a => !a.expired).map(a => a.name));
+              if ([...required].every(name => live.has(name))) {
+                core.notice(`Promoting release artifacts from validation run ${run.id}`);
+                core.setOutput('run-id', String(run.id));
+                core.setOutput('source', 'validated');
+                return;
+              }
+            }
+            core.notice('No complete exact-SHA validation artifact set found; rebuilding all platforms.');
+            core.setOutput('run-id', '');
+            core.setOutput('source', 'rebuilt');
+
+  windows:
+    needs: locate
+    if: needs.locate.outputs.validation-run-id == ''
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-windows.yml
+
+  linux:
+    needs: locate
+    if: needs.locate.outputs.validation-run-id == ''
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-linux.yml
+
+  macos:
+    needs: locate
+    if: needs.locate.outputs.validation-run-id == ''
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-macos.yml
+
+  publish:
+    name: Verify manifests and publish one release
+    needs: [locate, windows, linux, macos]
+    if: >-
+      always() &&
+      needs.locate.result == 'success' &&
+      (
+        needs.locate.outputs.validation-run-id != '' ||
+        (
+          needs.windows.result == 'success' &&
+          needs.linux.result == 'success' &&
+          needs.macos.result == 'success'
+        )
+      )
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download exact-SHA validation artifacts
+        if: needs.locate.outputs.validation-run-id != ''
+        uses: actions/download-artifact@v6
+        with:
+          run-id: ${{ needs.locate.outputs.validation-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-artifacts
+      - name: Download fallback rebuild artifacts
+        if: needs.locate.outputs.validation-run-id == ''
+        uses: actions/download-artifact@v6
+        with:
+          path: ${{ runner.temp }}/release-artifacts
+      - name: Verify manifests and assemble publish set
+        env:
+          VERSION: ${{ needs.locate.outputs.version }}
+        run: |
+          python3 scripts/release_ci.py prepare \
+            --root "$RUNNER_TEMP/release-artifacts" \
+            --output "$RUNNER_TEMP/release-assets" \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+      - name: Preserve verified publish evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: MoE4All-release-evidence-v${{ needs.locate.outputs.version }}
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.locate.outputs.version }}
+          SOURCE: ${{ needs.locate.outputs.artifact-source }}
+        run: |
+          tag="release-$VERSION"
+          asset_root="$RUNNER_TEMP/release-assets"
+          release_flags=()
+          if [[ "$VERSION" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset_root"/* --clobber
+          else
+            gh release create "$tag" "$asset_root"/* --verify-tag \
+              --title "MoE4All v$VERSION" --generate-notes "${release_flags[@]}"
+          fi
+          notes=$(gh release view "$tag" --json body --jq .body)
+          if [[ "$notes" != *'<!-- moe4all-artifact-provenance -->'* ]]; then
+            {
+              printf '%s\n\n' "$notes"
+              printf '%s\n' '<!-- moe4all-artifact-provenance -->'
+              printf 'Build provenance: exact commit `%s`, artifact source `%s`.\n\n' "$GITHUB_SHA" "$SOURCE"
+            } > "$RUNNER_TEMP/release-notes.md"
+          else
+            printf '%s\n' "$notes" > "$RUNNER_TEMP/release-notes.md"
+          fi
+          if ! grep -Fq '<!-- moe4all-linux-experimental -->' "$RUNNER_TEMP/release-notes.md"; then
+            printf '\n%s\n%s\n' \
+              '<!-- moe4all-linux-experimental -->' \
+              'Linux x86_64 is experimental: requires glibc 2.35+, Bash 4.3+, standard Linux utilities and a Vulkan GPU driver; no Python or jq is needed to launch. GPU inference and upgrading across real systems need community validation. / Linux 包为实验性版本，请反馈驱动、推理及更新兼容性问题。' \
+              >> "$RUNNER_TEMP/release-notes.md"
+          fi
+          if ! grep -Fq '<!-- moe4all-macos-experimental -->' "$RUNNER_TEMP/release-notes.md"; then
+            printf '\n%s\n%s\n' \
+              '<!-- moe4all-macos-experimental -->' \
+              'macOS arm64 / Metal is experimental. The package runs on Apple Silicon with the system zsh and standard Apple utilities; Homebrew, Python, jq and a Rust toolchain are not runtime dependencies. Text run/serve/bench and explicit MTP are included. Metal serving is currently single-slot; Vision and Embedding are not yet available. The binary is ad-hoc signed but not Apple-notarized. / macOS Apple Silicon 包为实验版，请反馈模型兼容性与性能问题。' \
+              >> "$RUNNER_TEMP/release-notes.md"
+          fi
+          gh release edit "$tag" --title "MoE4All v$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${release_flags[@]}"

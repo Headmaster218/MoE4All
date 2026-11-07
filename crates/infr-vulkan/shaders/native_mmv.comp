@@ -1,0 +1,200 @@
+#version 460
+// Int8 dp4a decode GEMV y = x·Wᵀ (m=1): the activation is pre-quantized to symmetric int8 per
+// 32-block (`quant_q8`: qa/dact/sact) and the weight stays in raw GGUF blocks — hardware int8
+// dot-product replaces the per-element dequant-to-f32 of `native_gemv` (llama.cpp's mmvq).
+// NUM_ROWS=2: each 64-thread workgroup computes 2 consecutive outputs, loading the activation
+// block ONCE for both (llama.cpp's rm_kq=2 on RDNA3) — halves the grid and the qa traffic.
+// Reduction: shared-tree — the workgroup is one wave64 on RDNA3 so its barriers compile out;
+// the subgroupAdd form measured 15-22% SLOWER on the big-n dispatches (lm_head) via ACO
+// register-allocation fallout (slice-2 notes in native_gemv_mrow.comp).
+// -DFMT_Q4K / -DFMT_Q6K / -DFMT_IQ4XS select the weight format; -DUSE_RES fuses a residual add.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Same push layout as native_gemv (w_base = element offset for fused-QKV slices / stacked experts).
+// Streamed (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-tensor element-offset meaning.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activation, packed 4/u32 [nblk*8]
+layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [nblk]
+layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [nblk]
+#ifdef USE_RES
+layout(binding = 4) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 5) buffer YB { float y_buf[]; };
+#else
+layout(binding = 4) buffer YB { float y_buf[]; };
+#endif
+
+shared float red[2u * 64u];
+
+// Weight-word read chokepoint. This family carries its OWN dp4a decode (it does not include
+// native_decode.glsl), so it declares the same `NW(i)` seam locally: every weight read below —
+// `rb()`'s byte extraction and the direct word loads in the per-format decoders — funnels through
+// it, which is what lets the file reroute weight reads to arena pointer reads by redefining a
+// single macro.
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+
+#ifdef FMT_Q4K
+// Q4_K 6-bit scale/min for sub-block i from the 12-byte scales field at sb.
+uvec2 k4(uint i, uint sb) {
+    if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
+    uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
+    uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
+    return uvec2(sc, mn);
+}
+
+// Dot the 32-elem sub-block at element `gelem` against the activation block (qaw, scales da/sa):
+// dp4a Σ(q4·qa) then dl·dact·Σ − mm·sact (dl=d·sc, mm=dmin·m) — same math as native_mmv_id_q4k.
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint bd = (gelem / 256u) * 144u; // super-block byte base
+    uint sub = (gelem / 32u) & 7u;   // sub-block 0..7
+    float d = f16tof32(ru16(bd));
+    float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 km = k4(sub, bd + 4u);
+    float dl = d * float(km.x);
+    float mm = dmin * float(km.y);
+    uint qbase = bd + 16u + (sub >> 1u) * 32u;
+    bool lo = (sub & 1u) == 0u;
+    int dp = 0;
+    for (uint j = 0u; j < 8u; j++) {
+        uint qp = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint qbyte = rb(qbase + j * 4u + b);
+            uint val = lo ? (qbyte & 0xFu) : (qbyte >> 4u);
+            qp |= val << (b * 8u);
+        }
+        dp = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp);
+    }
+    return dl * da * float(dp) - mm * sa;
+}
+#endif
+
+#ifdef FMT_Q6K
+// Q6_K: [u8 ql[128]][u8 qh[64]][i8 scales[16]][f16 d] = 210 bytes, 256 elements. The i8 scale
+// covers 16 elements, so the 32-block splits into two dp4a groups. The 6-bit q is re-biased to
+// signed (q−32) at pack time (fits int8) — no min/Σa term needed.
+int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
+
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint bd = (gelem / 256u) * 210u;
+    uint p0 = gelem % 256u;
+    float d = f16tof32(ru16(bd + 208u));
+    uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
+    uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
+    bool high = og >= 2u; uint qshift = og * 2u;
+    uint qoff = bd + hf * 64u + (((og & 1u) == 1u) ? 32u : 0u); // ql half (qa/qb) once
+    uint lbase = p0 % 32u;                                      // == 0 (gelem is 32-aligned)
+    int dp0 = 0; int dp1 = 0;
+    for (uint j = 0u; j < 8u; j++) {
+        uint qp = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint w = j * 4u + b;
+            uint base = rb(qoff + lbase + w);
+            uint qh = rb(bd + 128u + qho + lbase + w);
+            uint nib = high ? (base >> 4u) : (base & 0xFu);
+            uint q = nib | (((qh >> qshift) & 3u) << 4u);
+            qp |= ((q - 32u) & 0xFFu) << (b * 8u); // two's-complement signed byte
+        }
+        if (j < 4u) { dp0 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp0); }
+        else        { dp1 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp1); }
+    }
+    float sc0 = float(sgn8(rb(scbase)));
+    float sc1 = float(sgn8(rb(scbase + 1u)));
+    return d * da * (sc0 * float(dp0) + sc1 * float(dp1));
+}
+#endif
+
+#ifdef FMT_IQ4XS
+// IQ4_XS: [f16 d][u16 scales_h][u8 scales_l[4]][u8 qs[128]] = 136 bytes, 256 elements, 8 sub-blocks.
+// Non-linear codebook: the 4-bit code indexes KV_IQ4NL (signed int8). The dp4a trick still applies
+// with a gather step — codebook[code] -> int8, then dp4a against the int8-quantized activation. One
+// 6-bit scale dl per 32-elem sub-block (symmetric, like Q6_K — no min/Σa term). Element order:
+// elems 0..15 = KV[qs[j]&0xF], elems 16..31 = KV[qs[j]>>4] (j=0..15), matching the activation qaw's
+// natural order (qaw[j] covers elems 4j..4j+3). Same dl*KV product as the scalar dqblk decode.
+// Byte-packed LUT (see native_decode.glsl's kv_iq4nl): a 4-way dynamic index + bitfieldExtract
+// instead of a 16-way dynamic index — same values, bit-identical, cheaper ALU.
+const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+int kv_iq4nl(uint idx) {
+    return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
+}
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint p = gelem % 256u;
+    uint bd = (gelem / 256u) * 136u;
+    float d = f16tof32(ru16(bd));
+    uint scales_h = ru16(bd + 2u);
+    uint ib = p / 32u;
+    uint lo = (rb(bd + 4u + (ib >> 1u)) >> (4u * (ib & 1u))) & 0xFu;
+    uint hi = (scales_h >> (2u * ib)) & 3u;
+    float dl = d * float(int(lo | (hi << 4u)) - 32);
+    uint qw = (bd + 8u + 16u * ib) >> 2u;   // word-aligned qs base for this sub-block
+    int dp = 0;
+    for (uint j = 0u; j < 4u; j++) {
+        uint q = NW(qw + j);               // qs[4j..4j+3]
+        uint wl = 0u; uint wh = 0u;        // gathered int8 codebook values (low / high nibbles)
+        for (uint b = 0u; b < 4u; b++) {
+            uint qbyte = (q >> (8u * b)) & 0xFFu;
+            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
+            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
+        }
+        dp = dotPacked4x8AccSatEXT(int(wl), int(qaw[j]), dp);       // elems 4j..4j+3
+        dp = dotPacked4x8AccSatEXT(int(wh), int(qaw[j + 4u]), dp);  // elems 16+4j..16+4j+3
+    }
+    return dl * da * float(dp);
+}
+#endif
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid (host splits into (x,y) when
+    // ceil(out_f/2) exceeds maxComputeWorkGroupCount[0] — see Recorder::dispatch_wide); reduces to
+    // gl_WorkGroupID.x when 1-D. Unlike native_gemv_rm/sg, this kernel's `y_buf[o0]` write below is
+    // NOT individually guarded (only the tail `o0+1` is, via `has1`) — the host previously
+    // guaranteed o0 < out_f by dispatching exactly ceil(out_f/2) groups, so a padding workgroup
+    // from an uneven 2-D split needs an explicit early return here (workgroup-uniform, safe before
+    // the barrier() below).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
+    if (o0 >= pc.out_f) { return; }
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint nsub = pc.in_f / 32u;
+    uint wb0 = pc.w_base + o0 * pc.in_f;
+    bool has1 = (o0 + 1u) < pc.out_f; // workgroup-uniform tail guard (odd out_f)
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    for (uint s = t; s < nsub; s += 64u) {
+        uint qaw[8];
+        for (uint j = 0u; j < 8u; j++) { qaw[j] = qa[s * 8u + j]; }
+        float da = float(dact[s]);
+        float sa = float(sact[s]);
+        acc0 += dpsub(wb0 + s * 32u, qaw, da, sa);
+        if (has1) { acc1 += dpsub(wb0 + pc.in_f + s * 32u, qaw, da, sa); }
+    }
+    red[t] = acc0;
+    red[64u + t] = acc1;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            red[t] += red[t + stride];
+            red[64u + t] += red[64u + t + stride];
+        }
+        barrier();
+    }
+    if (t == 0u) {
+#ifdef USE_RES
+        y_buf[o0] = r_buf[o0] + red[0];
+        if (has1) { y_buf[o0 + 1u] = r_buf[o0 + 1u] + red[64u]; }
+#else
+        y_buf[o0] = red[0];
+        if (has1) { y_buf[o0 + 1u] = red[64u]; }
+#endif
+    }
+}

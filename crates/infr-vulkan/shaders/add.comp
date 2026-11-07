@@ -1,0 +1,14 @@
+#version 460
+// Elementwise add: y[i] = a[i] + b[i]. One thread per element.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; } pc;
+layout(binding = 0) readonly buffer AB { float a[]; };
+layout(binding = 1) readonly buffer BB { float b[]; };
+layout(binding = 2) buffer YB { float y[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    y[i] = a[i] + b[i];
+}

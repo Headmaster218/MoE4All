@@ -1,0 +1,217 @@
+#version 460
+// f32-weight GEMV y = x·Wᵀ, REDUCTION shape: ONE workgroup per output element, 64 threads striding
+// K with a shared tree-reduce (the f32 twin of linear_f16). The thread-per-output linear_f32 keeps
+// the eager path, but a decode-hot GEMV with few outputs (the qwen3moe router: 2048→128 per layer)
+// launches only out_f/64 workgroups there — this shape launches out_f workgroups instead.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA: the weight is read through a 64-bit buffer_reference into the resident arena
+// (base = arena_lo/arena_hi) instead of a bound SSBO — see native_gemv.comp's header for the
+// campaign rationale. The reference is vec4-typed under VEC4 (16-byte loads preserved; every
+// arena tensor offset is 256-aligned so the pointer alignment holds).
+#ifdef PAIR
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f;
+    uint arena_a_lo; uint arena_a_hi;
+    uint arena_b_lo; uint arena_b_hi;
+} pc;
+#else
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint arena_lo; uint arena_hi;
+} pc;
+#endif
+#ifdef VEC4
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ArenaW { vec4 v[]; };
+layout(binding = 1) readonly buffer XB { vec4 x[]; };      // [rows, in/4]
+#else
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { float v[]; };
+layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+#endif
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
+#ifdef PAIR
+layout(binding = 3) buffer YB2 { float y2[]; };            // [rows, out]
+#endif
+
+uint total_out_f() {
+#ifdef PAIR
+    return pc.out_f * 2u;
+#else
+    return pc.out_f;
+#endif
+}
+
+void select_weight(uint projection) {
+#ifdef PAIR
+    w_ptr = projection == 0u
+        ? ((uint64_t(pc.arena_a_hi) << 32) | uint64_t(pc.arena_a_lo))
+        : ((uint64_t(pc.arena_b_hi) << 32) | uint64_t(pc.arena_b_lo));
+#else
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo);
+#endif
+}
+
+void store_result(uint projection, uint index, float value) {
+#ifdef PAIR
+    if (projection == 0u) { y[index] = value; }
+    else { y2[index] = value; }
+#else
+    y[index] = value;
+#endif
+}
+
+#if defined(MROW) && defined(VEC4)
+// vec4 row-tiled prefill GEMM: same wg mapping as MROW below (one output column × MROW rows,
+// grid = out_f·ceil(rows/MROW)) but the K stream is vec4 loads (requires in_f % 4 == 0). The
+// small-m f32 projections (E2B per-layer inp_gate/proj, 1536×256) launch only out_f workgroups
+// (~2.6 waves/CU on a 7900 XTX) — latency-bound, so 4x fewer round trips is the lever (measured
+// 25.7 → single-digit us/op at m=4). Accumulates in vec4 lanes + a pairwise horizontal add, so
+// NOT bit-identical to the scalar kernels (f32 tolerance-level shift only).
+shared float red[64 * MROW];
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // Grid = out_f * ceil(rows/MROW): a padding workgroup from an uneven split has unit >=
+    // out_f*ceil(rows/MROW), which is caught below.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row_groups = (pc.rows + uint(MROW) - 1u) / uint(MROW);
+    uint outputs = total_out_f();
+    if (unit >= outputs * row_groups) { return; }
+    uint nv = pc.in_f / 4u;
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r0 = (unit / outputs) * uint(MROW);
+    uint t = gl_LocalInvocationID.x;
+    select_weight(projection);
+    uint wbase = o * nv;
+    vec4 acc[MROW];
+    for (uint j = 0u; j < uint(MROW); j++) { acc[j] = vec4(0.0); }
+    for (uint i = t; i < nv; i += 64u) {
+        vec4 wv = WV(wbase + i);
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { acc[j] += wv * x[r * nv + i]; }
+        }
+    }
+    for (uint j = 0u; j < uint(MROW); j++) {
+        vec4 a = acc[j];
+        red[j * 64u + t] = (a.x + a.y) + (a.z + a.w);
+    }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] += red[j * 64u + t + stride]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { store_result(projection, r * pc.out_f + o, red[j * 64u]); }
+        }
+    }
+}
+#elif defined(MROW)
+// Row-tiled prefill GEMM: one workgroup = one output column × MROW rows. Each weight element w[o,i]
+// is read ONCE by thread t and reused across all MROW rows, so the per-row weight re-read of the
+// 1-row kernel (grid = rows·out_f) drops to weight-once-per-MROW-rows (grid = out_f·ceil(rows/MROW)).
+// The per-(o,r) accumulation + tree-reduce order is IDENTICAL to the 1-row kernel → bit-identical.
+shared float red[64 * MROW];
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row_groups = (pc.rows + uint(MROW) - 1u) / uint(MROW);
+    uint outputs = total_out_f();
+    if (unit >= outputs * row_groups) { return; }
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r0 = (unit / outputs) * uint(MROW);
+    uint t = gl_LocalInvocationID.x;
+    select_weight(projection);
+    uint wbase = o * pc.in_f;
+    float acc[MROW];
+    for (uint j = 0u; j < uint(MROW); j++) { acc[j] = 0.0; }
+    for (uint i = t; i < pc.in_f; i += 64u) {
+        float wv = WV(wbase + i);
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { acc[j] += wv * x[r * pc.in_f + i]; }
+        }
+    }
+    for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] = acc[j]; }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] += red[j * 64u + t + stride]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { store_result(projection, r * pc.out_f + o, red[j * 64u]); }
+        }
+    }
+}
+#elif defined(VEC4)
+// Decode-sized vec4 GEMV: one workgroup per output just like the scalar arm, but each lane issues
+// 16-byte weight/activation loads and keeps four independent FMA chains. The final pairwise add is
+// reassociation-tolerant (the same contract as the existing MROW+VEC4 variants).
+shared float red[64];
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint outputs = total_out_f();
+    if (unit >= pc.rows * outputs) { return; }
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r = unit / outputs;
+    uint t = gl_LocalInvocationID.x;
+    uint nv = pc.in_f / 4u;
+    select_weight(projection);
+    uint wbase = o * nv;
+    uint xbase = r * nv;
+    vec4 acc = vec4(0.0);
+    for (uint i = t; i < nv; i += 64u) { acc += WV(wbase + i) * x[xbase + i]; }
+    red[t] = (acc.x + acc.y) + (acc.z + acc.w);
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { store_result(projection, r * pc.out_f + o, red[0]); }
+}
+#else
+shared float red[64];
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // = r * out_f + o
+    uint outputs = total_out_f();
+    if (unit >= pc.rows * outputs) { return; }
+    uint slot = unit % outputs;
+    uint projection = slot / pc.out_f;
+    uint o = slot % pc.out_f;
+    uint r = unit / outputs;
+    uint t = gl_LocalInvocationID.x;
+    select_weight(projection);
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += WV(wbase + i) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { store_result(projection, r * pc.out_f + o, red[0]); }
+}
+#endif

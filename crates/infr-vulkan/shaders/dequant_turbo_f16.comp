@@ -1,0 +1,40 @@
+#version 460
+// Expand a TurboQuant KV cache (-DTURBO2/3/4) → f16, so the f16 attention can read it. One thread per
+// 128-block: unpack centroid·norm (rotated domain) → inverse WHT → original domain → f16 (ports the
+// CPU crate::turbo::dequant_prefix_orig).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; } pc;
+layout(binding = 0) readonly buffer CB { uint8_t cb[]; };
+layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
+#include "turbo_common.glsl"
+
+void main() {
+    uint blk = gl_GlobalInvocationID.x;
+    if (blk * 128u >= pc.n) { return; }
+    uint bb = block_bytes();
+    uint bo = blk * bb;
+    uint nbits = uint(cb[bo]) | (uint(cb[bo + 1u]) << 8u);
+    float norm = float(uint16BitsToFloat16(uint16_t(nbits)));
+    float v[128];
+    for (uint j = 0u; j < 128u; j++) {
+        int idx;
+#if defined(TURBO2)
+        idx = int((cb[bo + 2u + j / 4u] >> ((j % 4u) * 2u)) & 0x3u);
+#elif defined(TURBO3)
+        uint low2 = (cb[bo + 2u + j / 4u] >> ((j % 4u) * 2u)) & 0x3u;
+        uint hi1 = (cb[bo + 34u + j / 8u] >> (j % 8u)) & 0x1u;
+        idx = int(low2 | (hi1 << 2));
+#elif defined(TURBO4)
+        idx = int((cb[bo + 2u + j / 2u] >> ((j % 2u) * 4u)) & 0xFu);
+#endif
+        v[j] = CENT[idx] * norm;
+    }
+    fwht_inv(v);
+    for (uint j = 0u; j < 128u; j++) dst[blk * 128u + j] = float16_t(v[j]);
+}

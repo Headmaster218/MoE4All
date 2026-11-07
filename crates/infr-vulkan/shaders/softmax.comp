@@ -1,0 +1,63 @@
+#version 460
+// Row-wise softmax: y[r,:] = softmax(x[r,:] * scale), one workgroup per row. diffusion-gemma's
+// in-graph self-conditioning (see docs/diffusion-gemma.md's Phase-B and the reference's
+// `dg_canvas_embed`): softmaxes the previous step's canvas logits over the FULL vocab before the
+// soft-embedding matmul. Same 256-thread subgroup-reduction shape as `rmsnorm.comp` — `dim` here
+// is the vocab (hundreds of thousands wide), so the cooperative reduction matters just as much.
+//
+// USE_SCALE_BUF (`softmax_dyn`, see `Recorder::softmax_dyn` + `Op::Softmax::scale_buf`'s doc):
+// `scale` comes from a 1-element device buffer instead of a push constant, so a cached/replayed
+// plan (DiffusionGemma denoise) can vary the softmax temperature every call without a rebuild —
+// only a tiny 4-byte host `upload` between calls, no push-constant/plan change.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef USE_SCALE_BUF
+layout(push_constant) uniform PC { uint rows; uint dim; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer SB { float scale_buf; };
+layout(binding = 2) buffer YB { float y[]; };
+#else
+layout(push_constant) uniform PC { uint rows; uint dim; float scale; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) buffer YB { float y[]; };
+#endif
+
+// Sized 256/MIN_SG (min subgroup 16) so a 16-lane subgroup can't overrun; the pipeline pins
+// requiredSubgroupSize=32 (kernel_sg(..., 32)), so only part[0..gl_NumSubgroups) (=8) is ever used.
+shared float part[16]; // one partial per subgroup (256 threads / sg; 8 waves @ sg32)
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint base = r * pc.dim;
+#ifdef USE_SCALE_BUF
+    float scale = scale_buf;
+#else
+    float scale = pc.scale;
+#endif
+
+    // row max (numerically stable exp)
+    float mx = -1e30; // sentinel below any real logit (matches argmax.comp)
+    for (uint i = t; i < pc.dim; i += 256u) { mx = max(mx, x[base + i] * scale); }
+    mx = subgroupMax(mx);
+    if (subgroupElect()) { part[gl_SubgroupID] = mx; }
+    barrier();
+    float m0 = part[0];
+    for (uint s = 1u; s < gl_NumSubgroups; s++) { m0 = max(m0, part[s]); }
+    barrier(); // every thread has read `part[]` for m0 before it's reused below
+
+    // row sum of exp(x*scale - m0)
+    float sum = 0.0;
+    for (uint i = t; i < pc.dim; i += 256u) { sum += exp(x[base + i] * scale - m0); }
+    sum = subgroupAdd(sum);
+    if (subgroupElect()) { part[gl_SubgroupID] = sum; }
+    barrier();
+    float tot = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
+    float inv = 1.0 / tot;
+
+    for (uint i = t; i < pc.dim; i += 256u) { y[base + i] = exp(x[base + i] * scale - m0) * inv; }
+}

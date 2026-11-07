@@ -1,0 +1,85 @@
+#version 460
+// O07 isolated candidate: retain the original 256-thread gate tree AND the
+// fixed-wave32 HC RMSNorm tree. Both gated residual and normed input survive.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint hc; uint n_embd; uint groups; float eps; } pc;
+layout(binding = 0) readonly buffer KB { float key[]; };
+layout(binding = 1) readonly buffer QB { float query[]; };
+layout(binding = 2) readonly buffer VB { float value[]; };
+layout(binding = 3) readonly buffer NB { float norm[]; };
+layout(binding = 4) coherent buffer GB { float gated_dst[]; };
+layout(binding = 5) writeonly buffer DB { float normed_dst[]; };
+shared float sums[256];
+shared float part[8];
+#ifdef PLE_CACHE_LDS
+#ifndef PLE_DIM_MAX
+#define PLE_DIM_MAX 2560
+#endif
+shared float gated_local[PLE_DIM_MAX];
+#define GATED_READ(d) gated_local[d]
+#else
+#define GATED_READ(d) gated_dst[base + (d)]
+#endif
+
+void main() {
+    uint group = gl_WorkGroupID.x;
+    if (group >= pc.groups) { return; }
+#ifdef PLE_CACHE_LDS
+    // The host must gate this build by n_embd <= PLE_DIM_MAX.
+    if (pc.n_embd > uint(PLE_DIM_MAX)) { return; }
+#endif
+    uint lane = gl_LocalInvocationID.x;
+    uint r = group / pc.hc;
+    uint h = group % pc.hc;
+    uint base = group * pc.n_embd;
+    float acc = 0.0;
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        acc += key[base + d] * query[base + d];
+    }
+    sums[lane] = acc;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) { sums[lane] += sums[lane + stride]; }
+        barrier();
+    }
+    if (lane == 0u) {
+        float score = sums[0] / sqrt(float(pc.n_embd));
+        float signed_root = score > 0.0 ? sqrt(max(abs(score), 1e-6))
+                           : score < 0.0 ? -sqrt(max(abs(score), 1e-6)) : 0.0;
+        sums[0] = 1.0 / (1.0 + exp(-signed_root));
+    }
+    barrier();
+    float gate_scale = sums[0];
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        float gated = value[r * pc.n_embd + d] * gate_scale;
+        gated_dst[base + d] = gated;
+#ifdef PLE_CACHE_LDS
+        gated_local[d] = gated;
+#endif
+    }
+#ifndef PLE_CACHE_LDS
+    // Materialize the F32 producer/consumer boundary, rather than cancelling the
+    // gate through RMSNorm or allowing its product to join a downstream FMA.
+    memoryBarrierBuffer();
+#endif
+    barrier();
+    float ss = 0.0;
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        float v = GATED_READ(d);
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) { part[gl_SubgroupID] = ss; }
+    barrier();
+    float total = 0.0;
+    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+        total += part[subgroup];
+    }
+    float norm_scale = inversesqrt(total / float(pc.n_embd) + pc.eps);
+    uint norm_base = h * pc.n_embd;
+    for (uint d = lane; d < pc.n_embd; d += 256u) {
+        normed_dst[base + d] = GATED_READ(d) * norm_scale * norm[norm_base + d];
+    }
+}

@@ -1,0 +1,300 @@
+#version 460
+// Flash-attention prefill, SPLIT-K partial pass. Like attn_flash but each workgroup handles only the
+// kv slice [split*ksplit, +ksplit) (split = gl_WorkGroupID.y) → S× more workgroups + S× shorter kv
+// loops, which is the occupancy the single-kernel flash lacks at high ctx (small q tile count). Each
+// (q-tile, head, split) emits an UN-normalized online-softmax partial: Os (running Σ exp(s-m)·v),
+// m (running max), l (running sum). attn_flash_combine merges splits per (row,head). No race: each
+// partial writes a disjoint [split] slice; combine only reads. Q/K/V f16, partials f32. hd%16,hd<=128.
+// BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (64 KiB
+// device); BM=32 → 29056 B (NVIDIA 48 KiB / MoltenVK 32 KiB). Recorder picks the tile from
+// maxComputeSharedMemorySize; workgroup = (BM/16) subgroups of 32. (See attn_flash_warp.comp.)
+//
+// SHMEM STAGING (Levers 2 & 5, kv-decode-perf-levers). Two opt-in build variants stage the K/V tile
+// into a shared `KVstg` slab and `coopMatLoad` FROM shmem (ds_load) instead of direct-from-descriptor:
+//   -DSTAGE            (INFR_FLASH_STAGE=1): f16 K/V copied into KVstg, then coopMatLoad from shmem.
+//                      The reuse experiment (Lever 5).
+//   -DSTAGE -DDEQUANT -DFMT_* (INFR_FLASH_DEQUANT=1): the K/V cache is a quantized GGUF block cache
+//                      (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0); each 32-elem sub-block is decoded to f16 IN the
+//                      stage via native_decode's coalesced scale-once `dqblk` (Lever 2), so quantized
+//                      KV prefill SKIPS the separate dequant_kv_f16 prepass + its f16 scratch.
+// OCCUPANCY: the slab is a 32-WIDE COLUMN BLOCK (KVstg[BN*32], 4096 B), ONE buffer REUSED for K then
+// V — mirrors llama.cpp flash_attn_cm1's single `kvsh` sub-tile rather than a full Bc×hd K+V stage
+// (which halved occupancy → 2x slower, kv-u64-campaign slice-4). BM=64 default 58112 B → staged
+// 62208 B (still 1 stage-slab under the 64 KiB cap). The stage is 32-wide because native_decode's
+// `dqblk` decodes 32 contiguous elements per call (one GGUF sub-block, scale decoded once); each slab
+// feeds two coopmat 16-wide kf/ct tiles. Q stays direct (query tile, small, always f16).
+#ifndef BM_TILE
+#define BM_TILE 64
+#endif
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = (BM_TILE * 2), local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = BM_TILE;
+const uint BN = 64u;
+
+layout(push_constant) uniform PC {
+    uint q_len;     // mpad (padded query rows)
+    uint kv_len;
+    uint nh;
+    uint nkv;
+    uint hd;
+    uint pos_offset;
+    uint n_splits;
+    uint ksplit;    // kv elements per split (multiple of BN)
+#ifdef KV_COOPMAT_BDA
+    // -DKV_COOPMAT_BDA build (#74 slice 4 resurrection): K/V cache base device addresses, uvec2-split
+    // (avoids 8-byte push align) — see kv_addr.glsl. K binding 1 / V binding 2 become INERT (bound
+    // only for Recorder::sync's store→read hazard edge, never read here); the QK/PV coopMatLoad reads
+    // through KvMat(k_addr) / KvMat(v_addr) instead.
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
+} pc;
+#ifdef KV_COOPMAT_BDA
+#include "kv_addr.glsl"
+#endif
+layout(binding = 0) readonly buffer QB { float16_t q[]; };  // [mpad, nh, hd]
+#if defined(DEQUANT)
+// Quantized K/V cache (raw GGUF blocks as u32 words); decoded in-stage via native_decode dqblk.
+// One included decode library serves BOTH sides: the NW read chokepoint selects K (g_kv_sel==0) or
+// V (g_kv_sel==1). The select is workgroup-uniform (all lanes decode the same side in a phase), so
+// ACO folds it to a single scalar descriptor pick — no per-load divergence.
+layout(binding = 1) readonly buffer KB { uint kw[]; };      // [kv_len, nkv, hd] quant blocks
+layout(binding = 2) readonly buffer VB { uint vw[]; };      // [kv_len, nkv, hd] quant blocks
+uint g_kv_sel;
+#define NW(i)  ((g_kv_sel == 0u) ? kw[(i)] : vw[(i)])
+#define NW2(w) ((g_kv_sel == 0u) ? uvec2(kw[(w)], kw[(w) + 1u]) \
+                                 : uvec2(vw[(w)], vw[(w) + 1u]))
+#define NW4(w) ((g_kv_sel == 0u) ? uvec4(kw[(w)], kw[(w) + 1u], kw[(w) + 2u], kw[(w) + 3u]) \
+                                 : uvec4(vw[(w)], vw[(w) + 1u], vw[(w) + 2u], vw[(w) + 3u]))
+#include "native_decode.glsl"
+#elif defined(KV_COOPMAT_BDA)
+// K binding 1 / V binding 2 stay INERT: the recorder still binds them (Recorder::sync's store→read
+// hazard edge) but the direct QK/PV path below reads via KvMat(k_addr)/KvMat(v_addr). No k[]/v[] here.
+#define KMAT KvMat(k_addr).v
+#define VMAT KvMat(v_addr).v
+#else
+layout(binding = 1) readonly buffer KB { float16_t k[]; };  // [kv_len, nkv, hd]
+layout(binding = 2) readonly buffer VB { float16_t v[]; };  // [kv_len, nkv, hd]
+#define KMAT k
+#define VMAT v
+#endif
+layout(binding = 3) writeonly buffer POB { float po[]; };   // [n_splits, mpad, nh, hd] un-normalized O
+layout(binding = 4) writeonly buffer PMB { float pm[]; };   // [n_splits, mpad, nh] running max
+layout(binding = 5) writeonly buffer PLB { float pl[]; };   // [n_splits, mpad, nh] running sum
+
+shared float Ss[BM * BN];
+shared float16_t Ps[BM * BN];
+shared float Os[BM * 128u];
+shared float mrow[BM];
+shared float lrow[BM];
+shared float corr[BM];
+#if defined(STAGE)
+// 32-wide K-or-V column slab, reused K→V within a kv0 block. 4096 B (BN*32*2).
+shared float16_t KVstg[BN * 32u];
+#endif
+
+void main() {
+    uint qt = gl_WorkGroupID.x / pc.nh;
+    uint h = gl_WorkGroupID.x % pc.nh;
+    uint split = gl_WorkGroupID.y;
+    uint qr0 = qt * BM;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint li = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID;
+    uint hd = pc.hd;
+    float scale = 1.0 / sqrt(float(hd));
+#ifdef KV_COOPMAT_BDA
+    // Wave-uniform K/V cache base pointers, set ONCE (kv_addr.glsl). coopMatLoad adds the u32
+    // element offset + row stride below → the base stays scalar-uniform (the slice-4 spelling).
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
+
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] = 0.0; }
+    if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
+    barrier();
+
+    uint qmax = pc.pos_offset + qr0 + BM - 1u;
+    uint kvend = min(min(pc.kv_len, qmax + 1u), split * pc.ksplit + pc.ksplit);
+    uint kv0 = split * pc.ksplit;
+    for (; kv0 < kvend; kv0 += BN) {
+#if defined(STAGE)
+        // ---- QK (staged): S = Q·Kᵀ. All BN/16 kv-col accumulators stay live so one 32-wide K slab
+        //      (two kf tiles) feeds every col tile before the slab is overwritten. ----
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> qkacc[BN / 16u];
+        for (uint c = 0u; c < BN / 16u; c++) {
+            qkacc[c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+        for (uint dcol = 0u; dcol < hd; dcol += 32u) {
+            // stage K[kv0..+BN][dcol..+32] → KVstg (bounds-guard past kv_len; masked out in softmax)
+#if defined(DEQUANT)
+            g_kv_sel = 0u;
+            for (uint kvl = li; kvl < BN; kvl += gl_WorkGroupSize.x) {
+                float vv[32];
+                if (kv0 + kvl < pc.kv_len) {
+                    dqblk((kv0 + kvl) * pc.nkv * hd + kvh * hd + dcol, vv);
+                    for (uint w = 0u; w < 32u; w++) { KVstg[kvl * 32u + w] = float16_t(vv[w]); }
+                } else {
+                    for (uint w = 0u; w < 32u; w++) { KVstg[kvl * 32u + w] = float16_t(0.0); }
+                }
+            }
+#else
+            for (uint i = li; i < BN * 32u; i += gl_WorkGroupSize.x) {
+                uint kvl = i / 32u;
+                uint dl = i % 32u;
+                KVstg[i] = (kv0 + kvl < pc.kv_len)
+                    ? k[(kv0 + kvl) * pc.nkv * hd + kvh * hd + dcol + dl]
+                    : float16_t(0.0);
+            }
+#endif
+            barrier();
+            for (uint kf2 = 0u; kf2 < 32u; kf2 += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopMatLoad(A, q, (qr0 + sg * 16u) * pc.nh * hd + h * hd + dcol + kf2,
+                            pc.nh * hd, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint c = 0u; c < BN / 16u; c++) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                    coopMatLoad(B, KVstg, c * 16u * 32u + kf2, 32u,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    qkacc[c] = coopMatMulAdd(A, B, qkacc[c]);
+                }
+            }
+            barrier();
+        }
+        for (uint c = 0u; c < BN / 16u; c++) {
+            coopMatStore(qkacc[c], Ss, (sg * 16u) * BN + c * 16u, BN,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+#else
+        for (uint ctile = 0u; ctile < BN; ctile += 16u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint kf = 0u; kf < hd; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, q, (qr0 + sg * 16u) * pc.nh * hd + h * hd + kf,
+                            pc.nh * hd, gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global K read (default arm): kvend is NOT BN-rounded, so the last column
+                // tile reads kv rows past kv_len. Unlike the -DSTAGE arm above (which guards the shmem
+                // copy with `kv0+kvl < kv_len`), a direct coopMatLoad can't mask per column — the
+                // over-read is instead bounded by the K/V ROW CAPACITY (the recorder gates flash on
+                // kv_len.div_ceil(64)*64 <= att_cap_rows) and the extra columns are masked to -1e30
+                // in the softmax below (masked positions contribute nothing).
+                coopMatLoad(B, KMAT, (kv0 + ctile) * pc.nkv * hd + kvh * hd + kf,
+                            pc.nkv * hd, gl_CooperativeMatrixLayoutColumnMajor);
+                acc = coopMatMulAdd(A, B, acc);
+            }
+            coopMatStore(acc, Ss, (sg * 16u) * BN + ctile, BN,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+#endif
+
+        if (li < BM) {
+            uint r = li;
+            uint qpos = pc.pos_offset + qr0 + r;
+            float rmax = mrow[r];
+            for (uint j = 0u; j < BN; j++) {
+                uint kpos = kv0 + j;
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
+                Ss[r * BN + j] = s;
+                rmax = max(rmax, s);
+            }
+            float cf = exp(mrow[r] - rmax);
+            float rsum = 0.0;
+            for (uint j = 0u; j < BN; j++) {
+                float p = exp(Ss[r * BN + j] - rmax);
+                Ps[r * BN + j] = float16_t(p);
+                rsum += p;
+            }
+            lrow[r] = lrow[r] * cf + rsum;
+            mrow[r] = rmax;
+            corr[r] = cf;
+        }
+        barrier();
+
+        for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] *= corr[i / hd]; }
+        barrier();
+
+#if defined(STAGE)
+        // ---- PV (staged): O += P·V. Stage a 32-wide V out-dim slab; two out-dim tiles per slab. ----
+        for (uint dcol = 0u; dcol < hd; dcol += 32u) {
+#if defined(DEQUANT)
+            g_kv_sel = 1u;
+            for (uint kvl = li; kvl < BN; kvl += gl_WorkGroupSize.x) {
+                float vv[32];
+                if (kv0 + kvl < pc.kv_len) {
+                    dqblk((kv0 + kvl) * pc.nkv * hd + kvh * hd + dcol, vv);
+                    for (uint w = 0u; w < 32u; w++) { KVstg[kvl * 32u + w] = float16_t(vv[w]); }
+                } else {
+                    for (uint w = 0u; w < 32u; w++) { KVstg[kvl * 32u + w] = float16_t(0.0); }
+                }
+            }
+#else
+            for (uint i = li; i < BN * 32u; i += gl_WorkGroupSize.x) {
+                uint kvl = i / 32u;
+                uint dl = i % 32u;
+                KVstg[i] = (kv0 + kvl < pc.kv_len)
+                    ? v[(kv0 + kvl) * pc.nkv * hd + kvh * hd + dcol + dl]
+                    : float16_t(0.0);
+            }
+#endif
+            barrier();
+            for (uint ct2 = 0u; ct2 < 32u; ct2 += 16u) {
+                uint ct = dcol + ct2;
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+                coopMatLoad(acc, Os, (sg * 16u) * hd + ct, hd, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint kf = 0u; kf < BN; kf += 16u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                    coopMatLoad(A, Ps, (sg * 16u) * BN + kf, BN,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                    coopMatLoad(B, KVstg, kf * 32u + ct2, 32u,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc = coopMatMulAdd(A, B, acc);
+                }
+                coopMatStore(acc, Os, (sg * 16u) * hd + ct, hd,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+        }
+#else
+        for (uint ct = 0u; ct < hd; ct += 16u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+            coopMatLoad(acc, Os, (sg * 16u) * hd + ct, hd, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint kf = 0u; kf < BN; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, Ps, (sg * 16u) * BN + kf, BN,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global V read (default arm): same bounded over-read as the K load above —
+                // rows past kv_len stay inside the row-capacity allocation and carry a 0 P weight.
+                coopMatLoad(B, VMAT, (kv0 + kf) * pc.nkv * hd + kvh * hd + ct,
+                            pc.nkv * hd, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(A, B, acc);
+            }
+            coopMatStore(acc, Os, (sg * 16u) * hd + ct, hd,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+#endif
+    }
+
+    // Emit UN-normalized partial for this split (combine merges + normalizes).
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) {
+        uint r = i / hd;
+        uint d = i % hd;
+        po[(split * pc.q_len + (qr0 + r)) * pc.nh * hd + h * hd + d] = Os[i];
+    }
+    if (li < BM) {
+        uint idx = (split * pc.q_len + (qr0 + li)) * pc.nh + h;
+        pm[idx] = mrow[li];
+        pl[idx] = lrow[li];
+    }
+}

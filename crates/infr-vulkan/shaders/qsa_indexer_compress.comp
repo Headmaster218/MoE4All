@@ -1,0 +1,121 @@
+#version 460
+#ifdef KV_SEGMENTED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+// Materialize each newly-complete QSA block once. This is bit-for-bit the old score shader's
+// key path: mean in f32, round to f16, RMSNorm, then RoPE at the block's first token position.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint first_block;
+    uint count;
+    uint head_dim;
+    uint ratio;
+    uint rope_dim;
+    float theta;
+    float eps;
+#ifdef KV_SEGMENTED
+    uint raw_shift;
+    uint block_shift;
+#endif
+#ifdef QSA_MROPE
+    uint s0;
+    uint s1;
+    uint s2;
+    uint s3;
+#endif
+} pc;
+#ifdef KV_SEGMENTED
+layout(binding = 0) readonly buffer KB { uvec2 raw_segments[]; };
+#else
+layout(binding = 0) readonly buffer KB { uint raw_k[]; };
+#endif
+layout(binding = 1) readonly buffer NB { float norm[]; };
+#ifdef QSA_MROPE
+layout(binding = 2) readonly buffer PB { int pos4[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 3) readonly buffer CB { uvec2 block_segments[]; };
+#include "kv_addr.glsl"
+#else
+layout(binding = 3) writeonly buffer CB { float block_k[]; };
+#endif
+#else
+#ifdef KV_SEGMENTED
+layout(binding = 2) readonly buffer CB { uvec2 block_segments[]; };
+#include "kv_addr.glsl"
+#else
+layout(binding = 2) writeonly buffer CB { float block_k[]; };
+#endif
+#endif
+
+shared float keyv[128];
+shared float rmsv[128];
+
+float kread(uint i) {
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.raw_shift);
+    uint64_t base = kv_segment_base(raw_segments[kv_segment(i, pc.raw_shift)]);
+    return kv_half(base, local);
+#else
+    uint w = raw_k[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+#endif
+}
+
+void main() {
+    uint local_block = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (local_block >= pc.count) { return; }
+    uint block = pc.first_block + local_block;
+    uint d = gl_LocalInvocationID.x;
+
+    float v = 0.0;
+    for (uint r = 0u; r < pc.ratio; ++r) {
+        v += kread((block * pc.ratio + r) * pc.head_dim + d);
+    }
+    v /= float(pc.ratio);
+    v = unpackHalf2x16(packHalf2x16(vec2(v, 0.0))).x;
+    keyv[d] = v;
+    rmsv[d] = v * v;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (d < stride) { rmsv[d] += rmsv[d + stride]; }
+        barrier();
+    }
+    float kn = v * inversesqrt(rmsv[0] / float(pc.head_dim) + pc.eps) * norm[d];
+    keyv[d] = kn;
+    barrier();
+
+    if (d < pc.rope_dim) {
+        uint hf = pc.rope_dim >> 1u;
+        uint pair = d % hf;
+        uint mate = pair + hf;
+        float pos = float(block * pc.ratio);
+#ifdef QSA_MROPE
+        uint sector = pair % (pc.s0 + pc.s1 + pc.s2 + pc.s3);
+        uint plane;
+        if (sector % 3u == 1u && sector < 3u * pc.s1) { plane = 1u; }
+        else if (sector % 3u == 2u && sector < 3u * pc.s2) { plane = 2u; }
+        else if (sector % 3u == 0u && sector < 3u * pc.s0) { plane = 0u; }
+        else { plane = 3u; }
+        pos = float(pos4[(block * pc.ratio) * 4u + plane]);
+#endif
+        float angle = pos *
+            pow(pc.theta, -2.0 * float(pair) / float(pc.rope_dim));
+        float s = sin(angle);
+        float c = cos(angle);
+        float a = keyv[pair];
+        float b = keyv[mate];
+        kn = d < hf ? a * c - b * s : a * s + b * c;
+    }
+    uint out_elem = block * pc.head_dim + d;
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(out_elem, pc.block_shift);
+    uint64_t base = kv_segment_base(block_segments[kv_segment(out_elem, pc.block_shift)]);
+    kv_store_f32(base, local, kn);
+#else
+    block_k[out_elem] = kn;
+#endif
+}

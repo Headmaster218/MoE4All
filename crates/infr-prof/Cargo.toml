@@ -1,0 +1,15 @@
+[package]
+name = "infr-prof"
+description = "#[infr_prof::instrument] — rewrites every fn in the annotated item to record a profiling span (INFR_PROFILE builds)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit-mut"] }

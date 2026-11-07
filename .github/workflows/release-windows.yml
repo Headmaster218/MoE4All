@@ -1,0 +1,200 @@
+name: Windows Release
+
+on:
+  workflow_dispatch: {}
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # Keep the release baseline explicit and aligned with .cargo/config.toml.
+  RUSTFLAGS: '-C target-cpu=x86-64 -C target-feature=+crt-static'
+  VULKAN_SDK_VERSION: '1.4.357.0'
+
+jobs:
+  package:
+    name: Build MoE4All Windows package
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: ./.github/actions/setup-build-cache
+        with:
+          shared-key: windows-release-x86-64
+          cache-on-failure: true
+
+      - name: Resolve and validate release version
+        id: release
+        shell: pwsh
+        run: |
+          $metadata = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+          $package = $metadata.packages | Where-Object { $_.name -eq 'infr-cli' } | Select-Object -First 1
+          if ($null -eq $package) { throw 'infr-cli is missing from cargo metadata.' }
+          $version = [string]$package.version
+          $expectedTag = "release-$version"
+          if ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne $expectedTag) {
+            throw "Tag '${{ github.ref_name }}' does not match Cargo version '$expectedTag'."
+          }
+          $packageName = "MoE4All-Windows-x86_64-v$version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "prerelease=$($version.Contains('-').ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "archive_name=$packageName.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Cache Vulkan SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-windows-x64-${{ env.VULKAN_SDK_VERSION }}
+      - name: Install Vulkan shader compiler
+        shell: pwsh
+        run: .\scripts\install-vulkan-sdk-windows.ps1
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install image codec build tools
+        shell: pwsh
+        run: |
+          python -m pip install meson==1.9.1 ninja==1.13.0
+          choco install nasm --version=2.16.03 --yes --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Cache bundled image codecs
+        id: codec-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/image-codecs
+            target/image-codec-sources.tar.gz
+          key: image-codecs-v1-windows-2025-x64-${{ hashFiles('scripts/build-image-codecs.py') }}
+      - name: Build bundled HEIC and AVIF decoders
+        if: steps.codec-cache.outputs.cache-hit != 'true'
+        run: python scripts/build-image-codecs.py --work "${{ runner.temp }}/image-codec-build"
+      - name: Restore codec source fixtures
+        if: steps.codec-cache.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'image-codec-build\sources'
+          New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
+          tar -xzf .\target\image-codec-sources.tar.gz -C $sourceRoot
+          if ($LASTEXITCODE -ne 0) { throw "Codec source extraction failed with exit code $LASTEXITCODE" }
+      - name: Verify image decoding without a GPU
+        shell: pwsh
+        env:
+          INFR_IMAGE_CODEC_DIR: ${{ github.workspace }}\target\image-codecs
+          INFR_IMAGE_CODEC_FIXTURES: ${{ runner.temp }}\image-codec-build\sources\libheif
+        run: |
+          cargo test --locked -p infr-vision --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-vision bundled_codecs -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test Windows platform code
+        shell: pwsh
+        env:
+          MOE4ALL_WORK_ROOT: ${{ runner.temp }}\moe4all-work
+        run: |
+          New-Item -ItemType Directory -Force -Path (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all') | Out-Null
+          powershell.exe -NoLogo -NoProfile -File .\scripts\test-benchmark-hardware.ps1 -FixtureRoot (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\benchmark-hardware')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-LaunchWizard.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-CpuMissWizard.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardEntryPolicy.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardModelCatalog.ps1 -WorkDir (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\model-catalog')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardSpeech.ps1 -WorkDir (Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\speech')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:MOE4ALL_WIZARD_TEST_TMP = Join-Path $env:MOE4ALL_WORK_ROOT 'tmp\moe4all\startup'
+          New-Item -ItemType Directory -Force -Path $env:MOE4ALL_WIZARD_TEST_TMP | Out-Null
+          $env:TEMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          $env:TMP = $env:MOE4ALL_WIZARD_TEST_TMP
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-WizardStartupPolicy.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -File .\scripts\Test-BenchmarkStartupGuide.ps1 -TaskRoot $env:MOE4ALL_WIZARD_TEST_TMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell.exe -NoLogo -NoProfile -STA -File .\scripts\Test-WizardStartupDialogs.ps1 -EvidenceDirectory $env:MOE4ALL_WIZARD_TEST_TMP
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check --locked -p infr-hub --all-targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-hub model_ref::tests::
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p infr-core hostmem::tests::the_windows_live_probe_is_plausible -- --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build portable MoE4All engine (infr.exe)
+        run: cargo build --release --locked -p infr-cli --features tts
+      - name: Show sccache statistics
+        if: always()
+        run: sccache --show-stats
+
+      - name: Create release archive
+        shell: pwsh
+        run: .\scripts\package-windows.ps1 -Version '${{ steps.release.outputs.version }}'
+      - name: Smoke-test extracted CMD package
+        shell: pwsh
+        run: |
+          $extractPath = Join-Path $env:RUNNER_TEMP 'infr-package-smoke'
+          Expand-Archive -LiteralPath '.\dist\${{ steps.release.outputs.archive_name }}' -DestinationPath $extractPath
+          $packageRoot = Join-Path $extractPath '${{ steps.release.outputs.package_name }}'
+          .\scripts\smoke-windows-package.ps1 -PackageRoot $packageRoot -ExpectedVersion '${{ steps.release.outputs.version }}' -SkipInteractiveDeviceChecks
+
+      - name: Write immutable release manifest
+        shell: pwsh
+        run: |
+          $rustc = (& rustc --version).Trim()
+          $cargo = (& cargo --version).Trim()
+          $runner = "$env:ImageOS-$env:ImageVersion"
+          $manifestArgs = @(
+            'scripts/release_ci.py'
+            'write'
+            '--platform', 'windows-x86_64'
+            '--version', '${{ steps.release.outputs.version }}'
+            '--commit', '${{ github.sha }}'
+            '--repository', '${{ github.repository }}'
+            '--output', 'dist/release-manifest-windows-x86_64.json'
+            '--metadata', "rustc=$rustc"
+            '--metadata', "cargo=$cargo"
+            '--metadata', "runner=$runner"
+            "dist/${{ steps.release.outputs.archive_name }}"
+            "dist/${{ steps.release.outputs.archive_name }}.sha256"
+            'dist/image-codec-sources.tar.gz'
+          )
+          & python @manifestArgs
+          if ($LASTEXITCODE -ne 0) { throw "Release manifest failed with exit code $LASTEXITCODE" }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.release.outputs.package_name }}
+          path: |
+            dist/${{ steps.release.outputs.archive_name }}
+            dist/${{ steps.release.outputs.archive_name }}.sha256
+            dist/image-codec-sources.tar.gz
+            dist/release-manifest-windows-x86_64.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest release archive
+        if: github.repository_visibility == 'public'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ steps.release.outputs.archive_name }}

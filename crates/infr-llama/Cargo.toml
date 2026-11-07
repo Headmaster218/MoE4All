@@ -1,0 +1,31 @@
+[package]
+name = "infr-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-prof.workspace = true
+infr-prof-rt.workspace = true
+infr-core.workspace = true
+infr-chat.workspace = true
+infr-vulkan.workspace = true
+infr-metal.workspace = true
+infr-gguf.workspace = true
+infr-cpu.workspace = true
+serde_json.workspace = true
+llguidance.workspace = true
+toktrie_hf_tokenizers.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+tokenizers = { workspace = true }
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+

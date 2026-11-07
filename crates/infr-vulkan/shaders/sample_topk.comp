@@ -1,0 +1,230 @@
+#version 460
+// GPU stochastic sampling over VOCAB-scale logits (Op::Sample): temperature + top-k + top-p,
+// matching the host `sample_logits` given the same uniform draw `u`. Two stages so the vocab scan
+// parallelizes across the GPU (the single-workgroup `moe_sample` re-reads all n logits 9 times on
+// 1 of 48 WGPs — fine for n = n_expert, ruinous for n = 262k; same lesson as argmax.comp):
+//   stage 1 (no define): 256 workgroups; each radix-selects the top-k of its contiguous slice and
+//     writes k (val, idx) candidate pairs — vals at cand[w*k+j], u32 index bit-patterns at
+//     cand[256*k + w*k+j]; short/empty slices pad with -1e30. The union of per-slice top-k
+//     provably contains the global top-k.
+//   stage 2 (-DPASS2): one workgroup radix-selects the global top-k among the 256*k candidates,
+//     then sorts, softmax(temp), nucleus cutoff, inverse-CDF with `u` — `u` is read from a
+//     1-float BUFFER (not a push constant) so a record-once replayed plan can vary it per token.
+//     -DCHAIN (stage 2 only, implies PASS2): the chained-decode variant — `u_buf` is a 64-slot
+//     ring (mirrors `id_log.comp`'s ring) and the draw is `u_buf[params[0] & 63]` instead of
+//     `u_buf[0]`, keyed by the SAME self-advancing `params[0]` the id-log ring uses. This lets ONE
+//     recording replay either singly (record-once per-token) or chained (N replays in one
+//     submission, `execute_chain`) while consuming the host RNG stream in lockstep with the
+//     per-token host sampler (see runner.rs's ring-slot uniform uploads).
+// Only the 4-byte token id ever reads back.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint n;      // stage 1: vocab size; stage 2: candidate count (256*k)
+    uint top_k;
+    float temp;  // stage 2 only
+    float top_p; // stage 2 only
+} pc;
+#ifdef PASS2
+layout(binding = 0) readonly buffer CB { float cand[]; };
+layout(binding = 1) readonly buffer UB { float u_buf[]; };
+#ifdef CHAIN
+// CHAIN binds `params` before `out_id` so the recorder's dispatch-buffer array (whose LAST
+// entries are the writes) still ends on `out_id` — see `Recorder::sample_topk_chain`.
+layout(binding = 2) readonly buffer PB2 { uint params[]; };
+layout(binding = 3) writeonly buffer OB { uint out_id[]; };
+#else
+layout(binding = 2) writeonly buffer OB { uint out_id[]; };
+#endif
+#else
+layout(binding = 0) readonly buffer LB { float logits[]; };
+layout(binding = 1) writeonly buffer CB { float cand[]; };
+#endif
+
+#define BLOCK 256u
+#define KMAX 64u
+
+shared uint bucket[16];
+shared uint sh_sel;
+shared uint sh_krem;
+shared uint gcnt;
+shared float gval[KMAX];
+shared uint gidx[KMAX];
+shared uint sinvalid;
+
+// Order-preserving float→uint: larger float ⇒ larger uint (ggml f2ui).
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    if ((y & 0x80000000u) != 0u) { y = ~y; } else { y |= 0x80000000u; }
+    return y;
+}
+
+#ifdef PASS2
+uint cand_row_base() { return gl_WorkGroupID.x * (2u * pc.n); }
+float val_at(uint i) { return cand[cand_row_base() + i]; }
+uint idx_at(uint i) { return floatBitsToUint(cand[cand_row_base() + pc.n + i]); }
+#endif
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint k = pc.top_k;
+#ifdef PASS2
+    uint lo = 0u;
+    uint hi = pc.n;
+#else
+    uint row = gl_WorkGroupID.x / 256u;
+    uint slice = gl_WorkGroupID.x % 256u;
+    uint chunk = (pc.n + 255u) / 256u;
+    uint lo = slice * chunk;
+    uint hi = min(lo + chunk, pc.n);
+#endif
+
+    // Phase A: radix N-ary select for the k-th largest key in [lo, hi) (MSB-first, 4 bits/pass).
+    uint prefix = 0u;
+    uint krem = k;
+    if (tid == 0u) { sinvalid = 0u; }
+    barrier();
+    for (uint level = 0u; level < 8u; level++) {
+        uint shift = 28u - 4u * level;
+        uint himask = (shift + 4u >= 32u) ? 0u : (0xFFFFFFFFu << (shift + 4u));
+        uint pfix = prefix & himask;
+        if (tid < 16u) { bucket[tid] = 0u; }
+        barrier();
+        for (uint i = lo + tid; i < hi; i += BLOCK) {
+#ifdef PASS2
+            uint index = idx_at(i);
+            if (level == 0u && index == 0xFFFFFFFFu) { atomicOr(sinvalid, 1u); }
+            uint key = f2ui(val_at(i));
+#else
+            float v = logits[row * pc.n + i];
+            bool finite = true;
+            if (level == 0u) {
+                finite = !(isnan(v) || isinf(v));
+                if (!finite) { atomicOr(sinvalid, 1u); }
+            }
+            uint key = f2ui(finite ? v : -1e30);
+#endif
+            if ((key & himask) == pfix) {
+                atomicAdd(bucket[(key >> shift) & 0xFu], 1u);
+            }
+        }
+        barrier();
+        if (tid == 0u) {
+            uint cum = 0u;
+            uint sel = 0u;
+            uint kr = krem;
+            for (int b = 15; b >= 0; b--) {
+                uint c = bucket[uint(b)];
+                if (cum + c >= krem) { sel = uint(b); kr = krem - cum; break; }
+                cum += c;
+            }
+            sh_sel = sel;
+            sh_krem = kr;
+        }
+        barrier();
+        prefix |= (sh_sel << shift);
+        krem = sh_krem;
+#ifdef PASS2
+        if (level == 0u && sinvalid != 0u) {
+            if (tid == 0u) { out_id[gl_WorkGroupID.x] = 0xFFFFFFFFu; }
+            return;
+        }
+#endif
+    }
+    uint thresh = prefix; // key of the k-th largest value in the range
+
+    // Phase B: gather values with key ≥ threshold into shared (cap k).
+    if (tid == 0u) { gcnt = 0u; }
+    barrier();
+#ifdef PASS2
+    for (uint i = lo + tid; i < hi; i += BLOCK) {
+        float v = val_at(i);
+        if (f2ui(v) >= thresh) {
+            uint slot = atomicAdd(gcnt, 1u);
+            if (slot < k) { gval[slot] = v; gidx[slot] = idx_at(i); }
+        }
+    }
+#else
+    // The first radix pass already proved this slice finite. A damaged slice only needs to emit
+    // its marker below; skip the ordinary gather and avoid another isfinite scan on the hot path.
+    if (sinvalid == 0u) {
+        for (uint i = lo + tid; i < hi; i += BLOCK) {
+            float v = logits[row * pc.n + i];
+            if (f2ui(v) >= thresh) {
+                uint slot = atomicAdd(gcnt, 1u);
+                if (slot < k) { gval[slot] = v; gidx[slot] = i; }
+            }
+        }
+    }
+#endif
+    barrier();
+
+#ifdef PASS2
+    // Phase C (single lane): sort the ≤k candidates descending, softmax+temp, nucleus cutoff,
+    // inverse-CDF sample with the buffered uniform — identical order of operations to the host
+    // `sample_logits`, so the same `u` picks the same token (modulo exact-tie order).
+    if (tid == 0u) {
+        if (sinvalid != 0u) {
+            out_id[gl_WorkGroupID.x] = 0xFFFFFFFFu;
+            return;
+        }
+        uint m = min(gcnt, k);
+        for (uint a = 1u; a < m; a++) {
+            float vv = gval[a];
+            uint ii = gidx[a];
+            uint b = a;
+            while (b > 0u && gval[b - 1u] < vv) {
+                gval[b] = gval[b - 1u];
+                gidx[b] = gidx[b - 1u];
+                b--;
+            }
+            gval[b] = vv;
+            gidx[b] = ii;
+        }
+        float maxl = gval[0];
+        float sum = 0.0;
+        for (uint j = 0u; j < m; j++) {
+            float p = exp((gval[j] - maxl) / pc.temp);
+            gval[j] = p; // reuse gval to hold probabilities
+            sum += p;
+        }
+        for (uint j = 0u; j < m; j++) { gval[j] /= sum; }
+        float cum = 0.0;
+        uint cutoff = m;
+        for (uint j = 0u; j < m; j++) {
+            cum += gval[j];
+            if (cum >= pc.top_p) { cutoff = j + 1u; break; }
+        }
+        float total = 0.0;
+        for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
+#ifdef CHAIN
+        float u = u_buf[params[0] & 63u];
+#else
+        float u = u_buf[gl_WorkGroupID.x];
+#endif
+        float r = u * total;
+        uint tok = gidx[cutoff - 1u];
+        float acc = 0.0;
+        for (uint j = 0u; j < cutoff; j++) {
+            acc += gval[j];
+            if (r <= acc) { tok = gidx[j]; break; }
+        }
+        out_id[gl_WorkGroupID.x] = tok;
+    }
+#else
+    // Stage-1 epilogue (single lane): write this slice's ≤k candidates, padding to exactly k so
+    // stage 2 reads a dense [256*k] grid. -1e30 pads rank below every real logit.
+    if (tid == 0u) {
+        uint m = min(gcnt, k);
+        uint row_base = row * (2u * 256u * k);
+        uint base = row_base + slice * k;
+        uint ncand = 256u * k;
+        for (uint j = 0u; j < k; j++) {
+            bool marker = sinvalid != 0u && j == 0u;
+            cand[base + j] = marker ? uintBitsToFloat(0x7F800000u)
+                                      : ((j < m) ? gval[j] : -1e30);
+            cand[row_base + ncand + slice * k + j] =
+                uintBitsToFloat(marker ? 0xFFFFFFFFu : ((j < m) ? gidx[j] : 0u));
+        }
+    }
+#endif
+}

@@ -1,0 +1,60 @@
+#version 460
+// Gather + dequantize embedding rows (Op::EmbedGather): dst[r, :] = table[ids[r], :] * scale.
+// One workgroup per row, 64 threads each dequantize whole 32-element sub-blocks via the shared
+// native_decode.glsl dqblk (same per-format decode as the native GEMV/GEMM family; -DFMT_*
+// selects the format). `ids` is the i32 token-id input — the host uploads 4 bytes per token
+// instead of a dequantized f32 embedding row.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// Resident-BDA (STREAMED is the only weight build): the token-embedding table is read from the
+// arena pool by 64-bit device address (native_weight_addr.glsl). `ids` selects the row within THIS
+// table (no per-expert stride to repurpose, unlike native_gemv_id's stacked-expert form), so
+// `arena_lo`/`arena_hi` carry the table's arena base BYTE address. `row_bytes` is a MODE SELECTOR
+// (see main): 0 = the original element-offset gather (`base = ids*ne`) for a table that fits u32
+// — every current model; nonzero = this token's whole-block row byte stride, folded into `w_addr`
+// as a 64-bit offset for a `>= 2^32`-element table (256k-vocab frontier models, whose `ids*ne`
+// element base would wrap u32) so the within-row index (`s*32 < ne`) stays u32 — one 64-bit
+// multiply per gathered token, the pattern the paged expert pool uses; the host passes it only when
+// it is a multiple of 4 (so `w_addr` stays buffer_reference-aligned).
+layout(push_constant) uniform PC {
+    uint rows; uint ne; float scale; uint arena_lo; uint arena_hi; uint row_bytes;
+} pc;
+layout(binding = 1) readonly buffer IB { int ids[]; };
+layout(binding = 2) writeonly buffer YB { float y_buf[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint nsub = pc.ne / 32u;
+    // `row_bytes == 0` (the host sentinel for a table that FITS u32 — every current model, INCLUDING
+    // quant tables whose row stride is NOT word-aligned, e.g. gemma) selects the original
+    // element-offset path: `base = ids*ne`, decoded off the 256-aligned table base by
+    // native_decode's byte-granular reads. BITWISE-identical to the pre-#77 kernel. A nonzero
+    // `row_bytes` (only a `>= 2^32`-element table, where `ids*ne` would wrap u32) folds the row into
+    // the 64-bit base instead — one u64 multiply per token, `row_bytes % 4 == 0` host-asserted so
+    // `w_addr` stays buffer_reference-aligned. The branch is workgroup-uniform (a push constant).
+    if (pc.row_bytes == 0u) {
+        w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+        uint base = uint(ids[row]) * pc.ne; // table element offset of this token's row
+        for (uint s = t; s < nsub; s += 64u) {
+            float v[32];
+            dqblk(base + s * 32u, v);
+            uint o = row * pc.ne + s * 32u;
+            for (uint w = 0u; w < 32u; w++) { y_buf[o + w] = v[w] * pc.scale; }
+        }
+    } else {
+        w_addr = arena_base(pc.arena_lo, pc.arena_hi)
+               + uint64_t(uint(ids[row])) * uint64_t(pc.row_bytes);
+        for (uint s = t; s < nsub; s += 64u) {
+            float v[32];
+            dqblk(s * 32u, v); // element offset WITHIN this token's row (< ne, u32-safe)
+            uint o = row * pc.ne + s * 32u;
+            for (uint w = 0u; w < 32u; w++) { y_buf[o + w] = v[w] * pc.scale; }
+        }
+    }
+}

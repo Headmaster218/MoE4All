@@ -1,0 +1,195 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Experimental only. Fixed32/full subgroups, no cross-WG producer/consumer edge.
+// Default: first copy_groups WGs copy late jobs, remaining WGs compute miss GU.
+// CLASSIFY_ONLY: one WG constructs a private early/late index list, charged by caller.
+// COPY_EARLY_ONLY: classified phase1 copy. MIXED_CLASSIFIED: consume late list.
+// GU_ONLY_CONTROL: same GU math/layout for the separate-dispatch control arm.
+// Binding 6 has 8+2*384 uints; word 7 is W0 for a LATER, joined miss-Down consumer.
+#ifndef LOCAL
+#define LOCAL 256
+#endif
+#ifndef NR
+#define NR 2
+#endif
+#ifndef MAX_NFF
+#define MAX_NFF 1024
+#endif
+#if LOCAL != 256 || NR != 2
+#error Initial_candidate_requires_LOCAL256_NR2_for_a_bounded_same_width_control
+#endif
+#if (defined(FMT_Q4K) + defined(FMT_Q5K) + defined(FMT_Q6K) + defined(FMT_IQ2S) + defined(FMT_IQ3S)) != 1
+#error Select_one_Gate_Up_format
+#endif
+#if (defined(FMT_IQ2S) || defined(FMT_IQ3S)) && !defined(USE_GRID)
+#error IQ_formats_require_generated_LDS_grid
+#endif
+
+layout(local_size_x = LOCAL) in;
+layout(std430, binding = 0) readonly buffer Journal { uint journal[]; };
+layout(std430, binding = 1) readonly buffer Jobs { uvec4 jobs[]; };
+layout(std430, binding = 2) readonly buffer Input { float x[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint ids[]; };
+layout(std430, binding = 4) readonly buffer Tape { uvec2 tape[]; };
+layout(std430, binding = 5) buffer Output { float output_values[]; };
+layout(std430, binding = 6) buffer Tasks { uint tasks[]; };
+layout(push_constant) uniform Params {
+    uint ne; uint nff; uint rows; uint used; uint experts; uint physical_used;
+    uint gate_tape; uint up_tape; uint down_tape;
+    uint ordinal; uint copy_groups; uint gate_block; uint up_block; uint down_block;
+    uint gu_bytes; uint down_bytes;
+} p;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer CopySource { uvec4 chunks[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer CopyTarget { uvec4 chunks[]; };
+const uint CAP = 384u, WORDS = 140u, COUNT = 136u, STATUS = 139u;
+const uint EARLY = 8u, LATE = EARLY + CAP;
+
+uint64_t addr(uvec2 a) { return uint64_t(a.x) | (uint64_t(a.y) << 32u); }
+bool fits(uint base, uint n, uint length) { return base <= length && n <= length - base; }
+bool valid_span(uvec2 a, uint n) {
+    uint64_t v = addr(a);
+    return v != uint64_t(0) && !all(equal(a, uvec2(0xffffffffu))) && n > 0u
+        && ((a.x | n) & 15u) == 0u && v + uint64_t(n) > v;
+}
+bool overlap(uvec2 a, uint an, uvec2 b, uint bn) {
+    return addr(a) < addr(b) + uint64_t(bn) && addr(b) < addr(a) + uint64_t(an);
+}
+uint jb(uint j) { return (p.ordinal * CAP + j) * 2u; }
+int role_of(uint block) {
+    if (block >= p.gate_block && block - p.gate_block < p.experts) return 0;
+    if (block >= p.up_block && block - p.up_block < p.experts) return 1;
+    if (block >= p.down_block && block - p.down_block < p.experts) return 2;
+    return -1;
+}
+bool geometry() {
+    return p.rows >= 1u && p.rows <= 8u && p.used >= 1u && p.used <= 16u
+        && p.experts >= p.used && p.experts <= 65536u && p.ne > 0u && p.ne <= 65536u
+        && (p.ne & 255u) == 0u && p.nff > 0u && p.nff <= uint(MAX_NFF)
+        && (p.nff & 31u) == 0u && p.physical_used >= p.used && p.physical_used <= p.used + 1u
+        && p.copy_groups >= 1u && p.copy_groups <= 32u
+        && p.ordinal < uint(journal.length()) / WORDS
+        && p.ordinal < uint(jobs.length()) / (CAP * 2u)
+        && uint(tasks.length()) >= LATE + CAP
+        && fits(p.gate_tape, p.experts, uint(tape.length()))
+        && fits(p.up_tape, p.experts, uint(tape.length()))
+        && fits(p.down_tape, p.experts, uint(tape.length()))
+        && p.gate_block + p.experts >= p.gate_block
+        && p.up_block + p.experts >= p.up_block && p.down_block + p.experts >= p.down_block
+        && (p.down_block + p.experts <= p.gate_block || p.gate_block + p.experts <= p.down_block)
+        && (p.down_block + p.experts <= p.up_block || p.up_block + p.experts <= p.down_block)
+        && uint(ids.length()) >= p.rows * (p.used + 2u)
+        && uint(x.length()) >= p.rows * p.ne
+        && uint(output_values.length()) >= p.rows * p.physical_used * p.nff
+        && p.gu_bytes > 0u && p.down_bytes > 0u;
+}
+// Static bank/source ownership, uniqueness and cross-bank nonaliasing are proved
+// ONCE by the fixture factory before recording. Never scan whole banks or N^2
+// job pairs in a GU WG. This is a private immutable module ABI, not owner admission.
+bool validate_copy_jobs(uint count, uint status) {
+    if ((status != 4u && status != 5u) || count == 0u || count > CAP) return false;
+    for (uint j = 0u; j < count; ++j) {
+        uvec4 a = jobs[jb(j)], b = jobs[jb(j) + 1u];
+        int r = role_of(b.y);
+        if (r < 0 || !valid_span(a.zw, b.x)) return false;
+        uint base = r == 0 ? p.gate_block : (r == 1 ? p.up_block : p.down_block);
+        uint tb = r == 0 ? p.gate_tape : (r == 1 ? p.up_tape : p.down_tape);
+        if (b.x != (r == 2 ? p.down_bytes : p.gu_bytes)
+            || any(notEqual(a.zw, tape[tb + b.y - base]))) return false;
+        bool cpu = all(equal(a.xy, uvec2(0u)));
+        if (cpu ? status != 5u : !valid_span(a.xy, b.x)) return false;
+        if (!cpu && overlap(a.xy, b.x, a.zw, b.x)) return false;
+    }
+    return true;
+}
+bool mapped_gu(uint count) {
+    for (uint j = 0u; j < count; ++j)
+        if (any(notEqual(jobs[jb(j)].xy, uvec2(0u))) && role_of(jobs[jb(j) + 1u].y) != 2) return true;
+    return false;
+}
+void copy_job(uint j, uint worker) {
+    uvec4 a = jobs[jb(j)];
+    if (all(equal(a.xy, uvec2(0u)))) return;
+    CopySource src = CopySource(addr(a.xy));
+    CopyTarget dst = CopyTarget(addr(a.zw));
+    uint n = jobs[jb(j) + 1u].x / 16u;
+    for (uint i = worker * uint(LOCAL) + gl_LocalInvocationIndex; i < n;
+         i += p.copy_groups * uint(LOCAL)) dst.chunks[i] = src.chunks[i];
+}
+
+#if !defined(CLASSIFY_ONLY) && !defined(COPY_EARLY_ONLY)
+#include "native_weight_addr.glsl"
+#define NW(index) arena_word(index)
+#define STREAMED
+#include "native_decode.glsl"
+#include "gpu_owned_down_copy_gu_tree64.glsl"
+#endif
+
+void main() {
+    if (gl_WorkGroupID.y != 0u || gl_WorkGroupID.z != 0u) return;
+    // Later joined consumers must not reuse a prior dispatch's readiness on rejection.
+    // No workgroup in this dispatch reads this word.
+    if (gl_WorkGroupID.x == 0u && gl_LocalInvocationIndex == 0u && tasks.length() > 7)
+        tasks[7] = 0u;
+    if (!geometry()) return;
+    uint count = journal[p.ordinal * WORDS + COUNT];
+    uint status = journal[p.ordinal * WORDS + STATUS];
+#ifdef CLASSIFY_ONLY
+    if (gl_WorkGroupID.x != 0u || gl_LocalInvocationIndex != 0u) return;
+    for (uint k = 0u; k < 8u; ++k) tasks[k] = 0u;
+    if (!validate_copy_jobs(count, status)) return;
+    bool gu = mapped_gu(count);
+    uint early = 0u, late = 0u;
+    for (uint j = 0u; j < count; ++j) {
+        if (all(equal(jobs[jb(j)].xy, uvec2(0u)))) continue;
+        if (!gu || role_of(jobs[jb(j) + 1u].y) != 2) tasks[EARLY + early++] = j;
+        else tasks[LATE + late++] = j;
+    }
+    tasks[0] = 1u; tasks[1] = status; tasks[2] = uint(status == 4u);
+    tasks[3] = early; tasks[4] = late;
+    return;
+#else
+    if (gl_SubgroupSize != 32u || gl_NumSubgroups != uint(LOCAL / 32)) return;
+#if defined(MIXED_CLASSIFIED) || defined(COPY_EARLY_ONLY)
+    bool valid = tasks[0] == 1u && tasks[1] == status && (status == 4u || status == 5u)
+        && count > 0u && count <= CAP && tasks[3] + tasks[4] <= count;
+#else
+    bool valid = (status == 4u || status == 5u) && count > 0u && count <= CAP;
+#endif
+    uint unit = gl_WorkGroupID.x;
+    // No WG in this dispatch reads word 7. The caller joins it before conditional Down.
+    if (unit == 0u && gl_LocalInvocationIndex == 0u) tasks[7] = uint(valid && status == 4u);
+    if (!valid) return;
+#ifdef GU_ONLY_CONTROL
+    if (status == 4u) mixed_gu(unit);
+#else
+    if (unit < p.copy_groups) {
+#if defined(MIXED_CLASSIFIED) || defined(COPY_EARLY_ONLY)
+#ifdef COPY_EARLY_ONLY
+        uint begin = EARLY, n = tasks[3];
+#else
+        uint begin = LATE, n = tasks[4];
+#endif
+        for (uint k = 0u; k < n; ++k) {
+            uint j = tasks[begin + k];
+            if (j >= count) return; // Private list is generated by CLASSIFY_ONLY and immutable.
+            copy_job(j, unit);
+        }
+#else
+        if (!validate_copy_jobs(count, status)) return;
+        bool gu = mapped_gu(count);
+        for (uint j = 0u; j < count; ++j)
+            if (gu && role_of(jobs[jb(j) + 1u].y) == 2) copy_job(j, unit);
+#endif
+        return;
+    }
+#ifndef COPY_EARLY_ONLY
+    if (status == 4u) mixed_gu(unit - p.copy_groups);
+#endif
+#endif
+#endif
+}

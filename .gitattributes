@@ -1,0 +1,21 @@
+# GitHub Linguist overrides.
+# `.comp` is our Vulkan compute-shader source (the bulk of the GPU kernels), but
+# Linguist doesn't classify it, so ~312 KB of shader code fell out of the language
+# stats — making Metal look larger than the Vulkan shaders when the reverse is true.
+*.comp linguist-language=GLSL
+scripts/perf-sweep.sh text eol=lf
+Start-INFR-Wizard-Linux.sh text eol=lf
+Start-INFR-Wizard-macOS.sh text eol=lf
+scripts/smoke-linux-wizard.sh text eol=lf
+scripts/install-shaderc-linux.sh text eol=lf
+scripts/test-linux-wizard.sh text eol=lf
+scripts/build-image-codecs.py text eol=lf
+scripts/linux_release.py text eol=lf
+scripts/test_linux_tools.py text eol=lf
+# Keep published experiment checksums stable in Windows checkouts.
+documentation/evidence/campaigns/qwen38/assets/expert-omission-20261011/* text eol=lf
+*.m4b text eol=lf
+*.m4e text eol=lf
+# Compressed index bytes must not be rewritten by checkout/add newline conversion.
+benchmark-database/index/v1/*.bin binary
+benchmark-database/index/v1/manifest.json text eol=lf

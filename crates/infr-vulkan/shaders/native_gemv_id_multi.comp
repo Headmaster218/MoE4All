@@ -1,0 +1,234 @@
+#version 460
+// Multi-slot id-indexed native GEMV: computes ALL n_used selected experts in one dispatch, so the
+// experts run concurrently (n_used*out_f workgroups) instead of serially with a barrier between each
+// (the decode FFN bottleneck). Workgroup `unit` → slot = unit / out_f, output row o = unit % out_f;
+// the expert is ids[slot], weight base = ids[slot]*stride + o*in_f. `x_per_slot` selects shared input
+// (gate/up read the single ffn-normed row) vs per-slot input (down reads each expert's activation).
+// Output y is [n_used, out_f]. Same cooperative-over-K dequant as native_gemv (-DFMT_* per format).
+//
+// Small-batch MoE fast path (Vulkan pp4@d4096 perf slice): the caller can widen this to `rows`
+// tokens in ONE dispatch by treating `ids`/`wts`/`y` as `[rows, n_used, ...]` flat and dispatching
+// `rows*n_used*out_f` workgroups — `slot` below is really a flat `(row, slot)` index (`slot_global`)
+// and gets split back into `row`/`slot` using `pc.n_used` (the per-row expert count). `pc.rows`
+// itself is used ONLY to bound-check the flat index against the possibly-2-D dispatch grid's
+// padding workgroups (see main()) — the addressing math still never needs the row count.
+// `rows == 1` (decode) reduces to the original single-token addressing exactly (row is always 0).
+// See `Op::MoeFfn`'s small-m branch in `adapter.rs`.
+// Reduction: subgroupAdd within each wave + one shared combine across the gl_NumSubgroups waves,
+// one barrier total, wave-size-agnostic (no pinned subgroup size) — same pattern as rmsnorm.comp /
+// mul_mat_vec_q.comp; see native_gemv_mrow.comp for why the m=1 native_gemv keeps its tree.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// `rows`: total dispatched-should-be workgroup count is rows*n_used*out_f — needed ONLY to bound-
+// check the flat index against a padding workgroup from a possibly-2-D dispatch grid (see main()).
+// -DPAGED extends the push constant with the arena's 64-bit base address (lo/hi) + per-slot byte
+// stride — see native_weight_addr.glsl; `stride` stays repurposed as the LUT window base.
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi; uint slot_bytes; uint active_mask; uint row_mask_bank;
+#ifdef SHARED_Q8
+    uint shared_lo; uint shared_hi; uint routed_used;
+#endif
+} pc;
+#elif defined(STREAMED)
+// -DSTREAMED (resident-BDA): the stacked role tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi. No LUT — the expert base is `ids[slot_global]` scaled by
+// `stride`, REPURPOSED in this build as the per-expert BYTE stride and applied on the 64-bit
+// pointer (see native_gemv_id.comp's STREAMED doc). Additive: non-STREAMED builds byte-identical.
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi;
+} pc;
+#else
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+} pc;
+#endif
+// PAGED/STREAMED read the arena by device address (native_weight_addr.glsl), not binding 0 — the
+// descriptor slot takes a harmless filler on the Rust side, so binding numbers below match all
+// builds.
+#if !defined(PAGED) && !defined(STREAMED)
+layout(binding = 0) readonly buffer WB { uint nw[]; };
+#endif
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+layout(binding = 2) readonly buffer IDB { uint ids[]; };
+// -DPAGED: see native_gemv_id.comp's doc comment — same LUT hop, same zero-cost-when-off contract.
+// `y_buf` (the sole write) is always the LAST binding — see that same doc comment for why the
+// original PAGED layout (`y_buf`=3, `lut`=4) made `Recorder::dispatch3`'s hazard tracking mark
+// `y_buf` as a read and `lut` as the write, silently dropping a barrier a later dispatch (e.g. the
+// small-m MoE arm's activation, reading this GEMV's `y`) needed.
+#ifdef PAGED
+layout(binding = 3) readonly buffer LUTB { uvec2 lut[]; };
+layout(binding = 4) buffer YB { float y_buf[]; };
+#else
+layout(binding = 3) buffer YB { float y_buf[]; };
+#endif
+
+#ifndef NR
+#define NR 1
+#endif
+shared float part[NR][8]; // one partial per output row and subgroup (8 subgroups maximum)
+
+#ifdef PAGED
+uint active_mask_for_row(uint row) {
+    if (pc.row_mask_bank == 0u) { return pc.active_mask; }
+#ifdef SHARED_Q8
+    uint routed_used = pc.routed_used;
+#else
+    uint routed_used = pc.n_used;
+#endif
+    uint mask_base = pc.rows * routed_used + (pc.row_mask_bank - 1u) * pc.rows;
+    return ids[mask_base + row];
+}
+#endif
+
+#if defined(PAGED) || defined(STREAMED)
+// Arena read via 64-bit device address (see native_weight_addr.glsl): the LUT (PAGED) or `ids`
+// (STREAMED) picks the expert, `w_addr` (set in main) is its byte address via a 64-bit multiply;
+// NW() dereferences it. Replaces the u32 word-base SSBO read whose element-space multiply wrapped
+// past ~102 Scout-sized slots.
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#endif
+
+#include "native_decode.glsl"
+
+#ifdef SHARED_Q8
+// The optional last slot is a fixed, dense Q8_0 shared expert while slots before it use the
+// paged routed format selected by FMT_*. Keep the Q8 decoder local instead of defining FMT_Q8_0
+// alongside the routed format: native_decode.glsl deliberately exposes one dqblk implementation
+// per build. The branch selecting this decoder is workgroup-uniform (one slot per workgroup).
+void dqblk_shared_q8(uint gstart, out float v[32]) {
+    uint bd = (gstart / 32u) * 34u;
+    float d = f16tof32(ru16(bd));
+    uint qoff = bd + 2u;
+    uint qwb = qoff >> 2u;
+    uint qsh = (qoff & 3u) << 3u;
+    uvec4 qA = NW4(qwb); uvec4 qB = NW4(qwb + 4u);
+    if (qsh == 0u) {
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            int q4 = int((w8 < 4u) ? qA[w8] : qB[w8 - 4u]);
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    } else {
+        uint qtail = NW(qwb + 8u);
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            uint qcur = (w8 < 4u) ? qA[w8] : qB[w8 - 4u];
+            uint w1 = w8 + 1u;
+            uint qnxt = (w1 < 4u) ? qA[w1] : ((w1 < 8u) ? qB[w1 - 4u] : qtail);
+            int q4 = int((qcur >> qsh) | (qnxt << (32u - qsh)));
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    }
+}
+
+float dqsub_shared_q8(uint gstart, uint xoff) {
+    float v[32];
+    dqblk_shared_q8(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+#endif
+
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // `slot_global` (and the `ids[]` read it drives) can go out of range for a padding workgroup,
+    // so reject padding before grid-codebook staging. Every invocation in the workgroup observes
+    // the same WorkGroupID and mask, keeping both the return and GRID_INIT's barrier uniform.
+    uint og = (pc.out_f + uint(NR) - 1u) / uint(NR);
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.n_used * og) { return; }
+    uint slot_global = unit / og; // (row, slot) flattened — see the small-batch note above
+    uint o0 = (unit - slot_global * og) * uint(NR);
+    uint row = slot_global / pc.n_used;
+    uint slot = slot_global - row * pc.n_used;
+#ifdef PAGED
+    if ((active_mask_for_row(row) & (1u << slot)) == 0u) { return; }
+#endif
+#ifdef SHARED_Q8
+    // The fixed Q8 slot uses no routed IQ lookup table. Avoid staging up to 8 KiB of codebook for
+    // every shared-expert output workgroup; `is_shared` is workgroup-uniform.
+    bool is_shared = slot == pc.routed_used;
+    if (!is_shared) { GRID_INIT; }
+#else
+    GRID_INIT;
+#endif
+    uint t = gl_LocalInvocationID.x;
+#ifdef PAGED
+    // Slot base BYTE address from the LUT slot index (see native_weight_addr.glsl); wbase keeps
+    // only the small within-expert element offset. `pc.stride` is repurposed in this build as the
+    // LUT WINDOW base: `ids` holds the layer-LOCAL expert ids straight from moe_topk (no host
+    // readback / global-id rewrite) and the host points `stride` at a run of per-expert slot
+    // indices for exactly this layer — a write-once window in the session's LUT tape (see
+    // `MoePagerSession::lut_window` for why in-flight segments must read a frozen copy, not the
+    // live pool LUT).
+#ifdef SHARED_Q8
+    if (is_shared) {
+        w_addr = arena_base(pc.shared_lo, pc.shared_hi);
+    } else {
+        uint routed_slot = row * pc.routed_used + slot;
+        w_addr = arena_base(lut[pc.stride + ids[routed_slot]].x,
+                            lut[pc.stride + ids[routed_slot]].y);
+    }
+#else
+    w_addr = arena_base(lut[pc.stride + ids[slot_global]].x, lut[pc.stride + ids[slot_global]].y);
+#endif
+    uint wexp = 0u;
+#elif defined(STREAMED)
+    // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE
+    // stride in this build. wbase keeps only the small within-expert element offset.
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
+    uint wexp = 0u;
+#else
+    uint wexp = ids[slot_global] * pc.stride;
+#endif
+    uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
+    uint nsub = pc.in_f / 32u;
+    float acc[NR];
+    for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }
+    for (uint s = t; s < nsub; s += 64u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= pc.out_f) { continue; }
+            uint wbase = wexp + o * pc.in_f;
+#ifdef SHARED_Q8
+            acc[rr] += is_shared
+                ? dqsub_shared_q8(wbase + s * 32u, xbase + s * 32u)
+                : dqsub(wbase + s * 32u, xbase + s * 32u);
+#else
+            acc[rr] += dqsub(wbase + s * 32u, xbase + s * 32u);
+#endif
+        }
+    }
+    for (uint rr = 0u; rr < uint(NR); rr++) {
+        float sg = subgroupAdd(acc[rr]);
+        if (subgroupElect()) { part[rr][gl_SubgroupID] = sg; }
+    }
+    barrier();
+    if (t == 0u) {
+        for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o >= pc.out_f) { continue; }
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[rr][s]; }
+            y_buf[slot_global * pc.out_f + o] = tot;
+        }
+    }
+}

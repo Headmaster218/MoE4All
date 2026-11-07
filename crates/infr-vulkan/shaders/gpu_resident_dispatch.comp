@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(binding = 0) readonly buffer Control { uint control[]; };
+layout(binding = 1) readonly buffer Metadata { uint metadata[]; };
+layout(binding = 2) writeonly buffer Dispatches { uint commands[]; };
+layout(push_constant) uniform Params { uint region; uint dimensions_base; } p;
+void main() {
+    uint header = p.region * 4;
+    uint start = metadata[header];
+    uint count = metadata[header + 1];
+    bool enabled = control[metadata[header + 2]] != 0;
+    for (uint i = gl_LocalInvocationID.x; i < count; i += 128) {
+        uint offset = (start + i) * 3;
+        commands[offset] = enabled ? metadata[p.dimensions_base + offset] : 0;
+        commands[offset + 1] = metadata[p.dimensions_base + offset + 1];
+        commands[offset + 2] = metadata[p.dimensions_base + offset + 2];
+    }
+}

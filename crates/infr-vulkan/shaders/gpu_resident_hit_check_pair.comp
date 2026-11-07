@@ -1,0 +1,124 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) buffer Ids { uint ids[]; };
+layout(std430, binding = 1) readonly buffer Tape { uvec2 addresses[]; };
+layout(std430, binding = 2) buffer Control {
+    uint run; uint stopped; uint reached; uint invalid; uint hit_run; uint predicates[];
+};
+layout(std430, binding = 3) buffer Journal { uint journal[]; };
+layout(push_constant) uniform Params {
+    uint count; uint experts; uint gate_base; uint up_base; uint down_base;
+    uint ordinal; uint used; uint shared_mask; uint immutable_predicates;
+} p;
+
+#define VERIFY_PAIR_BINDING 4
+#include "verify_pair.glsl"
+
+const uint JOURNAL_MASK_WORD = INFR_MAX_DECODE_ROWS * 16u;
+const uint JOURNAL_STATUS_WORD = JOURNAL_MASK_WORD + INFR_MAX_DECODE_ROWS + 3u;
+const uint JOURNAL_WORDS = JOURNAL_STATUS_WORD + 1u;
+shared uint ready;
+shared uint journal_base;
+shared uint resident[40];
+shared uint bad;
+shared uint missing;
+shared uint final_status;
+
+void finish(uint status, bool stop) {
+    reached = p.ordinal + 1u;
+    hit_run = invalid == 0u ? 1u : 0u;
+    journal[journal_base + JOURNAL_STATUS_WORD] = status;
+    if (stop) { run = 0u; stopped = p.ordinal; }
+    if (p.immutable_predicates != 0u) {
+        predicates[p.ordinal * 2u] = run;
+        predicates[p.ordinal * 2u + 1u] = hit_run;
+    }
+}
+
+bool present_at(uint base, uint id) {
+    uint length = uint(addresses.length());
+    if (base > length || id >= length - base) {
+        atomicOr(bad, 1u);
+        return false;
+    }
+    return any(notEqual(addresses[base + id], uvec2(0u)));
+}
+
+void main() {
+    if (any(notEqual(gl_WorkGroupID, uvec3(0u)))) return;
+    uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        ready = 0u;
+        journal_base = 0u;
+        final_status = 0u;
+        bad = invalid;
+        missing = 0u;
+        hit_run = 0u;
+        bool journal_valid = p.ordinal < uint(journal.length()) / JOURNAL_WORDS;
+        bool predicates_valid = p.immutable_predicates == 0u
+            || p.ordinal < uint(predicates.length()) / 2u;
+        if (journal_valid) {
+            journal_base = p.ordinal * JOURNAL_WORDS;
+            journal[journal_base + JOURNAL_STATUS_WORD] = 0u;
+        }
+        if (p.immutable_predicates != 0u && predicates_valid) {
+            predicates[p.ordinal * 2u] = 0u;
+            predicates[p.ordinal * 2u + 1u] = 0u;
+        }
+        if (run != 0u) {
+            bool dimensions_valid = p.count == 40u && p.used == 10u
+                && p.experts == 512u && uint(ids.length()) >= 48u;
+            if (journal_valid && predicates_valid && dimensions_valid) ready = 1u;
+            else {
+                invalid = 1u;
+                run = 0u;
+                stopped = p.ordinal;
+                reached = p.ordinal == 0xffffffffu ? p.ordinal : p.ordinal + 1u;
+                final_status = 3u;
+                if (journal_valid) journal[journal_base + JOURNAL_STATUS_WORD] = 3u;
+            }
+        }
+    }
+    barrier();
+    // Routing ids are still immutable here. The same workgroup classifies and resolves hits.
+    vp_begin(p.count, p.experts, p.used, p.shared_mask, ready != 0u);
+    if (ready == 0u) {
+        if (lane == 0u) vp_publish(final_status);
+        return;
+    }
+    for (uint a = lane; a < 40u; a += 32u) {
+        uint id = ids[a];
+        journal[journal_base + a] = id;
+        bool hit = false;
+        if (id >= p.experts) atomicOr(bad, 1u);
+        else {
+            // Separate calls also validate all three role spans when one role is absent.
+            bool gate = present_at(p.gate_base, id);
+            bool up = present_at(p.up_base, id);
+            bool down = present_at(p.down_base, id);
+            hit = gate && up && down;
+        }
+        resident[a] = uint(hit);
+    }
+    barrier();
+    if (lane < 4u) {
+        uint hit = 0u;
+        for (uint slot = 0u; slot < 10u; ++slot) {
+            if (resident[lane * 10u + slot] != 0u) hit |= 1u << slot;
+        }
+        uint miss = 0x3ffu ^ hit;
+        ids[40u + lane] = hit | p.shared_mask;
+        ids[44u + lane] = miss;
+        journal[journal_base + JOURNAL_MASK_WORD + lane] = hit;
+        if (miss != 0u) atomicOr(missing, 1u);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u) {
+        invalid = bad | vp_bad | uint(vp_valid == 0u);
+        uint status = invalid != 0u ? 3u : (missing != 0u ? 2u : 1u);
+        finish(status, invalid != 0u || missing != 0u);
+        vp_publish(status);
+    }
+}

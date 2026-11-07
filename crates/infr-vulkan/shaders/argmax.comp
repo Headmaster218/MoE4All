@@ -1,0 +1,75 @@
+#version 460
+// Greedy argmax over `n` logits → token id, in TWO stages so the vocab scan parallelizes across
+// the whole GPU (a single-workgroup scan of a 152-262k vocab ran on 1 of 48 WGPs and was SLOWER
+// than downloading the logits — measured gemma3-1b tg128 −18%).
+//   pass 1 (no define): 256 workgroups, each argmaxes its contiguous slice → part[] = 256
+//     (val, idx-bits) pairs: vals at [0,256), u32 index bit-patterns at [256,512).
+//   pass 2 (-DPASS2):   one workgroup reduces the 256 partials → out_id[0].
+// Ties: strict > plus an explicit lower-index-wins compare at every reduce step, so the result
+// matches the host argmax (first maximum) EXACTLY — slices are contiguous, so a lower partial
+// slot also means a lower global index.
+// Multi-row (MTP verify accept, issue #31): `off` selects the row — pass 1 reads
+// logits[off..off+n] (off = row*n, indices stay row-local so tie-break is per row), pass 2
+// writes out_id[off] (off = row). The recorder loops rows as sequential two-stage dispatches.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; uint off; } pc;
+#ifdef PASS2
+layout(binding = 0) readonly buffer PB { float part[]; }; // [0,n): vals, [n,2n): idx bits
+layout(binding = 1) writeonly buffer OB { uint out_id[]; };
+#else
+layout(binding = 0) readonly buffer LB { float logits[]; };
+layout(binding = 1) writeonly buffer PB { float part[]; };
+#endif
+shared float sval[256];
+shared uint sidx[256];
+shared uint sbad[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float best = -1e30;
+    uint bi = 0u;
+    uint bad = 0u;
+#ifdef PASS2
+    if (t < pc.n) {
+        best = part[t];
+        bi = floatBitsToUint(part[pc.n + t]);
+        bad = uint(bi == 0xFFFFFFFFu);
+    }
+#else
+    uint chunk = (pc.n + 255u) / 256u;
+    uint lo = gl_WorkGroupID.x * chunk;
+    uint hi = min(lo + chunk, pc.n);
+    for (uint i = lo + t; i < hi; i += 256u) {
+        float v = logits[pc.off + i];
+        if (isnan(v) || isinf(v)) {
+            bad = 1u;
+            continue;
+        }
+        // ascending scan + strict > keeps the lowest index within this thread's stride
+        if (v > best) { best = v; bi = i; }
+    }
+#endif
+    sval[t] = best;
+    sidx[t] = bi;
+    sbad[t] = bad;
+    barrier();
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s) {
+            sbad[t] |= sbad[t + s];
+            if (sval[t + s] > sval[t] ||
+                (sval[t + s] == sval[t] && sidx[t + s] < sidx[t])) {
+                sval[t] = sval[t + s];
+                sidx[t] = sidx[t + s];
+            }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+#ifdef PASS2
+        out_id[pc.off] = (sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0];
+#else
+        part[gl_WorkGroupID.x] = sval[0];
+        part[256u + gl_WorkGroupID.x] =
+            uintBitsToFloat((sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0]);
+#endif
+    }
+}

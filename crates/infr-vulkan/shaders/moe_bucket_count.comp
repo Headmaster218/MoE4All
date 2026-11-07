@@ -1,0 +1,12 @@
+#version 460
+// MoE bucketing pass 1 — count: tally how many (token,slot) assignments route to each expert.
+// `tok_ids[n_pairs]` holds the selected expert per assignment (n_pairs = n_tokens * n_used).
+// `counts[n_expert]` must be pre-zeroed. One thread per assignment, atomic increment.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n_pairs; } pc;
+layout(binding = 0) readonly buffer TB { uint tok_ids[]; };
+layout(binding = 1) buffer CB { uint counts[]; };
+void main() {
+    uint p = gl_GlobalInvocationID.x;
+    if (p < pc.n_pairs) { atomicAdd(counts[tok_ids[p]], 1u); }
+}

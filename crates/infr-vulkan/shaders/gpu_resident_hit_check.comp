@@ -1,0 +1,57 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(binding = 0) buffer Ids { uint ids[]; };
+layout(binding = 1) readonly buffer Tape { uvec2 addresses[]; };
+layout(binding = 2) buffer Control { uint run; uint stopped; uint reached; uint invalid; uint hit_run; uint predicates[]; };
+layout(binding = 3) buffer Journal { uint journal[]; };
+layout(push_constant) uniform Params {
+    uint count; uint experts; uint gate_base; uint up_base; uint down_base;
+    uint ordinal; uint used; uint shared_mask;
+    uint immutable_predicates;
+} p;
+const uint JOURNAL_MASK_WORD = INFR_MAX_DECODE_ROWS * 16u;
+const uint JOURNAL_STATUS_WORD = JOURNAL_MASK_WORD + INFR_MAX_DECODE_ROWS + 3u;
+const uint JOURNAL_WORDS = JOURNAL_STATUS_WORD + 1u;
+void main() {
+    hit_run = 0;
+    journal[p.ordinal * JOURNAL_WORDS + JOURNAL_STATUS_WORD] = 0;
+    if (p.immutable_predicates != 0) {
+        predicates[p.ordinal * 2] = 0;
+        predicates[p.ordinal * 2 + 1] = 0;
+    }
+    if (run == 0) return;
+    uint hit[INFR_MAX_DECODE_ROWS];
+    uint miss[INFR_MAX_DECODE_ROWS];
+    for (uint row = 0; row < INFR_MAX_DECODE_ROWS; ++row) {
+        hit[row] = 0;
+        miss[row] = 0;
+    }
+    bool missing = false;
+    for (uint i = 0; i < p.count; ++i) {
+        uint id = ids[i];
+        journal[p.ordinal * JOURNAL_WORDS + i] = id;
+        bool resident = false;
+        if (id >= p.experts) invalid = 1;
+        else resident = any(notEqual(addresses[p.gate_base + id], uvec2(0)))
+                     && any(notEqual(addresses[p.up_base + id], uvec2(0)))
+                     && any(notEqual(addresses[p.down_base + id], uvec2(0)));
+        uint row = i / p.used;
+        uint bit = 1u << (i % p.used);
+        if (resident) hit[row] |= bit;
+        else { miss[row] |= bit; missing = true; }
+    }
+    uint rows = p.count / p.used;
+    for (uint row = 0; row < rows; ++row) {
+        ids[p.count + row] = hit[row] | p.shared_mask;
+        ids[p.count + rows + row] = miss[row];
+        journal[p.ordinal * JOURNAL_WORDS + JOURNAL_MASK_WORD + row] = hit[row];
+    }
+    reached = p.ordinal + 1;
+    hit_run = invalid == 0 ? 1 : 0;
+    journal[p.ordinal * JOURNAL_WORDS + JOURNAL_STATUS_WORD] = invalid != 0 ? 3 : (missing ? 2 : 1);
+    if (missing) { run = 0; stopped = p.ordinal; }
+    if (p.immutable_predicates != 0) {
+        predicates[p.ordinal * 2] = run;
+        predicates[p.ordinal * 2 + 1] = hit_run;
+    }
+}

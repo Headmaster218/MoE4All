@@ -1,0 +1,210 @@
+#version 460
+// CHUNKED gated-DeltaNet prefill (qwen35/Qwen3.5). The sequential recurrence (one token at a time,
+// 2·kd state accesses each) is reformulated chunkwise (C=32): per chunk everything reduces to
+// small dense matmuls plus ONE unit-lower-triangular solve, so a whole chunk of tokens is
+// processed per state traversal. Math (validated CPU-side in tests/chunked_delta_math.rs):
+//   g_t = a_coef·softplus(α_t+dt_bias) (log-decay), G_j = Σ_{l≤j} g_l (inclusive, per chunk)
+//   A[j][l] = β_j e^{G_j−G_l} (k̂_j·k̂_l)            l<j
+//   R_j     = β_j v_j − β_j e^{G_j} (k̂_jᵀ S₀)
+//   Δ = (I+A)⁻¹ R                                    (forward substitution)
+//   o_j     = e^{G_j} (q̂_jᵀ S₀) + Σ_{l≤j} e^{G_j−G_l}(q̂_j·k̂_l) Δ_l
+//   S ← e^{G_{c−1}} S₀ + Σ_j e^{G_{c−1}−G_j} k̂_j ⊗ Δ_j
+// One workgroup per (value head, block of 32 state columns): Δ's columns are independent given A,
+// so column blocks only duplicate the cheap [C,C] A/Wq work. Exponent ratios e^{G_j−G_l} (j≥l)
+// are ≤1 (g ≤ 0) — no overflow. Chunks stay sequential (S carries), but that's rows/32 state
+// traversals instead of `rows`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define C 32u
+#define COLS 32u
+
+layout(push_constant) uniform PC {
+    uint rows;   // tokens to process in sequence (state carried across)
+    uint nv;     // value heads
+    uint nk;     // key/query heads (tiled up to nv)
+    uint kd;     // head_k_dim (≤ 128)
+    uint vd;     // head_v_dim
+    float eps;   // l2norm epsilon
+    float qscale; // 1/sqrt(kd)
+} pc;
+
+layout(binding = 0) readonly buffer QB  { float q[]; };       // [rows, nk*kd]
+layout(binding = 1) readonly buffer KB  { float k[]; };       // [rows, nk*kd]
+layout(binding = 2) readonly buffer VB  { float v[]; };       // [rows, nv*vd]
+layout(binding = 3) readonly buffer BB  { float blog[]; };    // [rows, nv]  beta logits
+layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [rows, nv]
+layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
+layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
+// coherent: the next chunk's R/O pass reads state columns updated by OTHER threads of this
+// workgroup — plain barrier() only covers shared memory, so state needs coherent + the
+// memoryBarrierBuffer() at the chunk-loop end.
+layout(binding = 7) coherent buffer SB { float state[]; };    // [nv*kd*vd] in/out
+layout(binding = 8) buffer OB { float outp[]; };              // [rows, nv*vd]
+
+shared float kn[C * 128u];   // normalized k̂ chunk [C, kd]      16 KiB
+shared float qn[C * 128u];   // normalized q̂ chunk (×1/√kd)     16 KiB
+shared float aa[C * C];      // A (solve), then Wq (output)      4 KiB
+shared float dl[C * COLS];   // R → Δ for this column block      4 KiB
+shared float gg[C];          // inclusive prefix log-decay
+shared float bb[C];          // β
+shared float gt[C];          // per-token log-decay (pre-scan)
+shared float wj[C];          // e^{G_{c−1}−G_j}
+shared float nrm[C];         // per-token norm scratch
+shared float red[256];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint nblk = (pc.vd + COLS - 1u) / COLS;
+    uint h = gl_WorkGroupID.x / nblk;
+    uint blk = gl_WorkGroupID.x % nblk;
+    uint d0 = blk * COLS;
+    uint khid = h % pc.nk;
+    uint sbase = h * pc.kd * pc.vd;
+    uint kd = pc.kd;
+
+    for (uint base = 0u; base < pc.rows; base += C) {
+        uint c = min(C, pc.rows - base);
+
+        // ── load raw k,q for the chunk into LDS ──
+        for (uint p = t; p < c * kd; p += 256u) {
+            uint j = p / kd;
+            uint kk = p % kd;
+            uint src = (base + j) * pc.nk * kd + khid * kd + kk;
+            kn[j * 128u + kk] = k[src];
+            qn[j * 128u + kk] = q[src];
+        }
+        barrier();
+
+        // ── per-token L2 norms (8 lanes per token) ──
+        {
+            uint j = t >> 3u;
+            uint lane = t & 7u;
+            float ks = 0.0;
+            if (j < c) {
+                for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * 128u + kk]; ks += x * x; }
+            }
+            red[t] = ks;
+            barrier();
+            if (lane == 0u && j < c) {
+                float s = 0.0;
+                for (uint i = 0u; i < 8u; i++) { s += red[(j << 3u) + i]; }
+                nrm[j] = sqrt(s + pc.eps);
+            }
+            barrier();
+            float kinv = (j < c) ? 1.0 / nrm[j] : 0.0;
+            barrier(); // nrm reused for q below
+            float qs = 0.0;
+            if (j < c) {
+                for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * 128u + kk]; qs += x * x; }
+            }
+            red[t] = qs;
+            barrier();
+            if (lane == 0u && j < c) {
+                float s = 0.0;
+                for (uint i = 0u; i < 8u; i++) { s += red[(j << 3u) + i]; }
+                nrm[j] = sqrt(s + pc.eps);
+            }
+            barrier();
+            if (j < c) {
+                float qinv = pc.qscale / nrm[j];
+                for (uint kk = lane; kk < kd; kk += 8u) {
+                    kn[j * 128u + kk] *= kinv;
+                    qn[j * 128u + kk] *= qinv;
+                }
+            }
+        }
+        // ── gates: β, per-token log-decay, then a tiny serial inclusive scan ──
+        if (t < c) {
+            uint ga = (base + t) * pc.nv + h;
+            bb[t] = 1.0 / (1.0 + exp(-blog[ga]));
+            float z = alpha[ga] + dtbias[h];
+            float sp = max(z, 0.0) + log(1.0 + exp(-abs(z)));
+            gt[t] = acoef[h] * sp;
+        }
+        barrier();
+        if (t == 0u) {
+            float run = 0.0;
+            for (uint j = 0u; j < c; j++) { run += gt[j]; gg[j] = run; }
+        }
+        barrier();
+
+        // ── R (into dl) + the e^{G}·(q̂ᵀS₀) base term of O (straight to global) ──
+        for (uint p = t; p < c * COLS; p += 256u) {
+            uint j = p / COLS;
+            uint d2 = p % COLS;
+            uint d = d0 + d2;
+            if (d < pc.vd) {
+                float ks0 = 0.0, qs0 = 0.0;
+                for (uint kk = 0u; kk < kd; kk++) {
+                    float sv = state[sbase + kk * pc.vd + d];
+                    ks0 += kn[j * 128u + kk] * sv;
+                    qs0 += qn[j * 128u + kk] * sv;
+                }
+                float eg = exp(gg[j]);
+                uint ob = (base + j) * pc.nv * pc.vd + h * pc.vd + d;
+                dl[j * COLS + d2] = bb[j] * (v[ob] - eg * ks0);
+                outp[ob] = eg * qs0;
+            }
+        }
+        // ── A[j][l] = β_j e^{G_j−G_l} (k̂_j·k̂_l), strictly lower ──
+        for (uint p = t; p < C * C; p += 256u) {
+            uint j = p >> 5u;
+            uint l = p & 31u;
+            if (j < c && l < j) {
+                float dot = 0.0;
+                for (uint kk = 0u; kk < kd; kk++) { dot += kn[j * 128u + kk] * kn[l * 128u + kk]; }
+                aa[j * C + l] = bb[j] * exp(gg[j] - gg[l]) * dot;
+            }
+        }
+        barrier();
+
+        // ── forward substitution: Δ_j = R_j − Σ_{l<j} A[j][l] Δ_l (32 lanes, one per column) ──
+        for (uint j = 1u; j < c; j++) {
+            if (t < COLS) {
+                float acc = dl[j * COLS + t];
+                for (uint l = 0u; l < j; l++) { acc -= aa[j * C + l] * dl[l * COLS + t]; }
+                dl[j * COLS + t] = acc;
+            }
+            barrier();
+        }
+
+        // ── Wq[i][j] = e^{G_i−G_j} (q̂_i·k̂_j), j≤i (reuses aa; solve is done with it) ──
+        for (uint p = t; p < C * C; p += 256u) {
+            uint i = p >> 5u;
+            uint j = p & 31u;
+            if (i < c && j <= i) {
+                float dot = 0.0;
+                for (uint kk = 0u; kk < kd; kk++) { dot += qn[i * 128u + kk] * kn[j * 128u + kk]; }
+                aa[i * C + j] = exp(gg[i] - gg[j]) * dot;
+            }
+        }
+        if (t < c) { wj[t] = exp(gg[c - 1u] - gg[t]); }
+        barrier();
+
+        // ── O += Wq·Δ ──
+        for (uint p = t; p < c * COLS; p += 256u) {
+            uint i = p / COLS;
+            uint d2 = p % COLS;
+            uint d = d0 + d2;
+            if (d < pc.vd) {
+                float acc = 0.0;
+                for (uint j = 0u; j <= i; j++) { acc += aa[i * C + j] * dl[j * COLS + d2]; }
+                outp[(base + i) * pc.nv * pc.vd + h * pc.vd + d] += acc;
+            }
+        }
+        // ── S ← e^{G_{c−1}} S₀ + Σ_j e^{G_{c−1}−G_j} k̂_j ⊗ Δ_j (this block's columns) ──
+        float egl = exp(gg[c - 1u]);
+        for (uint p = t; p < kd * COLS; p += 256u) {
+            uint kk = p / COLS;
+            uint d2 = p % COLS;
+            uint d = d0 + d2;
+            if (d < pc.vd) {
+                float acc = egl * state[sbase + kk * pc.vd + d];
+                for (uint j = 0u; j < c; j++) { acc += wj[j] * kn[j * 128u + kk] * dl[j * COLS + d2]; }
+                state[sbase + kk * pc.vd + d] = acc;
+            }
+        }
+        memoryBarrierBuffer(); // make this chunk's state writes visible to all threads
+        barrier();             // next chunk overwrites kn/qn/dl
+    }
+}

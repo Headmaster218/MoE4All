@@ -1,0 +1,72 @@
+#version 460
+// Non-FA prefill attention, stage 2: row-wise softmax of S[h,m,:] with causal masking, in place
+// (S → P). One workgroup per (head, query-row); 256 threads reduce over the kv dimension. Keys are
+// valid for n in [lo, min(qpos+1, kv_real)); padded/causally-masked/out-of-window keys get P=0 (so
+// the PV GEMM can sum over the full padded width without masking). `window`>0 adds a sliding-window
+// LOWER bound lo (gemma SWA layers): keys older than `window` back from the query are masked.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint m;          // query rows (padded)
+    uint kv_pad;     // padded kv width (row stride of S)
+    uint kv_real;    // true kv length (for masking)
+    uint pos_offset; // absolute position of query row 0
+    uint window;     // sliding-window span (0 = full causal); keys < qpos+1-window are masked
+} pc;
+layout(binding = 0) buffer SB { float16_t s[]; }; // [nh, m, kv_pad], read+write
+
+shared float red[256];
+
+void main() {
+    uint h = gl_WorkGroupID.z;
+    uint mi = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint qpos = pc.pos_offset + mi;
+    uint limit = min(qpos + 1u, pc.kv_real); // valid keys [lo, limit)
+    uint lo = (pc.window > 0u && qpos + 1u > pc.window) ? (qpos + 1u - pc.window) : 0u;
+    uint base = (h * pc.m + mi) * pc.kv_pad;
+
+    // row max over valid keys
+    float pmax = -1e30;
+    for (uint n = t; n < limit; n += 256u) {
+        if (n >= lo) {
+            pmax = max(pmax, float(s[base + n]));
+        }
+    }
+    red[t] = pmax;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (t < stride) {
+            red[t] = max(red[t], red[t + stride]);
+        }
+        barrier();
+    }
+    float m0 = red[0];
+    barrier();
+
+    // row sum of exp(s - max)
+    float psum = 0.0;
+    for (uint n = t; n < limit; n += 256u) {
+        if (n >= lo) {
+            psum += exp(float(s[base + n]) - m0);
+        }
+    }
+    red[t] = psum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (t < stride) {
+            red[t] = red[t] + red[t + stride];
+        }
+        barrier();
+    }
+    float inv = 1.0 / red[0];
+
+    // normalize (recompute exp; masked/padded/out-of-window keys → 0)
+    for (uint n = t; n < pc.kv_pad; n += 256u) {
+        float v = (n >= lo && n < limit) ? exp(float(s[base + n]) - m0) * inv : 0.0;
+        s[base + n] = float16_t(v);
+    }
+}

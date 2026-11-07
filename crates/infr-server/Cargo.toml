@@ -1,0 +1,30 @@
+[package]
+name = "infr-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+tts = ["dep:infr-tts"]
+
+[dependencies]
+infr-core.workspace = true
+infr-engine.workspace = true
+infr-audio = { path = "../infr-audio" }
+infr-tts = { path = "../infr-tts", optional = true }
+axum = { workspace = true, features = ["multipart"] }
+tower-http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+subtle.workspace = true
+futures-util = "0.3"
+
+[dev-dependencies]
+infr-chat.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -1,0 +1,45 @@
+#version 460
+// Expand `n` elements of the Vulkan PLANAR Q8_0 KV cache (codes int8[cap] then scales f16[cap/32];
+// see store_q8) into a contiguous f16 buffer. Used to dequant the Q8 KV prefix into an f16 scratch
+// so the fast coalesced flash / non-FA prefill kernels (f16-only) can read it — the persistent cache
+// stays Q8 (footprint preserved); the scratch is transient (freed after prefill). One thread/element.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// #74: read the planar-Q8 cache by 64-bit device address (kv_addr.glsl `k_addr`, s_lo/s_hi) — this
+// kernel is BDA-only (slice 5 deleted the bound-`su` twin). The `su` binding disappears; the recorder
+// keeps the cache BOUND at that read slot as an inert descriptor so the store→dequant-read barrier
+// survives (a BDA read is invisible to the descriptor hazard tracker). See Recorder::dequant_q8_f16.
+layout(push_constant) uniform PC { uint n; uint cap;
+    uint s_lo; uint s_hi;
+} pc;
+#ifdef KV_SEGMENTED
+layout(binding = 0) readonly buffer SB { uvec2 segments[]; };
+#endif
+layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
+#include "kv_addr.glsl"
+#define SU(wi) kv_word(k_addr, (wi))
+
+void main() {
+#ifndef KV_SEGMENTED
+    k_addr = kv_base(pc.s_lo, pc.s_hi);
+#endif
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+#ifdef KV_SEGMENTED
+    uint local = kv_segment_local(i, pc.cap);
+    k_addr = kv_segment_base(segments[kv_segment(i, pc.cap)]);
+    uint seg_elems = 1u << pc.cap;
+    int cw = int(SU(local >> 2u));
+    int c = bitfieldExtract(cw, int((local & 3u) * 8u), 8);
+    uint bk = local >> 5u;
+    float d = unpackHalf2x16(SU((seg_elems >> 2u) + (bk >> 1u)))[bk & 1u];
+#else
+    int cw = int(SU(i >> 2u));
+    int c = bitfieldExtract(cw, int((i & 3u) * 8u), 8);
+    uint bk = i >> 5u;
+    float d = unpackHalf2x16(SU((pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+#endif
+    dst[i] = float16_t(d * float(c));
+}

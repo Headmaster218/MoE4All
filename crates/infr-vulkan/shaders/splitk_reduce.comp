@@ -1,0 +1,16 @@
+#version 460
+// Split-K reduce: out[i] = Σ_s part[s·plane + i] over `splits` planes — the deterministic
+// (fixed-order) sum that closes a split-K GEMM. One thread per output element.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n_elems; uint splits; uint plane; } pc;
+layout(binding = 0) readonly buffer PB { float part[]; };
+layout(binding = 1) writeonly buffer OB { float o[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_elems) { return; }
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.splits; s++) { acc += part[s * pc.plane + i]; }
+    o[i] = acc;
+}

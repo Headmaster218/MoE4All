@@ -1,0 +1,2039 @@
+//! Native INFR execution for Nomic-BERT and Qwen3 embedding models.
+
+use crate::{
+    tokenizer::{BertWordPiece, QwenBpe},
+    EmbeddingBatch, EmbeddingConfig, EmbeddingEngine,
+};
+use anyhow::{anyhow, bail, Context, Result};
+use infr_core::{
+    backend::{Backend, Bindings, Buffer, BufferUsage, IdleResourceReclaimer, Plan},
+    graph::{Activation, AttnMask, Graph, Op},
+    loader::{MetaValue, TensorInfo},
+    tensor::{DType, TensorDesc, TensorId},
+    MemoryTier, ResourceKind, ResourceSnapshot, ResourceTracker, WeightSource,
+};
+use infr_gguf::Gguf;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug)]
+struct NomicConfig {
+    public: EmbeddingConfig,
+    layers: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+    ffn: usize,
+    vocab: usize,
+    eps: f32,
+    rope_theta: f32,
+}
+
+impl NomicConfig {
+    fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let public = EmbeddingConfig::from_gguf(gguf)?;
+        if public.architecture != "nomic-bert" {
+            bail!(
+                "native embedding currently supports general.architecture=\"nomic-bert\"; got {:?}",
+                public.architecture
+            );
+        }
+        let md = gguf.metadata();
+        let integer = |suffix: &str| -> Result<usize> {
+            let key = format!("{}.{suffix}", public.architecture);
+            usize::try_from(
+                md.u64(&key)
+                    .with_context(|| format!("GGUF missing {key}"))?,
+            )
+            .with_context(|| format!("GGUF {key} is too large"))
+        };
+        if matches!(
+            md.get("nomic-bert.attention.causal"),
+            Some(MetaValue::Bool(true))
+        ) {
+            bail!("native Nomic-BERT requires bidirectional attention");
+        }
+        let pooling = md.u64("nomic-bert.pooling_type").unwrap_or(1);
+        if pooling != 1 {
+            bail!("native Nomic-BERT requires mean pooling (pooling_type=1, got {pooling})");
+        }
+        let hidden = public.dimensions;
+        let heads = integer("attention.head_count")?;
+        if heads == 0 || hidden % heads != 0 {
+            bail!("invalid Nomic-BERT head geometry: hidden={hidden}, heads={heads}");
+        }
+        let vocab = gguf
+            .metadata()
+            .get("tokenizer.ggml.tokens")
+            .and_then(MetaValue::as_arr)
+            .context("GGUF missing tokenizer.ggml.tokens")?
+            .len();
+        Ok(Self {
+            layers: integer("block_count")?,
+            head_dim: hidden / heads,
+            ffn: integer("feed_forward_length")?,
+            eps: md
+                .get("nomic-bert.attention.layer_norm_epsilon")
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(1e-12) as f32,
+            rope_theta: md
+                .get("nomic-bert.rope.freq_base")
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(1000.0) as f32,
+            public,
+            hidden,
+            heads,
+            vocab,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Qwen3Config {
+    public: EmbeddingConfig,
+    layers: usize,
+    hidden: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    q_width: usize,
+    kv_width: usize,
+    ffn: usize,
+    vocab: usize,
+    eps: f32,
+    rope_theta: f32,
+}
+
+impl Qwen3Config {
+    fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        let public = EmbeddingConfig::from_gguf(gguf)?;
+        if public.architecture != "qwen3" {
+            bail!("native Qwen3 embedding requires general.architecture=\"qwen3\"");
+        }
+        let md = gguf.metadata();
+        let integer = |suffix: &str| -> Result<usize> {
+            let key = format!("qwen3.{suffix}");
+            usize::try_from(
+                md.u64(&key)
+                    .with_context(|| format!("GGUF missing {key}"))?,
+            )
+            .with_context(|| format!("GGUF {key} is too large"))
+        };
+        let pooling = md
+            .u64("qwen3.pooling_type")
+            .context("native Qwen3 embedding requires qwen3.pooling_type")?;
+        if pooling != 3 {
+            bail!("native Qwen3 embedding requires last-token pooling (pooling_type=3, got {pooling})");
+        }
+        let hidden = public.dimensions;
+        let heads = integer("attention.head_count")?;
+        let kv_heads = integer("attention.head_count_kv")?;
+        let head_dim = integer("attention.key_length")?;
+        let value_dim = integer("attention.value_length")?;
+        if heads == 0 || kv_heads == 0 || heads % kv_heads != 0 || head_dim == 0 {
+            bail!(
+                "invalid Qwen3 head geometry: heads={heads}, kv_heads={kv_heads}, head_dim={head_dim}"
+            );
+        }
+        if value_dim != head_dim {
+            bail!(
+                "native Qwen3 embedding requires equal key/value head dimensions; got key={head_dim}, value={value_dim}"
+            );
+        }
+        let vocab = md
+            .get("tokenizer.ggml.tokens")
+            .and_then(MetaValue::as_arr)
+            .context("GGUF missing tokenizer.ggml.tokens")?
+            .len();
+        Ok(Self {
+            layers: integer("block_count")?,
+            q_width: heads * head_dim,
+            kv_width: kv_heads * head_dim,
+            ffn: integer("feed_forward_length")?,
+            eps: md
+                .get("qwen3.attention.layer_norm_rms_epsilon")
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(1e-6) as f32,
+            rope_theta: md
+                .get("qwen3.rope.freq_base")
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(1_000_000.0) as f32,
+            public,
+            hidden,
+            heads,
+            kv_heads,
+            head_dim,
+            vocab,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NativeConfig {
+    Nomic(NomicConfig),
+    Qwen3(Qwen3Config),
+}
+
+impl NativeConfig {
+    fn from_gguf(gguf: &Gguf) -> Result<Self> {
+        match gguf.metadata().str("general.architecture") {
+            Some("nomic-bert") => Ok(Self::Nomic(NomicConfig::from_gguf(gguf)?)),
+            Some("qwen3") => Ok(Self::Qwen3(Qwen3Config::from_gguf(gguf)?)),
+            architecture => bail!(
+                "native embedding supports general.architecture=\"nomic-bert\" or \"qwen3\"; got {architecture:?}"
+            ),
+        }
+    }
+
+    fn public(&self) -> &EmbeddingConfig {
+        match self {
+            Self::Nomic(cfg) => &cfg.public,
+            Self::Qwen3(cfg) => &cfg.public,
+        }
+    }
+
+    fn hidden(&self) -> usize {
+        self.public().dimensions
+    }
+}
+
+enum NativeTokenizer {
+    Nomic(BertWordPiece),
+    Qwen3(QwenBpe),
+}
+
+impl NativeTokenizer {
+    fn from_gguf(gguf: &Gguf, cfg: &NativeConfig) -> Result<Self> {
+        match cfg {
+            NativeConfig::Nomic(cfg) => Ok(Self::Nomic(BertWordPiece::from_metadata(
+                gguf.metadata(),
+                cfg.public.max_context,
+            )?)),
+            NativeConfig::Qwen3(cfg) => Ok(Self::Qwen3(QwenBpe::from_metadata(
+                gguf.metadata(),
+                cfg.public.max_context,
+            )?)),
+        }
+    }
+
+    fn encode(&self, input: &str) -> Result<Vec<u32>> {
+        match self {
+            Self::Nomic(tokenizer) => tokenizer.encode(input),
+            Self::Qwen3(tokenizer) => tokenizer.encode(input),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WeightSpec {
+    label: String,
+    source: String,
+    source_offset: usize,
+    nbytes: usize,
+    desc: TensorDesc,
+}
+
+#[derive(Clone, Copy)]
+struct NomicLayerWeights {
+    qkv: usize,
+    attn_output: usize,
+    attn_norm_weight: usize,
+    attn_norm_bias: usize,
+    ffn_gate: usize,
+    ffn_up: usize,
+    ffn_down: usize,
+    output_norm_weight: usize,
+    output_norm_bias: usize,
+}
+
+struct NomicWeightLayout {
+    token_embedding: usize,
+    token_type_zero: usize,
+    embedding_norm_weight: usize,
+    embedding_norm_bias: usize,
+    layers: Vec<NomicLayerWeights>,
+}
+
+#[derive(Clone, Copy)]
+struct Qwen3LayerWeights {
+    attn_norm: usize,
+    q: usize,
+    q_norm: usize,
+    k: usize,
+    k_norm: usize,
+    v: usize,
+    attn_output: usize,
+    ffn_norm: usize,
+    ffn_gate: usize,
+    ffn_up: usize,
+    ffn_down: usize,
+}
+
+struct Qwen3WeightLayout {
+    token_embedding: usize,
+    output_norm: usize,
+    layers: Vec<Qwen3LayerWeights>,
+}
+
+enum WeightLayout {
+    Nomic(NomicWeightLayout),
+    Qwen3(Qwen3WeightLayout),
+}
+
+struct NativePlan {
+    plan: Box<dyn Plan>,
+    ids: TensorId,
+    positions: TensorId,
+    output: TensorId,
+    weight_ids: Vec<TensorId>,
+    ids_buffer: Box<dyn Buffer>,
+    positions_buffer: Box<dyn Buffer>,
+    output_buffer: Box<dyn Buffer>,
+}
+
+type WeightBuffers = Vec<Box<dyn Buffer>>;
+
+struct WeightResidency {
+    buffers: Option<WeightBuffers>,
+    idle_deadline: Option<Instant>,
+}
+
+impl WeightResidency {
+    fn arm_idle_deadline(&mut self, timeout: Duration, now: Instant) {
+        self.idle_deadline = if timeout.is_zero() {
+            None
+        } else {
+            // An absurd command-line value should mean "effectively never", not panic while
+            // computing an Instant outside the platform's representable range.
+            now.checked_add(timeout)
+        };
+    }
+
+    fn idle_deadline_reached(&self, now: Instant) -> bool {
+        self.idle_deadline.is_some_and(|deadline| deadline <= now)
+    }
+}
+
+struct WeightCache {
+    residency: Mutex<WeightResidency>,
+    changed: Condvar,
+    stop: AtomicBool,
+}
+
+struct EmbeddingWeightReclaimer {
+    cache: Arc<WeightCache>,
+    plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
+    resource: Arc<ResourceTracker>,
+}
+
+impl IdleResourceReclaimer for EmbeddingWeightReclaimer {
+    fn try_reclaim_idle(&self) -> bool {
+        // An Embedding request holds residency while entering the device gate. Waiting here,
+        // with that gate already held by the allocator, would invert the request's lock order.
+        let Ok(mut residency) = self.cache.residency.try_lock() else {
+            return false;
+        };
+        if residency.buffers.is_none()
+            || residency.idle_deadline.is_none()
+            || self.resource.snapshot().active_requests != 0
+        {
+            return false;
+        }
+        let Ok(mut plans) = self.plans.try_lock() else {
+            return false;
+        };
+        let old_plans = std::mem::take(&mut *plans);
+        let old_weights = residency.buffers.take();
+        residency.idle_deadline = None;
+        drop(old_plans);
+        drop(old_weights);
+        let released_bytes = self.resource.snapshot().resident_bytes;
+        self.resource.set_residency(MemoryTier::Ssd, 0);
+        self.cache.changed.notify_one();
+        tracing::info!(
+            weight_bytes = released_bytes,
+            "idle embedding weights returned to SSD backing under unified VRAM pressure"
+        );
+        true
+    }
+}
+
+struct IdleWeightReaper {
+    cache: Arc<WeightCache>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl IdleWeightReaper {
+    fn spawn(
+        cache: Arc<WeightCache>,
+        plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
+        resource: Arc<ResourceTracker>,
+        unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
+        weight_bytes: u64,
+    ) -> Result<Self> {
+        let worker_cache = Arc::clone(&cache);
+        let worker = thread::Builder::new()
+            .name("infr-embedding-idle".to_owned())
+            .spawn(move || {
+                let mut residency = worker_cache
+                    .residency
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                loop {
+                    if worker_cache.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(deadline) = residency.idle_deadline else {
+                        residency = worker_cache
+                            .changed
+                            .wait(residency)
+                            .unwrap_or_else(|error| error.into_inner());
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if !residency.idle_deadline_reached(now) {
+                        let (next, _) = worker_cache
+                            .changed
+                            .wait_timeout(residency, deadline.saturating_duration_since(now))
+                            .unwrap_or_else(|error| error.into_inner());
+                        residency = next;
+                        continue;
+                    }
+
+                    residency.idle_deadline = None;
+                    if residency.buffers.is_none() {
+                        continue;
+                    }
+
+                    // The request path takes these locks in the same order and holds the weight
+                    // lock through synchronous execution. No command can still reference these
+                    // buffers once the reaper reaches this point.
+                    let mut cached_plans = plans.lock().unwrap_or_else(|error| error.into_inner());
+                    let old_plans = std::mem::take(&mut *cached_plans);
+                    let old_weights = residency.buffers.take();
+                    drop(old_plans);
+                    drop(old_weights);
+                    resource.set_residency(MemoryTier::Ssd, 0);
+                    if let Some(pool) = &unified_pool {
+                        use infr_vulkan::unified::UnifiedVramClass;
+                        let stats = pool.stats();
+                        tracing::info!(
+                            arena_bytes = stats.capacity_bytes,
+                            expert_bytes = stats.class_bytes(UnifiedVramClass::Expert),
+                            llm_runtime_bytes = stats.class_bytes(UnifiedVramClass::LlmRuntime),
+                            embedding_weight_bytes =
+                                stats.class_bytes(UnifiedVramClass::EmbeddingWeights),
+                            embedding_runtime_bytes =
+                                stats.class_bytes(UnifiedVramClass::EmbeddingRuntime),
+                            free_bytes = stats.free_bytes,
+                            largest_free_bytes = stats.largest_free_bytes,
+                            "idle embedding residency released from unified VRAM"
+                        );
+                    }
+                    tracing::info!(
+                        weights_mib = weight_bytes as f64 / 1048576.0,
+                        "idle embedding weights returned to SSD backing"
+                    );
+                }
+            })
+            .context("spawn embedding idle-reaper thread")?;
+        Ok(Self {
+            cache,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop_and_join(&mut self) {
+        self.cache.stop.store(true, Ordering::Release);
+        self.cache.changed.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for IdleWeightReaper {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Embedding inference executed directly by INFR's CPU or Vulkan graph backend.
+pub struct NativeEmbeddingEngine {
+    model_path: PathBuf,
+    cfg: NativeConfig,
+    tokenizer: NativeTokenizer,
+    backend: Box<dyn Backend>,
+    specs: Vec<WeightSpec>,
+    weights: Arc<WeightCache>,
+    weight_bytes: u64,
+    /// A backend fork sharing the LLM elastic arena loads weights only for an active request and
+    /// retains them only until the configured idle deadline. Low-level standalone constructors are
+    /// eager; standalone services wrap them in LazyNativeEmbeddingEngine to release whole backends.
+    dynamic_weights: bool,
+    idle_timeout: Duration,
+    layout: WeightLayout,
+    plans: Arc<Mutex<HashMap<usize, NativePlan>>>,
+    resource: Arc<ResourceTracker>,
+    _idle_reaper: Option<IdleWeightReaper>,
+    _pressure_reclaimer: Option<Arc<dyn IdleResourceReclaimer>>,
+}
+
+impl NativeEmbeddingEngine {
+    /// Standalone service: defer backend creation until a request, then drop the whole backend
+    /// after the idle deadline. Weight arenas and CPU repack caches must be released together.
+    pub fn load_cpu_with_idle(
+        path: &Path,
+        engine_cfg: Arc<infr_core::config::Config>,
+        idle_timeout: Duration,
+    ) -> Result<crate::LazyNativeEmbeddingEngine> {
+        let source = path.to_owned();
+        crate::LazyNativeEmbeddingEngine::new(path, idle_timeout, move || {
+            Ok(Box::new(Self::load_cpu(&source, Arc::clone(&engine_cfg))?))
+        })
+    }
+
+    pub fn load_vulkan_with_idle(
+        path: &Path,
+        engine_cfg: Arc<infr_core::config::Config>,
+        idle_timeout: Duration,
+    ) -> Result<crate::LazyNativeEmbeddingEngine> {
+        let source = path.to_owned();
+        let engine_cfg = standalone_backend_config(&engine_cfg);
+        crate::LazyNativeEmbeddingEngine::new(path, idle_timeout, move || {
+            Ok(Box::new(Self::load_vulkan(
+                &source,
+                Arc::clone(&engine_cfg),
+            )?))
+        })
+    }
+
+    pub fn load_cpu(path: &Path, engine_cfg: Arc<infr_core::config::Config>) -> Result<Self> {
+        Self::load(
+            path,
+            Box::new(infr_cpu::CpuBackend::new_with(engine_cfg)),
+            MemoryTier::Ram,
+            false,
+            Duration::ZERO,
+            None,
+        )
+    }
+
+    pub fn load_vulkan(path: &Path, engine_cfg: Arc<infr_core::config::Config>) -> Result<Self> {
+        let backend = infr_vulkan::VulkanBackend::new_with(engine_cfg)
+            .map_err(|error| anyhow!("initialize Vulkan embedding backend: {error}"))?;
+        Self::load(
+            path,
+            Box::new(backend),
+            MemoryTier::Vram,
+            false,
+            Duration::ZERO,
+            None,
+        )
+    }
+
+    /// Load on a Vulkan client derived from an already-warm LLM backend. The client shares the
+    /// device and unified VRAM arena while keeping a separate Embedding execution graph.
+    pub fn load_vulkan_with_backend(
+        path: &Path,
+        backend: infr_vulkan::VulkanBackend,
+        idle_timeout: Duration,
+    ) -> Result<Self> {
+        let unified_pool = backend.unified_vram();
+        Self::load(
+            path,
+            Box::new(backend),
+            MemoryTier::Vram,
+            true,
+            idle_timeout,
+            unified_pool,
+        )
+    }
+
+    fn load(
+        path: &Path,
+        backend: Box<dyn Backend>,
+        tier: MemoryTier,
+        dynamic_weights: bool,
+        idle_timeout: Duration,
+        unified_pool: Option<Arc<infr_vulkan::unified::UnifiedVramPool>>,
+    ) -> Result<Self> {
+        if !path.is_file() {
+            bail!("embedding model does not exist: {}", path.display());
+        }
+        let gguf = Gguf::open(path).map_err(|error| anyhow!(error.to_string()))?;
+        let cfg = NativeConfig::from_gguf(&gguf)?;
+        let tokenizer = NativeTokenizer::from_gguf(&gguf, &cfg)?;
+        let (specs, layout, weight_bytes) = build_weight_catalog(&gguf, &cfg)?;
+        let weights = if dynamic_weights {
+            None
+        } else {
+            Some(load_weight_buffers(&gguf, &specs, backend.as_ref())?)
+        };
+        let resident_bytes = weights.as_ref().map_or(0, |_| weight_bytes);
+        let resident_tier = if weights.is_some() {
+            tier
+        } else {
+            MemoryTier::Ssd
+        };
+        let model_id = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&cfg.public().name)
+            .to_owned();
+        tracing::info!(
+            model = %model_id,
+            architecture = %cfg.public().architecture,
+            backend = backend.name(),
+            tier = ?tier,
+            weights_mib = weight_bytes as f64 / 1048576.0,
+            resident_mib = resident_bytes as f64 / 1048576.0,
+            dynamic_weights,
+            idle_timeout_secs = idle_timeout.as_secs(),
+            "native embedding model ready"
+        );
+        let resource = Arc::new(ResourceTracker::new(
+            format!("embedding:{model_id}"),
+            ResourceKind::EmbeddingWeights,
+            weight_bytes,
+            resident_bytes,
+            resident_tier,
+            weight_bytes,
+        ));
+        let weights = Arc::new(WeightCache {
+            residency: Mutex::new(WeightResidency {
+                buffers: weights,
+                idle_deadline: None,
+            }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let plans = Arc::new(Mutex::new(HashMap::new()));
+        let idle_reaper = if dynamic_weights && !idle_timeout.is_zero() {
+            Some(IdleWeightReaper::spawn(
+                Arc::clone(&weights),
+                Arc::clone(&plans),
+                Arc::clone(&resource),
+                unified_pool.clone(),
+                weight_bytes,
+            )?)
+        } else {
+            None
+        };
+        let pressure_reclaimer: Option<Arc<dyn IdleResourceReclaimer>> = if dynamic_weights
+            && !idle_timeout.is_zero()
+        {
+            let reclaimer: Arc<dyn IdleResourceReclaimer> = Arc::new(EmbeddingWeightReclaimer {
+                cache: Arc::clone(&weights),
+                plans: Arc::clone(&plans),
+                resource: Arc::clone(&resource),
+            });
+            backend.register_idle_reclaimer(Arc::downgrade(&reclaimer));
+            Some(reclaimer)
+        } else {
+            None
+        };
+        Ok(Self {
+            model_path: path.to_owned(),
+            cfg,
+            tokenizer,
+            backend,
+            specs,
+            weights,
+            weight_bytes,
+            dynamic_weights,
+            idle_timeout,
+            layout,
+            plans,
+            resource,
+            _idle_reaper: idle_reaper,
+            _pressure_reclaimer: pressure_reclaimer,
+        })
+    }
+
+    pub fn config(&self) -> &EmbeddingConfig {
+        self.cfg.public()
+    }
+
+    pub fn resource_snapshot(&self) -> ResourceSnapshot {
+        self.resource.snapshot()
+    }
+
+    pub fn embed(&self, inputs: &[String]) -> Result<EmbeddingBatch> {
+        if inputs.is_empty() {
+            bail!("input array must contain at least one string");
+        }
+        let encoded = inputs
+            .iter()
+            .map(|input| self.tokenizer.encode(input))
+            .collect::<Result<Vec<_>>>()?;
+        let prompt_tokens = encoded.iter().try_fold(0u32, |sum, ids| {
+            sum.checked_add(ids.len() as u32)
+                .context("embedding prompt-token count overflow")
+        })?;
+        let _lease = self.resource.acquire();
+        let mut weights = self
+            .weights
+            .residency
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if weights.buffers.is_none() {
+            let gguf = Gguf::open(&self.model_path).map_err(|error| anyhow!(error.to_string()))?;
+            let loaded = load_weight_buffers(&gguf, &self.specs, self.backend.as_ref())?;
+            weights.buffers = Some(loaded);
+            self.resource
+                .set_residency(MemoryTier::Vram, self.weight_bytes);
+            tracing::info!(
+                weights_mib = self.weight_bytes as f64 / 1048576.0,
+                "embedding weights admitted to unified VRAM"
+            );
+        }
+        let result = (|| {
+            let resident = weights.buffers.as_ref().expect("weights loaded above");
+            let mut plans = self.plans.lock().unwrap_or_else(|error| error.into_inner());
+            let mut embeddings = Vec::with_capacity(encoded.len());
+            for ids in encoded {
+                let plan = match plans.entry(ids.len()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(self.build_plan(ids.len())?)
+                    }
+                };
+                embeddings.push(self.execute_plan(plan, &ids, resident)?);
+            }
+            Ok(EmbeddingBatch {
+                embeddings,
+                prompt_tokens,
+            })
+        })();
+        if self.dynamic_weights {
+            weights.arm_idle_deadline(self.idle_timeout, Instant::now());
+            self.weights.changed.notify_one();
+        }
+        result
+    }
+
+    fn build_plan(&self, rows: usize) -> Result<NativePlan> {
+        match (&self.cfg, &self.layout) {
+            (NativeConfig::Nomic(cfg), WeightLayout::Nomic(layout)) => {
+                self.build_nomic_plan(rows, cfg, layout)
+            }
+            (NativeConfig::Qwen3(cfg), WeightLayout::Qwen3(layout)) => {
+                self.build_qwen3_plan(rows, cfg, layout)
+            }
+            _ => unreachable!("embedding config and weight layout must use the same architecture"),
+        }
+    }
+
+    fn build_nomic_plan(
+        &self,
+        rows: usize,
+        cfg: &NomicConfig,
+        layout: &NomicWeightLayout,
+    ) -> Result<NativePlan> {
+        let mut graph = Graph::new();
+        let ids = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let ids = graph.label(ids, "embedding.token_ids");
+        let positions = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let positions = graph.label(positions, "embedding.positions");
+        let weight_ids = self
+            .specs
+            .iter()
+            .map(|spec| {
+                let id = graph.weight(spec.desc.clone());
+                graph.label(id, spec.label.clone())
+            })
+            .collect::<Vec<_>>();
+        let wid = |index: usize| weight_ids[index];
+        let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+        let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+        let hidden_len = rows * cfg.hidden;
+        let ffn_len = rows * cfg.ffn;
+        let state = [
+            graph.internal(f32d(hidden_len)),
+            graph.internal(f32d(hidden_len)),
+        ];
+        let normed = graph.internal(f32d(hidden_len));
+        let q = graph.internal(f32d(hidden_len));
+        let k = graph.internal(f32d(hidden_len));
+        let v = graph.internal(f32d(hidden_len));
+        let q_roped = graph.internal(f32d(hidden_len));
+        let k_roped = graph.internal(f32d(hidden_len));
+        let q16 = graph.internal(f16d(hidden_len));
+        let k16 = graph.internal(f16d(hidden_len));
+        let v16 = graph.internal(f16d(hidden_len));
+        let attention = graph.internal(f32d(hidden_len));
+        let sublayer = graph.internal(f32d(hidden_len));
+        let gate = graph.internal(f32d(ffn_len));
+        let up = graph.internal(f32d(ffn_len));
+        let activated = graph.internal(f32d(ffn_len));
+        let output = graph.output(f32d(hidden_len));
+        let output = graph.label(output, "embedding.last_hidden_state");
+
+        graph.push(Op::EmbedGather {
+            ids,
+            table: wid(layout.token_embedding),
+            dst: state[0],
+            rows: rows as u32,
+            ne: cfg.hidden as u32,
+            scale: 1.0,
+        });
+        graph.push(Op::AddBias {
+            x: state[0],
+            bias: wid(layout.token_type_zero),
+            dst: state[0],
+            rows: rows as u32,
+            n: cfg.hidden as u32,
+        });
+        graph.push(Op::LayerNorm {
+            x: state[0],
+            weight: wid(layout.embedding_norm_weight),
+            bias: wid(layout.embedding_norm_bias),
+            dst: state[1],
+            rows: rows as u32,
+            dim: cfg.hidden as u32,
+            eps: cfg.eps,
+        });
+
+        let current = state[1];
+        let residual = state[0];
+        let matrix = cfg.hidden * cfg.hidden;
+        for layer in &layout.layers {
+            for (dst, offset) in [(q, 0usize), (k, matrix), (v, 2 * matrix)] {
+                graph.push(Op::Linear {
+                    x: current,
+                    weight: wid(layer.qkv),
+                    dst,
+                    m: rows as u32,
+                    in_f: cfg.hidden as u32,
+                    out_f: cfg.hidden as u32,
+                    w_off: offset as u32,
+                });
+            }
+            for (src, dst) in [(q, q_roped), (k, k_roped)] {
+                graph.push(Op::Rope {
+                    x: src,
+                    positions,
+                    dst,
+                    rows: rows as u32,
+                    n_head: cfg.heads as u32,
+                    head_dim: cfg.head_dim as u32,
+                    rope_dim: cfg.head_dim as u32,
+                    theta: cfg.rope_theta,
+                    freq_factors: None,
+                    x_stride: 0,
+                    neox: true,
+                    backward: false,
+                });
+            }
+            for (src, dst) in [(q_roped, q16), (k_roped, k16), (v, v16)] {
+                graph.push(Op::Copy {
+                    src,
+                    src_off: 0,
+                    dst,
+                    dst_off: 0,
+                    n: hidden_len as u32,
+                });
+            }
+            graph.push(Op::Attention {
+                q: q16,
+                k_cache: k16,
+                v_cache: v16,
+                dst: attention,
+                rows: rows as u32,
+                kv_len: rows as u32,
+                n_head: cfg.heads as u32,
+                n_kv: cfg.heads as u32,
+                head_dim: cfg.head_dim as u32,
+                scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+                mask: AttnMask::Canvas { lo: 0 },
+                pos: 0,
+                sinks: None,
+            });
+            graph.push(Op::Linear {
+                x: attention,
+                weight: wid(layer.attn_output),
+                dst: sublayer,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.hidden as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: current,
+                b: sublayer,
+                dst: residual,
+                n: hidden_len as u32,
+            });
+            graph.push(Op::LayerNorm {
+                x: residual,
+                weight: wid(layer.attn_norm_weight),
+                bias: wid(layer.attn_norm_bias),
+                dst: normed,
+                rows: rows as u32,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.ffn_gate),
+                dst: gate,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.ffn_up),
+                dst: up,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
+                w_off: 0,
+            });
+            graph.push(Op::GatedAct {
+                gate,
+                up,
+                dst: activated,
+                rows: rows as u32,
+                nff: cfg.ffn as u32,
+                act: Activation::Silu,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            });
+            graph.push(Op::Linear {
+                x: activated,
+                weight: wid(layer.ffn_down),
+                dst: sublayer,
+                m: rows as u32,
+                in_f: cfg.ffn as u32,
+                out_f: cfg.hidden as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: normed,
+                b: sublayer,
+                dst: residual,
+                n: hidden_len as u32,
+            });
+            graph.push(Op::LayerNorm {
+                x: residual,
+                weight: wid(layer.output_norm_weight),
+                bias: wid(layer.output_norm_bias),
+                dst: current,
+                rows: rows as u32,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
+            });
+        }
+        graph.push(Op::Copy {
+            src: current,
+            src_off: 0,
+            dst: output,
+            dst_off: 0,
+            n: hidden_len as u32,
+        });
+
+        let plan = self
+            .backend
+            .compile(&graph)
+            .map_err(|error| anyhow!("compile native embedding graph: {error}"))?;
+        let ids_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
+        let positions_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
+        let output_buffer = self.alloc(hidden_len * 4, BufferUsage::Readback)?;
+        Ok(NativePlan {
+            plan,
+            ids,
+            positions,
+            output,
+            weight_ids,
+            ids_buffer,
+            positions_buffer,
+            output_buffer,
+        })
+    }
+
+    fn build_qwen3_plan(
+        &self,
+        rows: usize,
+        cfg: &Qwen3Config,
+        layout: &Qwen3WeightLayout,
+    ) -> Result<NativePlan> {
+        let mut graph = Graph::new();
+        let ids = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let ids = graph.label(ids, "embedding.token_ids");
+        let positions = graph.input(TensorDesc::new(vec![rows], DType::I32));
+        let positions = graph.label(positions, "embedding.positions");
+        let weight_ids = self
+            .specs
+            .iter()
+            .map(|spec| {
+                let id = graph.weight(spec.desc.clone());
+                graph.label(id, spec.label.clone())
+            })
+            .collect::<Vec<_>>();
+        let wid = |index: usize| weight_ids[index];
+        let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+        let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+        let hidden_len = rows * cfg.hidden;
+        let q_len = rows * cfg.q_width;
+        let kv_len = rows * cfg.kv_width;
+        let ffn_len = rows * cfg.ffn;
+        let state = [
+            graph.internal(f32d(hidden_len)),
+            graph.internal(f32d(hidden_len)),
+        ];
+        let normed = graph.internal(f32d(hidden_len));
+        let q = graph.internal(f32d(q_len));
+        let k = graph.internal(f32d(kv_len));
+        let v = graph.internal(f32d(kv_len));
+        let q16 = graph.internal(f16d(q_len));
+        let k16 = graph.internal(f16d(kv_len));
+        let v16 = graph.internal(f16d(kv_len));
+        let attention = graph.internal(f32d(q_len));
+        let sublayer = graph.internal(f32d(hidden_len));
+        let gate = graph.internal(f32d(ffn_len));
+        let up = graph.internal(f32d(ffn_len));
+        let activated = graph.internal(f32d(ffn_len));
+        let output = graph.output(f32d(hidden_len));
+        let output = graph.label(output, "embedding.last_hidden_state");
+
+        graph.push(Op::EmbedGather {
+            ids,
+            table: wid(layout.token_embedding),
+            dst: state[0],
+            rows: rows as u32,
+            ne: cfg.hidden as u32,
+            scale: 1.0,
+        });
+        let current = state[0];
+        let residual = state[1];
+        for layer in &layout.layers {
+            graph.push(Op::RmsNorm {
+                x: current,
+                weight: wid(layer.attn_norm),
+                dst: normed,
+                rows: rows as u32,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.q),
+                dst: q,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.q_width as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.k),
+                dst: k,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.kv_width as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.v),
+                dst: v,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.kv_width as u32,
+                w_off: 0,
+            });
+            graph.push(Op::QkNormRope {
+                x: q,
+                weight: wid(layer.q_norm),
+                positions,
+                dst: q16,
+                rows: rows as u32,
+                n_head: cfg.heads as u32,
+                head_dim: cfg.head_dim as u32,
+                rope_dim: cfg.head_dim as u32,
+                theta: cfg.rope_theta,
+                eps: cfg.eps,
+                freq_factors: None,
+                x_stride: 0,
+            });
+            graph.push(Op::QkNormRope {
+                x: k,
+                weight: wid(layer.k_norm),
+                positions,
+                dst: k16,
+                rows: rows as u32,
+                n_head: cfg.kv_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                rope_dim: cfg.head_dim as u32,
+                theta: cfg.rope_theta,
+                eps: cfg.eps,
+                freq_factors: None,
+                x_stride: 0,
+            });
+            graph.push(Op::Copy {
+                src: v,
+                src_off: 0,
+                dst: v16,
+                dst_off: 0,
+                n: kv_len as u32,
+            });
+            graph.push(Op::Attention {
+                q: q16,
+                k_cache: k16,
+                v_cache: v16,
+                dst: attention,
+                rows: rows as u32,
+                kv_len: rows as u32,
+                n_head: cfg.heads as u32,
+                n_kv: cfg.kv_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+                mask: AttnMask::Causal,
+                pos: 0,
+                sinks: None,
+            });
+            graph.push(Op::Linear {
+                x: attention,
+                weight: wid(layer.attn_output),
+                dst: sublayer,
+                m: rows as u32,
+                in_f: cfg.q_width as u32,
+                out_f: cfg.hidden as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: current,
+                b: sublayer,
+                dst: residual,
+                n: hidden_len as u32,
+            });
+            graph.push(Op::RmsNorm {
+                x: residual,
+                weight: wid(layer.ffn_norm),
+                dst: normed,
+                rows: rows as u32,
+                dim: cfg.hidden as u32,
+                eps: cfg.eps,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.ffn_gate),
+                dst: gate,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Linear {
+                x: normed,
+                weight: wid(layer.ffn_up),
+                dst: up,
+                m: rows as u32,
+                in_f: cfg.hidden as u32,
+                out_f: cfg.ffn as u32,
+                w_off: 0,
+            });
+            graph.push(Op::GatedAct {
+                gate,
+                up,
+                dst: activated,
+                rows: rows as u32,
+                nff: cfg.ffn as u32,
+                act: Activation::Silu,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            });
+            graph.push(Op::Linear {
+                x: activated,
+                weight: wid(layer.ffn_down),
+                dst: sublayer,
+                m: rows as u32,
+                in_f: cfg.ffn as u32,
+                out_f: cfg.hidden as u32,
+                w_off: 0,
+            });
+            graph.push(Op::Add {
+                a: residual,
+                b: sublayer,
+                dst: current,
+                n: hidden_len as u32,
+            });
+        }
+        graph.push(Op::RmsNorm {
+            x: current,
+            weight: wid(layout.output_norm),
+            dst: output,
+            rows: rows as u32,
+            dim: cfg.hidden as u32,
+            eps: cfg.eps,
+        });
+
+        let plan = self
+            .backend
+            .compile(&graph)
+            .map_err(|error| anyhow!("compile native Qwen3 embedding graph: {error}"))?;
+        let ids_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
+        let positions_buffer = self.alloc(rows * 4, BufferUsage::Staging)?;
+        let output_buffer = self.alloc(hidden_len * 4, BufferUsage::Readback)?;
+        Ok(NativePlan {
+            plan,
+            ids,
+            positions,
+            output,
+            weight_ids,
+            ids_buffer,
+            positions_buffer,
+            output_buffer,
+        })
+    }
+
+    fn execute_plan(
+        &self,
+        plan: &mut NativePlan,
+        ids: &[u32],
+        weights: &[Box<dyn Buffer>],
+    ) -> Result<Vec<f32>> {
+        self.backend
+            .upload(plan.ids_buffer.as_ref(), bytemuck::cast_slice(ids))
+            .map_err(|error| anyhow!("upload embedding token ids: {error}"))?;
+        let positions = (0..ids.len() as u32).collect::<Vec<_>>();
+        self.backend
+            .upload(
+                plan.positions_buffer.as_ref(),
+                bytemuck::cast_slice(&positions),
+            )
+            .map_err(|error| anyhow!("upload embedding positions: {error}"))?;
+        let mut bindings = Bindings::new();
+        bindings
+            .bind(plan.ids, plan.ids_buffer.as_ref())
+            .bind(plan.positions, plan.positions_buffer.as_ref())
+            .bind(plan.output, plan.output_buffer.as_ref());
+        for ((id, buffer), spec) in plan.weight_ids.iter().zip(weights).zip(&self.specs) {
+            debug_assert_eq!(
+                buffer.len_bytes(),
+                spec.desc
+                    .dtype
+                    .dense_bytes(spec.desc.numel())
+                    .unwrap_or(buffer.len_bytes())
+            );
+            bindings.bind(*id, buffer.as_ref());
+        }
+        self.backend
+            .execute(plan.plan.as_ref(), &bindings)
+            .map_err(|error| anyhow!("execute native embedding graph: {error}"))?;
+        let hidden_size = self.cfg.hidden();
+        let mut bytes = vec![0u8; ids.len() * hidden_size * 4];
+        self.backend
+            .download(plan.output_buffer.as_ref(), &mut bytes)
+            .map_err(|error| anyhow!("download native embedding output: {error}"))?;
+        let hidden = bytemuck::cast_slice::<u8, f32>(&bytes);
+        let mut pooled = match &self.cfg {
+            NativeConfig::Nomic(_) => {
+                let mut pooled = vec![0.0f32; hidden_size];
+                for row in hidden.chunks_exact(hidden_size) {
+                    for (dst, value) in pooled.iter_mut().zip(row) {
+                        *dst += *value;
+                    }
+                }
+                let inv_rows = 1.0 / ids.len() as f32;
+                for value in &mut pooled {
+                    *value *= inv_rows;
+                }
+                pooled
+            }
+            NativeConfig::Qwen3(_) => hidden[hidden.len() - hidden_size..].to_vec(),
+        };
+        let norm = pooled.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut pooled {
+                *value /= norm;
+            }
+        }
+        Ok(pooled)
+    }
+
+    fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        self.backend
+            .alloc_uninit(bytes, usage)
+            .map_err(|error| anyhow!("allocate native embedding buffer: {error}"))
+    }
+}
+
+/// Validate the native architecture and weight catalog without initializing a compute device or
+/// touching weight payloads. The temporary GGUF mapping is not retained by a dormant service.
+pub(crate) fn standalone_metadata(path: &Path) -> Result<(EmbeddingConfig, u64)> {
+    let gguf = Gguf::open(path).map_err(|error| anyhow!(error.to_string()))?;
+    let cfg = NativeConfig::from_gguf(&gguf)?;
+    let (_, _, weight_bytes) = build_weight_catalog(&gguf, &cfg)?;
+    Ok((cfg.public().clone(), weight_bytes))
+}
+
+fn standalone_backend_config(
+    cfg: &Arc<infr_core::config::Config>,
+) -> Arc<infr_core::config::Config> {
+    // A standalone embedding backend creates no LLM pager/host cache. UMA admission must not
+    // subtract a legacy cache target inherited from that absent module. Keep explicit process
+    // and device ceilings, the selected device and the saved/source configuration unchanged.
+    if cfg.paging.dram.is_none() {
+        return Arc::clone(cfg);
+    }
+    let mut standalone = (**cfg).clone();
+    standalone.paging.dram = None;
+    Arc::new(standalone)
+}
+
+impl Drop for NativeEmbeddingEngine {
+    fn drop(&mut self) {
+        if let Some(reaper) = self._idle_reaper.as_mut() {
+            reaper.stop_and_join();
+        }
+    }
+}
+
+impl EmbeddingEngine for NativeEmbeddingEngine {
+    fn config(&self) -> &EmbeddingConfig {
+        NativeEmbeddingEngine::config(self)
+    }
+
+    fn resource_snapshot(&self) -> ResourceSnapshot {
+        NativeEmbeddingEngine::resource_snapshot(self)
+    }
+
+    fn embed(&self, inputs: &[String]) -> Result<EmbeddingBatch> {
+        NativeEmbeddingEngine::embed(self, inputs)
+    }
+}
+
+struct WeightCatalogBuilder<'a> {
+    gguf: &'a Gguf,
+    specs: Vec<WeightSpec>,
+    weight_bytes: u64,
+}
+
+impl<'a> WeightCatalogBuilder<'a> {
+    fn new(gguf: &'a Gguf) -> Self {
+        Self {
+            gguf,
+            specs: Vec::new(),
+            weight_bytes: 0,
+        }
+    }
+
+    fn tensor(&self, name: &str, shape: &[usize]) -> Result<&TensorInfo> {
+        let info = self
+            .gguf
+            .tensors()
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .with_context(|| format!("GGUF missing tensor {name}"))?;
+        if info.shape != shape {
+            bail!(
+                "GGUF tensor {name} has shape {:?}; expected {shape:?}",
+                info.shape
+            );
+        }
+        Ok(info)
+    }
+
+    fn push(&mut self, name: &str, shape: &[usize]) -> Result<usize> {
+        let info = self.tensor(name, shape)?;
+        let desc = TensorDesc::new(info.shape.clone(), info.dtype);
+        let nbytes = info.nbytes;
+        let index = self.specs.len();
+        self.specs.push(WeightSpec {
+            label: name.to_owned(),
+            source: name.to_owned(),
+            source_offset: 0,
+            nbytes,
+            desc,
+        });
+        self.weight_bytes += nbytes as u64;
+        Ok(index)
+    }
+}
+
+fn build_weight_catalog(
+    gguf: &Gguf,
+    cfg: &NativeConfig,
+) -> Result<(Vec<WeightSpec>, WeightLayout, u64)> {
+    match cfg {
+        NativeConfig::Nomic(cfg) => {
+            let (specs, layout, bytes) = build_nomic_weight_catalog(gguf, cfg)?;
+            Ok((specs, WeightLayout::Nomic(layout), bytes))
+        }
+        NativeConfig::Qwen3(cfg) => {
+            let (specs, layout, bytes) = build_qwen3_weight_catalog(gguf, cfg)?;
+            Ok((specs, WeightLayout::Qwen3(layout), bytes))
+        }
+    }
+}
+
+fn build_nomic_weight_catalog(
+    gguf: &Gguf,
+    cfg: &NomicConfig,
+) -> Result<(Vec<WeightSpec>, NomicWeightLayout, u64)> {
+    let mut loader = WeightCatalogBuilder::new(gguf);
+    let token_embedding = loader.push("token_embd.weight", &[cfg.hidden, cfg.vocab])?;
+    let token_type_dtype = loader.tensor("token_types.weight", &[cfg.hidden, 2])?.dtype;
+    if token_type_dtype != DType::F32 {
+        bail!(
+            "GGUF token_types.weight must be F32, got {:?}",
+            token_type_dtype
+        );
+    }
+    let row_bytes = cfg.hidden * 4;
+    let token_type_zero = loader.specs.len();
+    loader.specs.push(WeightSpec {
+        label: "token_types.weight[row=0]".into(),
+        source: "token_types.weight".into(),
+        source_offset: 0,
+        nbytes: row_bytes,
+        desc: TensorDesc::new(vec![cfg.hidden], DType::F32),
+    });
+    loader.weight_bytes += row_bytes as u64;
+    let embedding_norm_weight = loader.push("token_embd_norm.weight", &[cfg.hidden])?;
+    let embedding_norm_bias = loader.push("token_embd_norm.bias", &[cfg.hidden])?;
+
+    let mut layers = Vec::with_capacity(cfg.layers);
+    for layer in 0..cfg.layers {
+        let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+        layers.push(NomicLayerWeights {
+            qkv: loader.push(&name("attn_qkv.weight"), &[cfg.hidden, 3 * cfg.hidden])?,
+            attn_output: loader.push(&name("attn_output.weight"), &[cfg.hidden, cfg.hidden])?,
+            attn_norm_weight: loader.push(&name("attn_output_norm.weight"), &[cfg.hidden])?,
+            attn_norm_bias: loader.push(&name("attn_output_norm.bias"), &[cfg.hidden])?,
+            ffn_gate: loader.push(&name("ffn_gate.weight"), &[cfg.hidden, cfg.ffn])?,
+            ffn_up: loader.push(&name("ffn_up.weight"), &[cfg.hidden, cfg.ffn])?,
+            ffn_down: loader.push(&name("ffn_down.weight"), &[cfg.ffn, cfg.hidden])?,
+            output_norm_weight: loader.push(&name("layer_output_norm.weight"), &[cfg.hidden])?,
+            output_norm_bias: loader.push(&name("layer_output_norm.bias"), &[cfg.hidden])?,
+        });
+    }
+    let WeightCatalogBuilder {
+        specs,
+        weight_bytes,
+        ..
+    } = loader;
+    Ok((
+        specs,
+        NomicWeightLayout {
+            token_embedding,
+            token_type_zero,
+            embedding_norm_weight,
+            embedding_norm_bias,
+            layers,
+        },
+        weight_bytes,
+    ))
+}
+
+fn build_qwen3_weight_catalog(
+    gguf: &Gguf,
+    cfg: &Qwen3Config,
+) -> Result<(Vec<WeightSpec>, Qwen3WeightLayout, u64)> {
+    let mut loader = WeightCatalogBuilder::new(gguf);
+    let token_embedding = loader.push("token_embd.weight", &[cfg.hidden, cfg.vocab])?;
+    let output_norm = loader.push("output_norm.weight", &[cfg.hidden])?;
+    let mut layers = Vec::with_capacity(cfg.layers);
+    for layer in 0..cfg.layers {
+        let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+        layers.push(Qwen3LayerWeights {
+            attn_norm: loader.push(&name("attn_norm.weight"), &[cfg.hidden])?,
+            q: loader.push(&name("attn_q.weight"), &[cfg.hidden, cfg.q_width])?,
+            q_norm: loader.push(&name("attn_q_norm.weight"), &[cfg.head_dim])?,
+            k: loader.push(&name("attn_k.weight"), &[cfg.hidden, cfg.kv_width])?,
+            k_norm: loader.push(&name("attn_k_norm.weight"), &[cfg.head_dim])?,
+            v: loader.push(&name("attn_v.weight"), &[cfg.hidden, cfg.kv_width])?,
+            attn_output: loader.push(&name("attn_output.weight"), &[cfg.q_width, cfg.hidden])?,
+            ffn_norm: loader.push(&name("ffn_norm.weight"), &[cfg.hidden])?,
+            ffn_gate: loader.push(&name("ffn_gate.weight"), &[cfg.hidden, cfg.ffn])?,
+            ffn_up: loader.push(&name("ffn_up.weight"), &[cfg.hidden, cfg.ffn])?,
+            ffn_down: loader.push(&name("ffn_down.weight"), &[cfg.ffn, cfg.hidden])?,
+        });
+    }
+    let WeightCatalogBuilder {
+        specs,
+        weight_bytes,
+        ..
+    } = loader;
+    Ok((
+        specs,
+        Qwen3WeightLayout {
+            token_embedding,
+            output_norm,
+            layers,
+        },
+        weight_bytes,
+    ))
+}
+
+fn load_weight_buffers(
+    gguf: &Gguf,
+    specs: &[WeightSpec],
+    backend: &dyn Backend,
+) -> Result<Vec<Box<dyn Buffer>>> {
+    let mut buffers = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let source = gguf
+            .tensor_bytes(&spec.source)
+            .map_err(|error| anyhow!("read GGUF tensor {}: {error}", spec.source))?;
+        let end = spec
+            .source_offset
+            .checked_add(spec.nbytes)
+            .context("embedding weight source range overflow")?;
+        let bytes = source.get(spec.source_offset..end).with_context(|| {
+            format!(
+                "embedding weight {} source range {}..{end} exceeds {} bytes",
+                spec.label,
+                spec.source_offset,
+                source.len()
+            )
+        })?;
+        let buffer = backend
+            .alloc_uninit(spec.nbytes, BufferUsage::Weights)
+            .map_err(|error| anyhow!("allocate embedding weight {}: {error}", spec.label))?;
+        backend
+            .upload(buffer.as_ref(), bytes)
+            .map_err(|error| anyhow!("upload embedding weight {}: {error}", spec.label))?;
+        buffers.push(buffer);
+    }
+    Ok(buffers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_uma_does_not_reserve_absent_llm_cache_or_change_explicit_caps() {
+        use infr_core::{
+            config::{AutoProfile, Config},
+            hostmem, SizeSpec,
+        };
+        for profile in [AutoProfile::Conservative, AutoProfile::Aggressive] {
+            let mut original = Config::default();
+            original.device.auto_profile = profile;
+            original.device.dev = Some("Vulkan2".into());
+            original.device.vram_budget = Some(SizeSpec::Bytes(2 << 30));
+            original.paging.dram = Some(SizeSpec::Bytes(128 << 30));
+            original.paging.dram_bypass = false;
+            let original = Arc::new(original);
+            let standalone = standalone_backend_config(&original);
+            let old = hostmem::unified_device_budget_for_snapshot(
+                &original,
+                Some(32 << 30),
+                Some(64 << 30),
+                Some(1 << 30),
+            );
+            let new = hostmem::unified_device_budget_for_snapshot(
+                &standalone,
+                Some(32 << 30),
+                Some(64 << 30),
+                Some(1 << 30),
+            );
+            assert_eq!(old, Some(0));
+            assert!(new.unwrap() > 0);
+            assert!(original.paging.dram.is_some());
+            assert!(standalone.paging.dram.is_none());
+            assert_eq!(standalone.device, original.device);
+
+            let mut explicit = (*original).clone();
+            explicit.device.ram_budget = Some(SizeSpec::Bytes(8 << 30));
+            let explicit = Arc::new(explicit);
+            let standalone = standalone_backend_config(&explicit);
+            assert_eq!(standalone.device, explicit.device);
+            assert_eq!(
+                hostmem::unified_device_budget_for_snapshot(
+                    &explicit,
+                    Some(32 << 30),
+                    Some(64 << 30),
+                    Some(1 << 30)
+                ),
+                hostmem::unified_device_budget_for_snapshot(
+                    &standalone,
+                    Some(32 << 30),
+                    Some(64 << 30),
+                    Some(1 << 30)
+                )
+            );
+        }
+    }
+    use serde::Deserialize;
+
+    #[test]
+    fn idle_weight_deadline_is_disabled_or_rearmed_from_latest_use() {
+        let start = Instant::now();
+        let mut residency = WeightResidency {
+            buffers: Some(Vec::new()),
+            idle_deadline: None,
+        };
+
+        residency.arm_idle_deadline(Duration::ZERO, start);
+        assert_eq!(residency.idle_deadline, None);
+
+        residency.arm_idle_deadline(Duration::from_secs(10), start);
+        assert!(!residency.idle_deadline_reached(start + Duration::from_secs(9)));
+        residency.arm_idle_deadline(Duration::from_secs(10), start + Duration::from_secs(9));
+        assert!(!residency.idle_deadline_reached(start + Duration::from_secs(10)));
+        assert!(residency.idle_deadline_reached(start + Duration::from_secs(19)));
+
+        // Must not panic even for an intentionally nonsensical CLI value.
+        residency.arm_idle_deadline(Duration::MAX, start);
+    }
+
+    #[test]
+    fn idle_reaper_releases_residency_after_deadline() {
+        let cache = Arc::new(WeightCache {
+            residency: Mutex::new(WeightResidency {
+                buffers: Some(Vec::new()),
+                idle_deadline: None,
+            }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let plans = Arc::new(Mutex::new(HashMap::new()));
+        let resource = Arc::new(ResourceTracker::new(
+            "embedding:test".to_owned(),
+            ResourceKind::EmbeddingWeights,
+            1,
+            1,
+            MemoryTier::Vram,
+            1,
+        ));
+        let mut reaper =
+            IdleWeightReaper::spawn(Arc::clone(&cache), plans, Arc::clone(&resource), None, 1)
+                .unwrap();
+        {
+            let mut residency = cache.residency.lock().unwrap();
+            residency.arm_idle_deadline(Duration::from_millis(10), Instant::now());
+            cache.changed.notify_one();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while resource.snapshot().resident_bytes != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(resource.snapshot().resident_bytes, 0);
+        assert!(cache.residency.lock().unwrap().buffers.is_none());
+        reaper.stop_and_join();
+    }
+
+    struct CountedBuffer(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Buffer for CountedBuffer {
+        fn len_bytes(&self) -> usize {
+            16
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for CountedBuffer {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pressure_plan(drops: &Arc<std::sync::atomic::AtomicUsize>) -> NativePlan {
+        NativePlan {
+            plan: infr_core::backend::GraphPlan::boxed(&Graph::new()),
+            ids: TensorId(0),
+            positions: TensorId(1),
+            output: TensorId(2),
+            weight_ids: vec![],
+            ids_buffer: Box::new(CountedBuffer(Arc::clone(drops))),
+            positions_buffer: Box::new(CountedBuffer(Arc::clone(drops))),
+            output_buffer: Box::new(CountedBuffer(Arc::clone(drops))),
+        }
+    }
+
+    fn pressure_fixture() -> (
+        Arc<EmbeddingWeightReclaimer>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let weights_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plans_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reclaimer = Arc::new(EmbeddingWeightReclaimer {
+            cache: Arc::new(WeightCache {
+                residency: Mutex::new(WeightResidency {
+                    buffers: Some(vec![Box::new(CountedBuffer(Arc::clone(&weights_dropped)))]),
+                    idle_deadline: Some(Instant::now() + Duration::from_secs(60)),
+                }),
+                changed: Condvar::new(),
+                stop: AtomicBool::new(false),
+            }),
+            plans: Arc::new(Mutex::new(HashMap::from([(
+                4,
+                pressure_plan(&plans_dropped),
+            )]))),
+            resource: Arc::new(ResourceTracker::new(
+                "embedding:pressure-test",
+                ResourceKind::EmbeddingWeights,
+                16,
+                16,
+                MemoryTier::Vram,
+                16,
+            )),
+        });
+        (reclaimer, weights_dropped, plans_dropped)
+    }
+
+    #[test]
+    fn pressure_reclaims_idle_weights_before_deadline_and_clears_plans() {
+        let (reclaimer, weights, plans) = pressure_fixture();
+        assert!(!reclaimer
+            .cache
+            .residency
+            .lock()
+            .unwrap()
+            .idle_deadline_reached(Instant::now()));
+        assert!(reclaimer.try_reclaim_idle());
+        assert_eq!(weights.load(Ordering::SeqCst), 1);
+        assert_eq!(plans.load(Ordering::SeqCst), 3);
+        assert!(reclaimer.plans.lock().unwrap().is_empty());
+        let residency = reclaimer.cache.residency.lock().unwrap();
+        assert!(residency.buffers.is_none());
+        assert!(residency.idle_deadline.is_none());
+        drop(residency);
+        let snapshot = reclaimer.resource.snapshot();
+        assert_eq!(snapshot.tier, MemoryTier::Ssd);
+        assert_eq!(snapshot.resident_bytes, 0);
+        assert!(!reclaimer.try_reclaim_idle());
+    }
+
+    #[test]
+    fn pressure_preserves_active_requests_and_explicit_residency() {
+        let (reclaimer, weights, plans) = pressure_fixture();
+        let lease = reclaimer.resource.acquire();
+        assert!(!reclaimer.try_reclaim_idle());
+        drop(lease);
+        reclaimer.cache.residency.lock().unwrap().idle_deadline = None;
+        assert!(!reclaimer.try_reclaim_idle());
+        assert_eq!(weights.load(Ordering::SeqCst), 0);
+        assert_eq!(plans.load(Ordering::SeqCst), 0);
+        assert_eq!(reclaimer.resource.snapshot().tier, MemoryTier::Vram);
+    }
+
+    #[test]
+    fn pressure_skips_locked_plans_without_partially_dropping_weights() {
+        let (reclaimer, weights, _) = pressure_fixture();
+        let plans = reclaimer.plans.lock().unwrap();
+        assert!(!reclaimer.try_reclaim_idle());
+        assert!(reclaimer.cache.residency.lock().unwrap().buffers.is_some());
+        assert_eq!(weights.load(Ordering::SeqCst), 0);
+        drop(plans);
+        assert!(reclaimer.try_reclaim_idle());
+    }
+
+    #[test]
+    fn pressure_does_not_wait_for_a_request_blocked_on_the_device_gate() {
+        use std::sync::mpsc;
+        let (reclaimer, weights, _) = pressure_fixture();
+        let gate = Arc::new(Mutex::new(()));
+        let exclusive = gate.lock().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let request_cache = Arc::clone(&reclaimer.cache);
+        let request_gate = Arc::clone(&gate);
+        let request = thread::spawn(move || {
+            let _weights = request_cache.residency.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _gate = request_gate.lock().unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_reclaimer = Arc::clone(&reclaimer);
+        let pressure = thread::spawn(move || {
+            done_tx.send(worker_reclaimer.try_reclaim_idle()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(exclusive);
+        request.join().unwrap();
+        pressure.join().unwrap();
+        assert!(
+            !result.unwrap(),
+            "pressure callback must skip a busy request"
+        );
+        assert_eq!(weights.load(Ordering::SeqCst), 0);
+        assert!(reclaimer.try_reclaim_idle());
+    }
+
+    #[test]
+    fn pressure_supports_reloaded_weights_and_repeated_idle_eviction() {
+        let (reclaimer, weights, _) = pressure_fixture();
+        assert!(reclaimer.try_reclaim_idle());
+        {
+            let mut residency = reclaimer.cache.residency.lock().unwrap();
+            residency.buffers = Some(vec![Box::new(CountedBuffer(Arc::clone(&weights)))]);
+            residency.arm_idle_deadline(Duration::from_secs(60), Instant::now());
+            reclaimer.resource.set_residency(MemoryTier::Vram, 16);
+        }
+        assert!(reclaimer.try_reclaim_idle());
+        assert_eq!(weights.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pressure_and_idle_reaper_share_a_safe_reload_lifecycle() {
+        let (reclaimer, weights, _) = pressure_fixture();
+        let mut reaper = IdleWeightReaper::spawn(
+            Arc::clone(&reclaimer.cache),
+            Arc::clone(&reclaimer.plans),
+            Arc::clone(&reclaimer.resource),
+            None,
+            16,
+        )
+        .unwrap();
+        let pressure_deadline = Instant::now() + Duration::from_secs(2);
+        while !reclaimer.try_reclaim_idle() {
+            assert!(
+                Instant::now() < pressure_deadline,
+                "idle reaper never yielded residency"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        {
+            let mut residency = reclaimer.cache.residency.lock().unwrap();
+            residency.buffers = Some(vec![Box::new(CountedBuffer(Arc::clone(&weights)))]);
+            residency.arm_idle_deadline(Duration::from_millis(10), Instant::now());
+            reclaimer.resource.set_residency(MemoryTier::Vram, 16);
+            reclaimer.cache.changed.notify_one();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while reclaimer.resource.snapshot().resident_bytes != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        reaper.stop_and_join();
+        assert_eq!(weights.load(Ordering::SeqCst), 2);
+        assert_eq!(reclaimer.resource.snapshot().tier, MemoryTier::Ssd);
+        assert!(!reclaimer.try_reclaim_idle());
+    }
+
+    #[derive(Deserialize)]
+    struct Oracle {
+        cases: Vec<OracleCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct OracleCase {
+        name: String,
+        input: Vec<String>,
+        prompt_tokens: u32,
+        dimensions: usize,
+        embeddings: Vec<f32>,
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            let (x, y) = (x as f64, y as f64);
+            dot += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        dot / (aa.sqrt() * bb.sqrt())
+    }
+
+    fn run_oracle(engine: NativeEmbeddingEngine, oracle_path: &Path, all_cases: bool) {
+        let bytes = std::fs::read(oracle_path).unwrap();
+        let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
+        let oracle: Oracle = serde_json::from_slice(bytes).unwrap();
+        let cases = if all_cases {
+            oracle.cases.as_slice()
+        } else {
+            &oracle.cases[..1]
+        };
+        for case in cases {
+            let got = engine.embed(&case.input).unwrap();
+            assert_eq!(
+                got.prompt_tokens, case.prompt_tokens,
+                "{} tokens",
+                case.name
+            );
+            assert_eq!(got.embeddings.len(), case.input.len(), "{} rows", case.name);
+            assert_eq!(
+                case.embeddings.len(),
+                case.input.len() * case.dimensions,
+                "{} oracle shape",
+                case.name
+            );
+            for (row, expected) in got
+                .embeddings
+                .iter()
+                .zip(case.embeddings.chunks_exact(case.dimensions))
+            {
+                let cos = cosine(row, expected);
+                let max_abs = row
+                    .iter()
+                    .zip(expected)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "native embedding {}: cosine={cos:.8}, max_abs={max_abs:.6}",
+                    case.name
+                );
+                assert!(
+                    cos > 0.999,
+                    "{} cosine {cos} is below parity floor",
+                    case.name
+                );
+                assert!(
+                    max_abs < 0.005,
+                    "{} max absolute error {max_abs} exceeds parity floor",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn real_nomic_cpu_matches_llama_cpp_when_available() {
+        let (Ok(model), Ok(oracle)) = (
+            std::env::var("INFR_EMBEDDING_TEST_MODEL"),
+            std::env::var("INFR_EMBEDDING_TEST_ORACLE"),
+        ) else {
+            return;
+        };
+        let engine = NativeEmbeddingEngine::load_cpu(
+            Path::new(&model),
+            Arc::new(infr_core::config::Config::default()),
+        )
+        .unwrap();
+        run_oracle(engine, Path::new(&oracle), false);
+    }
+
+    #[test]
+    #[ignore = "requires INFR_QWEN_EMBEDDING_TEST_MODEL and a Vulkan device"]
+    fn real_embedding_workspace_idle_is_independent_of_weights() {
+        use infr_vulkan::unified::UnifiedVramClass as Class;
+        let model = std::env::var("INFR_QWEN_EMBEDDING_TEST_MODEL").unwrap();
+        let primary = infr_vulkan::VulkanBackend::new().unwrap();
+        let pool = primary.init_unified_vram(1536 * 1024 * 1024).unwrap();
+        let engine = NativeEmbeddingEngine::load_vulkan_with_backend(
+            Path::new(&model),
+            primary.fork_embedding_client().unwrap(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let inputs = vec!["How can local LLM inference be accelerated?".to_owned()];
+        let baseline = engine.embed(&inputs).unwrap();
+        let retained = pool.stats();
+        assert!(retained.class_bytes(Class::EmbeddingRuntime) > 0);
+        let weight_bytes = retained.class_bytes(Class::EmbeddingWeights);
+        assert!(weight_bytes > 0);
+        for _ in 0..3 {
+            let actual = engine.embed(&inputs).unwrap();
+            assert_eq!(actual.prompt_tokens, baseline.prompt_tokens);
+            assert_eq!(actual.embeddings, baseline.embeddings);
+            assert_eq!(pool.stats().allocated_bytes, retained.allocated_bytes);
+        }
+        let deadline = Instant::now() + Duration::from_secs(7);
+        while pool.stats().class_bytes(Class::EmbeddingRuntime) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "embedding workspace did not expire"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            pool.stats().class_bytes(Class::EmbeddingWeights),
+            weight_bytes
+        );
+        let actual = engine.embed(&inputs).unwrap();
+        assert_eq!(actual.embeddings, baseline.embeddings);
+        assert!(pool.stats().class_bytes(Class::EmbeddingRuntime) > 0);
+        drop(engine);
+        assert_eq!(pool.stats().allocated_bytes, 0);
+    }
+
+    #[test]
+    fn real_nomic_vulkan_matches_llama_cpp_when_requested() {
+        let (Ok(model), Ok(oracle), Ok(_)) = (
+            std::env::var("INFR_EMBEDDING_TEST_MODEL"),
+            std::env::var("INFR_EMBEDDING_TEST_ORACLE"),
+            std::env::var("INFR_EMBEDDING_TEST_VULKAN"),
+        ) else {
+            return;
+        };
+        let engine = NativeEmbeddingEngine::load_vulkan(
+            Path::new(&model),
+            Arc::new(infr_core::config::Config::default()),
+        )
+        .unwrap();
+        run_oracle(engine, Path::new(&oracle), true);
+    }
+
+    #[test]
+    fn real_qwen3_vulkan_matches_llama_cpp_when_requested() {
+        let (Ok(model), Ok(runner), Ok(_)) = (
+            std::env::var("INFR_QWEN_EMBEDDING_TEST_MODEL"),
+            std::env::var("INFR_EMBEDDING_TEST_RUNNER"),
+            std::env::var("INFR_EMBEDDING_TEST_VULKAN"),
+        ) else {
+            return;
+        };
+        let mut engine_cfg = infr_core::config::Config::default();
+        if let Ok(device) = std::env::var("INFR_QWEN_EMBEDDING_TEST_DEVICE") {
+            engine_cfg.device.dev = Some(device);
+        }
+        let engine_cfg = Arc::new(engine_cfg);
+        let inputs = vec![
+            "如何提高本地大模型推理速度？".to_owned(),
+            "How can local LLM inference be accelerated?".to_owned(),
+        ];
+        let oracle = crate::LlamaCppEmbeddingEngine::load_vulkan_on(
+            Path::new(&model),
+            Arc::clone(&engine_cfg),
+            None,
+            Some(Path::new(&runner)),
+            1,
+        )
+        .unwrap();
+        let expected = oracle.embed(&inputs).unwrap();
+        drop(oracle);
+
+        let native = NativeEmbeddingEngine::load_vulkan(Path::new(&model), engine_cfg).unwrap();
+        let got = native.embed(&inputs).unwrap();
+        assert_eq!(got.prompt_tokens, expected.prompt_tokens);
+        assert_eq!(got.embeddings.len(), expected.embeddings.len());
+        for (index, (actual, reference)) in
+            got.embeddings.iter().zip(&expected.embeddings).enumerate()
+        {
+            assert_eq!(actual.len(), reference.len());
+            let similarity = cosine(actual, reference);
+            let max_abs = actual
+                .iter()
+                .zip(reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "native Qwen3 embedding row {index}: cosine={similarity:.8}, max_abs={max_abs:.6}"
+            );
+            assert!(
+                similarity > 0.999,
+                "Qwen3 row {index} cosine {similarity} is below parity floor"
+            );
+            assert!(
+                max_abs < 0.01,
+                "Qwen3 row {index} max absolute error {max_abs} exceeds parity floor"
+            );
+        }
+    }
+}

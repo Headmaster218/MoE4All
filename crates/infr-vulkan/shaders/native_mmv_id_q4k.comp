@@ -1,0 +1,89 @@
+#version 460
+// Multi-slot id-indexed Q4_K mmq GEMV (decode): y = x·W[ids[slot]]ᵀ using hardware int8 dp4a instead
+// of dequant-to-f16. The activation x is pre-quantized to int8 per 32-block (qa/dact/sact from
+// quant_q8); the Q4_K weight stays packed and is read per 32-sub-block (4-bit quants + the 6-bit
+// sub-scale/min). Per sub-block: dp4a Σ(q4·qa) then y += dl·dact·Σ - mm·sact (dl=d·sc, mm=dmin·m).
+// One workgroup per (slot,output): slot = unit/out_f picks expert ids[slot]; 64 threads cooperate
+// over K. x is shared across slots (gate/up read the one ffn-normed row). Q4_K-only (down is Q6_K).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// Resident-BDA (STREAMED is the only weight build): the stacked expert tensor lives in a resident
+// BDA arena at the 64-bit base passed as arena_lo/arena_hi; the expert base is `ids[slot]` scaled
+// by `stride`, REPURPOSED as the per-expert BYTE stride on the 64-bit pointer (see
+// native_gemv_id.comp's STREAMED doc). No bound weight SSBO exists.
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activation, packed 4/u32 [nblk*8]
+layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [nblk]
+layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [nblk]
+layout(binding = 4) readonly buffer IDB { uint ids[]; };
+layout(binding = 5) buffer YB { float y_buf[]; };
+
+shared float red[64];
+
+// Weight-byte read chokepoint — this file carries its own Q4_K dp4a decode (not
+// native_decode.glsl), so it declares the arena seam locally like the native_mmv family.
+#include "native_weight_addr.glsl"
+uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+// Q4_K 6-bit scale/min for sub-block i from the 12-byte scales field at sb.
+uvec2 k4(uint i, uint sb) {
+    if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
+    uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
+    uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
+    return uvec2(sc, mn);
+}
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // Total dispatched-should-be count is n_used*out_f (no `rows` here — decode-only caller); a
+    // padding workgroup's `slot` would otherwise OOB-read `ids[]` and OOB-write `y_buf[]`.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.n_used * pc.out_f) { return; }
+    uint slot = unit / pc.out_f;
+    uint o = unit - slot * pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    // Expert base BYTE address straight from `ids`; `pc.stride` is the per-expert BYTE stride.
+    // wbase keeps only the small within-expert element offset.
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[slot]) * uint64_t(pc.stride);
+    uint wbase = o * pc.in_f;                         // element offset, multiple of 256
+    uint nsub = pc.in_f / 32u;                        // 32-element sub-blocks (= activation blocks)
+    float acc = 0.0;
+    for (uint s = t; s < nsub; s += 64u) {
+        uint gelem = wbase + s * 32u;
+        uint bd = (gelem / 256u) * 144u; // Q4_K super-block byte base
+        uint sub = (gelem / 32u) & 7u;   // sub-block 0..7 within the super-block
+        float d = f16tof32(ru16(bd));
+        float dmin = f16tof32(ru16(bd + 2u));
+        uvec2 km = k4(sub, bd + 4u);
+        float dl = d * float(km.x);
+        float mm = dmin * float(km.y);
+        uint qbase = bd + 16u + (sub >> 1u) * 32u;
+        bool lo = (sub & 1u) == 0u;
+        // pack the 32 q4 nibbles into 8 int8x4 words and dp4a against the activation block.
+        int dp = 0;
+        for (uint j = 0u; j < 8u; j++) {
+            uint qp = 0u;
+            for (uint b = 0u; b < 4u; b++) {
+                uint qbyte = rb(qbase + j * 4u + b);
+                uint val = lo ? (qbyte & 0xFu) : (qbyte >> 4u);
+                qp |= val << (b * 8u);
+            }
+            dp = dotPacked4x8AccSatEXT(int(qp), int(qa[s * 8u + j]), dp);
+        }
+        acc += dl * float(dact[s]) * float(dp) - mm * float(sact[s]);
+    }
+    red[t] = acc;
+    barrier();
+    for (uint rs = 32u; rs > 0u; rs /= 2u) {
+        if (t < rs) { red[t] += red[t + rs]; }
+        barrier();
+    }
+    if (t == 0u) { y_buf[unit] = red[0]; }
+}

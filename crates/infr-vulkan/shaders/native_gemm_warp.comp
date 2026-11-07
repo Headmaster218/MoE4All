@@ -1,0 +1,279 @@
+#version 460
+// Native-block prefill GEMM, LARGE WARPTILE: C[M,N] = A[M,K] · Wᵀ, W = [N,K] raw GGUF blocks
+// dequantized in-shader during staging. Same mul_mm-style 8-warp/256-thread warptile as
+// gemm_proj_warp (BM=64 × BN=256 → warp 32×64 → 2×4 register-blocked 16×16 coopmat frags) — the
+// extra warps hide the W-dequant latency, and the 4× wider N tile amortizes each staged
+// A-row/decoded W-column over 4× more math than the 64×64 native_gemm. BK=32 (one whole quant
+// sub-block per column per stage: BN=256 columns / 256 threads → each thread runs dqblk once).
+// -DFMT_* selects the format. Requires requiredSubgroupSize=32, N%256, K%32.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+// -DBF16CM (opt-in, RDNA4 bf16 WMMA; see adapter.rs `bf16cm_ok`): swaps the coopmat A/B operand
+// type float16_t -> bfloat16_t and drops the f16 clamp on FMT_BF16 weights — bf16 keeps its full
+// 8-bit exponent range end to end (no value narrowed to f16's tighter max-normal 65504) since the
+// weight bits (already bf16-truncated f32, an exact decode) and f32 activations both cast
+// straight to bfloat16_t instead of routing through float16_t. Every OTHER structural choice
+// (staging, tiling, A_GLOBAL, dqblk, epilogue) is untouched: CMTYPE is a pure token substitution
+// for the coopmat operand type, so the default (non-BF16CM) build is byte-identical to before
+// this existed. Replaces the old standalone native_gemm_bf16cm.comp measurement kernel (retired —
+// this is the SAME tuned production warptile as the f16-clamped native_gemm_warp_bf16, so it
+// should match that kernel's speed while keeping bf16's accuracy).
+#ifdef BF16CM
+#extension GL_EXT_bfloat16 : require
+#define CMTYPE bfloat16_t
+#else
+#define CMTYPE float16_t
+#endif
+
+// Cooperative-matrix FRAGMENT shape (the coopmat<> template dims), default 16x16x16 — the shape
+// every desktop RADV/NVIDIA device enumerates. -DCM_M=8 -DCM_N=8 (the `_cm8` builds, selected at
+// runtime only when the device enumerates 8x8x16 f16 AND INFR_CM_8X8=1 — Intel Arc/ANV XMX, which
+// enumerates NO 16x16x16 f16 config) shrinks the A/B/acc fragments to 8x8x16; K stays 16 on both.
+// Everything downstream is derived: CMS_M/CMS_N (fragments per warp) = WM/CM_M and WN/CM_N, the
+// frag-granular LDS offsets/loop strides use CM_M/CM_N/CM_K, and the warptile constants
+// (BM/BN/BK/WM/WN) are untouched — so the default build's preprocessed source is byte-identical
+// to the pre-parameterization kernel. -DWG_THREADS=128 accompanies the _cm8 builds: they pin
+// subgroup size 16 (XMX/DPAS is SIMD16-native; the default builds pin 32), and the warp index
+// math requires exactly WARPS_M*WARPS_N == 8 subgroups, so threads = 8*16 = 128.
+#ifndef CM_M
+#define CM_M 16
+#endif
+#ifndef CM_N
+#define CM_N 16
+#endif
+#define CM_K 16
+#ifndef WG_THREADS
+#define WG_THREADS 256
+#endif
+
+layout(local_size_x = WG_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+const uint THREADS = WG_THREADS;
+// -DNARROW_N halves the column tile (BN 256→128) and doubles the k-stage (BK 32→64): the SAME
+// 256 dequant calls per stage (128 cols × 2 k-blocks), the same ~25 KiB LDS, but 2× the
+// workgroups — narrow-n GEMMs (n=1024/2048: the qkv/o/down shapes of small-ne models) underfill
+// a big GPU with the wide tile (n=1024 → 32 wgs on a 96-wg part = 5-9 TFLOPS vs the kernel's 36).
+// Tile-shape experiments (kernel tuning): -DBM128 doubles the row tile (WM 32→64: 4×4 acc frags
+// per warp — more B-frag reuse per LDS load); -DBM32 HALVES it (WM 32→16: 2×4 → 1×4 acc frags
+// per warp) for small-m batched prefill (MTP verify's m≈6-24 draft window on a 64-row default
+// tile wastes most of the tile as masked rows past `pc.m`); -DBK64W doubles the k-stage on the
+// WIDE tile (half the barriers, 2 staging iterations per thread). Composable. WARPS_M = BM/WM is
+// always 2 (128/64, 64/32, 32/16) — the coopmat compute/store loop indexes `gl_SubgroupID` over
+// WARPS_M*WARPS_N (=2*4=8) without bounds-checking, so this ratio must stay fixed at 2 for any
+// BM32/64/128-style variant to reuse the same warp-index math.
+//
+// -DBM16 is the one exception: 16 rows is exactly one coopmat M-frag (WM=16, the floor — coopmat
+// frags are 16×16, so WM can't shrink further), forcing WARPS_M = BM/WM = 1 instead of 2. Keeping
+// WARPS_N at its usual 4 would leave only WARPS_M*WARPS_N=4 of the 8 launched warps (256
+// threads/32) mapped to valid (warp_r, warp_c) pairs — the other 4 would get warp_c >= WARPS_N via
+// `warp_c = warp / WARPS_M`, reading/writing Bs and C past the intended tile (real OOB, not just
+// waste). So -DBM16 also HALVES WN (32→16 narrow, 64→32 wide), doubling WARPS_N to 8 and
+// restoring the WARPS_M*WARPS_N==8 invariant the compute/store loop relies on — every launched
+// warp gets exactly one CMS_M×CMS_N frag block (1×1 narrow, 1×2 wide) and the tile math stays
+// generic (CMS_M/CMS_N fall out of WM/WN as always).
+#ifdef BM128
+const uint BM = 128u;
+const uint WM = 64u;
+#elif defined(BM32)
+const uint BM = 32u;
+const uint WM = 16u;
+#elif defined(BM16)
+const uint BM = 16u;
+const uint WM = 16u;
+#else
+const uint BM = 64u;
+const uint WM = 32u;
+#endif
+#ifdef N64
+// Four-wave narrow-output tile for shapes such as Qwen3.8's [M,10240] x
+// [320,10240]^T recurrent projection. The old BN=64 kernel restaged A and
+// synchronized every BK=32; this variant reads the caller's f16 A directly,
+// doubles BK, and keeps the same 64-column output granularity without padding N.
+const uint BN = 64u;
+const uint BK = 64u;
+const uint WN = 32u;
+#elif defined(NARROW_N)
+const uint BN = 128u;
+#ifdef BK32
+const uint BK = 32u;
+#else
+const uint BK = 64u;
+#endif
+#ifdef BM16
+const uint WN = 16u;
+#else
+const uint WN = 32u;
+#endif
+#else
+const uint BN = 256u;
+#ifdef BK64W
+const uint BK = 64u;
+#else
+const uint BK = 32u;
+#endif
+#ifdef BM16
+const uint WN = 32u;
+#else
+const uint WN = 64u;
+#endif
+#endif
+const uint WARPS_M = BM / WM;   // 2 (1 for BM16)
+const uint WARPS_N = BN / WN;   // 4 → 8 warps / 256 threads (8 for BM16, same product)
+const uint CMS_M = WM / CM_M;   // 2 (1 for BM16/BM32; doubled under -DCM_M=8)
+const uint CMS_N = WN / CM_N;   // 4 (1 narrow / 2 wide for BM16; doubled under -DCM_N=8)
+const uint SAK = BK + 8u;
+const uint SBK = BK + 8u;     // Bs is [BN][BK]
+
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// -DSTREAMED (dense layer streaming, see pager.rs `DensePagerSession` and native_gemm.comp's arm):
+// the weight is read from the arena pool by 64-bit device address (native_weight_addr.glsl) instead
+// of the bound binding-1 SSBO — `arena_lo`/`arena_hi` (appended LAST so the split-K fields keep
+// their offsets) carry the resident slot's base BYTE address; the NW(i) chokepoint in
+// native_decode's dqblk is redefined to read the arena, the only weight-source change. Composes
+// with every tile/format define (NARROW_N/A_GLOBAL/SPLIT_K/BM*/…): STREAMED touches only the
+// weight binding, push tail, and NW macro, all orthogonal to the tiling. The default (non-STREAMED)
+// build is byte-identical — additive, exactly like the -DBF16CM and -DSPLIT_K arms.
+#ifdef SPLIT_K
+// Split-K (narrow-n occupancy fix, rides NARROW_N): the grid gains a k-split dimension — split s
+// computes a partial over its k-range and stores it at plane s of the [splits, mpad, n] partials
+// buffer; a tiny reduce pass sums the planes. mpad = tilesM·BM (the store plane's row pitch).
+#ifdef STREAMED
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint splits; uint mpad; uint arena_lo; uint arena_hi; } pc;
+#else
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint splits; uint mpad; } pc;
+#endif
+#else
+#ifdef STREAMED
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; } pc;
+#else
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
+#endif
+#ifdef A_DIRECT
+// A read directly as f32 from the caller's activation buffer (no separate store_f16 pass):
+// staged to As with an f32→f16 cast, then coopMatLoad from As. Saves one dispatch + barrier
+// per GEMM at the cost of re-adding As shared memory and its stage loop.
+layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+#elif defined(A_GLOBAL)
+// A pre-converted to f16 by the caller (one store_f16 pass, padded to the row tile): A fragments
+// coopMatLoad straight from global — no As staging, no As LDS. LDS shrinks to Bs-only
+// (~20 KiB → 3 workgroups/WGP instead of 2), which is the occupancy the f32-staging tile lacks.
+layout(binding = 0) readonly buffer ABuf { CMTYPE a[]; }; // [Mpad, K] f16 (or bf16 under BF16CM) activations
+#else
+layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+#endif
+#ifndef STREAMED
+layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF blocks (native)
+#endif
+layout(binding = 2) writeonly buffer CBuf { float c[]; };
+
+#if !defined(A_GLOBAL) || defined(A_DIRECT)
+shared CMTYPE As[BM * SAK];
+#endif
+shared CMTYPE Bs[BN * SBK];
+
+#ifdef STREAMED
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#endif
+
+#include "native_decode.glsl"
+
+void main() {
+#ifdef STREAMED
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
+    uint tilesN = pc.n / BN;
+#ifdef SPLIT_K
+    uint tilesMN = (pc.mpad / BM) * tilesN;
+    uint split = gl_WorkGroupID.x / tilesMN;
+    uint tile = gl_WorkGroupID.x % tilesMN;
+    uint wgRow = (tile / tilesN) * BM;
+    uint wgCol = (tile % tilesN) * BN;
+    // This split's k-range, BK-aligned (dqblk needs 32-elem alignment; BK covers it).
+    uint kchunk = ((pc.k / pc.splits + BK - 1u) / BK) * BK;
+    uint kstart = split * kchunk;
+    uint kend = min(pc.k, kstart + kchunk);
+#else
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+#endif
+    uint warp = gl_SubgroupID;
+    uint warp_r = warp % WARPS_M;
+    uint warp_c = warp / WARPS_M;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+#ifdef SPLIT_K
+    for (uint k0 = kstart; k0 < kend; k0 += BK) {
+#else
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+#endif
+#if !defined(A_GLOBAL) || defined(A_DIRECT)
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[r * SAK + cc] = (gr < pc.m) ? CMTYPE(a[gr * pc.k + k0 + cc]) : CMTYPE(0.0);
+        }
+#endif
+        // one thread per (column, 32-elem k-block) per iteration — BN·(BK/32) decode slots per
+        // stage, striped across THREADS (exactly one iteration for the base configs).
+        for (uint slot = li; slot < BN * (BK / 32u); slot += THREADS) {
+            uint cc = slot % BN;
+            uint kb = (slot / BN) * 32u;
+            float v[32];
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
+            [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
+                Bs[cc * SBK + kb + kk] = CMTYPE(v[kk]);
+            }
+        }
+        barrier();
+        [[unroll]] for (uint kf = 0u; kf < BK; kf += CM_K) {
+            coopmat<CMTYPE, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> af[CMS_M];
+            [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+#if defined(A_DIRECT)
+                coopMatLoad(af[i], As, (warp_r * WM + i * CM_M) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+#elif defined(A_GLOBAL)
+                coopMatLoad(af[i], a, (wgRow + warp_r * WM + i * CM_M) * pc.k + k0 + kf, pc.k,
+                            gl_CooperativeMatrixLayoutRowMajor);
+#else
+                coopMatLoad(af[i], As, (warp_r * WM + i * CM_M) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
+            [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+                coopmat<CMTYPE, gl_ScopeSubgroup, CM_K, CM_N, gl_MatrixUseB> bf;
+                coopMatLoad(bf, Bs, (warp_c * WN + j * CM_N) * SBK + kf, SBK,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                    acc[i][j] = coopMatMulAdd(af[i], bf, acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            uint cr = wgRow + warp_r * WM + i * CM_M;
+            uint cc = wgCol + warp_c * WN + j * CM_N;
+#ifdef SPLIT_K
+            coopMatStore(acc[i][j], c, split * pc.mpad * pc.n + cr * pc.n + cc, pc.n,
+                         gl_CooperativeMatrixLayoutRowMajor);
+#else
+            coopMatStore(acc[i][j], c, cr * pc.n + cc, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+    }
+}

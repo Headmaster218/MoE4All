@@ -1,0 +1,98 @@
+#version 460
+// Fused paged gate+up IQ2_XS GEMV and SwiGLU for Qwen3.8 decode. One subgroup owns NR output
+// rows for one routed expert. Gate and up share the activation row, selected expert id, and the
+// 4 KiB IQ2_XS codebook staged by GRID_INIT; only their weight addresses differ. The two dot
+// products retain the existing subgroup+NR reduction order, then lane 0 writes silu(gate)*up
+// directly, removing both intermediate buffers from the command stream.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef SG
+#define SG 32
+#endif
+#ifndef NR
+#define NR 8
+#endif
+layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint in_f;
+    uint out_f;
+    uint n_used;
+    uint gate_lut_base;
+    uint up_lut_base;
+    uint rows;
+    uint active_mask;
+} pc;
+
+layout(binding = 0) readonly buffer XB { float x_buf[]; };
+layout(binding = 1) readonly buffer IDB { uint ids[]; };
+layout(binding = 2) readonly buffer GLB { uvec2 gate_lut[]; };
+layout(binding = 3) readonly buffer ULB { uvec2 up_lut[]; };
+layout(binding = 4) writeonly buffer YB { float y_buf[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#define FMT_IQ2XS
+#define USE_GRID
+#include "native_decode.glsl"
+
+float dot_at(uint64_t addr, uint gstart, uint xoff) {
+    w_addr = addr;
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    GRID_INIT;
+    uint lane = gl_SubgroupInvocationID;
+    uint og = (pc.out_f + uint(NR) - 1u) / uint(NR);
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.n_used * og) { return; }
+    uint slot_global = unit / og;
+    uint o0 = (unit - slot_global * og) * uint(NR);
+    uint row = slot_global / pc.n_used;
+    uint slot = slot_global - row * pc.n_used;
+    if ((pc.active_mask & (1u << slot)) == 0u) { return; }
+
+    uint expert = ids[slot_global];
+    uvec2 ga = gate_lut[pc.gate_lut_base + expert];
+    uvec2 ua = up_lut[pc.up_lut_base + expert];
+    uint64_t gate_addr = arena_base(ga.x, ga.y);
+    uint64_t up_addr = arena_base(ua.x, ua.y);
+    // A zero tape address denotes a non-resident expert. Production reaches this kernel after
+    // staging, but keeping the guard here makes a stale/partial window fail closed, not fault BDA.
+    if (gate_addr == 0ul || up_addr == 0ul) { return; }
+
+    uint xbase = row * pc.in_f;
+    uint nsub = pc.in_f / 32u;
+    float gate_acc[NR];
+    float up_acc[NR];
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+        gate_acc[rr] = 0.0;
+        up_acc[rr] = 0.0;
+    }
+    for (uint s = lane; s < nsub; s += uint(SG)) {
+        uint xoff = xbase + s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                uint woff = o * pc.in_f + s * 32u;
+                gate_acc[rr] += dot_at(gate_addr, woff, xoff);
+                up_acc[rr] += dot_at(up_addr, woff, xoff);
+            }
+        }
+    }
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+        float gate = subgroupAdd(gate_acc[rr]);
+        float up = subgroupAdd(up_acc[rr]);
+        uint o = o0 + rr;
+        if (lane == 0u && o < pc.out_f) {
+            y_buf[slot_global * pc.out_f + o] = gate / (1.0 + exp(-gate)) * up;
+        }
+    }
+}

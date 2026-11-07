@@ -1,0 +1,13 @@
+#version 460
+// Advance the record-once decode `params` SSBO on the DEVICE: params = [pos, kv_len] becomes
+// [pos+1, pos+2]. Recorded as the FIRST dispatch of the decode replay (params is initialized to
+// [pos0-1, pos0] at record time, so the first replay lands on pos0) — the position stream never
+// crosses the bus after the recording is built. One thread; the recorder's hazard tracking orders
+// it before every params-reading _dyn kernel.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) buffer PB { uint params[]; };
+void main() {
+    uint p = params[0] + 1u;
+    params[0] = p;
+    params[1] = p + 1u;
+}

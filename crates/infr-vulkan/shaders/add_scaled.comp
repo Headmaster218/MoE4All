@@ -1,0 +1,11 @@
+#version 460
+// axpy: acc += scale * x (in place into acc). Used to accumulate weighted MoE expert outputs into
+// the resident hidden state on the GPU (hidden += w_e * y_e) without a host round-trip.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; float scale; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) buffer AB { float acc[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) { acc[i] += pc.scale * x[i]; }
+}

@@ -1,0 +1,48 @@
+#version 460
+// Sequential gated-DeltaNet, pass 1/3 (NORM): L2-normalize q/k per (token, k-head).
+//
+// This is `deltanet_prep` minus the chunked path's D=K̂K̂ᵀ / Dq=Q̂K̂ᵀ dot matrices — the token-serial
+// scan (deltanet_seq.comp) never forms them, so the whole coopmat half of prep disappears along
+// with its [nchunk, nk, 32, 32] dk/dq scratch buffers.
+//
+// One 32-lane workgroup per (token, k-head): the lanes split the kd-dim reduction and the norm is a
+// single subgroupAdd — no LDS, no barriers. Grid is rows·nk (8192 at rows=512, nk=16), so this pass
+// is embarrassingly parallel and effectively free next to the scan.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nk;
+    uint kd;
+    float eps;
+    float qscale; // 1/√kd, folded into q̂ exactly as deltanet_prep does
+} pc;
+
+layout(binding = 0) readonly buffer QB { float q[]; };    // [rows, nk*kd] raw
+layout(binding = 1) readonly buffer KB { float k[]; };    // [rows, nk*kd] raw
+layout(binding = 2) writeonly buffer KN { float kng[]; }; // [rows, nk*kd] k̂
+layout(binding = 3) writeonly buffer QN { float qng[]; }; // [rows, nk*kd] q̂ ×1/√kd
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint tok = gl_WorkGroupID.x / pc.nk;
+    uint kh = gl_WorkGroupID.x % pc.nk;
+    uint base = tok * pc.nk * pc.kd + kh * pc.kd;
+
+    float ks = 0.0, qs = 0.0;
+    for (uint i = lane; i < pc.kd; i += 32u) {
+        float a = k[base + i];
+        float b = q[base + i];
+        ks += a * a;
+        qs += b * b;
+    }
+    float kinv = 1.0 / sqrt(subgroupAdd(ks) + pc.eps);
+    float qinv = pc.qscale / sqrt(subgroupAdd(qs) + pc.eps);
+
+    for (uint i = lane; i < pc.kd; i += 32u) {
+        kng[base + i] = k[base + i] * kinv;
+        qng[base + i] = q[base + i] * qinv;
+    }
+}

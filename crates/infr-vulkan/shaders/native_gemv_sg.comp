@@ -1,0 +1,93 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+// llama-style REASSOCIATION-TOLERANT decode GEMV y = x·Wᵀ for the latency-STARVED low-out_f
+// projection shapes (q/k/v/o/down, out_f ~1024..8192). Structure ported from llama.cpp's
+// mul_mat_vec_q: one WAVE32 SUBGROUP per NR-output group, NO shared memory, NO barriers —
+// subgroupAdd finalizes each row. Each lane strides 32-elem weight sub-blocks (s = lane, lane+32,…)
+// and carries NR independent accumulators (one activation run feeds all NR rows), so a workgroup
+// keeps 32×NR weight-load requests in flight per wave — the MLP that lets the shallow low-out_f grid
+// saturate DRAM like lm_head/gate+up already do on the 64-thread tree kernel.
+//
+// NOT bit-identical to native_gemv: wave32 lane partitioning + the subgroupAdd reduction tree REORDER
+// the float accumulation vs the 64-thread shared tree-reduce (a valid different summation order,
+// ULP-level per element). Gated to the projection band ONLY — the big GEMVs (lm_head/gate+up) stay on
+// the tree kernel where subgroupAdd was measured to REGRESS occupancy ~20%. -DFMT_* selects the
+// format, -DNR=N the rows/workgroup, -DUSE_RES fuses a residual. Requires requiredSubgroupSize=SG.
+//
+// -DSG=16|32 (default 32) sets the pinned subgroup width: the workgroup is always exactly ONE
+// subgroup (local_size_x = SG), lanes stride SG sub-blocks, and subgroupAdd spans SG lanes — the
+// same full reduction at either width, only the summation order differs (already blessed as
+// reassociation-tolerant). SG=16 is the Intel build (SIMD8/16 EUs; a pinned-32 compile starves
+// per-lane registers there — see caps.sg_pref); SG=32 SPIR-V is bit-identical to the pre-SG code.
+
+#ifndef SG
+#define SG 32
+#endif
+layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
+
+// Resident-BDA (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-slot element-offset meaning. The ONLY weight build (the bound-SSBO
+// resident twin died with the eager `Recorder::linear_native_sg` caller, its sole consumer).
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+#ifndef NR
+#define NR 2
+#endif
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+// Dot one 32-elem sub-block of weights (decoded once) against the matching activation run.
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    uint lane = gl_SubgroupInvocationID; // 0..SG-1
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
+    // why no extra bounds check is needed here (the existing `o < pc.out_f` guards already cover
+    // a padding workgroup's out-of-range o0).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(NR);
+    uint nsub = pc.in_f / 32u;
+    float acc[NR];
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }
+    for (uint s = lane; s < nsub; s += uint(SG)) {
+        uint xoff = s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                acc[rr] += dqsub(pc.w_base + o * pc.in_f + s * 32u, xoff);
+            }
+        }
+    }
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+        float sum = subgroupAdd(acc[rr]);
+        uint o = o0 + rr;
+        if (lane == 0u && o < pc.out_f) {
+#ifdef USE_RES
+            y_buf[o] = r_buf[o] + sum;
+#else
+            y_buf[o] = sum;
+#endif
+        }
+    }
+}

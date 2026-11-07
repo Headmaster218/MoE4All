@@ -1,0 +1,66 @@
+flowchart TB
+    subgraph Workloads["业务与调度层"]
+        Decode["Decode<br/>hit + shared 计算<br/>miss 并行搬运"]
+        Prefill["Prefill<br/>小批复用 Decode<br/>大批使用 streaming ring"]
+        Embed["Embedding<br/>按需加载，用后释放"]
+        Vision["Vision<br/>整组图片完成后释放"]
+        Scheduler["阶段调度器<br/>依赖、安全点、计算/搬运汇合"]
+        Decode --> Scheduler
+        Prefill --> Scheduler
+        Embed --> Scheduler
+        Vision --> Scheduler
+    end
+
+    subgraph Cache["Pager / 缓存层"]
+        Lookup["resident directory<br/>hit / miss / in-flight epoch"]
+        Cluster["尺寸类平衡规划<br/>软目标比例、平滑交错<br/>claim 按实际字节提交"]
+        VramLru["VRAM LRU[class]"]
+        RamLru["RAM LRU[class]"]
+        Lookup --> VramLru
+        Lookup --> RamLru
+        Cluster --> VramLru
+        Cluster --> RamLru
+    end
+
+    subgraph Manager["统一内存层"]
+        Owner["owner lease<br/>KV / runtime / ring / embedding / vision"]
+        Tx["事务式 claim / relocate / publish / rollback"]
+        Directory["逻辑 extent -> shard / offset / BDA"]
+        Owner --> Tx --> Directory
+    end
+
+    subgraph VramLayout["VRAM 分段逻辑空间"]
+        Low["低地址<br/>动态 KV + recurrent state"]
+        Middle["中间<br/>Expert filler<br/>或 transient ring"]
+        High["高地址<br/>runtime phase arena"]
+        Low --- Middle --- High
+    end
+
+    subgraph Physical["物理后端层：加载前探测并冻结路线"]
+        Rebar["Mapped ReBAR<br/>CPU direct write"]
+        DeviceLocal["Device-local VRAM<br/>staging / GPU DMA"]
+        HostImport["Imported host RAM<br/>GPU DMA"]
+        CpuCopy["普通 RAM<br/>CPU copy / file read"]
+    end
+
+    SSD["SSD / immutable GGUF<br/>最终真源"]
+    RAM["RAM expert cache<br/>按尺寸类 LRU；可全驻留"]
+    GPU["Vulkan compute queue"]
+
+    Scheduler -->|"资源需求"| Lookup
+    Scheduler -->|"计算任务"| GPU
+    Lookup --> Cluster --> Owner
+    Directory --> VramLayout
+    Directory --> Physical
+
+    SSD -->|"miss read"| RAM
+    SSD -->|"direct staging fallback"| DeviceLocal
+    RAM --> CpuCopy
+    RAM --> HostImport
+    CpuCopy --> Rebar
+    CpuCopy --> DeviceLocal
+    HostImport --> DeviceLocal
+    Rebar --> VramLayout
+    DeviceLocal --> VramLayout
+    VramLayout --> GPU
+    GPU -->|"完成依赖"| Scheduler

@@ -1,0 +1,107 @@
+#version 460
+// Fused single-row argmax + softmax top-1 probability (Op::ArgmaxProb — MTP draft-loop accept,
+// issue #33 follow-up to argmax.comp's VERIFY-side fusion): `dst_id[0] = argmax(x[0..n])`,
+// `dst_prob[0] = softmax(x)[dst_id[0]] = 1 / sum_j exp(x[j] - x[dst_id[0]])`. Two stages, the SAME
+// 256-workgroup-partials -> 1-workgroup-merge shape as argmax.comp and for the same reason (a
+// single-workgroup whole-vocab scan measured 18% slower than the download it replaces — see that
+// file's doc): a one-pass-per-stage ONLINE-SOFTMAX reduction tracks a running `(max, argmax,
+// sum_exp)` triple so both stats fall out of the SAME two dispatches `Op::Argmax` already pays for
+// (no extra global-max readback + third pass).
+//
+// Online-softmax merge of two `(max, sum_exp)` pairs (each `sum_exp` already relative to its own
+// `max`): `new_max = max(a.max, b.max)`; `new_sum = a.sum*exp(a.max-new_max) +
+// b.sum*exp(b.max-new_max)` — algebraically exact softmax-sum regardless of merge order. Argmax
+// ties break the SAME way as argmax.comp (strict `>`, lower index wins on equal max), so the
+// returned id always matches the host/CPU-reference argmax exactly. The `sum_exp` itself is
+// generally NOT bit-identical to the host's strictly-sequential accumulation (this is a tree
+// reduction) — see Op::ArgmaxProb's doc on why that's harmless for the shipped `p_min == 0.0`.
+//   pass 1 (no define): 256 workgroups, each scans its contiguous slice with a running online
+//     update per element, tree-reduces within the workgroup -> part[] = 256 (max, idx-bits,
+//     sum_exp) triples: vals at [0,256), idx bits at [256,512), sum_exp at [512,768).
+//   pass 2 (-DPASS2): one workgroup online-merges the 256 partials -> out_id[0] / out_prob[0].
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; } pc;
+#ifdef PASS2
+layout(binding = 0) readonly buffer PB { float part[]; }; // [0,n): vals, [n,2n): idx, [2n,3n): sum
+layout(binding = 1) writeonly buffer IB { uint out_id[]; };
+layout(binding = 2) writeonly buffer RB { float out_prob[]; };
+#else
+layout(binding = 0) readonly buffer LB { float logits[]; };
+layout(binding = 1) writeonly buffer PB { float part[]; };
+#endif
+shared float sval[256];
+shared uint sidx[256];
+shared float ssum[256];
+shared uint sbad[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float best = -1e30;
+    uint bi = 0u;
+    float sum = 0.0;
+    uint bad = 0u;
+#ifdef PASS2
+    if (t < pc.n) {
+        best = part[t];
+        bi = floatBitsToUint(part[pc.n + t]);
+        sum = part[2u * pc.n + t];
+        bad = uint(bi == 0xFFFFFFFFu);
+    }
+#else
+    uint chunk = (pc.n + 255u) / 256u;
+    uint lo = gl_WorkGroupID.x * chunk;
+    uint hi = min(lo + chunk, pc.n);
+    for (uint i = lo + t; i < hi; i += 256u) {
+        float v = logits[i];
+        if (isnan(v) || isinf(v)) {
+            bad = 1u;
+            continue;
+        }
+        // Online update: rescale the running sum onto the new max when `v` strictly exceeds it
+        // (ascending scan + strict `>` keeps the lowest index within this thread's stride, exactly
+        // like argmax.comp), accumulate onto the current max otherwise.
+        if (v > best) {
+            sum = sum * exp(best - v) + 1.0;
+            best = v;
+            bi = i;
+        } else if (v == best) {
+            sum += 1.0;
+        } else {
+            sum += exp(v - best);
+        }
+    }
+#endif
+    sval[t] = best;
+    sidx[t] = bi;
+    ssum[t] = sum;
+    sbad[t] = bad;
+    barrier();
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s) {
+            sbad[t] |= sbad[t + s];
+            float bv = sval[t], ov = sval[t + s];
+            uint bidx = sidx[t], oidx = sidx[t + s];
+            float bs = ssum[t], os = ssum[t + s];
+            if (ov > bv || (ov == bv && oidx < bidx)) {
+                sval[t] = ov;
+                sidx[t] = oidx;
+                ssum[t] = bs * exp(bv - ov) + os;
+            } else {
+                sval[t] = bv;
+                sidx[t] = bidx;
+                ssum[t] = bs + os * exp(ov - bv);
+            }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+#ifdef PASS2
+        out_id[0] = (sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0];
+        out_prob[0] = (sbad[0] != 0u) ? 0.0 : 1.0 / ssum[0];
+#else
+        part[gl_WorkGroupID.x] = sval[0];
+        part[256u + gl_WorkGroupID.x] =
+            uintBitsToFloat((sbad[0] != 0u) ? 0xFFFFFFFFu : sidx[0]);
+        part[512u + gl_WorkGroupID.x] = ssum[0];
+#endif
+    }
+}

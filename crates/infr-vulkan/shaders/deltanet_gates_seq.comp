@@ -1,0 +1,40 @@
+#version 460
+// Sequential gated-DeltaNet, pass 2/3 (GATES): per (token, value head), β = sigmoid(b) and the
+// PER-TOKEN decay exp(a_coef·softplus(α+dt_bias)).
+//
+// Unlike deltanet_gates.comp (which emits the chunk-local INCLUSIVE prefix log-decay G_j the
+// chunked scan needs), the serial scan wants the plain per-token multiplier, so there is no prefix
+// sum here and the grid is flat over rows·nv.
+//
+// The point of this pass is to keep the scan's inner loop free of transcendentals: computing β and
+// decay inline there costs 4 transcendentals (2 exp, 1 log, 1 exp) per token, and on RDNA3 those
+// are quarter-rate — ~8k FMA-equivalents against the loop's ~12k of real FMA work, i.e. it would
+// have roughly doubled the serial loop. Hoisted here they are computed once per (token, head)
+// instead of once per (token, head, state column) — a vd=128x reduction in transcendental work.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nv;
+} pc;
+
+layout(binding = 0) readonly buffer BB { float blog[]; };    // [rows, nv] beta logits
+layout(binding = 1) readonly buffer AB { float alpha[]; };   // [rows, nv]
+layout(binding = 2) readonly buffer ACB { float acoef[]; };  // [nv] ssm_a weight
+layout(binding = 3) readonly buffer DTB { float dtbias[]; }; // [nv]
+layout(binding = 4) writeonly buffer BG { float bet[]; };    // [rows, nv] β
+layout(binding = 5) writeonly buffer DG { float dec[]; };    // [rows, nv] per-token decay
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint n = pc.rows * pc.nv;
+    if (i >= n) {
+        return;
+    }
+    uint h = i % pc.nv;
+
+    bet[i] = 1.0 / (1.0 + exp(-blog[i]));
+    float z = alpha[i] + dtbias[h];
+    float sp = max(z, 0.0) + log(1.0 + exp(-abs(z))); // softplus, numerically stable
+    dec[i] = exp(acoef[h] * sp);
+}

@@ -1,0 +1,94 @@
+#version 460
+// Multi-row native-block dequant GEMV: y[r] = x[r]·Wᵀ for r in 0..rows (rows ≤ 8) with the weight
+// streamed ONCE — the spec-decode verify / short-suffix-prefill shape (m = 2..8). The m=1 GEMV
+// grid re-streams the whole weight per row (m× bandwidth), and the coopmat GEMM at a single
+// M-tile launches only n/64 workgroups (underfills the GPU: measured 47-170 GiB/s effective vs the
+// GEMV's 292-651 on a 7900 XTX). This kernel keeps the GEMV's out_f-wide grid and cooperative-
+// over-K shape — one workgroup per OUTPUT, 64 threads own whole 32-elem sub-blocks, decode each
+// weight sub-block once (dqblk), then dot it against ALL rows' activations (L2-resident: m·k·4 is
+// a few hundred KiB) — so the per-call cost stays near the m=1 GEMV for every m ≤ 8.
+// -DFMT_* selects the format (shared native_decode.glsl). MR defaults to 8; hot fixed-row builds
+// may lower it at compile time so inactive rows do not consume accumulators/registers. The
+// r-loops remain compile-time unrolled with uniform `r < pc.rows` guards.
+// Reduction: per-row subgroupAdd within each wave + one shared combine across the gl_NumSubgroups
+// waves (one barrier total, wave-size-agnostic — same pattern as rmsnorm.comp/mul_mat_vec_q.comp)
+// — replaces the old 8-row shared-tree reduce (6 levels / 7 barriers over 2 KiB of LDS). The m=1
+// native_gemv.comp deliberately KEEPS its tree: measured neutral-to-negative there (RDNA3 wave64
+// runs a 64-thread workgroup as one wave, so its barriers are nearly free; qwen3-8b tg128 lost 6%
+// with the subgroup form), while this kernel's 8-row tree was the real cost.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Same push layout as native_gemv (w_base = element offset for fused-QKV slices / MoE experts).
+// Streamed (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-slot element-offset meaning.
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+// Activations as vec4 (in_f % 32 == 0, so every row/sub-block boundary is vec4-aligned): 8 wide
+// loads per (row, sub-block) instead of 32 scalar ones — at m=8 the inner loop is issue-bound
+// (m*32 scalar FMAs + loads per decoded block), and the vec4 form keeps the cost near-flat in m.
+layout(binding = 1) readonly buffer XB { vec4 x4[]; };
+layout(binding = 2) buffer YB { float y_buf[]; };
+
+#ifndef MR
+#define MR 8
+#endif
+const uint MAX_ROWS = MR;
+const uint MAX_SG = 8u;             // 64 threads / min 8-wide subgroup
+shared float part[MAX_ROWS * MAX_SG]; // one partial per (row, subgroup)
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
+    // an explicit early return is needed (the final `y_buf[...+o]` write below is unconditional on
+    // o, unlike native_gemv_rm/sg's per-output-guarded writes).
+    uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
+    if (o >= pc.out_f) { return; }
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint wbase = pc.w_base + o * pc.in_f;
+    uint nsub = pc.in_f / 32u;
+    uint in_f4 = pc.in_f >> 2u;
+    float acc[MAX_ROWS];
+    for (uint r = 0u; r < MAX_ROWS; r++) { acc[r] = 0.0; }
+    for (uint s = t; s < nsub; s += 64u) {
+        float v[32];
+        dqblk(wbase + s * 32u, v);
+        // Repack the decoded sub-block into vec4s once; each row then runs 8 vec4 dots.
+        vec4 v4[8];
+        for (uint w4 = 0u; w4 < 8u; w4++) {
+            v4[w4] = vec4(v[4u * w4], v[4u * w4 + 1u], v[4u * w4 + 2u], v[4u * w4 + 3u]);
+        }
+        uint xo4 = s * 8u;
+        for (uint r = 0u; r < MAX_ROWS; r++) {
+            if (r < pc.rows) {
+                uint b = r * in_f4 + xo4;
+                vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
+                a += v4[2] * x4[b + 2u] + v4[3] * x4[b + 3u];
+                a += v4[4] * x4[b + 4u] + v4[5] * x4[b + 5u];
+                a += v4[6] * x4[b + 6u] + v4[7] * x4[b + 7u];
+                acc[r] += a.x + a.y + a.z + a.w;
+            }
+        }
+    }
+    for (uint r = 0u; r < MAX_ROWS; r++) {
+        if (r < pc.rows) {
+            float sg = subgroupAdd(acc[r]);
+            if (subgroupElect()) { part[r * MAX_SG + gl_SubgroupID] = sg; }
+        }
+    }
+    barrier();
+    if (t < pc.rows) {
+        float tot = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[t * MAX_SG + s]; }
+        y_buf[t * pc.out_f + o] = tot;
+    }
+}

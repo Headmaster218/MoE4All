@@ -1,0 +1,303 @@
+# infr configuration — example file.
+#
+# Copy to `./infr.toml` (project-local) or `~/.config/infr/config.toml` (global)
+# and edit. Full reference: docs/config.md. The complete key list is
+# `infr_core::config::Config::all_paths()`; the env-name mapping is
+# `crates/infr-core/src/config/manifest.rs`.
+#
+# Precedence, later wins:  defaults < this file < INFR_* env < CLI flags/--set.
+# Lookup, FIRST existing file wins (no merging):
+#   1. --config <PATH>          (an error if it does not exist)
+#   2. ./infr.toml
+#   3. $XDG_CONFIG_HOME/infr/config.toml, else ~/.config/infr/config.toml
+#
+# The file speaks the POSITIVE field names: `gemm_warp = false`, never
+# `no_gemm_warp`. The `INFR_NO_*` spellings exist only in the environment.
+#
+# Every ACTIVE line below is set to its shipped DEFAULT, so this file as-is
+# changes nothing. Commented lines show the grammar for knobs whose default is
+# "unset"; their default is stated in the comment.
+
+# ── device ───────────────────────────────────────────────────────────────────
+
+[device]
+# Device for the forward: "Vulkan0"/"Vulkan1"/…, "metal", "cpu".
+# Same grammar as `--dev` / INFR_DEV. Default: unset = first discrete Vulkan GPU.
+# dev = "Vulkan0"
+
+# Context window. Shared size grammar: 8192 / 256k / 50% (of the free-VRAM KV
+# capacity). Default: unset = the model's trained context, clamped to VRAM.
+# ctx = "32k"
+
+# Prefill micro-batch rows (llama-bench's -ub). Default: unset = the engine's
+# adaptive chunk policy.
+# ubatch = 512
+
+# Worker threads; published as RAYON_NUM_THREADS. Not an INFR_* knob.
+# Default: unset = all cores.
+# threads = 16
+
+# Prefill chunk for a sequence sharing the GPU (`serve --parallel N`).
+ubatch_parallel = 256
+
+# Submit-splitter cap; 0 = never split. Raise only to chase an iGPU watchdog
+# reset. Default: unset = the measured per-device cap. A bad value is a HARD
+# error, not a fallback.
+# submit_dispatches = 64
+
+# Subgroup-size preference — exactly 16 or 32; anything else is a HARD error.
+# Default: unset = vendor-derived.
+# subgroup_pref = 32
+
+# ── sampling ─────────────────────────────────────────────────────────────────
+#
+# CAUTION: temp / top_k / top_p / max_new are PROVENANCE-sensitive. `infr run`
+# and `infr serve` fill whatever NO layer specified from the model's own
+# recommended sampling (the arch-family table plus any generation_config.json
+# beside the model). Naming one here PINS it and suppresses that fallback —
+# which is the point of setting it, but it is not the same as leaving it out.
+# The `Config` defaults, used by library callers, are temp 0.0 (greedy),
+# top_k 20, top_p 0.95, max_new 2048.
+
+[sampling]
+# temp = 0.6      # 0 = greedy/argmax
+# top_k = 40      # 0 = keep all
+# top_p = 0.95
+# max_new = 2048
+
+# RNG seed. Default: unset = seeded from the clock (the CLI/diffusion paths use
+# 42 as their own fallback).
+# seed = 42
+
+# Never stop at EOS. Bench pins this on for its own runs.
+ignore_eos = false
+
+# Suppress the model's `<think>` block where the template supports one.
+no_think = false
+# Optional native template controls. Omit to retain the template's defaults.
+# Qwen3.8 accepts low / medium / xhigh (NOT high). Other templates differ.
+# reasoning_effort = "medium"
+# preserve_thinking = true
+
+# ── kv cache ─────────────────────────────────────────────────────────────────
+
+[kv]
+# K/V cache element format. Names: f16 f32 bf16 q8_0 q4_0 q4_1 q5_0 q5_1
+# iq4_nl turbo2 turbo3 turbo4. Default: unset = f16 (with the engine's auto-q8
+# policy, which naming EITHER of these suppresses).
+# type_k = "q8_0"
+# type_v = "q8_0"
+
+# Legacy both-sides-q8 alias for the pair above.
+force_q8 = false
+
+# Prefix-cache slots (`infr serve` reuses a matching prefix across requests).
+slots = 4
+
+# Grow supported Qwen Vulkan KV caches in 32K-token physical segments.
+dynamic = true
+
+# Optional disk-backed conversation state. Unset keeps every session resident and creates no
+# worker or files. This currently requires dynamic Q8_0/Q8_0 KV on Qwen3.5/3.6/3.8. Cache files
+# contain token ids and model state; use a private directory.
+# session_cache_dir = "D:/infr-kv"
+session_idle_secs = 120
+session_cache_max = "5GiB" # absolute size only; 0 disables the store
+session_cache_ttl_hours = 24 # 0 disables age expiry
+
+# The sliding-window ring cache (INFR_NO_KV_RING inverted).
+ring = true
+
+# Decode-time inline KV write, and the coopmat/BDA KV path.
+inline_decode = false
+coopmat_bda = false
+
+# Spill the KV cache to host RAM when VRAM runs out (VRAM-first). Note the
+# grammar of the env twin: INFR_KV_OVERFLOW="" and ="0" are OFF.
+overflow = false
+# VRAM ceiling for the KV cache, in MiB. Default: unset = the fit calculation.
+# overflow_vram_mb = 512
+# Headroom left for everything else, in MiB. Default: max(12% of VRAM, 2 GiB).
+# overflow_reserve_mb = 2048
+
+# ── paging (MoE expert cache + dense layer streaming) ────────────────────────
+
+[paging]
+# Force every layer through the paged VRAM cache with this budget, regardless of
+# whether the weights would have fit. Size grammar (19GiB / 80%).
+# Default: unset = resident when it fits, paged with the remaining VRAM if not.
+# cache = "8GiB"
+
+# Upload staging ring. Default: unset = budget/8, clamped to [256 MiB, 2 GiB].
+# ring = "1GiB"
+
+# Host weight-cache budget. Default: unset = size automatically from available RAM while leaving
+# headroom. For paged MoE, a budget large enough for every routed expert selects one permanent
+# layer-contiguous Host Store and disables runtime SSD reads; smaller budgets use RAM as an
+# inclusive cache above SSD. Set to "0" to disable the RAM cache.
+# dram = "40GiB"
+
+# Print per-pool hit/miss/eviction counts at exit.
+stats = false
+
+# ── kernels ──────────────────────────────────────────────────────────────────
+#
+# Backend-independent graph-shape gates. Everything under [kernels.*] is a
+# kernel-TIER override: the engine picks the best tier its device supports, and
+# these exist to force a tier off when bisecting a correctness or perf problem.
+
+[kernels]
+qkv_fuse = true
+gated_rmsnorm = true
+
+[kernels.vulkan]
+# Capability masking — these AND with what the device actually reports.
+# `f16 = false` also turns coopmat off, regardless of `coopmat`.
+coopmat = true
+f16 = true
+i8_dot = true
+coopmat_8x8 = false # Intel Arc XMX 8x8x16 opt-in
+i8_coopmat = false
+bf16_coopmat = false
+
+# GEMM / GEMV tiers.
+gemm_warp = true
+mmv = true
+mrow = true
+moe_small_m = 8 # clamped to 0..=64 by the accessor
+
+# Attention.
+flash_warp = true
+flash_min_rows = 24
+# flash_splits = 2   # default: unset = the engine's split heuristic
+# pv_splits = 2      # default: unset
+
+# Misc.
+push_desc = true
+pipeline_cache_disk = true
+gpu_pos = true
+fuse_add = true
+no_replay = false # sanctioned negative: true DISABLES the decode replay tape
+
+[kernels.cpu]
+spin = 32768 # spin-pool idle ceiling
+spinpool = true
+repack_mb = 4096 # repack-cache budget, MiB
+reference = false # bit-reference kernels (no env twin)
+
+# ── Profiling ──────────────────────────────────────────────────────────────────
+# wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
+# coop_tile = "64x64" # default: unset = the 128x64 tile
+
+[kernels.metal]
+f16_cmm = true
+bf16_cmm = true
+f32_cmm = true
+kquant_native = true
+deltanet = true
+moe = true
+
+# ── speculative decode / MTP ─────────────────────────────────────────────────
+
+[spec]
+# MTP self-speculative decode is currently PARKED — see README "MTP is parked".
+mtp = false
+k = 6 # draft-length upper bound
+decode_chain = 8 # decode iterations per submission
+debug = false
+gpu_argmax = true
+gpu_sample = true
+gpu_embed = true
+# draft = "/path/to/draft.gguf"   # default: unset
+
+# ── multi-GPU ────────────────────────────────────────────────────────────────
+
+[multi]
+# Device lists: [0, 1] or ["Vulkan0", "Vulkan1"]. pipeline and tensor_parallel
+# need >= 2 devices, expert_parallel >= 1; too few is a HARD error.
+# Default for all three: unset = single device.
+# pipeline = [0, 1]
+# tensor_parallel = [0, 1]
+# expert_parallel = [0]
+
+# Transport. true = GPU-to-GPU P2P, false = stage through host RAM (the
+# INFR_*_HOST env keys, inverted).
+pipeline_p2p = true
+tp_p2p = true
+ep_p2p = true
+
+# ── profiling ────────────────────────────────────────────────────────────────
+#
+# Turning any prof.* / debug.* knob on FROM THIS FILE prints one line at startup
+# naming the file and the fields, so "why is my server printing timings" stays
+# answerable from the command line.
+
+[prof]
+# Per-op profiling, on EVERY backend (vulkan / metal / cpu): one table
+# format, one process-exit aggregate. See docs/perf/playbook.md § Profiling.
+ops = false
+op_shapes = false # vulkan only: itemize labels by shape instead of by kernel
+# Host-side stage timing — prompt/decode throughput, the decode setup-vs-execute
+# split, the per-chunk prefill build/compile/execute split, MTP verify time and
+# diffusion per-step phases. Each section prints only if its pipeline ran.
+stages = false
+vram = false           # live VRAM in use after weight load
+diffusion_trace = false
+# out = "/tmp/infr-profile.json"   # ALSO write the exit report as JSON
+# How Metal obtains per-op DEVICE time (it is never free there — its ops batch
+# into one command buffer). Named modes, not a level.
+# metal_device_time = "counters"   # off (default) | flush | counters
+metal_debug = false
+
+# ── serve ────────────────────────────────────────────────────────────────────
+
+[serve]
+# Bearer token for the HTTP API. An EMPTY value means NO auth.
+# Default: unset = no auth.
+# api_key = "hunter2"
+
+max_tokens_cap = 131072
+
+# Per-request wall-clock deadline, in seconds. 0 (the default) means NO deadline
+# — a deadline truncates a legitimate slow reply, so it is opt-in.
+request_timeout_secs = 0
+
+# How often the server logs its throughput line, in seconds. 0 switches the line
+# off. The line is ACTIVITY-ONLY: an interval in which nothing happened emits
+# nothing, so an idle server leaves a clean log.
+stats_interval_secs = 5
+
+# Supervisor stop trigger. Creating this file asks the process to stop accepting work, drain the
+# GPU at its normal poll boundary, and exit. Normally set only by infr-gui.
+# shutdown_file = "D:/AIinfr/infr/gui-data/worker.stop"
+
+# Optional llama-server executable used by `serve-embedding` and `serve --embedding-model`.
+# Unset = discover it from the INFR directory, PATH, or LM Studio backends.
+# embedding_runner = "C:/path/to/llama-server.exe"
+
+# ── debug ────────────────────────────────────────────────────────────────────
+
+[debug]
+coopmat = false # print the enumerated/chosen coopmat shapes
+bda_chunk = false
+wide_dispatch = false
+chat = false
+moe_counts = false
+poison_uninit = false # fill fresh buffers with a poison pattern
+no_barrier = false
+full_barrier = false
+
+# ── hub ──────────────────────────────────────────────────────────────────────
+
+[hub]
+# HuggingFace-compatible origin. Domestic mirror example: https://hf-mirror.com
+endpoint = "https://huggingface.co"
+
+# How many CONNECTIONS one model's download may use at once. The CONNECTION is
+# the ceiling, not the link (measured here: 1 connection 8.39 MiB/s, 5 connections
+# 75.1 MiB/s). They go to whatever the model offers: a split model gets one file
+# per connection, a single-file model is split into byte ranges and reassembled
+# (measured on a 150 GiB one-file GGUF: 10.9 MiB/s at 1, 76.8 MiB/s at 8). One
+# number for both, because a bound per axis would multiply — some repos ship 236
+# shards. 0 and 1 both mean strictly one connection, never split.
+pull_jobs = 8

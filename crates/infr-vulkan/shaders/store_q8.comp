@@ -1,0 +1,92 @@
+#version 460
+// Quantize a contiguous source row (`n` elements) into the Vulkan PLANAR Q8_0 KV cache at element
+// offset `off`. Planar (not GGUF-interleaved): all int8 codes in bytes [0, cap), then all f16 scales
+// in bytes [cap, cap*17/16) — one scale per 32-elem block. `cap` = total cache elements. d = amax/127,
+// q = round(x/d). One workgroup = one subgroup (32 lanes) = one 32-element block, so `n`/`off` are
+// multiples of 32 (the KV row width n_kv*head_dim is block-aligned and off = pos*row_width). This
+// aligned split lets the decode read load 4 codes as one u32 + one scale word (see attn_partial).
+//   SRC_F16 : source is f16 (the un-fused roped K staging); default source is f32 (V projection).
+//   USE_PARAMS : record-once decode — off = p_pos*n from a host-updated params SSBO (one KV row).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+// #74: write the planar-Q8 cache by 64-bit device address (kv_addr.glsl `k_addr`, d_lo/d_hi) — this
+// kernel is BDA-only (slice 5 deleted the bound-`cbuf` twin). The cache stays bound at the write slot
+// as an inert descriptor for the store→read barrier (see Recorder::store_q8). Byte stores don't
+// vectorize (cold path); the hot f16 stores go through store_f16/qk_norm_rope.
+layout(push_constant) uniform PC { uint n; uint off; uint cap; uint src_off;
+    uint d_lo; uint d_hi;
+} pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
+layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
+#ifdef USE_PARAMS
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifdef KV_SEGMENTED
+layout(binding = 2) readonly buffer CB { uvec2 segments[]; };
+#endif
+#elif defined(KV_SEGMENTED)
+layout(binding = 1) readonly buffer CB { uvec2 segments[]; };
+#endif
+#define KV_STORE_BYTE
+#include "kv_addr.glsl"
+#define STB(bo, v) kv_store_byte(k_addr, (bo), (v))
+
+void main() {
+    uint blk = gl_WorkGroupID.x;         // 0 .. n/32-1  (source block)
+    uint t = gl_LocalInvocationID.x;     // 0 .. 31      (element within block)
+#ifdef USE_PARAMS
+    // SWA ring cache: row capacity = cap/n (total elements / row width; decode writes one row, so
+    // n IS the row width here). The ring recycles rows the window mask already excludes, so the
+    // write row is pos % rows — an identity on a full-context cache (pos < rows always).
+    uint rows =
+#ifdef KV_SEGMENTED
+        0u;
+#else
+        pc.cap / pc.n;
+#endif
+    uint row = (rows > 0u) ? (p_pos % rows) : p_pos;
+    uint off = row * pc.n;
+#else
+    uint off = pc.off;
+#endif
+    float v = float(src[pc.src_off + blk * 32u + t]);
+    float amax = subgroupMax(abs(v));
+    float d = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+    int q = clamp(int(round(v * inv)), -127, 127);
+    // Planar: code byte = global element index (codes region [0,cap)); scale for this block sits in
+    // the scales region at byte cap + block*2 (block = (off+blk*32)/32 = off/32 + blk).
+#ifdef KV_SEGMENTED
+    uint global_elem = off + blk * 32u + t;
+    uint seg = kv_segment(global_elem, pc.cap);
+    uint elem = kv_segment_local(global_elem, pc.cap);
+    uint seg_elems = 1u << pc.cap;
+    k_addr = kv_segment_base(segments[seg]);
+#else
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+    uint elem = off + blk * 32u + t;
+#endif
+    STB(elem, uint(q) & 0xFFu);   // two's-complement byte; reader sign-extends
+    if (t == 0u) {
+#ifdef KV_SEGMENTED
+        uint block = elem / 32u;
+        uint sb = seg_elems + block * 2u;
+#else
+        uint block = off / 32u + blk;
+        uint sb = pc.cap + block * 2u;
+#endif
+        uint16_t s = float16BitsToUint16(float16_t(d));
+        STB(sb, uint(s & uint16_t(0xFFu)));
+        STB(sb + 1u, uint(s >> 8));
+    }
+}

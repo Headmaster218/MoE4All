@@ -1,0 +1,65 @@
+#version 460
+// Gated-GLU with SEPARATE gate/up buffers: y[i] = act(gate[i]) * up[i]. One thread/element.
+// Default act = SiLU (SwiGLU). -DGELU = GELU tanh-approx (GeGLU) — gemma4's per-layer-embd gate.
+// up_off/up_stride/row_width: strided read from `up` buffer (E2B per-layer embedding).
+// gate_stride/gate_row_width/gate_block_width: interleaved or strided gate read.
+//   gate_block_width > 0: each head's block occupies gate_block_width elements (qwen35 q+g layout).
+//     Gate starts at offset gate_row_width within each block. gate_stride = per-row stride.
+//   gate_block_width == 0 && gate_stride > 0: simple per-row strided gate read.
+//   gate_block_width == 0 && gate_stride == 0: flat gate read.
+// do_clamp/limit: DeepSeek V4's per-layer SwiGLU clamp — y = act(min(g, limit)) * clamp(u, -limit,
+// limit). The gate bound is ONE-SIDED and applied BEFORE the activation (V4 clamps pre-SiLU where
+// every other arch clamps post-SiLU); `up` is clamped symmetrically. `do_clamp == 0` (every model
+// but V4) takes the identical instruction sequence this kernel had before the field existed — the
+// branch is uniform across the whole dispatch (a push constant).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n; uint up_off; uint up_stride; uint row_width;
+    uint gate_stride; uint gate_row_width; uint gate_block_width;
+    uint do_clamp; float limit;
+} pc;
+layout(binding = 0) readonly buffer GB { float gate[]; };
+layout(binding = 1) readonly buffer UB { float up[]; };
+layout(binding = 2) buffer YB { float y[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+
+    float g;
+    if (pc.gate_block_width > 0u) {
+        uint nff = pc.row_width;
+        uint headw = pc.gate_block_width / 2u;
+        uint gr = i / nff;
+        uint gc = i % nff;
+        uint head = gc / headw;
+        uint off = gc % headw;
+        g = gate[gr * pc.gate_stride + head * pc.gate_block_width + headw + off];
+    } else if (pc.gate_stride > 0u) {
+        uint gr = i / pc.gate_row_width;
+        uint gc = i % pc.gate_row_width;
+        g = gate[gr * pc.gate_stride + gc];
+    } else {
+        // Flat gate read
+        g = gate[i];
+    }
+
+    if (pc.do_clamp != 0u) { g = min(g, pc.limit); }
+#ifdef GELU
+    float a = 0.5 * g * (1.0 + tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
+#else
+    float a = g / (1.0 + exp(-g));
+#endif
+    uint up_idx;
+    if (pc.up_stride == 0u) {
+        up_idx = pc.up_off + i;
+    } else {
+        uint r = i / pc.row_width;
+        uint c = i % pc.row_width;
+        up_idx = pc.up_off + r * pc.up_stride + c;
+    }
+    float u = up[up_idx];
+    if (pc.do_clamp != 0u) { u = clamp(u, -pc.limit, pc.limit); }
+    y[i] = a * u;
+}

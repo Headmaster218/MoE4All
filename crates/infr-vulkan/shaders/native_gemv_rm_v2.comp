@@ -1,0 +1,183 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#if defined(VARIANT_SG) || defined(VARIANT_REG)
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+// Experimental decode GEMV variants for RM kernel tuning (env-gated, default OFF).
+// Variants selected via compile flags:
+//   VARIANT_SG    — subgroup shuffle reduce (replaces shared-mem tree + 2 barriers per row)
+//   VARIANT_DBUF  — double-buffered dequant: pre-load next dqblk while computing current dot
+//   VARIANT_WG128 — 128-thread workgroup (2x memory requests in flight)
+//   VARIANT_REG   — register-only reduce via subgroup ops (no shared memory at all)
+// Base behavior (no variant) = identical to native_gemv_rm (shared-mem tree-reduce, 64 threads).
+
+#ifdef VARIANT_WG128
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#define THREADS 128u
+#else
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#define THREADS 64u
+#endif
+
+// Resident-BDA (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-slot element-offset meaning. The ONLY weight build (the bound-SSBO
+// resident twin died with the eager `Recorder::linear_native_rm_v2` caller, its sole consumer).
+// Orthogonal to the VARIANT_* tuning knobs (weight source only).
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+#ifndef RM
+#define RM 2
+#endif
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+#ifdef VARIANT_DBUF
+// Double-buffered dequant: while computing dot product for sub-block s, dequant sub-block s+1.
+// The pre-decoded [32] floats for the NEXT sub-block are stored in a register array.
+float dqsub_dbuf(uint gstart, uint xoff, inout float next_v[32], inout uint next_xoff) {
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += next_v[w] * x_buf[next_xoff + w]; }
+    // Pre-load next sub-block
+    next_xoff = xoff + 32u;
+    dqblk(gstart + 32u, next_v);
+    return a;
+}
+#endif
+
+#ifdef VARIANT_REG
+// One slot per subgroup: THREADS/minSubgroupSize upper-bounds gl_NumSubgroups (WG128 → 8, WG64 → 4).
+// The former [2] overflowed under -DVARIANT_WG128 (4 wave32 subgroups wrote idx 2,3 OOB).
+shared float reg_part[THREADS / 16u];
+#elif defined(VARIANT_SG)
+shared float red[8]; // up to 8 subgroups with 256-thread WG
+#elif !defined(VARIANT_SG) && !defined(VARIANT_REG)
+shared float red[64];
+#endif
+
+void main() {
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(RM);
+    uint t = gl_LocalInvocationID.x;
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    uint nsub = pc.in_f / 32u;
+    float acc[RM];
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) { acc[rr] = 0.0; }
+
+#ifdef VARIANT_DBUF
+    float next_v[RM][32];
+    uint next_xoff[RM];
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+        uint o = o0 + rr;
+        if (o < pc.out_f && t < nsub) {
+            dqblk(pc.w_base + o * pc.in_f + t * 32u, next_v[rr]);
+            next_xoff[rr] = t * 32u;
+        }
+    }
+    for (uint s = t; s < nsub; s += THREADS) {
+        [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                float a = 0.0;
+                for (uint w = 0u; w < 32u; w++) { a += next_v[rr][w] * x_buf[next_xoff[rr] + w]; }
+                acc[rr] += a;
+                uint ns = s + THREADS;
+                if (ns < nsub) {
+                    next_xoff[rr] = ns * 32u;
+                    dqblk(pc.w_base + o * pc.in_f + ns * 32u, next_v[rr]);
+                }
+            }
+        }
+    }
+#else
+    for (uint s = t; s < nsub; s += THREADS) {
+        uint xoff = s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                acc[rr] += dqsub(pc.w_base + o * pc.in_f + s * 32u, xoff);
+            }
+        }
+    }
+#endif
+
+#if defined(VARIANT_REG)
+    // Register-only reduce: subgroupAdd within each wave, cross-wave via 1-element shared array
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+        float sg_sum = subgroupAdd(acc[rr]);
+        if (subgroupElect()) { reg_part[gl_SubgroupID] = sg_sum; }
+        barrier();
+        // Thread 0 holds the final sum (sum of subgroup sums)
+        uint o = o0 + rr;
+        if (t == 0u && o < pc.out_f) {
+            float final_sum = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) { final_sum += reg_part[s]; }
+#ifdef USE_RES
+            y_buf[o] = r_buf[o] + final_sum;
+#else
+            y_buf[o] = final_sum;
+#endif
+        }
+        barrier(); // ensure reg_part is free for next row
+    }
+#elif defined(VARIANT_SG)
+    // Subgroup shuffle reduce: subgroupAdd within each wave, shared combine for the 2 waves
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+        float sg_sum = subgroupAdd(acc[rr]);
+        // Use shared memory for the 2-wave combine
+        if (subgroupElect()) { red[gl_SubgroupID] = sg_sum; }
+        barrier();
+        // Thread 0 reads both subgroup sums and writes result
+        uint o = o0 + rr;
+        if (t == 0u && o < pc.out_f) {
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += red[s]; }
+#ifdef USE_RES
+            y_buf[o] = r_buf[o] + tot;
+#else
+            y_buf[o] = tot;
+#endif
+        }
+        barrier(); // red[] free for next row
+    }
+#else
+    // Baseline: shared-memory tree-reduce (original native_gemv_rm behavior)
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+        red[t] = acc[rr];
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] += red[t + stride]; }
+            barrier();
+        }
+        uint o = o0 + rr;
+        if (t == 0u && o < pc.out_f) {
+#ifdef USE_RES
+            y_buf[o] = r_buf[o] + red[0];
+#else
+            y_buf[o] = red[0];
+#endif
+        }
+        barrier();
+    }
+#endif
+}

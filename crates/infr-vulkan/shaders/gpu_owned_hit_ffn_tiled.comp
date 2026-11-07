@@ -1,0 +1,294 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Test-only complete-hit FFN: one WG per (assignment, Down-output tile).
+// Select one FMT_Q4K/Q5K/Q6K/IQ2S/IQ3S; optional DOWN_IQ4NL and SHARED_Q8.
+// IQ2S/IQ3S use USE_GRID and the existing generated native_grids.glsl include.
+// LOCAL_SIZE (or LOCAL) = 128|256, MAX_NFF = 1024|2048. Host must pin
+// Fixed32/full subgroups. No host integration or numerical qualification implied.
+// Bindings 0/1/2/3 = X/Ids/Tape/Y, identical to gpu_owned_hit_ffn.comp.
+// Push ABI is ten uints/40B; SHARED_Q8 appends three uvec2 BDAs at 40/48/56 (64B).
+// Dispatch rows*(SHARED_Q8 ? physical_used : used)*down_tiles WGs; padded 2-D
+// grids are supported. Runtime down_tiles = 1|2|4|8|16|32. Each tile recomputes
+// all GU, then writes only its Down slice. No global GU/ACT/partial sums.
+// IDs always use routed used stride; only Y uses physical_used. H is mask bank 1.
+// SHARED_Q8 requires physical_used=used+1 and three valid same-geometry Q8_0
+// matrices. The shared slot ignores H; shared gating/weighting stays with caller.
+// Without SHARED_Q8, an optional extra physical slot is left untouched.
+// All rejection, including the H mask, precedes grid staging. Caller must keep
+// IDs/tape/weights immutable and alive and provide the usual output dependency.
+
+#ifndef LOCAL_SIZE
+#ifdef LOCAL
+#define LOCAL_SIZE LOCAL
+#else
+#define LOCAL_SIZE 128
+#endif
+#endif
+#if defined(LOCAL) && LOCAL != LOCAL_SIZE
+#error LOCAL_and_LOCAL_SIZE_must_match
+#endif
+#ifndef MAX_NFF
+#define MAX_NFF 1024
+#endif
+#if LOCAL_SIZE != 128 && LOCAL_SIZE != 256 && LOCAL_SIZE != 512 && LOCAL_SIZE != 1024
+#error LOCAL_SIZE_must_be_128_256_512_or_1024
+#endif
+#if MAX_NFF != 1024 && MAX_NFF != 2048
+#error MAX_NFF_must_be_1024_or_2048
+#endif
+#if (defined(FMT_Q4K) + defined(FMT_Q5K) + defined(FMT_Q6K) + defined(FMT_IQ2S) + defined(FMT_IQ3S)) != 1
+#error Select_exactly_one_supported_Gate_Up_format
+#endif
+#if defined(DOWN_Q6K)
+#error Mixed_Down_Q6K_is_not_implemented_use_the_unfused_fallback
+#endif
+#if defined(FMT_IQ4NL)
+#error Use_DOWN_IQ4NL_for_the_mixed_Down_format
+#endif
+#if (defined(FMT_IQ2S) || defined(FMT_IQ3S)) && !defined(USE_GRID)
+#error Grid_quant_formats_require_USE_GRID
+#endif
+#if defined(IQ2_GRID_BUFFER) || defined(IQ3_GRID_BUFFER)
+#error This_experiment_preserves_the_four_binding_ABI_and_uses_LDS_grids
+#endif
+#if defined(GU_ONLY) || defined(SPLITK_REDUCE)
+#error This_experiment_is_complete_hit_FFN_only
+#endif
+
+layout(local_size_x = LOCAL_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer Input { float x[]; };
+layout(std430, binding = 1) readonly buffer Ids { uint ids[]; };
+layout(std430, binding = 2) readonly buffer Tape { uvec2 tape[]; };
+layout(std430, binding = 3) buffer Output { float output_values[]; };
+layout(push_constant) uniform Params {
+    uint ne;
+    uint nff;
+    uint rows;
+    uint used;
+    uint experts;
+    uint physical_used;
+    uint gate_base;
+    uint up_base;
+    uint down_base;
+    uint down_tiles;
+#ifdef SHARED_Q8
+    layout(offset = 40) uvec2 shared_gate;
+    layout(offset = 48) uvec2 shared_up;
+    layout(offset = 56) uvec2 shared_down;
+#endif
+} p;
+
+#include "native_weight_addr.glsl"
+#define NW(index) arena_word(index)
+#ifndef STREAMED
+#define STREAMED
+#endif
+#include "native_decode.glsl"
+
+#ifdef DOWN_IQ4NL
+#include "gpu_owned_hit_ffn_down_iq4nl.glsl"
+#else
+void owned_down_dqblk32(uint start, out float values[32]) {
+    dqblk(start, values);
+}
+#endif
+#ifdef SHARED_Q8
+#include "gpu_owned_hit_ffn_shared_q8.glsl"
+#endif
+
+// Plane-major halves let the cooperative combine read consecutive output rows.
+// After GU's barrier, gate_half[0] becomes activation in place. After the next
+// barrier, up_half becomes Down's half-sum scratch (MAX_NFF outputs per batch).
+// Total LDS = 16*MAX_NFF bytes plus the selected grid (IQ2S 8 KiB, IQ3S 2 KiB).
+// Reuse avoids both a separate activation allocation and per-output WG barriers.
+shared float gate_half[2][MAX_NFF];
+shared float up_half[2][MAX_NFF];
+
+bool fits(uint base, uint count, uint length) {
+    return base <= length && count <= length - base;
+}
+
+bool valid_address(uvec2 address) {
+    return any(notEqual(address, uvec2(0u)))
+        && !all(equal(address, uvec2(0xffffffffu))) && (address.x & 3u) == 0u;
+}
+
+// Match native_gemv_id_multi::dqsub: each block starts a fresh accumulator.
+// Do not fold its 32 products directly into the accumulator across K blocks.
+float input_block(uint start, uint input_base, bool shared_slot) {
+    float values[32];
+#ifdef SHARED_Q8
+    if (shared_slot) {
+        owned_shared_q8_dqblk32(start, values);
+    } else
+#endif
+    {
+        dqblk(start, values);
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+        sum += values[i] * x[input_base + i];
+    }
+    return sum;
+}
+
+float activation_block(uint start, uint activation_base, bool shared_slot) {
+    float values[32];
+#ifdef SHARED_Q8
+    if (shared_slot) {
+        owned_shared_q8_dqblk32(start, values);
+    } else
+#endif
+    {
+        owned_down_dqblk32(start, values);
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+        sum += values[i] * gate_half[0][activation_base + i];
+    }
+    return sum;
+}
+
+void main() {
+    // These decisions are WG-uniform under the Fixed32/full-subgroup contract.
+    // No grid or activation barrier has been entered by a rejected assignment.
+    if (p.rows == 0u || p.rows > 8u || p.used == 0u || p.used > 16u
+        || p.experts == 0u || p.ne == 0u || p.ne > 65536u
+        || p.nff == 0u || p.nff > uint(MAX_NFF)
+        || (p.ne & 255u) != 0u || (p.nff & 31u) != 0u
+        || p.physical_used < p.used || p.physical_used > p.used + 1u) return;
+    if (gl_SubgroupSize != 32u || gl_NumSubgroups != uint(LOCAL_SIZE) / 32u) return;
+    if (p.down_tiles != 1u && p.down_tiles != 2u && p.down_tiles != 4u
+        && p.down_tiles != 8u && p.down_tiles != 16u && p.down_tiles != 32u) return;
+#ifndef DOWN_IQ4NL
+    // Same-format Down's K dimension must contain complete 256-element blocks.
+    if ((p.nff & 255u) != 0u) return;
+#endif
+#ifdef SHARED_Q8
+    if (p.physical_used != p.used + 1u
+        || !valid_address(p.shared_gate) || !valid_address(p.shared_up)
+        || !valid_address(p.shared_down)) return;
+#endif
+    uint routed_assignments = p.rows * p.used;
+    if (uint(ids.length()) < routed_assignments + p.rows
+        || uint(x.length()) < p.rows * p.ne
+        || uint(output_values.length()) < p.rows * p.physical_used * p.ne
+        || !fits(p.gate_base, p.experts, uint(tape.length()))
+        || !fits(p.up_base, p.experts, uint(tape.length()))
+        || !fits(p.down_base, p.experts, uint(tape.length()))) return;
+    if (gl_WorkGroupID.z != 0u) return;
+#ifdef SHARED_Q8
+    uint slots_per_row = p.physical_used;
+#else
+    uint slots_per_row = p.used;
+#endif
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= p.rows * slots_per_row * p.down_tiles) return;
+    uint assignment = unit / p.down_tiles;
+    uint tile = unit % p.down_tiles;
+    uint row = assignment / slots_per_row;
+    uint slot = assignment % slots_per_row;
+    bool shared_slot = false;
+#ifdef SHARED_Q8
+    shared_slot = slot == p.used;
+#endif
+    uint mask = ids[routed_assignments + row];
+    if (!shared_slot && (mask & (1u << slot)) == 0u) return;
+
+    uvec2 gate, up, down;
+#ifdef SHARED_Q8
+    if (shared_slot) {
+        gate = p.shared_gate;
+        up = p.shared_up;
+        down = p.shared_down;
+    } else
+#endif
+    {
+        uint expert = ids[row * p.used + slot];
+        if (expert >= p.experts) return;
+        gate = tape[p.gate_base + expert];
+        up = tape[p.up_base + expert];
+        down = tape[p.down_base + expert];
+    }
+    if (!valid_address(gate) || !valid_address(up) || !valid_address(down)) return;
+
+    // Q8 shared WGs never read the routed codebook. The branch is WG-uniform;
+    // every invocation of a live routed WG participates in grid_init's barrier.
+    if (!shared_slot) { GRID_INIT; }
+
+    const uint groups = uint(LOCAL_SIZE) / 64u;
+    uint wave = gl_SubgroupID;
+    uint half_wave = wave & 1u;
+    uint group = wave / 2u;
+    uint t = half_wave * 32u + gl_SubgroupInvocationID;
+    uint local = gl_LocalInvocationIndex;
+    uint input_base = row * p.ne;
+    uint64_t gate_address = arena_base(gate.x, gate.y);
+    uint64_t up_address = arena_base(up.x, up.y);
+
+    // Each pair of SG32s owns a complete GU row, with native's t,t+64,... K
+    // blocks and subgroupAdd tree. All row half sums are staged before combine,
+    // allowing the SG pairs to advance without a barrier after every GU row.
+    for (uint f = group; f < p.nff; f += groups) {
+        float g = 0.0, u = 0.0;
+        for (uint s = t; s < p.ne / 32u; s += 64u) {
+            uint start = f * p.ne + s * 32u;
+            uint xoff = input_base + s * 32u;
+            w_addr = gate_address;
+            g += input_block(start, xoff, shared_slot);
+            w_addr = up_address;
+            u += input_block(start, xoff, shared_slot);
+        }
+        g = subgroupAdd(g);
+        u = subgroupAdd(u);
+        if (subgroupElect()) {
+            gate_half[half_wave][f] = g;
+            up_half[half_wave][f] = u;
+        }
+    }
+    barrier();
+    for (uint f = local; f < p.nff; f += uint(LOCAL_SIZE)) {
+        // Match native's +0, SG0, SG1 ordering, including an empty second half.
+        float g = 0.0, u = 0.0;
+        for (uint h = 0u; h < 2u; ++h) {
+            g += gate_half[h][f];
+            u += up_half[h][f];
+        }
+        // This invocation alone consumes and overwrites this row's gate_half[0].
+        gate_half[0][f] = (g / (1.0 + exp(-g))) * u;
+    }
+    barrier();
+
+    w_addr = arena_base(down.x, down.y);
+    uint first = p.ne * tile / p.down_tiles;
+    uint end = p.ne * (tile + 1u) / p.down_tiles;
+    uint output_base = (row * p.physical_used + slot) * p.ne;
+    // Reuse dead GU Up planes to batch Down half sums. Large ne / few tiles
+    // needs multiple batches; all bounds and barriers remain WG-uniform.
+    for (uint batch = first; batch < end; batch += uint(MAX_NFF)) {
+        uint width = min(uint(MAX_NFF), end - batch);
+        for (uint o = group; o < width; o += groups) {
+            float sum = 0.0;
+            for (uint s = t; s < p.nff / 32u; s += 64u) {
+                uint element = s * 32u;
+                sum += activation_block((batch + o) * p.nff + element,
+                                        element, shared_slot);
+            }
+            sum = subgroupAdd(sum);
+            if (subgroupElect()) up_half[half_wave][o] = sum;
+        }
+        barrier();
+        for (uint o = local; o < width; o += uint(LOCAL_SIZE)) {
+            float total = 0.0;
+            for (uint h = 0u; h < 2u; ++h) total += up_half[h][o];
+            output_values[output_base + batch + o] = total;
+        }
+        // Readers must finish before any SG overwrites scratch in the next batch.
+        // There is no scratch reuse after the last batch, so omit its barrier.
+        if (end - batch > uint(MAX_NFF)) { barrier(); }
+    }
+}

@@ -1,0 +1,17 @@
+#version 460
+// Naive f32 matmul C[m×n] = A[m×k] × B[k×n], one thread per output (16×16 tiles).
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint n; uint k; } pc;
+layout(binding = 0) readonly buffer AB { float a[]; };
+layout(binding = 1) readonly buffer BB { float b[]; };
+layout(binding = 2) buffer CB { float c[]; };
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    uint col = gl_GlobalInvocationID.y;
+    if (row >= pc.m || col >= pc.n) { return; }
+    float acc = 0.0;
+    for (uint ki = 0u; ki < pc.k; ki++) { acc += a[row * pc.k + ki] * b[ki * pc.n + col]; }
+    c[row * pc.n + col] = acc;
+}

@@ -1,0 +1,315 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#ifdef KV_SEGMENTED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+// Batched Qwen3.8 QSA attention. One workgroup owns one (query row, attention head), reads that
+// row's selected complete blocks directly from F16 or planar-Q8 KV caches, and appends its
+// incomplete causal tail. Four fixed wave32 subgroups split the selected keys and accumulate
+// independent online-softmax states; one final reduction combines those states. This avoids both
+// the old second QK pass and its per-key workgroup barriers. Each subgroup lane owns four elements
+// of a 128-wide head or eight elements of a 256-wide head.
+#ifndef GQA_HEADS
+#define GQA_HEADS 1
+#endif
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint kv_len;
+    uint n_head;
+    uint n_kv;
+    uint head_dim;
+    uint top_blocks;
+    uint ratio;
+    float scale;
+    uint kcap;
+    uint vcap;
+    uint segment_shift;
+} pc;
+layout(binding = 0) readonly buffer QB { uint q[]; };
+#ifdef KV_SEGMENTED
+layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
+layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
+#include "kv_addr.glsl"
+#else
+layout(binding = 1) readonly buffer KB { uint k[]; };
+layout(binding = 2) readonly buffer VB { uint v[]; };
+#endif
+layout(binding = 3) readonly buffer IB { uint indices[]; };
+layout(binding = 4) writeonly buffer DB { float dst[]; };
+
+const uint SUBGROUP_WIDTH = 32u;
+const uint SUBGROUPS = 4u;
+shared float subgroup_max[SUBGROUPS][GQA_HEADS];
+shared float subgroup_sum[SUBGROUPS][GQA_HEADS];
+shared float subgroup_out[SUBGROUPS][GQA_HEADS][256];
+
+float qread(uint i) {
+    uint w = q[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+}
+
+#ifdef KV_SEGMENTED
+uint64_t k_segment_address(uint segment) {
+    uvec2 address = uvec2(0u);
+    if (subgroupElect()) {
+        address = k_segments[segment];
+    }
+    address.x = subgroupBroadcastFirst(address.x);
+    address.y = subgroupBroadcastFirst(address.y);
+    return kv_segment_base(address);
+}
+
+uint64_t v_segment_address(uint segment) {
+    uvec2 address = uvec2(0u);
+    if (subgroupElect()) {
+        address = v_segments[segment];
+    }
+    address.x = subgroupBroadcastFirst(address.x);
+    address.y = subgroupBroadcastFirst(address.y);
+    return kv_segment_base(address);
+}
+
+float kread_local(uint64_t base, uint local, uint segment_elems) {
+#ifdef KQ8
+    int codes = int(kv_word(base, local >> 2u));
+    int code = bitfieldExtract(codes, int((local & 3u) * 8u), 8);
+    uint block = local >> 5u;
+    uint scales = 0u;
+    if (subgroupElect()) {
+        scales = kv_word(base, (segment_elems >> 2u) + (block >> 1u));
+    }
+    scales = subgroupBroadcastFirst(scales);
+    float scale = unpackHalf2x16(scales)[block & 1u];
+    return scale * float(code);
+#else
+    return kv_half(base, local);
+#endif
+}
+
+float vread_local(uint64_t base, uint local, uint segment_elems) {
+#ifdef VQ8
+    int codes = int(kv_word(base, local >> 2u));
+    int code = bitfieldExtract(codes, int((local & 3u) * 8u), 8);
+    uint block = local >> 5u;
+    uint scales = 0u;
+    if (subgroupElect()) {
+        scales = kv_word(base, (segment_elems >> 2u) + (block >> 1u));
+    }
+    scales = subgroupBroadcastFirst(scales);
+    float scale = unpackHalf2x16(scales)[block & 1u];
+    return scale * float(code);
+#else
+    return kv_half(base, local);
+#endif
+}
+#else
+float kread(uint i) {
+#ifdef KQ8
+    int codes = int(k[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    uint scales = 0u;
+    if (subgroupElect()) {
+        scales = k[(pc.kcap >> 2u) + (block >> 1u)];
+    }
+    scales = subgroupBroadcastFirst(scales);
+    float scale = unpackHalf2x16(scales)[block & 1u];
+    return scale * float(code);
+#else
+    uint w = k[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+#endif
+}
+
+float vread(uint i) {
+#ifdef VQ8
+    int codes = int(v[i >> 2u]);
+    int code = bitfieldExtract(codes, int((i & 3u) * 8u), 8);
+    uint block = i >> 5u;
+    uint scales = 0u;
+    if (subgroupElect()) {
+        scales = v[(pc.vcap >> 2u) + (block >> 1u)];
+    }
+    scales = subgroupBroadcastFirst(scales);
+    float scale = unpackHalf2x16(scales)[block & 1u];
+    return scale * float(code);
+#else
+    uint w = v[i >> 1u];
+    uint h = (i & 1u) == 0u ? w & 0xffffu : w >> 16u;
+    return unpackHalf2x16(h).x;
+#endif
+}
+#endif
+
+uint source_row(uint row, uint logical, uint selected, uint complete) {
+    uint selected_rows = selected * pc.ratio;
+    if (logical < selected_rows) {
+        uint slot = logical / pc.ratio;
+        uint block = indices[row * pc.top_blocks + slot];
+        return block * pc.ratio + logical % pc.ratio;
+    }
+    return complete * pc.ratio + logical - selected_rows;
+}
+
+void main() {
+    uint job = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint head_jobs = pc.n_head / GQA_HEADS;
+    uint row = job / head_jobs;
+    uint head_base = (job - row * head_jobs) * GQA_HEADS;
+    if (row >= pc.rows || (pc.head_dim != 128u && pc.head_dim != 256u)) { return; }
+    uint subgroup = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint group = pc.n_head / pc.n_kv;
+    uint kv_head = head_base / group;
+    uint visible = pc.kv_len - pc.rows + row + 1u;
+    uint complete = visible / pc.ratio;
+    uint tail = visible - complete * pc.ratio;
+    uint selected = min(pc.top_blocks, complete);
+    uint keys = selected * pc.ratio + tail;
+    uint qbase = (row * pc.n_head + head_base) * pc.head_dim;
+
+    float qv[GQA_HEADS][8];
+    float accum[GQA_HEADS][8];
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            qv[query][component] = d < pc.head_dim
+                ? qread(qbase + query * pc.head_dim + d)
+                : 0.0;
+            accum[query][component] = 0.0;
+        }
+    }
+
+    float local_max[GQA_HEADS];
+    float local_sum[GQA_HEADS];
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        local_max[query] = -3.402823466e+38;
+        local_sum[query] = 0.0;
+    }
+#ifdef KV_SEGMENTED
+    uint segment_elems = 1u << pc.segment_shift;
+    uint cached_segment = 0xffffffffu;
+    uint64_t k_address = 0ul;
+    uint64_t v_address = 0ul;
+#endif
+    for (uint logical = subgroup; logical < keys; logical += SUBGROUPS) {
+        uint src_row = source_row(row, logical, selected, complete);
+        uint kbase = (src_row * pc.n_kv + kv_head) * pc.head_dim;
+#ifdef KV_SEGMENTED
+        // A physical segment contains whole 32K-token rows, so one selected KV row never crosses
+        // its boundary. Selected blocks are chronological, so retain both table entries until the
+        // wave advances into another segment instead of resolving them again for every key.
+        uint segment = kv_segment(kbase, pc.segment_shift);
+        if (segment != cached_segment) {
+            k_address = k_segment_address(segment);
+            v_address = v_segment_address(segment);
+            cached_segment = segment;
+        }
+        uint local_base = kv_segment_local(kbase, pc.segment_shift);
+#endif
+        float dot[GQA_HEADS];
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            dot[query] = 0.0;
+        }
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            if (d < pc.head_dim) {
+#ifdef KV_SEGMENTED
+                float key = kread_local(k_address, local_base + d, segment_elems);
+#else
+                float key = kread(kbase + d);
+#endif
+                for (uint query = 0u; query < GQA_HEADS; ++query) {
+                    dot[query] += qv[query][component] * key;
+                }
+            }
+        }
+        float score[GQA_HEADS];
+        float next_max[GQA_HEADS];
+        float previous_scale[GQA_HEADS];
+        float value_scale[GQA_HEADS];
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            score[query] = subgroupAdd(dot[query]) * pc.scale;
+            next_max[query] = max(local_max[query], score[query]);
+            previous_scale[query] = 1.0;
+            value_scale[query] = 1.0;
+            if (score[query] > local_max[query]) {
+                previous_scale[query] = local_sum[query] == 0.0
+                    ? 0.0
+                    : exp(local_max[query] - score[query]);
+            } else {
+                value_scale[query] = exp(score[query] - local_max[query]);
+            }
+            local_sum[query] = local_sum[query] * previous_scale[query] + value_scale[query];
+        }
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            if (d < pc.head_dim) {
+#ifdef KV_SEGMENTED
+                float value = vread_local(v_address, local_base + d, segment_elems);
+#else
+                float value = vread(kbase + d);
+#endif
+                for (uint query = 0u; query < GQA_HEADS; ++query) {
+                    accum[query][component] = accum[query][component] * previous_scale[query]
+                        + value_scale[query] * value;
+                }
+            }
+        }
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            local_max[query] = next_max[query];
+        }
+    }
+
+    if (lane == 0u) {
+        for (uint query = 0u; query < GQA_HEADS; ++query) {
+            subgroup_max[subgroup][query] = local_max[query];
+            subgroup_sum[subgroup][query] = local_sum[query];
+        }
+    }
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            if (d < pc.head_dim) {
+                subgroup_out[subgroup][query][d] = accum[query][component];
+            }
+        }
+    }
+    barrier();
+
+    if (subgroup != 0u) { return; }
+    for (uint query = 0u; query < GQA_HEADS; ++query) {
+        float merged_max = max(
+            max(subgroup_max[0][query], subgroup_max[1][query]),
+            max(subgroup_max[2][query], subgroup_max[3][query])
+        );
+        float merge_scale[SUBGROUPS];
+        float merged_sum = 0.0;
+        for (uint source = 0u; source < SUBGROUPS; ++source) {
+            merge_scale[source] = subgroup_sum[source][query] == 0.0
+                ? 0.0
+                : exp(subgroup_max[source][query] - merged_max);
+            merged_sum += subgroup_sum[source][query] * merge_scale[source];
+        }
+        uint out_base = (row * pc.n_head + head_base + query) * pc.head_dim;
+        for (uint component = 0u; component < 8u; ++component) {
+            uint d = lane + component * SUBGROUP_WIDTH;
+            if (d < pc.head_dim) {
+                float merged = 0.0;
+                for (uint source = 0u; source < SUBGROUPS; ++source) {
+                    merged += subgroup_out[source][query][d] * merge_scale[source];
+                }
+                dst[out_base + d] = merged / merged_sum;
+            }
+        }
+    }
+}

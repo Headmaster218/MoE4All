@@ -1,0 +1,127 @@
+#version 460
+// Non-coopmat float-weight prefill GEMM ("fma-warp" tier): C[m,n] = A[m,k]·Wᵀ, W = [n,k] raw
+// f16/bf16/f32 words, A f32 activations. This is the REAL middle tier of the capability ladder
+// for devices without a usable 16x16x16 f16 cooperative matrix (Intel Arc/ANV enumerates f16
+// coopmat only at M=8,N=8,K=16 — see lib.rs `has_coop_matrix`): every other "warp" GEMM here is
+// coopmat SPIR-V, so before this kernel a float-weight prefill GEMM fell all the way to the
+// per-row scalar GEMVs (`linear`/`linear_native_off`), re-streaming the whole weight once per
+// row — the 10-30x Arc prefill gap. Selected by the adapter's non-coopmat tier (adapter.rs
+// `nc_fma`, gated `!caps.f16_coopmat`); it does not need to beat the coopmat tile, it needs to
+// amortize each weight element across a 64-row tile.
+//
+// Design constraints (Intel Arc audit — the target this ships for, tuned blind on RADV):
+//  • NO subgroup ops and no workgroup-layout dependence on gl_SubgroupSize: Arc subgroups are
+//    8-32 and ANV may pick any; accumulation is per-thread registers + shared staging only.
+//    (The dispatch does NOT pin a subgroup size — nothing here cares.)
+//  • Small tile, modest registers: BM=64 x BN=64 x BK=32, 256 threads, TM=TN=4 register block
+//    (acc 16 + av/bv 8 floats) — Alchemist SIMD8 EUs spill easily and prefer MORE smaller
+//    workgroups over giant occupancy-starved tiles. Same geometry as the proven
+//    native_gemm_mmq_* family (register-blocked 64x64, scalar inner product).
+//  • Shared: (64+64)*(32+1)*4B = 16.5 KiB « the 64 KiB Arc SLM budget (no double buffer — the
+//    barrier discipline below is the mmq family's, race lesson included).
+//  • bf16 stays NATIVE end to end: FMT_BF16 reads the raw bf16 bits and shifts <<16 into f32
+//    registers — no f16 clamp (full exponent range), no f32 upconvert of the weight buffer.
+//  • No f16 arithmetic/storage extensions at all: f16 words unpack via the CORE
+//    unpackHalf2x16, so the kernel is dispatchable even where shaderFloat16 is off.
+//
+// -DFMT_F16 / -DFMT_BF16 / -DFMT_F32 selects the weight reader. w_base = element offset into
+// the weight buffer (fused-QKV slice / streamed-slot base). Requires n%64, k%32; writes the
+// full ceil(m/64)*64 padded row range (same convention as every GEMM here — dst pad rows are
+// never read); A rows >= m stage as zeros.
+#extension GL_EXT_control_flow_attributes : require
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN); // 256
+const uint SAK = BK + 1u; // +1 word pad de-conflicts the strided column reads
+const uint SBK = BK + 1u;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+// Resident-BDA: the weight words are read through a 64-bit buffer_reference into the resident
+// arena (base = arena_lo/arena_hi appended LAST) instead of a bound SSBO; w_base keeps its
+// element-offset meaning.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 0) readonly buffer AB { float a[]; };  // [m, k] f32 activations
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { uint v[]; };
+uint64_t w_ptr = 0ul;
+#define NWD(i) ArenaW(w_ptr).v[i]
+layout(binding = 2) writeonly buffer CB { float c[]; }; // [ceil(m/64)*64, n]
+
+shared float As[BM * SAK];
+shared float Bs[BN * SBK];
+
+// Weight element `e` (index into the [n, k] grid, w_base already applied) as f32. f16/bf16 pack
+// two elements per u32 word; the per-element word re-read is caught by L1 and keeps odd w_base
+// (a bf16 fused-QKV slice offset is only guaranteed 32-element aligned) trivially correct.
+#ifdef FMT_F16
+float wload(uint e) {
+    uint w = NWD(e >> 1u);
+    return unpackHalf2x16(w)[e & 1u];
+}
+#elif defined(FMT_BF16)
+float wload(uint e) {
+    uint w = NWD(e >> 1u);
+    uint h = (e & 1u) == 0u ? (w & 0xffffu) : (w >> 16u);
+    return uintBitsToFloat(h << 16u);
+}
+#else // FMT_F32
+float wload(uint e) { return uintBitsToFloat(NWD(e)); }
+#endif
+
+void main() {
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    uint tilesN = pc.n / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN);
+    uint tc = li % (BN / TN);
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        // stage activations: BM rows x BK f32 (rows >= m stage 0 — `a` is sized m*k, not padded)
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[r * SAK + cc] = (gr < pc.m) ? a[gr * pc.k + k0 + cc] : 0.0;
+        }
+        // stage weights: BN cols x BK elements, decoded to f32
+        for (uint idx = li; idx < BN * BK; idx += THREADS) {
+            uint cc = idx / BK;
+            uint kk = idx % BK;
+            Bs[cc * SBK + kk] = wload(pc.w_base + (wgCol + cc) * pc.k + k0 + kk);
+        }
+        barrier();
+
+        for (uint kk = 0u; kk < BK; kk++) {
+            float av[TM];
+            float bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = As[(tr * TM + i) * SAK + kk];
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = Bs[(tc * TN + j) * SBK + kk];
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] += av[i] * bv[j];
+        }
+        // AFTER all shared reads of this iteration (the mmq family's race lesson: a barrier that
+        // lets a fast thread loop around and restage As/Bs while a slow one still reads them is
+        // a data race, nondeterministic output).
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        uint rr = wgRow + tr * TM + i;
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
+        }
+    }
+}

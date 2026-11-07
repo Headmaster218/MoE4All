@@ -1,0 +1,610 @@
+#version 460
+// Flash-decoding pass 1 (split-K), subgroup-reduction variant. One workgroup per (head, kv-chunk);
+// it computes this chunk's softmax partials (max m, sum l, weighted V acc) for a single decode
+// query. The QK dot uses a SUBGROUP reduction: the 32 lanes of a wave cooperate on ONE key's hd
+// vector — lane reads k[key, kvh, lane + 32r] (contiguous → coalesced), partial-sums, subgroupAdd.
+// This replaces the old thread-per-key WGSL kernel whose 64 threads read keys 2 KiB apart (fully
+// uncoalesced, ~25x bandwidth amplification — the decode bottleneck at long context). Uses almost
+// no shared memory, so occupancy stays high. Requires requiredSubgroupSize=32 (wave32 → 2 sgs).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;   // KVQ8: total cache elements — the planar scales region begins at word cap/4
+    // Small-m rows (STATIC path only; the dyn/replay variants stay rows==1, dispatch 1D, and never
+    // read these — their push stays short, like `cap` for the f16 dyn variant): `rows` query rows
+    // at absolute positions pos..pos+rows-1. gl_WorkGroupID.y picks the row; each row's causal end
+    // is pos+row+1. A 1D dispatch with rows=1, pos=kv_len-1 is EXACTLY the old decode behavior.
+    uint pos; uint rows;
+#ifdef KV_BDA
+    // -DKV_BDA build (#74 slice 2): K/V cache base device addresses, uvec2-split (avoids 8-byte push
+    // align) — see kv_addr.glsl. K binding 1 / V binding 2 become INERT (bound only for the store→read
+    // hazard edge, never read here); every KVEC4/VVEC4 reads through k_addr/v_addr instead.
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
+} pc;
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#endif
+#if defined(KMAINLINE) || defined(VMAINLINE)
+// Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV (q4_0/q4_1/q5_0/q5_1) decode reads the
+// compact GGUF block format INLINE via a dedicated COALESCED, block-amortized decoder (`dqv4` below)
+// — instead of the dequant→f16 PREPASS (dequant_kv_f16 → f16 scratch → f16 attention). Decode is
+// KV-read-bound at long context; the prepass pays a 2× f16-scratch round-trip (write + read) the
+// inline path skips, so reading the ¼-size Q4 (⅜-size Q5) cache directly should win at depth. The
+// v1 attempt reused native_decode `dq()` PER ELEMENT (uncoalesced reads, scale re-decoded every
+// element) and regressed ~2.8×; `dqv4` fixes that the way the Q8 inline `dq8k`/`dq8v` do — scale
+// (and Q4_1/Q5_1 min, Q5 qh plane) decoded ONCE per block, the four codes pulled from ONE u32.
+// The NW/NW2/NW4 read chokepoint points at a MUTABLE `dq_addr` (kv_addr.glsl `kv_word*`), set to
+// k_addr for K reads / v_addr for V reads — the QK dot pass fully precedes the P·V pass, so one
+// global base is unambiguous. Same saddr `kv_word` shape dequant_kv_f16.comp's -DKV_BDA build uses.
+// Each vec4 is f16-rounded (`mlround`) to REPRODUCE the prepass's f16 scratch bit-for-bit → the
+// inline output is byte-identical to the dequant→f16 path (kv_addr_parity mainline case). iq4_nl
+// (codebook gather) is NOT inlined — it stays on the prepass.
+uint64_t dq_addr = 0ul;
+#define NW(i) kv_word(dq_addr, (i))
+#define NW2(wbase) kv_word2(dq_addr, (wbase))
+#define NW4(wbase) kv_word4(dq_addr, (wbase))
+#include "native_decode.glsl" // reused for the block-header readers ru16/ru32u/ru32b + f16tof32
+// Round a decoded vec4 to IEEE binary16 EXACTLY like the prepass's f16 scratch (`dequant_kv_f16.comp`
+// stores `float16_t(dq(i))`, later read back as an `f16vec4`). The round MUST go through a real
+// `f16vec4`: a scalar `float(float16_t(x))` gets folded back to full f32 by ACO (measured ~7e-4 off
+// the prepass), but building an `f16vec4` then `vec4()`-converting is the SAME op the bound f16 path
+// runs on a memory `f16vec4` (`vec4(k4[i])`), so the 16-bit round survives → byte-identical.
+vec4 mlround(vec4 v) {
+    return vec4(f16vec4(float16_t(v.x), float16_t(v.y), float16_t(v.z), float16_t(v.w)));
+}
+// ── COALESCED, block-AMORTIZED inline vec4 decoders (v2) ────────────────────────────────────────
+// The v1 arm called native_decode `dq()` PER ELEMENT — uncoalesced scalar reads + a re-decoded block
+// scale every element → ~2.8x the prepass KV-path cost (a decode regression). These decode a whole
+// vec4 (elements g..g+3, always within ONE 32-elem block and ONE nibble-half since g is a multiple of
+// 4) the way the Q8 inline `dq8k`/`dq8v` do: read the block's f16 scale (and Q4_1/Q5_1 min, Q5's qh
+// plane) ONCE per block, and pull the four 4-bit codes from ONE u32 word (`ru32u`, a single saddr
+// b32/b64) instead of four per-byte reads. Bit-identical to `dq()` (same integers, same product order)
+// and to the prepass after `mlround`. iq4_nl (codebook gather) is NOT inlined — it stays on the prepass.
+#if defined(FMT_Q4_0)
+// Q4_0 [f16 d][u8 qs[16]] = 18B. y = d*(nib-8). Low half (pos<16) → qs low nibbles, high half → high.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 18u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd));
+    uint w = ru32u(bd + 2u + ((p < 16u) ? p : p - 16u)); // 4 code bytes, one read
+    uint s0 = (p < 16u) ? 0u : 4u;                        // low vs high nibble of each byte
+    return mlround(vec4(d * (float((w >> s0) & 0xFu) - 8.0),
+                        d * (float((w >> (8u + s0)) & 0xFu) - 8.0),
+                        d * (float((w >> (16u + s0)) & 0xFu) - 8.0),
+                        d * (float((w >> (24u + s0)) & 0xFu) - 8.0)));
+}
+#elif defined(FMT_Q4_1)
+// Q4_1 [f16 d][f16 m][u8 qs[16]] = 20B. y = d*nib + m.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 20u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd)); float m = f16tof32(ru16(bd + 2u));
+    uint w = ru32u(bd + 4u + ((p < 16u) ? p : p - 16u));
+    uint s0 = (p < 16u) ? 0u : 4u;
+    return mlround(vec4(d * float((w >> s0) & 0xFu) + m,
+                        d * float((w >> (8u + s0)) & 0xFu) + m,
+                        d * float((w >> (16u + s0)) & 0xFu) + m,
+                        d * float((w >> (24u + s0)) & 0xFu) + m));
+}
+#elif defined(FMT_Q5_0)
+// Q5_0 [f16 d][u8 qh[4]][u8 qs[16]] = 22B. y = d*(q5-16); q5 = nib | (bit p of qh)<<4.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 22u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd)); uint qh = ru32b(bd + 2u);
+    uint w = ru32u(bd + 6u + ((p < 16u) ? p : p - 16u));
+    uint s0 = (p < 16u) ? 0u : 4u;
+    vec4 r;
+    r.x = d * (float(((w >> s0) & 0xFu) | (((qh >> p) & 1u) << 4u)) - 16.0);
+    r.y = d * (float(((w >> (8u + s0)) & 0xFu) | (((qh >> (p + 1u)) & 1u) << 4u)) - 16.0);
+    r.z = d * (float(((w >> (16u + s0)) & 0xFu) | (((qh >> (p + 2u)) & 1u) << 4u)) - 16.0);
+    r.w = d * (float(((w >> (24u + s0)) & 0xFu) | (((qh >> (p + 3u)) & 1u) << 4u)) - 16.0);
+    return mlround(r);
+}
+#elif defined(FMT_Q5_1)
+// Q5_1 [f16 d][f16 m][u8 qh[4]][u8 qs[16]] = 24B. y = d*q5 + m; q5 = nib | (bit p of qh)<<4.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 24u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd)); float m = f16tof32(ru16(bd + 2u)); uint qh = ru32b(bd + 4u);
+    uint w = ru32u(bd + 8u + ((p < 16u) ? p : p - 16u));
+    uint s0 = (p < 16u) ? 0u : 4u;
+    vec4 r;
+    r.x = d * float(((w >> s0) & 0xFu) | (((qh >> p) & 1u) << 4u)) + m;
+    r.y = d * float(((w >> (8u + s0)) & 0xFu) | (((qh >> (p + 1u)) & 1u) << 4u)) + m;
+    r.z = d * float(((w >> (16u + s0)) & 0xFu) | (((qh >> (p + 2u)) & 1u) << 4u)) + m;
+    r.w = d * float(((w >> (24u + s0)) & 0xFu) | (((qh >> (p + 3u)) & 1u) << 4u)) + m;
+    return mlround(r);
+}
+#endif
+#endif
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
+#ifdef KV_SEGMENTED
+// The ordinary cache bindings become address tables. Each physical 32K-row segment keeps the
+// original local f16 or planar-Q8 layout, so only the address calculation changes below.
+layout(binding = 1) readonly buffer KB { uvec2 k_segments[]; };
+layout(binding = 2) readonly buffer VB { uvec2 v_segments[]; };
+#define SEGMENT_SHIFT (pc.cap & 31u)
+#define SEGMENTED_RING ((pc.cap & 0x80000000u) != 0u)
+#endif
+// PLANAR Q8_0 KV cache (per-side): codes int8[cap] then scales f16[cap/32] (see store_q8), read as
+// `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by the
+// 8 vec4s of a block. K and V pick their dtype INDEPENDENTLY (-DKQ8 / -DVQ8), so the four f16/q8
+// combinations are separate pipeline variants. Q8 moves half the KV bytes at decode depth.
+// A planar-Q8 vec4 at vec4-index i4 (elements 4*i4..+3): word i4 = 4 packed int8 codes; the block's
+// f16 scale is at scale-word cap/4 + block/2 (block = 4*i4/32 = i4/8), lane picked by block&1.
+#ifdef KMAINLINE
+// Mainline low-bit K: decode a vec4 (elements 4*i4..+3) inline. `dq_addr` is set to k_addr ONCE in
+// main (a single wave-uniform program point, like k_addr itself) before any K read, so native_decode's
+// kv_word reads keep a saddr scalar base. `dqh` rounds each element to f16 to match the prepass.
+vec4 kvec4_ml(uint i4) { return dqv4(i4 << 2u); }
+#define KVEC4(i) kvec4_ml(i)
+#elif defined(KQ8)
+#ifdef KV_SEGMENTED
+vec4 kvec4(uint i4) {
+    uint elem = i4 << 2u;
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(k_segments[kv_segment(elem, SEGMENT_SHIFT)]);
+    int cw = int(kv_word(base, local >> 2u));
+    uint bk = local >> 5u;
+    uint seg_elems = 1u << SEGMENT_SHIFT;
+    float d = unpackHalf2x16(kv_word(base, (seg_elems >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define KVEC4(i) kvec4(i)
+#elif defined(KV_BDA)
+// Planar-Q8 K by device address: the code word (`ku[i4]`) and the block scale are single u32 words,
+// so each reads through kv_word (one global_load_b32) off k_addr — the wide KV2/KV4 reads are for the
+// f16 vec4 loads below, not the already-scalar Q8 words. Mirrors attention_kv.comp's -DKV_BDA dq8k.
+vec4 kvec4(uint i4) {
+    int cw = int(kv_word(k_addr, i4));
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(kv_word(k_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define KVEC4(i) kvec4(i)
+#else
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+vec4 kvec4(uint i4) {
+    int cw = int(ku[i4]);
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define KVEC4(i) kvec4(i)
+#endif
+#else
+#ifdef KV_SEGMENTED
+vec4 kread4(uint i4) {
+    uint elem = i4 << 2u;
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(k_segments[kv_segment(elem, SEGMENT_SHIFT)]);
+    uvec2 w = KV2(base, local >> 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+#define KVEC4(i) kread4(i)
+#elif defined(KV_BDA)
+// f16 K by device address: one `f16vec4` (8 bytes) = two adjacent u32 words = ONE KV2 read (a single
+// global_load_b64 with a saddr scalar base), NOT four kv_half calls (four unfused global_load_b16 —
+// the bandwidth regression this whole slice exists to avoid). Word base = vec4-index << 1; the two
+// words carry f16 lanes {0,1} and {2,3}, unpacked back to the vec4 the bound `vec4(k4[i])` returns.
+vec4 kread4(uint i4) {
+    uvec2 w = KV2(k_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+#define KVEC4(i) kread4(i)
+#else
+layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
+#define KVEC4(i) vec4(k4[i])
+#endif
+#endif
+#ifdef VMAINLINE
+// Mainline low-bit V: `dq_addr` is re-pointed to v_addr ONCE in main just before the V pass (the QK
+// pass has fully finished by then, so switching the shared base is safe and stays wave-uniform).
+vec4 vvec4_ml(uint i4) { return dqv4(i4 << 2u); }
+#define VVEC4(i) vvec4_ml(i)
+#elif defined(VQ8)
+#ifdef KV_SEGMENTED
+vec4 vvec4(uint i4) {
+    uint elem = i4 << 2u;
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(v_segments[kv_segment(elem, SEGMENT_SHIFT)]);
+    int cw = int(kv_word(base, local >> 2u));
+    uint bk = local >> 5u;
+    uint seg_elems = 1u << SEGMENT_SHIFT;
+    float d = unpackHalf2x16(kv_word(base, (seg_elems >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define VVEC4(i) vvec4(i)
+#elif defined(KV_BDA)
+vec4 vvec4(uint i4) {
+    int cw = int(kv_word(v_addr, i4));
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(kv_word(v_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define VVEC4(i) vvec4(i)
+#else
+layout(binding = 2) readonly buffer VB { uint vu[]; };
+vec4 vvec4(uint i4) {
+    int cw = int(vu[i4]);
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define VVEC4(i) vvec4(i)
+#endif
+#else
+#ifdef KV_SEGMENTED
+vec4 vread4(uint i4) {
+    uint elem = i4 << 2u;
+    uint local = kv_segment_local(elem, SEGMENT_SHIFT);
+    uint64_t base = kv_segment_base(v_segments[kv_segment(elem, SEGMENT_SHIFT)]);
+    uvec2 w = KV2(base, local >> 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+#define VVEC4(i) vread4(i)
+#elif defined(KV_BDA)
+// f16 V by device address — same KV2 b64 read shape as f16 K above, off v_addr.
+vec4 vread4(uint i4) {
+    uvec2 w = KV2(v_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+#define VVEC4(i) vread4(i)
+#else
+layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
+#define VVEC4(i) vec4(v4[i])
+#endif
+#endif
+#ifdef USE_PARAMS
+// Record-once decode: kv_len comes from a host-updated params SSBO so the buffer replays across
+// tokens. Outputs shift to bindings 4/5/6 (params takes binding 3) to stay output-last.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 4) buffer PM { float pm[]; };
+layout(binding = 5) buffer PL { float pl[]; };
+layout(binding = 6) buffer PACC { float pacc[]; };
+#else
+layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
+layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
+layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
+#endif
+
+shared float sc[1024];
+shared float red[64];
+shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-occupancy V pass)
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+#if defined(KV_BDA) && !defined(KV_SEGMENTED)
+    // Wave-uniform K/V cache base pointers, set ONCE (kv_addr.glsl). Every KVEC4/VVEC4 adds a u32
+    // element/word offset to these before the uint64_t cast → saddr scalar-base loads (no per-load
+    // 64-bit carry-add) and, for f16, a fused b64.
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#ifdef KMAINLINE
+    // Point native_decode's read chokepoint at the K cache for the whole QK pass (uniform, once).
+    dq_addr = k_addr;
+#endif
+#endif
+    uint hd = pc.hd;
+    uint hd4 = hd >> 2u;
+    // Workgroup ID ordered so the g query heads sharing a (kv-head, chunk) are CONSECUTIVE — the
+    // scheduler keeps neighbors co-resident, so the 2nd..g-th head re-read their K/V slice from L2
+    // (hot, multi-TB/s) instead of DRAM. Captures the GQA re-use benefit at zero occupancy cost.
+    uint g = pc.nh / pc.nkv;
+    // scale > 0 → caller-supplied (gemma4 uses 1.0, QK-norm controls magnitude); else 1/√hd default.
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
+#ifdef USE_PARAMS
+    uint kv_len = p_kvlen;
+    // Replay decode: always a single row, the query IS position kv_len-1.
+    uint row = 0u;
+    uint qpos1 = kv_len;
+    // Sliding-window attention: THIS ROW attends only keys j >= lo (0 = full causal). Chunks below
+    // `lo` never dispatch work — SELF_CHUNK offsets its chunk grid by `lo`; the static path clamps
+    // each chunk's range (empty → zero-weight partial).
+    uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
+#else
+    uint kv_len = pc.kv_len;
+    // Small-m static path: workgroup y picks the query row (1D dispatch → row 0 = old decode);
+    // this row's causal END is its absolute position + 1 (mirrors attention_kv's per-row bound).
+    uint row = gl_WorkGroupID.y;
+    // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): `pc.rows` is otherwise DEAD in this
+    // shader (the dispatch grid already encodes the row via gl_WorkGroupID.y, so nothing here
+    // ever needed the row COUNT) — repurposed as `canvas_lo+1` (0 = disabled) by
+    // `attention_kv_split`. When set, EVERY row attends the SAME fixed bidirectional range
+    // `[lo, kv_len)` — `qpos1` becomes `kv_len` (not this row's causal end) and `lo` is the
+    // caller's value directly, ignoring the sliding-window formula entirely (the canvas mask
+    // isn't a window relative to the query's own position — see `AttnMask::Canvas`'s doc).
+    bool canvas = pc.rows > 0u;
+    uint qpos1 = canvas ? kv_len : (pc.pos + row + 1u);
+    uint lo = canvas ? (pc.rows - 1u)
+                     : ((pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u);
+#endif
+#ifdef SELF_CHUNK
+    // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
+    // chunk can't serve every depth (small chunks drown in per-workgroup overhead at deep kv; big
+    // chunks under-occupy at shallow kv). Derive the SAME adaptive policy the re-recording path
+    // uses (~32 chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len.
+    // The attn_live prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup →
+    // (head, chunk) decomposition must use the live count, NOT the baked pc.n_chunks (which is
+    // only the pm/pl/pacc scratch stride).
+    // Chunk the WINDOW's span, offset by `lo` — every dispatched chunk is fully in-window (the
+    // attn_live prologue derives the identical span-based live count).
+    uint span = kv_len - lo;
+    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+    uint live = (span + chunkv - 1u) / chunkv;
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % live;
+    uint kvh = rest / live;
+    uint h = kvh * g + hh;
+    uint j0 = lo + c * chunkv;
+    uint j1 = min(j0 + chunkv, kv_len);
+#else
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
+    // SWA chunk-grid base: the STATIC host path chunks only the rows' union window span
+    // `[base, kv_len)` (`n_chunks` covers that span, not the full cache — see the adapter's
+    // `swa_base`), so this MUST derive the identical base from the same pos/window inputs.
+    // Canvas keeps base 0 (its chunk policy spans the full kv_len; `lo` rides the repurposed
+    // rows slot instead). The plain-dyn variant (USE_PARAMS without SELF_CHUNK) keeps base 0
+    // too: its chunk grid is baked from the cache CAPACITY at record time and `attention_kv_dyn`
+    // doesn't re-chunk per token (the window-aware replay path is SELF_CHUNK, handled above).
+#ifdef USE_PARAMS
+    uint base = 0u;
+#else
+    uint base = (!canvas && pc.window > 0u && pc.pos + 1u > pc.window) ? pc.pos + 1u - pc.window
+                                                                       : 0u;
+#endif
+    // Clamp to the window AND this row's causal end: a chunk fully outside either gets an empty
+    // range → zero-weight partial (m = -3e38, l = 0) the combine's `wexp != 0` test skips.
+    uint j0 = max(base + c * pc.chunk, lo);
+    uint j1 = min(base + c * pc.chunk + pc.chunk, qpos1);
+#endif
+
+    // SWA ring cache: row capacity = cap / row width (cap = total cache ELEMENTS, always pushed).
+    // Key/value POSITION j lives at row j % rcap — the ring only ever recycles rows whose
+    // positions the sliding-window mask (lo/j0) already excludes, so this mapping is exact. On a
+    // full-context cache every processed j < kv_len <= rcap, so RROW is an identity there.
+#ifdef KV_SEGMENTED
+    uint rcap = SEGMENTED_RING ? pc.window : 0u;
+#define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
+#else
+    uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
+#define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
+#endif
+    // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
+    // query vec4(s) are loop-invariant across keys → hold in registers (no q_sh, no barrier).
+    uint sg = gl_SubgroupID;            // 0..1
+    uint lane = gl_SubgroupInvocationID; // 0..31
+    uint nsg = gl_NumSubgroups;          // 2
+    // Fixed 4-slot guarded unroll (covers hd <= 512): a compile-time trip count keeps qreg[] in
+    // registers — the old `qreg[nq++]` dynamic index forced a scratch spill re-read on EVERY key
+    // for the hd4 > 32 shapes (gemma4's hd=256/512 layers).
+    vec4 qreg[4];
+    uint qbase = (row * pc.nh + h) * hd4;
+    for (uint i = 0u; i < 4u; i++) {
+        uint r = lane + 32u * i;
+        qreg[i] = (r < hd4) ? vec4(q4[qbase + r]) : vec4(0.0);
+    }
+    float lmax = -3.0e38;
+    uint j = j0 + sg;
+    if (hd4 == 32u) {
+        // fast path (hd=128): one vec4/lane per key → software-pipeline 4 keys per iteration. Issue
+        // all 4 independent loads before the dependent subgroupAdds → 4 loads in flight per wave (vs
+        // 1), hiding DRAM latency within the wave instead of relying only on workgroup count.
+        uint q4b = h * 32u;
+        uint kb = (pc.nkv * 32u);
+        for (; j + 3u * nsg < j1; j += 4u * nsg) {
+            vec4 a0 = KVEC4(RROW(j) * kb + kvh * 32u + lane);
+            vec4 a1 = KVEC4(RROW(j + nsg) * kb + kvh * 32u + lane);
+            vec4 a2 = KVEC4(RROW(j + 2u * nsg) * kb + kvh * 32u + lane);
+            vec4 a3 = KVEC4(RROW(j + 3u * nsg) * kb + kvh * 32u + lane);
+            float d0 = subgroupAdd(dot(qreg[0], a0)) * scale;
+            float d1 = subgroupAdd(dot(qreg[0], a1)) * scale;
+            float d2 = subgroupAdd(dot(qreg[0], a2)) * scale;
+            float d3 = subgroupAdd(dot(qreg[0], a3)) * scale;
+            if (lane == 0u) {
+                sc[j - j0] = d0;
+                sc[j + nsg - j0] = d1;
+                sc[j + 2u * nsg - j0] = d2;
+                sc[j + 3u * nsg - j0] = d3;
+            }
+            lmax = max(max(max(max(lmax, d0), d1), d2), d3);
+        }
+    }
+#ifndef NO_HD_SPEC
+    // hd=256/512 fast QK (gemma4's per-layer dims; hd4==32 keeps its 4-key path above): the
+    // compile-time-constant hd4 unrolls the per-key dot (no dynamic qreg index, literal strides)
+    // and software-pipelines 2 keys — 4 (hd=256) / 8 (hd=512) independent loads in flight per
+    // lane before the dependent subgroupAdds. -DNO_HD_SPEC (INFR_NO_ATTN_HD=1) compiles these
+    // out for A/B against the general loop below.
+    else if (hd4 == 64u) {
+        uint kb = pc.nkv * 64u;
+        uint kh = kvh * 64u + lane;
+        for (; j + nsg < j1; j += 2u * nsg) {
+            uint jr0 = RROW(j) * kb;
+            uint jr1 = RROW(j + nsg) * kb;
+            vec4 a0 = KVEC4(jr0 + kh);
+            vec4 a1 = KVEC4(jr0 + kh + 32u);
+            vec4 b0 = KVEC4(jr1 + kh);
+            vec4 b1 = KVEC4(jr1 + kh + 32u);
+            float d0 = subgroupAdd(dot(qreg[0], a0) + dot(qreg[1], a1)) * scale;
+            float d1 = subgroupAdd(dot(qreg[0], b0) + dot(qreg[1], b1)) * scale;
+            if (lane == 0u) {
+                sc[j - j0] = d0;
+                sc[j + nsg - j0] = d1;
+            }
+            lmax = max(lmax, max(d0, d1));
+        }
+    } else if (hd4 == 128u) {
+        uint kb = pc.nkv * 128u;
+        uint kh = kvh * 128u + lane;
+        for (; j + nsg < j1; j += 2u * nsg) {
+            uint jr0 = RROW(j) * kb;
+            uint jr1 = RROW(j + nsg) * kb;
+            vec4 a0 = KVEC4(jr0 + kh);
+            vec4 a1 = KVEC4(jr0 + kh + 32u);
+            vec4 a2 = KVEC4(jr0 + kh + 64u);
+            vec4 a3 = KVEC4(jr0 + kh + 96u);
+            vec4 b0 = KVEC4(jr1 + kh);
+            vec4 b1 = KVEC4(jr1 + kh + 32u);
+            vec4 b2 = KVEC4(jr1 + kh + 64u);
+            vec4 b3 = KVEC4(jr1 + kh + 96u);
+            float d0 = subgroupAdd(dot(qreg[0], a0) + dot(qreg[1], a1)
+                                   + dot(qreg[2], a2) + dot(qreg[3], a3)) * scale;
+            float d1 = subgroupAdd(dot(qreg[0], b0) + dot(qreg[1], b1)
+                                   + dot(qreg[2], b2) + dot(qreg[3], b3)) * scale;
+            if (lane == 0u) {
+                sc[j - j0] = d0;
+                sc[j + nsg - j0] = d1;
+            }
+            lmax = max(lmax, max(d0, d1));
+        }
+    }
+#endif
+    for (; j < j1; j += nsg) {
+        uint kbase4 = (RROW(j) * pc.nkv + kvh) * hd4;
+        float part = 0.0;
+        for (uint i = 0u; i < 4u; i++) {
+            uint r = lane + 32u * i;
+            if (r < hd4) { part += dot(qreg[i], KVEC4(kbase4 + r)); }
+        }
+        float dot = subgroupAdd(part) * scale;
+        if (lane == 0u) { sc[j - j0] = dot; }
+        lmax = max(lmax, dot);
+    }
+    red[t] = lmax;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] = max(red[t], red[t + s]); }
+        barrier();
+    }
+    float m = red[0];
+    barrier();
+
+    // exp(s - m) → sc, sum l
+    float lsum = 0.0;
+    for (uint j = j0 + t; j < j1; j += 64u) {
+        float p = exp(sc[j - j0] - m);
+        sc[j - j0] = p;
+        lsum += p;
+    }
+    red[t] = lsum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    float l = red[0];
+
+#ifdef VMAINLINE
+    // Re-point native_decode's read chokepoint at the V cache for the P·V pass (uniform, once). The
+    // QK pass (which used dq_addr = k_addr under KMAINLINE) has fully completed above.
+    dq_addr = v_addr;
+#endif
+    // V: thread owns a vec4 of output dims; one wide coalesced load per key.
+    uint pbase = ((row * pc.nh + h) * pc.n_chunks + c) * hd;
+    if (hd4 <= 32u) {
+        // Full-occupancy V: each lane owns dim `lane`, and the TWO subgroups split the key range
+        // (sg reads keys j0+sg, j0+sg+nsg, …). Both subgroups now issue V loads — the old loop ran V
+        // on a single subgroup (32 idle threads), capping V-read throughput at half the K pass. The
+        // two partials are summed via shared `vsh`. Software-pipeline 2 keys to keep loads in flight.
+        vec4 acc = vec4(0.0);
+        if (lane < hd4) {
+            uint base = kvh * hd4 + lane;
+            uint stride = pc.nkv * hd4;
+            uint j = j0 + sg;
+            for (; j + nsg < j1; j += 2u * nsg) {
+                vec4 b0 = VVEC4(RROW(j) * stride + base);
+                vec4 b1 = VVEC4(RROW(j + nsg) * stride + base);
+                acc += sc[j - j0] * b0;
+                acc += sc[j + nsg - j0] * b1;
+            }
+            for (; j < j1; j += nsg) {
+                acc += sc[j - j0] * VVEC4(RROW(j) * stride + base);
+            }
+        }
+        if (sg == 1u && lane < hd4) { vsh[lane] = acc; }
+        barrier();
+        if (sg == 0u && lane < hd4) {
+            acc += vsh[lane];
+            pacc[pbase + 4u * lane] = acc.x;
+            pacc[pbase + 4u * lane + 1u] = acc.y;
+            pacc[pbase + 4u * lane + 2u] = acc.z;
+            pacc[pbase + 4u * lane + 3u] = acc.w;
+        }
+    }
+#ifndef NO_HD_SPEC
+    // hd=256/512 fast V (full occupancy at compile-time-constant strides). hd4==64: every thread
+    // owns exactly one dim-vec4; software-pipeline 2 keys so 2 loads are in flight per thread.
+    // hd4==128: thread owns dims t and t+64 in ONE pass over keys (the general loop below walks
+    // the key range twice) — 2 independent loads per key, sc read once.
+    else if (hd4 == 64u) {
+        uint vb = kvh * 64u + t;
+        uint stride = pc.nkv * 64u;
+        vec4 acc = vec4(0.0);
+        uint jv = j0;
+        for (; jv + 1u < j1; jv += 2u) {
+            vec4 b0 = VVEC4(RROW(jv) * stride + vb);
+            vec4 b1 = VVEC4(RROW(jv + 1u) * stride + vb);
+            acc += sc[jv - j0] * b0;
+            acc += sc[jv + 1u - j0] * b1;
+        }
+        if (jv < j1) { acc += sc[jv - j0] * VVEC4(RROW(jv) * stride + vb); }
+        pacc[pbase + 4u * t] = acc.x;
+        pacc[pbase + 4u * t + 1u] = acc.y;
+        pacc[pbase + 4u * t + 2u] = acc.z;
+        pacc[pbase + 4u * t + 3u] = acc.w;
+    } else if (hd4 == 128u) {
+        uint vb = kvh * 128u + t;
+        uint stride = pc.nkv * 128u;
+        vec4 acc0 = vec4(0.0);
+        vec4 acc1 = vec4(0.0);
+        for (uint jv = j0; jv < j1; jv++) {
+            uint jvr = RROW(jv) * stride;
+            vec4 b0 = VVEC4(jvr + vb);
+            vec4 b1 = VVEC4(jvr + vb + 64u);
+            float s = sc[jv - j0];
+            acc0 += s * b0;
+            acc1 += s * b1;
+        }
+        pacc[pbase + 4u * t] = acc0.x;
+        pacc[pbase + 4u * t + 1u] = acc0.y;
+        pacc[pbase + 4u * t + 2u] = acc0.z;
+        pacc[pbase + 4u * t + 3u] = acc0.w;
+        pacc[pbase + 4u * (t + 64u)] = acc1.x;
+        pacc[pbase + 4u * (t + 64u) + 1u] = acc1.y;
+        pacc[pbase + 4u * (t + 64u) + 2u] = acc1.z;
+        pacc[pbase + 4u * (t + 64u) + 3u] = acc1.w;
+    }
+#endif
+    else {
+        // General fallback (hd4 > 32): all 64 threads each own a dim, loop over all keys.
+        for (uint g = t; g < hd4; g += 64u) {
+            vec4 acc = vec4(0.0);
+            for (uint j = j0; j < j1; j += 1u) {
+                acc += sc[j - j0] * VVEC4((RROW(j) * pc.nkv + kvh) * hd4 + g);
+            }
+            pacc[pbase + 4u * g] = acc.x;
+            pacc[pbase + 4u * g + 1u] = acc.y;
+            pacc[pbase + 4u * g + 2u] = acc.z;
+            pacc[pbase + 4u * g + 3u] = acc.w;
+        }
+    }
+    if (t == 0u) {
+        pm[(row * pc.nh + h) * pc.n_chunks + c] = m;
+        pl[(row * pc.nh + h) * pc.n_chunks + c] = l;
+    }
+}

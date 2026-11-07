@@ -1,0 +1,61 @@
+#version 460
+// Quantize f32 activations A[m,k] → symmetric int8 (Q8) per BLK-element block, for the dp4a mmq
+// prefill matmul. One workgroup (= one subgroup, 32 threads) per (row, block). Outputs:
+//   qa[m,k]    int8   — q = round(a / d), d = amax/127  (K contiguous → read as packed u32 by mmq)
+//   d_act      f16    — per-block scale, [m, nblk]
+//   s_act      f16    — per-block Σ(d·q) = Σ(dequant a), [m, nblk]  (folds the weight-min term)
+// Fixed BLK=32 (the u4 weight block) → local_size_x = 32 = one subgroup per block.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint k; uint blk; } pc;
+// Binding order mirrors the recorder's hazard convention (inputs first, outputs last), so the
+// GATHER variant's extra readonly input shifts the outputs up by one.
+#ifdef GATHER
+// Batched-MoE fused gather+quant: the m rows are BUCKET slots (expert-grouped assignments); each
+// reads its source token row through `bucket_rows` and quantizes straight into the packed layout —
+// one dispatch replaces the per-expert gather + per-expert quant stages.
+#define QB 2
+#define DBI 3
+#define SBI 4
+layout(binding = 1) readonly buffer RB { uint bucket_rows[]; };
+#else
+#define QB 1
+#define DBI 2
+#define SBI 3
+#endif
+layout(binding = 0) readonly buffer ABuf { float a[]; };       // [m, k]
+layout(binding = QB) writeonly buffer QBuf { int8_t qa[]; };    // [m, k]
+layout(binding = DBI) writeonly buffer DBuf { float16_t dact[]; }; // [m, nblk]
+layout(binding = SBI) writeonly buffer SBuf { float16_t sact[]; }; // [m, nblk]
+
+void main() {
+    uint nblk = pc.k / pc.blk;
+    uint gid = gl_WorkGroupID.x;       // 0 .. m*nblk-1
+    uint row = gid / nblk;
+    uint blk = gid % nblk;
+    uint t = gl_LocalInvocationID.x;   // 0 .. blk-1
+    uint idx = row * pc.k + blk * pc.blk + t;
+
+#ifdef GATHER
+    float v = a[bucket_rows[row] * pc.k + blk * pc.blk + t];
+#else
+    float v = a[idx];
+#endif
+    float amax = subgroupMax(abs(v));
+    float d = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+    int q = int(round(v * inv));
+    q = clamp(q, -127, 127);
+    qa[idx] = int8_t(q);
+    float s = subgroupAdd(d * float(q));
+    if (t == 0u) {
+        dact[row * nblk + blk] = float16_t(d);
+        sact[row * nblk + blk] = float16_t(s);
+    }
+}

@@ -1,0 +1,140 @@
+#version 460
+// Gated-DeltaNet linear-attention recurrence (qwen35/Qwen3.5). One workgroup per (value head, block of
+// COL_BLOCK columns of the state S[kd,vd]); the columns of S are independent, so a thread owns one
+// column d and runs the whole `rows`-token recurrence for it. Per head: L2-normalize q,k (q also
+// ×1/√kd), beta=sigmoid(b), decay=exp(a_coef·softplus(alpha+dt_bias)); per token: S*=decay, kv=kᵀS,
+// delta=(v−kv)·beta, S+=k⊗delta, out=qᵀS. GQA: nk q/k heads tile to nv value heads → head h uses
+// q/k head h % nk.
+//
+// KEY PERF: the state column is cached in SHARED memory for the whole `rows` scan — the recurrence
+// re-reads+writes S[:,d] every timestep, and doing that against GLOBAL VRAM (2·kd accesses/token) was
+// the bottleneck (latency-bound: the sequential dependency can't hide ~300-cycle loads). Blocking to
+// COL_BLOCK columns keeps `kd·COL_BLOCK` floats of state in LDS; global traffic drops to ONE load +
+// ONE store of the block. qn/kn are normalized into shared once per token (shared by all columns).
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define COL_BLOCK 32u
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nv;
+    uint nk;
+    uint kd;
+    uint vd;
+    float eps;
+    float qscale;
+    uint src_stride;  // >0: q/k/v from same buffer at offsets 0, nk*kd, 2*nk*kd
+} pc;
+
+layout(binding = 0) readonly buffer QB  { float q[]; };       // [rows, nk*kd]
+layout(binding = 1) readonly buffer KB  { float k[]; };       // [rows, nk*kd]
+layout(binding = 2) readonly buffer VB  { float v[]; };       // [rows, nv*vd]
+layout(binding = 3) readonly buffer BB  { float blog[]; };    // [rows, nv]  beta logits
+layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [rows, nv]
+layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
+layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
+layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
+layout(binding = 8) writeonly buffer OB { float outp[]; };    // [rows,nv*vd]
+
+shared float ss[128u * COL_BLOCK]; // state block [kd, COL_BLOCK] cached in LDS (kd ≤ 128)
+shared float qn[128];              // normalized q for the current token (kd ≤ 128)
+shared float kn[128];              // normalized k
+shared float red[32];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;             // column within the block, and reduction lane
+    uint nblk = (pc.vd + COL_BLOCK - 1u) / COL_BLOCK;
+    uint h = gl_WorkGroupID.x / nblk;            // value head
+    uint blk = gl_WorkGroupID.x % nblk;          // column block within the head
+    uint d0 = blk * COL_BLOCK;                   // first column of this block
+    uint d = d0 + t;                             // this thread's column (may be ≥ vd → inactive)
+    bool live = d < pc.vd;
+
+    uint khid = h % pc.nk;
+    uint hqbase = khid * pc.kd;   // this head's q/k offset WITHIN a token row
+    uint hvbase = h * pc.vd;      // this head's v/out offset within a token row
+    uint sbase = h * pc.kd * pc.vd;
+
+    // Load this block's state columns [kd, t] into shared: ss[kk*COL_BLOCK + t] = S[kk, d0+t].
+    if (live) {
+        for (uint kk = 0u; kk < pc.kd; kk++) {
+            ss[kk * COL_BLOCK + t] = state[sbase + kk * pc.vd + d];
+        }
+    }
+    barrier();
+
+    for (uint tk = 0u; tk < pc.rows; tk++) {
+        uint row_off = pc.src_stride > 0u ? tk * pc.src_stride : 0u;
+        uint qbase = row_off + hqbase;
+        uint kbase = row_off + pc.nk * pc.kd + hqbase; // k at offset nk*kd within row
+        uint vbase = row_off + pc.nk * pc.kd * 2u + hvbase; // v at offset 2*nk*kd
+        uint obase = tk * pc.nv * pc.vd + hvbase;
+        uint ga = tk * pc.nv + h;
+
+        // ── L2-normalize q,k over kd into shared (all threads cooperate; 32 lanes) ──
+        float qs = 0.0, ks = 0.0;
+        for (uint i = t; i < pc.kd; i += 32u) {
+            float qv = q[qbase + i];
+            float kv = q[kbase + i]; // k reads from q buffer when strided
+            qn[i] = qv;
+            kn[i] = kv;
+            qs += qv * qv;
+            ks += kv * kv;
+        }
+        red[t] = qs;
+        barrier();
+        for (uint s = 16u; s > 0u; s >>= 1) {
+            if (t < s) { red[t] += red[t + s]; }
+            barrier();
+        }
+        float qnorm = sqrt(red[0] + pc.eps);
+        barrier();
+        red[t] = ks;
+        barrier();
+        for (uint s = 16u; s > 0u; s >>= 1) {
+            if (t < s) { red[t] += red[t + s]; }
+            barrier();
+        }
+        float knorm = sqrt(red[0] + pc.eps);
+        barrier();
+        for (uint i = t; i < pc.kd; i += 32u) {
+            qn[i] = qn[i] / qnorm * pc.qscale;
+            kn[i] = kn[i] / knorm;
+        }
+        barrier();
+
+        // ── per-head gates ──
+        float beta = 1.0 / (1.0 + exp(-blog[ga]));
+        float zsp = alpha[ga] + dtbias[h];
+        float sp = max(zsp, 0.0) + log(1.0 + exp(-abs(zsp))); // softplus
+        float decay = exp(acoef[h] * sp);
+
+        // ── recurrence for this thread's column d, all in shared state ──
+        if (live) {
+            float kvv = 0.0;
+            for (uint kk = 0u; kk < pc.kd; kk++) {
+                float sval = ss[kk * COL_BLOCK + t] * decay;
+                ss[kk * COL_BLOCK + t] = sval;
+                kvv += kn[kk] * sval;
+            }
+            float delta = (v[vbase + d] - kvv) * beta;
+            float o = 0.0;
+            for (uint kk = 0u; kk < pc.kd; kk++) {
+                float sval = ss[kk * COL_BLOCK + t] + kn[kk] * delta;
+                ss[kk * COL_BLOCK + t] = sval;
+                o += qn[kk] * sval;
+            }
+            // `vbase` includes the q+k prefix in the interleaved SOURCE.  Output is packed and
+            // must not inherit that prefix (doing so wrote past `outp` even for rows==1).
+            outp[obase + d] = o;
+        }
+        barrier(); // finish reading qn/kn before the next token overwrites them
+    }
+
+    // Persist the updated state block back to global.
+    if (live) {
+        for (uint kk = 0u; kk < pc.kd; kk++) {
+            state[sbase + kk * pc.vd + d] = ss[kk * COL_BLOCK + t];
+        }
+    }
+}

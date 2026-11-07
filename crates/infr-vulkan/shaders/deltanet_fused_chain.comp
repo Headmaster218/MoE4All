@@ -1,0 +1,111 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Recurrence is unchanged; the norm stage mirrors rmsnorm.comp's GATE build.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint norm_dim; uint nk; float eps; float norm_eps; float qscale;
+} pc;
+layout(binding=0) readonly buffer X { float x[]; };
+layout(binding=1) readonly buffer B { float blog[]; };
+layout(binding=2) readonly buffer A { float alpha[]; };
+layout(binding=3) readonly buffer AC { float acoef[]; };
+layout(binding=4) readonly buffer DT { float dtbias[]; };
+layout(binding=5) readonly buffer NW { float norm_weight[]; };
+layout(binding=6) readonly buffer Z { float gate_input[]; };
+layout(binding=7) buffer S { float state[]; };
+layout(binding=8) writeonly buffer O { float outp[]; };
+shared float qn[128], kn[128], red[32];
+shared float norm_input[128];
+shared float norm_part[8];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uint h = gl_WorkGroupID.x;
+    uint kh = h % pc.nk;
+    uint col = t;
+    bool live = t < 128u;
+    float value = live ? x[(2u * pc.nk + h) * 128u + col] : 0.0;
+    // Preserve the split baseline's FP32 phase order, not a different mathematical rule.
+    float qs=0.0, ks=0.0;
+    if (t < 32u) {
+        for (uint i=t; i<pc.norm_dim; i+=32u) {
+            float qv = x[kh * pc.norm_dim + i];
+            float kv = x[(pc.nk + kh) * pc.norm_dim + i];
+            qn[i] = qv;
+            kn[i] = kv;
+            qs += qv * qv;
+            ks += kv * kv;
+        }
+        red[t]=qs;
+    }
+    barrier();
+    for (uint s=16u; s>0u; s>>=1u) {
+        if (t<s) red[t]+=red[t+s];
+        barrier();
+    }
+    float qnorm=sqrt(red[0]+pc.eps);
+    barrier();
+    if (t<32u) red[t]=ks;
+    barrier();
+    for (uint s=16u; s>0u; s>>=1u) {
+        if (t<s) red[t]+=red[t+s];
+        barrier();
+    }
+    float knorm=sqrt(red[0]+pc.eps);
+    barrier();
+    if (t<32u) {
+        for (uint i=t; i<pc.norm_dim; i+=32u) {
+            qn[i]=qn[i]/qnorm*pc.qscale;
+            kn[i]=kn[i]/knorm;
+        }
+    }
+    barrier();
+    float beta=1.0/(1.0+exp(-blog[h]));
+    float az=alpha[h]+dtbias[h];
+    float sp=max(az,0.0)+log(1.0+exp(-abs(az)));
+    float decay=exp(acoef[h]*sp);
+    float ss[128];
+    float kvv=0.0;
+    if (live) {
+        for (uint k=0u; k<128u; ++k) {
+            float s=state[h*16384u+k*128u+col]*decay;
+            ss[k]=s;
+            kvv+=kn[k]*s;
+        }
+    }
+    float delta=(value-kvv)*beta;
+    float o=0.0;
+    if (live) {
+        for (uint k=0u; k<128u; ++k) {
+            float s=ss[k]+kn[k]*delta;
+            state[h*16384u+k*128u+col]=s;
+            o+=qn[k]*s;
+        }
+    }
+    // Reproduce the split shader's F32 producer/consumer boundary without VRAM scratch.
+    if (live) norm_input[t] = o;
+    barrier();
+    float sum = 0.0;
+    for (uint i=t; i<pc.norm_dim; i+=256u) {
+        float v = norm_input[i];
+        sum += v * v;
+    }
+    sum = subgroupAdd(sum);
+    if (subgroupElect()) norm_part[gl_SubgroupID] = sum;
+    barrier();
+    float total = 0.0;
+    uint nsg = gl_NumSubgroups;
+    for (uint i=0u; i<nsg; ++i) total += norm_part[i];
+    float scale = inversesqrt(total / float(pc.norm_dim) + pc.norm_eps);
+    for (uint i=t; i<pc.norm_dim; i+=256u) {
+        float z = gate_input[h*128u+i];
+#ifdef GATE_SIGMOID
+        float g = 1.0/(1.0+exp(-z));
+#else
+        float g = z/(1.0+exp(-z));
+#endif
+        outp[h*128u+i] = norm_input[i]*scale*norm_weight[i]*g;
+    }
+}

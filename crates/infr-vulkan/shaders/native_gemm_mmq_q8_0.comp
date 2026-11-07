@@ -1,0 +1,201 @@
+#version 460
+// Tiled dp4a (mmq) GEMM for stacked Q8_0 experts (diffusion-gemma ships its MoE down projection
+// as Q8_0): C[m,n] = A[m,k]·W[ids]ᵀ via hardware int8 dot-product. Q8_0 blocks are ALREADY signed
+// int8 (w = d·q8, q8 the raw two's-complement byte — no nibble unpack, no centering, no min term),
+// and BLK=32 matches the activation's quant block exactly (one dact per block, one weight scale
+// per block — no superblock sub-block indexing like Q4_K/Q6_K need). Mirrors native_gemm_mmq_q6k
+// (register-blocked 64×64 tile, TM×TN=4×4, scalar dp4a — RADV int8 WMMA hangs). w_base =
+// expert·stride. Requires n%64, k%32.
+// Padded-C contract (same as gemm_proj.comp:6): the `qa`/`dact` staging reads for rows ≥ m pull
+// garbage (their output is ignored) and — outside the EXPERT_GRID rowEnd guard — the store writes
+// the full BM-row tile unconditionally, so C MUST be allocated ceil(m/64)*64 rows. Every caller
+// honors this (recorder.rs `matmul_native_dp4a_q8_0`/`matmul_native` allocate the padded dst).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef BM_TILE
+#define BM_TILE 64u
+#endif
+const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE callers may
+                         // override smaller (e.g. 32) to fit small per-expert row counts
+
+const uint BN = 64u;
+const uint BLK = 32u;       // Q8_0 block == the activation's 32-block, exactly
+const uint WPB = BLK / 4u;  // 8 packed-int8 u32 words per 32-block
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN); // 256
+const uint SP = WPB + 1u;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+#ifdef PAGED
+// -DPAGED appends the arena's 64-bit base address (lo/hi) + per-slot byte stride — see
+// native_weight_addr.glsl. pc.w_base carries the layer's LUT window base; pc.m is unused.
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#elif defined(STREAMED)
+// -DSTREAMED (resident-BDA): the stacked weight tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi — same rb() pointer read as PAGED but with NO LUT and NO slot
+// stride (the base already points at THIS tensor). Under EXPERT_GRID, pc.m is the per-expert
+// BYTE stride applied on the pointer; pc.w_base keeps only the small within-bank element offset.
+// Additive: non-STREAMED builds are byte-identical.
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
+layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32]
+#if !defined(PAGED) && !defined(STREAMED)
+layout(binding = 2) readonly buffer WB { uint nw[]; };          // stacked Q8_0 weight bytes
+#endif
+#ifdef PAGED
+// PAGED (implies EXPERT_GRID): `nw` is a GpuPager arena of uniform slots; see
+// native_gemm_mmq_q2_k.comp's PAGED doc (word base not slot index, pc.w_base = layer_base, pc.m
+// unused, rb() chokepoint).
+layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#elif defined(EXPERT_GRID)
+// Batched-MoE all-experts-in-one-dispatch: gl_WorkGroupID.y = expert id; the packed activation
+// rows for expert e live at [offsets[e], offsets[e]+counts[e]) (bucket layout). pc.m is repurposed
+// as the per-expert weight stride (elements). Row tiles past the segment exit immediately; row
+// stores are clipped to the segment (rows are packed — no per-expert padding to stomp). The two
+// extra readonly inputs sit before `c` so the recorder's inputs-first/outputs-last order holds.
+layout(binding = 3) readonly buffer CNT { uint counts[]; };
+layout(binding = 4) readonly buffer OFF { uint offsets[]; };
+layout(binding = 5) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#else
+layout(binding = 3) writeonly buffer CB { float c[]; };         // [m, n]
+#endif
+
+shared uint As[BM * SP];
+shared uint Bs[BN * SP];
+shared float Bdl[BN];
+
+#if defined(PAGED) || defined(STREAMED)
+// Arena read via 64-bit device address (see native_weight_addr.glsl): `w_addr` (set in main) is
+// this expert's slot byte base; rb() reads a byte through it. The LUT stores the SLOT INDEX,
+// scaled onto the arena base with a 64-bit multiply (replaces the u32 word-base SSBO read).
+#include "native_weight_addr.glsl"
+uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+#else
+uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#endif
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+
+void main() {
+#ifdef STREAMED
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address; NO LUT/slot multiply
+#endif
+    uint nblk = pc.k / BLK;
+    uint kw = pc.k / 4u;
+    uint tilesN = pc.n / BN;
+#ifdef EXPERT_GRID
+    uint ex = gl_WorkGroupID.y;
+    uint cnt = counts[ex];
+    if ((gl_WorkGroupID.x / tilesN) * BM >= cnt) { return; }
+    uint wgRow = offsets[ex] + (gl_WorkGroupID.x / tilesN) * BM;
+    uint rowEnd = offsets[ex] + cnt;
+#ifdef PAGED
+    // Resolved AFTER the count early-exit: a bucket with count 0 was never routed, so its LUT
+    // entry may be stale/absent — no workgroup that would read it gets here.
+    w_addr = arena_base(lut[pc.w_base + ex].x, lut[pc.w_base + ex].y);
+    uint wbase = 0u;
+#elif defined(STREAMED)
+    // Expert base scaled onto the 64-bit pointer — pc.m is REPURPOSED as the per-expert BYTE
+    // stride in this build (same convention as native_gemv_id.comp's STREAMED arm); pc.w_base
+    // keeps its small within-bank element offset. Kills the u32 `ex * stride` element multiply.
+    w_addr += uint64_t(ex) * uint64_t(pc.m);
+    uint wbase = pc.w_base;
+#else
+    uint wbase = pc.w_base + ex * pc.m;
+#endif
+#else
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wbase = pc.w_base;
+#endif
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN);
+    uint tc = li % (BN / TN);
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint blk = 0u; blk < nblk; blk++) {
+        // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
+        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
+            uint r = idx / WPB;
+            uint p = idx % WPB;
+            As[r * SP + p] = qa[(wgRow + r) * kw + blk * WPB + p];
+        }
+        // per-col scale for this block (Q8_0: one f16 scale per 32-element block, no sub-scale)
+        for (uint cc = li; cc < BN; cc += THREADS) {
+            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
+            uint bd = (gelem / 32u) * 34u;
+            Bdl[cc] = f16tof32(ru16(bd));
+        }
+        // stage weights: BN cols × WPB words — Q8_0 bytes are already signed int8, copy as-is.
+        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
+            uint cc = idx / WPB;
+            uint p = idx % WPB;
+            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
+            uint bd = (gelem / 32u) * 34u;
+            uint packed = 0u;
+            [[unroll]] for (uint b = 0u; b < 4u; b++) {
+                packed |= rb(bd + 2u + p * 4u + b) << (b * 8u);
+            }
+            Bs[cc * SP + p] = packed;
+        }
+        barrier();
+
+        int qsum[TM][TN];
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+            [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
+        [[unroll]] for (uint p = 0u; p < WPB; p++) {
+            int av[TM];
+            int bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++)
+                    qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
+        }
+
+        float dval[TM];
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk + blk]);
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            float dl = Bdl[tc * TN + j];
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                acc[i][j] += dval[i] * dl * float(qsum[i][j]);
+            }
+        }
+        // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
+        // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete
+        // before any thread loops around and restages — a barrier between qsum and this block let
+        // a fast thread overwrite Bdl/Bmm while a slow one was still reading them (data race,
+        // exposed by the BN=128 wide tile's fuller occupancy; nondeterministic expert GEMM output).
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        uint rr = wgRow + tr * TM + i;
+#ifdef EXPERT_GRID
+        if (rr >= rowEnd) { continue; }
+#endif
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
+        }
+    }
+}

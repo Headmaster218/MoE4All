@@ -1,0 +1,243 @@
+#version 460
+// Batched expert-grid dp4a GEMM for the two compact grid i-quants used by
+// Qwen3.8-Flash-Next's Q2_K_XL expert banks:
+//
+//   IQ2_XS  [f16 d][u16 qs[32]][u8 scales[8]] = 74 bytes / 256 values
+//   IQ3_XXS [f16 d][u8 qs[64]][u32 aux[8]]    = 98 bytes / 256 values
+//
+// Both formats decode one 32-value activation block into eight packed int8
+// words and reuse it across the expert bucket's row tile. IQ2_XS has two
+// 16-value scales per pass; IQ3_XXS has one scale per pass. The resident,
+// paged and small-row-tile variants are produced from this one source.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+#if !defined(FMT_IQ2XS) && !defined(FMT_IQ3XXS)
+#error "native_gemm_mmq_iq_xs requires FMT_IQ2XS or FMT_IQ3XXS"
+#endif
+
+#ifndef BM_TILE
+#define BM_TILE 64u
+#endif
+const uint BM = BM_TILE;
+const uint BN = 64u;
+const uint BLK = 32u;
+const uint WPB = 8u;
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN);
+const uint SP = WPB + 1u;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+#include "native_grids.glsl"
+
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#elif defined(STREAMED)
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
+
+layout(binding = 0) readonly buffer QA { uint qa[]; };
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };
+#if !defined(PAGED) && !defined(STREAMED)
+layout(binding = 2) readonly buffer WB { uint nw[]; };
+#endif
+#ifdef PAGED
+layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };
+#elif defined(EXPERT_GRID)
+layout(binding = 3) readonly buffer CNT { uint counts[]; };
+layout(binding = 4) readonly buffer OFF { uint offsets[]; };
+layout(binding = 5) writeonly buffer CB { float c[]; };
+#else
+layout(binding = 3) writeonly buffer CB { float c[]; };
+#endif
+
+shared uint As[BM * SP];
+shared uint Bs[BN * SP];
+shared float Bdl[BN];
+#if defined(FMT_IQ2XS)
+shared float Bdh[BN];
+#endif
+
+#if defined(PAGED) || defined(STREAMED)
+#include "native_weight_addr.glsl"
+uint rb(uint byte) { return (arena_word(byte >> 2u) >> ((byte & 3u) * 8u)) & 0xFFu; }
+#else
+uint rb(uint byte) { return (nw[byte >> 2u] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#endif
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+uint ru32(uint byte) {
+    return rb(byte) | (rb(byte + 1u) << 8u) | (rb(byte + 2u) << 16u) |
+           (rb(byte + 3u) << 24u);
+}
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+
+void main() {
+#ifdef STREAMED
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+#endif
+    grid_init();
+    uint nblk = pc.k / BLK;
+    uint kw = pc.k / 4u;
+    uint tilesN = pc.n / BN;
+#ifdef EXPERT_GRID
+    uint ex = gl_WorkGroupID.y;
+    uint cnt = counts[ex];
+    if ((gl_WorkGroupID.x / tilesN) * BM >= cnt) { return; }
+    uint wgRow = offsets[ex] + (gl_WorkGroupID.x / tilesN) * BM;
+    uint rowEnd = offsets[ex] + cnt;
+#ifdef PAGED
+    w_addr = arena_base(lut[pc.w_base + ex].x, lut[pc.w_base + ex].y);
+    uint wbase = 0u;
+#elif defined(STREAMED)
+    w_addr += uint64_t(ex) * uint64_t(pc.m);
+    uint wbase = pc.w_base;
+#else
+    uint wbase = pc.w_base + ex * pc.m;
+#endif
+#else
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wbase = pc.w_base;
+#endif
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN);
+    uint tc = li % (BN / TN);
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; ++i)
+        [[unroll]] for (uint j = 0u; j < TN; ++j) acc[i][j] = 0.0;
+
+#ifdef EXPERT_GRID
+    bool live = (wgRow + tr * TM) < rowEnd;
+#else
+    const bool live = true;
+#endif
+
+    for (uint blk = 0u; blk < nblk; ++blk) {
+        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
+            uint r = idx / WPB;
+            uint p = idx % WPB;
+            As[r * SP + p] = qa[(wgRow + r) * kw + blk * WPB + p];
+        }
+
+        for (uint cc = li; cc < BN; cc += THREADS) {
+            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
+            uint ib32 = (gelem >> 5u) & 7u;
+#if defined(FMT_IQ2XS)
+            uint bd = (gelem / 256u) * 74u;
+            float d = f16tof32(ru16(bd));
+            uint sc = rb(bd + 66u + ib32);
+            Bdl[cc] = d * (0.5 + float(sc & 0xFu)) * 0.25;
+            Bdh[cc] = d * (0.5 + float(sc >> 4u)) * 0.25;
+#else
+            uint bd = (gelem / 256u) * 98u;
+            float d = f16tof32(ru16(bd));
+            uint aux = ru32(bd + 66u + 4u * ib32);
+            Bdl[cc] = d * (0.5 + float(aux >> 28u)) * 0.5;
+#endif
+        }
+
+        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
+            uint cc = idx / WPB;
+            uint p = idx % WPB;
+            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
+            uint ib32 = (gelem >> 5u) & 7u;
+            uint packed = 0u;
+#if defined(FMT_IQ2XS)
+            uint bd = (gelem / 256u) * 74u;
+            uint l = p >> 1u;
+            uint word_half = p & 1u;
+            uint qs16 = ru16(bd + 2u + (ib32 * 4u + l) * 2u);
+            uint grididx = qs16 & 511u;
+            uint signs = KSIGNS[qs16 >> 9u] >> (word_half * 4u);
+            int gw = int(G_IQ2XS[2u * grididx + word_half]);
+#else
+            uint bd = (gelem / 256u) * 98u;
+            uint l = p >> 1u;
+            uint word_half = p & 1u;
+            uint aux = ru32(bd + 66u + 4u * ib32);
+            uint signs = KSIGNS[(aux >> (7u * l)) & 127u] >> (word_half * 4u);
+            int gw = int(G_IQ3XXS[rb(bd + 2u + ib32 * 8u + p)]);
+#endif
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                int qv = bitfieldExtract(gw, int(8u * b), 8);
+                if (((signs >> b) & 1u) != 0u) { qv = -qv; }
+                packed |= (uint(qv) & 0xFFu) << (8u * b);
+            }
+            Bs[cc * SP + p] = packed;
+        }
+        barrier();
+
+        if (live) {
+#if defined(FMT_IQ2XS)
+            int qlo[TM][TN];
+            int qhi[TM][TN];
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                [[unroll]] for (uint j = 0u; j < TN; ++j) { qlo[i][j] = 0; qhi[i][j] = 0; }
+            [[unroll]] for (uint p = 0u; p < WPB; ++p) {
+                int av[TM]; int bv[TN];
+                [[unroll]] for (uint i = 0u; i < TM; ++i) av[i] = int(As[(tr * TM + i) * SP + p]);
+                [[unroll]] for (uint j = 0u; j < TN; ++j) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    [[unroll]] for (uint j = 0u; j < TN; ++j) {
+                        if (p < 4u) qlo[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qlo[i][j]);
+                        else qhi[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qhi[i][j]);
+                    }
+            }
+#else
+            int qsum[TM][TN];
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                [[unroll]] for (uint j = 0u; j < TN; ++j) qsum[i][j] = 0;
+            [[unroll]] for (uint p = 0u; p < WPB; ++p) {
+                int av[TM]; int bv[TN];
+                [[unroll]] for (uint i = 0u; i < TM; ++i) av[i] = int(As[(tr * TM + i) * SP + p]);
+                [[unroll]] for (uint j = 0u; j < TN; ++j) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
+                [[unroll]] for (uint i = 0u; i < TM; ++i)
+                    [[unroll]] for (uint j = 0u; j < TN; ++j)
+                        qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
+            }
+#endif
+            float dval[TM];
+            [[unroll]] for (uint i = 0u; i < TM; ++i)
+                dval[i] = float(dact[(wgRow + tr * TM + i) * nblk + blk]);
+            [[unroll]] for (uint j = 0u; j < TN; ++j) {
+                float dl = Bdl[tc * TN + j];
+#if defined(FMT_IQ2XS)
+                float dh = Bdh[tc * TN + j];
+#endif
+                [[unroll]] for (uint i = 0u; i < TM; ++i) {
+#if defined(FMT_IQ2XS)
+                    acc[i][j] += dval[i] * dl * float(qlo[i][j]);
+                    acc[i][j] += dval[i] * dh * float(qhi[i][j]);
+#else
+                    acc[i][j] += dval[i] * dl * float(qsum[i][j]);
+#endif
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; ++i) {
+        uint rr = wgRow + tr * TM + i;
+#ifdef EXPERT_GRID
+        if (rr >= rowEnd) { continue; }
+#endif
+        [[unroll]] for (uint j = 0u; j < TN; ++j)
+            c[rr * pc.n + wgCol + tc * TN + j] = acc[i][j];
+    }
+}

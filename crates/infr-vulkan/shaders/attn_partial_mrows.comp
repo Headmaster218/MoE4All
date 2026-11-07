@@ -1,0 +1,186 @@
+#version 460
+// PROBE: flash-decoding pass 1, rows-batched at RB=4 — one workgroup per (head, kv-chunk) computes
+// partials for a group of up to 4 query rows against ONE K/V stream. The RB=8 version measured
+// 2-3x SLOWER than the per-row grid (occupancy: 22 KiB LDS / ~90 VGPRs, and per-key reduction
+// serialization). RB=4 cuts LDS to ~11 KiB and packs the whole group's dots into a SINGLE
+// subgroupAdd(vec4) per key — per-key cost is then one load + 4 dots + 1 reduction, near the
+// per-row kernel's (1 + 1 + 1) while serving 4 rows from one K/V stream. Opt-in via
+// INFR_MROWS_ATTN=1 (occupancy-hypothesis probe; the per-row grid stays the default).
+// f16 KV only, hd <= 128. Same 44-byte push + pm/pl/pacc layout as attn_partial.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;   // unused (f16 only) — kept so the push layout matches attn_partial
+    uint pos; uint rows;
+#ifdef KV_BDA
+    // -DKV_BDA build (#74 slice 2): K/V cache base device addresses, uvec2-split. K/V bindings 1/2
+    // become INERT (bound only for the store→read hazard edge) — reads go through k_addr/v_addr.
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
+} pc;
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#endif
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
+#ifdef KV_BDA
+// f16 K/V by device address: one f16vec4 (8 B) = one KV2 read (global_load_b64), unpacked to a vec4 —
+// the drop-in for the bound `vec4(k4[i])` / `vec4(v4[i])`. Word base = vec4-index << 1.
+vec4 kread4(uint i4) { uvec2 w = KV2(k_addr, i4 << 1u); return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
+vec4 vread4(uint i4) { uvec2 w = KV2(v_addr, i4 << 1u); return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
+#define KVEC4(i) kread4(i)
+#define VVEC4(i) vread4(i)
+#else
+layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
+layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
+#define KVEC4(i) vec4(k4[i])
+#define VVEC4(i) vec4(v4[i])
+#endif
+layout(binding = 3) buffer PM { float pm[]; };               // [rows*nh, n_chunks]
+layout(binding = 4) buffer PL { float pl[]; };               // [rows*nh, n_chunks]
+layout(binding = 5) buffer PACC { float pacc[]; };           // [rows*nh, n_chunks, hd]
+
+const uint RB = 4u; // rows per group
+// -DSC_MAX=256 variant: half the score staging (4 KiB) for chunk <= 256 — the residency probe.
+#ifndef SC_MAX
+#define SC_MAX 512u
+#endif
+const uint SC = SC_MAX;
+shared float sc[RB * SC]; // per-row chunk scores (chunk <= SC)
+shared float red[RB * 64u]; // 1 KiB
+shared vec4 vsh[RB * 32u];  // subgroup-1 V partials: 2 KiB
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+#ifdef KV_BDA
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
+    uint hd = pc.hd;
+    uint hd4 = hd >> 2u;
+    uint g = pc.nh / pc.nkv;
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
+    uint row0 = gl_WorkGroupID.y * RB;
+    uint rb = min(RB, pc.rows - row0);
+
+    // Group key range = chunk ∩ [row 0's window lo, last row's causal end]; per-(row, key)
+    // validity is masked in the softmax pass (invalid → weight 0).
+    uint end_last = pc.pos + row0 + rb;
+    uint end_first = pc.pos + row0 + 1u;
+    uint lo0 = (pc.window > 0u && end_first > pc.window) ? end_first - pc.window : 0u;
+    uint j0 = max(c * pc.chunk, lo0);
+    uint j1 = min(c * pc.chunk + pc.chunk, end_last);
+
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint nsg = gl_NumSubgroups;
+
+    // Each lane holds one q vec4 per row (hd4 <= 32); rows past rb contribute zeros.
+    vec4 qreg[RB];
+    for (uint i = 0u; i < RB; i++) {
+        qreg[i] = (i < rb && lane < hd4)
+            ? vec4(q4[((row0 + i) * pc.nh + h) * hd4 + lane])
+            : vec4(0.0);
+    }
+
+    // QK: keys subgroup-strided; ONE coalesced K load and ONE subgroupAdd(vec4) per key serve
+    // the whole row group.
+    vec4 lmax = vec4(-3.0e38);
+    for (uint j = j0 + sg; j < j1; j += nsg) {
+        vec4 kv = (lane < hd4) ? KVEC4((j * pc.nkv + kvh) * hd4 + lane) : vec4(0.0);
+        vec4 d = subgroupAdd(vec4(
+                     dot(qreg[0], kv), dot(qreg[1], kv), dot(qreg[2], kv), dot(qreg[3], kv)))
+            * scale;
+        if (lane == 0u) {
+            sc[0u * SC + (j - j0)] = d.x;
+            sc[1u * SC + (j - j0)] = d.y;
+            sc[2u * SC + (j - j0)] = d.z;
+            sc[3u * SC + (j - j0)] = d.w;
+        }
+        // Per-row causal mask on the max only (an out-of-range key's score never enters exp).
+        bvec4 ok = lessThan(uvec4(j), uvec4(pc.pos + row0 + 1u, pc.pos + row0 + 2u,
+                                            pc.pos + row0 + 3u, pc.pos + row0 + 4u));
+        lmax = mix(lmax, max(lmax, d), ok);
+    }
+    for (uint i = 0u; i < RB; i++) { red[i * 64u + t] = lmax[i]; }
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) {
+            for (uint i = 0u; i < RB; i++) {
+                red[i * 64u + t] = max(red[i * 64u + t], red[i * 64u + t + s]);
+            }
+        }
+        barrier();
+    }
+    vec4 m = vec4(red[0], red[64], red[128], red[192]);
+    barrier();
+
+    // exp(s - m) with per-(row, key) validity: lo_i <= j < qpos1_i.
+    vec4 lsum = vec4(0.0);
+    for (uint j = j0 + t; j < j1; j += 64u) {
+        for (uint i = 0u; i < RB; i++) {
+            uint qpos1 = pc.pos + row0 + i + 1u;
+            uint lo_i = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
+            bool valid = i < rb && j >= lo_i && j < qpos1;
+            float p = valid ? exp(sc[i * SC + (j - j0)] - m[i]) : 0.0;
+            sc[i * SC + (j - j0)] = p;
+            lsum[i] += p;
+        }
+    }
+    for (uint i = 0u; i < RB; i++) { red[i * 64u + t] = lsum[i]; }
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) {
+            for (uint i = 0u; i < RB; i++) { red[i * 64u + t] += red[i * 64u + t + s]; }
+        }
+        barrier();
+    }
+
+    // V: lane owns dim-vec4 `lane`; subgroups split keys; ONE V load per key serves all rows.
+    vec4 acc[RB];
+    for (uint i = 0u; i < RB; i++) { acc[i] = vec4(0.0); }
+    if (lane < hd4) {
+        uint base = kvh * hd4 + lane;
+        uint stride = pc.nkv * hd4;
+        for (uint j = j0 + sg; j < j1; j += nsg) {
+            vec4 vv = VVEC4(j * stride + base);
+            acc[0] += sc[0u * SC + (j - j0)] * vv;
+            acc[1] += sc[1u * SC + (j - j0)] * vv;
+            acc[2] += sc[2u * SC + (j - j0)] * vv;
+            acc[3] += sc[3u * SC + (j - j0)] * vv;
+        }
+    }
+    if (sg == 1u && lane < hd4) {
+        for (uint i = 0u; i < RB; i++) { vsh[i * 32u + lane] = acc[i]; }
+    }
+    barrier();
+    if (sg == 0u && lane < hd4) {
+        for (uint i = 0u; i < RB; i++) {
+            if (i < rb) {
+                vec4 a = acc[i] + vsh[i * 32u + lane];
+                uint pbase = (((row0 + i) * pc.nh + h) * pc.n_chunks + c) * hd;
+                pacc[pbase + 4u * lane] = a.x;
+                pacc[pbase + 4u * lane + 1u] = a.y;
+                pacc[pbase + 4u * lane + 2u] = a.z;
+                pacc[pbase + 4u * lane + 3u] = a.w;
+            }
+        }
+    }
+    if (t == 0u) {
+        for (uint i = 0u; i < RB; i++) {
+            if (i < rb) {
+                pm[((row0 + i) * pc.nh + h) * pc.n_chunks + c] = m[i];
+                pl[((row0 + i) * pc.nh + h) * pc.n_chunks + c] = red[i * 64u];
+            }
+        }
+    }
+}

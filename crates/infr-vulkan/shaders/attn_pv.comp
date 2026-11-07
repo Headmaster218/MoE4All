@@ -1,0 +1,102 @@
+#version 460
+// Non-FA prefill attention, stage 3: O[m,h,:] = sum_n P[h,m,n] · V[n,kvh,:]. A clean coopmat GEMM
+// (A=P, B=V, C=A·B) per head, batched over heads via gl_WorkGroupID.z. P is f16 (softmax output,
+// 0 on masked keys so we sum the full padded kv width), V is f16, O is f32 ([m, nh*hd]).
+// Split-K: gl_WorkGroupID.y = split; each split reduces its [split*ksplit, +ksplit) slice of the kv
+// dim and writes a PARTIAL O into o[split*(m*nh*hd) + ...]; a reduce pass sums the splits. This adds
+// workgroups + shortens the serial K-loop (attn_pv at high ctx is occupancy/latency-bound: few
+// workgroups grinding a 1024-iter reduction). n_splits=1 → base 0, writes O directly (no reduce).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+const uint SAK = BK + 8u;
+const uint SBN = BN + 8u;
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint kv_pad;
+    uint hd;
+    uint nh;
+    uint nkv;
+    uint n_splits;
+    uint ksplit;   // kv elements per split (multiple of BK)
+} pc;
+layout(binding = 0) readonly buffer PB { float16_t p[]; }; // [nh, m, kv_pad]
+layout(binding = 1) readonly buffer VB { float16_t v[]; }; // [kv, nkv, hd]
+layout(binding = 2) writeonly buffer OB { float o[]; };    // [m, nh*hd]
+
+shared float16_t As[BM * SAK];
+shared float16_t Bs[BK * SBN];
+
+void main() {
+    uint h = gl_WorkGroupID.z;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint hd = pc.hd;
+    uint tilesN = hd / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint sgid = gl_SubgroupID;
+    uint sgRow = (sgid / 2u) * 32u;
+    uint sgCol = (sgid % 2u) * 32u;
+    uint li = gl_LocalInvocationIndex;
+    uint pbase = h * pc.m * pc.kv_pad;
+    uint split = gl_WorkGroupID.y;
+    uint kstart = split * pc.ksplit;
+    uint kend = min(kstart + pc.ksplit, pc.kv_pad);
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
+
+    for (uint k0 = kstart; k0 < kend; k0 += BK) {
+        for (uint idx = li; idx < BM * BK; idx += 128u) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            As[r * SAK + cc] = p[pbase + (wgRow + r) * pc.kv_pad + (k0 + cc)];
+        }
+        for (uint idx = li; idx < BK * BN; idx += 128u) {
+            uint kk = idx / BN;
+            uint cc = idx % BN;
+            Bs[kk * SBN + cc] = v[(k0 + kk) * pc.nkv * hd + kvh * hd + (wgCol + cc)];
+        }
+        barrier();
+        for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b1;
+            coopMatLoad(a0, As, (sgRow + 0u) * SAK + kf, SAK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, As, (sgRow + 16u) * SAK + kf, SAK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, Bs, kf * SBN + (sgCol + 0u), SBN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, Bs, kf * SBN + (sgCol + 16u), SBN, gl_CooperativeMatrixLayoutRowMajor);
+            acc00 = coopMatMulAdd(a0, b0, acc00);
+            acc01 = coopMatMulAdd(a0, b1, acc01);
+            acc10 = coopMatMulAdd(a1, b0, acc10);
+            acc11 = coopMatMulAdd(a1, b1, acc11);
+        }
+        barrier();
+    }
+
+    uint cr = wgRow + sgRow;
+    uint cc0 = h * hd + wgCol + sgCol;
+    uint stride = pc.nh * hd;
+    uint obase = split * pc.m * stride; // partial-O slice for this split (0 when n_splits==1)
+    coopMatStore(acc00, o, obase + (cr + 0u) * stride + (cc0 + 0u), stride,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc01, o, obase + (cr + 0u) * stride + (cc0 + 16u), stride,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc10, o, obase + (cr + 16u) * stride + (cc0 + 0u), stride,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc11, o, obase + (cr + 16u) * stride + (cc0 + 16u), stride,
+                 gl_CooperativeMatrixLayoutRowMajor);
+}

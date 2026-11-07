@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer Journal { uint journal[]; };
+layout(std430, binding = 1) readonly buffer Candidates { uvec4 nodes[]; };
+layout(std430, binding = 2) buffer Control { uint control[]; };
+layout(push_constant) uniform Params {
+    uint ordinal;
+    uint recorded;
+    uint generation_lo;
+    uint generation_hi;
+} p;
+const uint COUNT_WORD = INFR_MAX_DECODE_ROWS * 17u;
+const uint STATUS_WORD = COUNT_WORD + 3u;
+const uint JOURNAL_WORDS = STATUS_WORD + 1u;
+void main() {
+    uint length = uint(control.length());
+    if (length < 8u || (length & 1u) != 0u) return;
+    uint seed = length - 1u;
+    bool valid = p.recorded > 0u && p.recorded <= (length - 6u) / 2u
+        && p.ordinal < p.recorded && p.ordinal < uint(journal.length()) / JOURNAL_WORDS
+        && uint(nodes.length()) >= 3u;
+    if (valid) {
+        uint base = p.ordinal * JOURNAL_WORDS;
+        valid = control[0] == 0u && control[1] == p.ordinal
+            && control[2] == p.ordinal + 1u && control[3] == 0u
+            && journal[base + STATUS_WORD] == 5u
+            && journal[base + COUNT_WORD] > 0u
+            && journal[base + COUNT_WORD] <= INFR_MAX_DECODE_ROWS * 16u * 3u
+            && journal[base + COUNT_WORD + 1u] == p.generation_lo
+            && journal[base + COUNT_WORD + 2u] == p.generation_hi
+            && nodes[0].x == 4u && nodes[0].w == p.generation_lo
+            && nodes[1].x == p.generation_hi;
+    }
+    control[4] = 0u;
+    control[seed] = uint(valid);
+    if (!valid) {
+        // A later guarded recovery must never turn a failed forward back into a fresh seed.
+        control[0] = 0u;
+        control[3] = 1u;
+        return;
+    }
+    control[0] = 1u;
+    control[1] = 0xffffffffu;
+    control[2] = 0u;
+    // invalid was checked above; only a true new-forward seed may clear an old failure.
+}

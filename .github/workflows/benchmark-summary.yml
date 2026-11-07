@@ -1,0 +1,84 @@
+name: Benchmark PR summary
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Open or merged benchmark PR number'
+        required: true
+        type: string
+      publish_comment:
+        description: 'Post/update the PR comment (otherwise preview only)'
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-summary-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  summarize:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      # Only trusted base/maintainer-dispatched source is executed. PR blobs are data.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve immutable PR and historical commits
+        id: pr
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          script: |
+            const { pathToFileURL } = require('node:url');
+            const { prepare } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/benchmark-summary-comment.mjs`));
+            await prepare({ github, context, core, prNumber: process.env.PR_NUMBER });
+      - name: Read reports and render three tables
+        if: steps.pr.outputs.enabled == 'true'
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          BASELINE_SHA: ${{ steps.pr.outputs.baseline }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA" "$BASELINE_SHA"
+          python3 scripts/benchmark_pr_summary.py \
+            --base "$BASE_SHA" --head "$HEAD_SHA" --baseline "$BASELINE_SHA" \
+            --repository "$GITHUB_REPOSITORY" --output "$RUNNER_TEMP/benchmark-review.json"
+      - name: Preview or update one PR comment
+        if: steps.pr.outputs.enabled == 'true'
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          WRITE_COMMENT: ${{ github.event_name == 'pull_request_target' || inputs.publish_comment }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const { pathToFileURL } = require('node:url');
+            const { publish } = await import(pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/benchmark-summary-comment.mjs`));
+            const result = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/benchmark-review.json`, 'utf8'));
+            core.info(await publish({ github, context, core, result, prNumber: process.env.PR_NUMBER, expectedHead: process.env.HEAD_SHA, write: process.env.WRITE_COMMENT === 'true' }));
+      - uses: actions/upload-artifact@v6
+        if: steps.pr.outputs.enabled == 'true'
+        with:
+          name: benchmark-pr-review-${{ steps.pr.outputs.number }}
+          path: ${{ runner.temp }}/benchmark-review.json
+          if-no-files-found: error
+          retention-days: 7

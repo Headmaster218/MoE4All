@@ -1,0 +1,158 @@
+#version 460
+// Official DeepSeek V4 cache encodings. DSV4_FP8 writes the 64-token paged mixed row
+// (448 OCP E4M3 + 64 BF16 + 8 UE8M0 bytes). DSV4_MXFP4 applies the normalized 128-wide
+// Hadamard rotation, then writes 64 adjacent-pair E2M1 bytes + four UE8M0 scale bytes.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint row; uint cache_off; } pc;
+layout(binding = 0) readonly buffer SB { float src[]; };
+layout(binding = 1) buffer DB { uint dst[]; };
+
+shared float scale_value[8];
+shared uint scale_code[8];
+#ifdef DSV4_MXFP4
+shared float had[128];
+#endif
+
+uint pack4(uint a, uint b, uint c, uint d) {
+    return a | (b << 8u) | (c << 16u) | (d << 24u);
+}
+
+void ue8m0_scale(uint block, uint base, uint n, float qmax) {
+    float amax = 0.0;
+    for (uint i = 0u; i < n; ++i) { amax = max(amax, abs(src[base + i])); }
+    int exponent = amax > 0.0 ? int(ceil(log2(amax / qmax))) : -127;
+    exponent = clamp(exponent, -127, 128);
+    scale_code[block] = uint(exponent + 127);
+    scale_value[block] = exp2(float(exponent));
+}
+
+float e4m3_value(uint code) {
+    uint expv = code >> 3u;
+    uint mant = code & 7u;
+    if (expv == 0u) { return float(mant) * exp2(-9.0); }
+    return (1.0 + float(mant) * 0.125) * exp2(float(int(expv) - 7));
+}
+
+uint quant_e4m3(float x) {
+    uint sign = x < 0.0 ? 0x80u : 0u;
+    float ax = min(abs(x), 448.0);
+    uint best = 0u;
+    float best_err = 1.0 / 0.0;
+    for (uint code = 0u; code <= 0x7eu; ++code) {
+        float err = abs(e4m3_value(code) - ax);
+        if (err < best_err || (err == best_err && (code & 1u) == 0u)) {
+            best = code;
+            best_err = err;
+        }
+    }
+    return sign | best;
+}
+
+uint bf16_bits(float x) {
+    uint bits = floatBitsToUint(x);
+    return (bits + 0x7fffu + ((bits >> 16u) & 1u)) >> 16u;
+}
+
+const float E2M1[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+uint quant_e2m1(float x) {
+    uint sign = x < 0.0 ? 8u : 0u;
+    float ax = abs(x);
+    uint best = 0u;
+    float best_err = abs(ax);
+    for (uint code = 1u; code < 8u; ++code) {
+        float err = abs(E2M1[code] - ax);
+        if (err < best_err || (err == best_err && (code & 1u) == 0u)) {
+            best = code;
+            best_err = err;
+        }
+    }
+    return sign | best;
+}
+
+void main() {
+    uint out_row = gl_WorkGroupID.x;
+    if (out_row >= pc.rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+
+#ifdef DSV4_FP8
+    uint sb = out_row * 512u;
+    if (t < 7u) { ue8m0_scale(t, sb + t * 64u, 64u, 448.0); }
+    barrier();
+    uint logical_row = pc.row + out_row;
+    uint page = logical_row / 64u;
+    uint in_page = logical_row % 64u;
+    uint page_base = pc.cache_off + page * 37376u;
+    uint data_base = page_base + in_page * 576u;
+    uint scale_base = page_base + 64u * 576u + in_page * 8u;
+    if (t < 112u) {
+        uint i = t * 4u;
+        uint block = i / 64u;
+        float inv = 1.0 / scale_value[block];
+        dst[(data_base + i) >> 2u] = pack4(
+            quant_e4m3(src[sb + i] * inv),
+            quant_e4m3(src[sb + i + 1u] * inv),
+            quant_e4m3(src[sb + i + 2u] * inv),
+            quant_e4m3(src[sb + i + 3u] * inv));
+    }
+    if (t < 32u) {
+        uint i = 2u * t;
+        dst[(data_base + 448u) / 4u + t] =
+            bf16_bits(src[sb + 448u + i]) | (bf16_bits(src[sb + 448u + i + 1u]) << 16u);
+    }
+    if (t < 2u) {
+        uint i = 4u * t;
+        uint a = scale_code[i];
+        uint b = scale_code[i + 1u];
+        uint c = scale_code[i + 2u];
+        uint d = t == 0u ? scale_code[3] : 0u;
+        dst[scale_base / 4u + t] = pack4(a, b, c, d);
+    }
+#endif
+
+#ifdef DSV4_MXFP4
+    uint sb = out_row * 128u;
+    if (t < 128u) { had[t] = src[sb + t]; }
+    barrier();
+    for (uint stride = 1u; stride < 128u; stride <<= 1u) {
+        if (t < 64u) {
+            uint block = t / stride;
+            uint lane = t % stride;
+            uint i0 = block * (2u * stride) + lane;
+            uint i1 = i0 + stride;
+            float a = had[i0];
+            float b = had[i1];
+            had[i0] = a + b;
+            had[i1] = a - b;
+        }
+        barrier();
+    }
+    if (t < 128u) { had[t] *= 0.08838834764831845; }
+    barrier();
+    if (t < 4u) {
+        float amax = 0.0;
+        for (uint i = 0u; i < 32u; ++i) { amax = max(amax, abs(had[t * 32u + i])); }
+        int exponent = amax > 0.0 ? int(ceil(log2(amax / 6.0))) : -127;
+        exponent = clamp(exponent, -127, 128);
+        scale_code[t] = uint(exponent + 127);
+        scale_value[t] = exp2(float(exponent));
+    }
+    barrier();
+    uint base = pc.cache_off + (pc.row + out_row) * 68u;
+    if (t < 16u) {
+        uint first = t * 8u;
+        uint bytes = 0u;
+        for (uint pair = 0u; pair < 4u; ++pair) {
+            uint i = first + 2u * pair;
+            uint block = i / 32u;
+            float inv = 1.0 / scale_value[block];
+            uint packed = quant_e2m1(had[i] * inv) | (quant_e2m1(had[i + 1u] * inv) << 4u);
+            bytes |= packed << (8u * pair);
+        }
+        dst[base / 4u + t] = bytes;
+    }
+    if (t == 0u) {
+        dst[(base + 64u) / 4u] = pack4(scale_code[0], scale_code[1], scale_code[2], scale_code[3]);
+    }
+#endif
+}

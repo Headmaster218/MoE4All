@@ -1,0 +1,187 @@
+#version 460
+// Chunked gated-DeltaNet, pass 1/3 (PREP — fully parallel over (chunk, k-head)): L2-normalize the
+// chunk's q/k and precompute the intra-chunk dot matrices the scan needs:
+//   kn/qn: normalized k̂ (and q̂·1/√kd), written back to global
+//   D [j][l] = k̂_j·k̂_l   (l < j;  the A matrix before its per-VALUE-head β/decay factors)
+//   Dq[i][j] = q̂_i·k̂_j   (j ≤ i;  the Wq matrix before its decay factor)
+// Hoisting this out of the sequential chunk scan removes the work the scan's column-block
+// workgroups used to DUPLICATE (measured ~37% of the monolithic kernel at 4 blocks), and it runs
+// here at full occupancy since chunks are independent.
+//
+// D/Dq are the two [C,C]=[32,32] contractions over kd (≤128, multiple of 16 — qwen35's SSM head_k
+// dim is a fixed 128): STRUCTURAL rework replaces the scalar per-thread dot-product loop (kd·C·C
+// FMA done by 256 scalar lanes) with RDNA3 cooperative-matrix (VK_KHR_cooperative_matrix, the same
+// f16-in/f32-accumulate 16x16x16 tiles native_gemm_warp.comp uses for the main GEMM path): one
+// subgroup computes D = K̂K̂ᵀ (2x2 tiles, K̂ loaded RowMajor for the [C,kd] operand and ColumnMajor
+// for the same buffer as the [kd,C] operand — a transpose-free outer product), a second subgroup
+// computes Dq = Q̂K̂ᵀ the same way. Both a full (unmasked) 32x32 tile — the scan only ever reads the
+// strict/lower-triangular half, so the unused half is harmless waste, not a correctness issue.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define C 32u
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nk;      // k/q heads
+    uint kd;      // head_k_dim (≤ 128, multiple of 16)
+    float eps;
+    float qscale; // 1/sqrt(kd)
+} pc;
+
+layout(binding = 0) readonly buffer QB { float q[]; };   // [rows, nk*kd] raw
+layout(binding = 1) readonly buffer KB { float k[]; };   // [rows, nk*kd] raw
+layout(binding = 2) writeonly buffer KN { float kng[]; }; // [rows, nk*kd] normalized
+layout(binding = 3) writeonly buffer QN { float qng[]; }; // [rows, nk*kd] normalized ×1/√kd
+layout(binding = 4) writeonly buffer DK { float dk[]; };  // [nchunk, nk, C, C], l<j
+layout(binding = 5) writeonly buffer DQ { float dq[]; };  // [nchunk, nk, C, C], j≤i
+
+shared float kn[C * 128u];
+shared float qn[C * 128u];
+shared float16_t knf[C * 128u]; // f16 mirror of kn, coopmat A/B operand (row j, col kk, stride 128)
+shared float16_t qnf[C * 128u]; // f16 mirror of qn
+shared float red[256];
+shared float nrm[C];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint chunk = gl_WorkGroupID.x / pc.nk;
+    uint kh = gl_WorkGroupID.x % pc.nk;
+    uint base = chunk * C;
+    uint c = min(C, pc.rows - base);
+    uint kd = pc.kd;
+
+    // load raw k,q
+    for (uint p = t; p < c * kd; p += 256u) {
+        uint j = p / kd;
+        uint kk = p % kd;
+        uint src = (base + j) * pc.nk * kd + kh * kd + kk;
+        kn[j * 128u + kk] = k[src];
+        qn[j * 128u + kk] = q[src];
+    }
+    barrier();
+
+    // per-token L2 norms (8 lanes per token) — same reduction shape as the monolithic kernel
+    {
+        uint j = t >> 3u;
+        uint lane = t & 7u;
+        float ks = 0.0;
+        if (j < c) {
+            for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * 128u + kk]; ks += x * x; }
+        }
+        red[t] = ks;
+        barrier();
+        if (lane == 0u && j < c) {
+            float s = 0.0;
+            for (uint i = 0u; i < 8u; i++) { s += red[(j << 3u) + i]; }
+            nrm[j] = sqrt(s + pc.eps);
+        }
+        barrier();
+        float kinv = (j < c) ? 1.0 / nrm[j] : 0.0;
+        barrier(); // nrm reused for q
+        float qs = 0.0;
+        if (j < c) {
+            for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * 128u + kk]; qs += x * x; }
+        }
+        red[t] = qs;
+        barrier();
+        if (lane == 0u && j < c) {
+            float s = 0.0;
+            for (uint i = 0u; i < 8u; i++) { s += red[(j << 3u) + i]; }
+            nrm[j] = sqrt(s + pc.eps);
+        }
+        barrier();
+        if (j < c) {
+            float qinv = pc.qscale / nrm[j];
+            for (uint kk = lane; kk < kd; kk += 8u) {
+                kn[j * 128u + kk] *= kinv;
+                qn[j * 128u + kk] *= qinv;
+            }
+        }
+    }
+    barrier();
+
+    // write normalized k̂/q̂ back to global (the scan streams them per column block)
+    for (uint p = t; p < c * kd; p += 256u) {
+        uint j = p / kd;
+        uint kk = p % kd;
+        uint dst = (base + j) * pc.nk * kd + kh * kd + kk;
+        kng[dst] = kn[j * 128u + kk];
+        qng[dst] = qn[j * 128u + kk];
+    }
+
+    // f16 mirror for the coopmat contraction (f32 accumulate downstream keeps precision; matches
+    // the f16-in/f32-accum convention native_gemm_warp/attn_qk_warp already use everywhere else in
+    // the transformer). Zero-pad rows ≥ c so a partial last chunk's tile loads read defined (finite)
+    // values — those output rows/cols are never read back (dk/dq reads are guarded by c downstream)
+    // so the exact padding value doesn't affect correctness, only avoids stale-LDS garbage.
+    for (uint p = t; p < c * kd; p += 256u) {
+        uint j = p / kd;
+        uint kk = p % kd;
+        knf[j * 128u + kk] = float16_t(kn[j * 128u + kk]);
+        qnf[j * 128u + kk] = float16_t(qn[j * 128u + kk]);
+    }
+    for (uint p = t + c * kd; p < C * kd; p += 256u) {
+        uint j = p / kd;
+        uint kk = p % kd;
+        knf[j * 128u + kk] = float16_t(0.0);
+        qnf[j * 128u + kk] = float16_t(0.0);
+    }
+    barrier();
+
+    // D[j][l] = k̂_j·k̂_l and Dq[j][l] = q̂_j·k̂_l, full 32x32 tiles via coopmat (2x2 16x16 frags).
+    // One subgroup per matrix — kd/16 is small (≤8), so this is a handful of coopMatMulAdd ops vs.
+    // the scalar loop's kd·C·C serial FMAs; the rest of the workgroup's subgroups are idle here
+    // (this pass is many-small-workgroups parallel already, so within-workgroup underuse is cheap).
+    uint sg = gl_SubgroupID;
+    uint mbase = (chunk * pc.nk + kh) * C * C;
+    if (sg == 0u) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
+        for (uint kf = 0u; kf < kd; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0, a1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;
+            coopMatLoad(a0, knf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, knf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, knf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, knf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
+            acc00 = coopMatMulAdd(a0, b0, acc00);
+            acc01 = coopMatMulAdd(a0, b1, acc01);
+            acc10 = coopMatMulAdd(a1, b0, acc10);
+            acc11 = coopMatMulAdd(a1, b1, acc11);
+        }
+        coopMatStore(acc00, dk, mbase + 0u * C + 0u, C, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc01, dk, mbase + 0u * C + 16u, C, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc10, dk, mbase + 16u * C + 0u, C, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc11, dk, mbase + 16u * C + 16u, C, gl_CooperativeMatrixLayoutRowMajor);
+    } else if (sg == 1u) {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
+        for (uint kf = 0u; kf < kd; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0, a1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;
+            coopMatLoad(a0, qnf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, qnf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, knf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, knf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
+            acc00 = coopMatMulAdd(a0, b0, acc00);
+            acc01 = coopMatMulAdd(a0, b1, acc01);
+            acc10 = coopMatMulAdd(a1, b0, acc10);
+            acc11 = coopMatMulAdd(a1, b1, acc11);
+        }
+        coopMatStore(acc00, dq, mbase + 0u * C + 0u, C, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc01, dq, mbase + 0u * C + 16u, C, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc10, dq, mbase + 16u * C + 0u, C, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc11, dq, mbase + 16u * C + 16u, C, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}

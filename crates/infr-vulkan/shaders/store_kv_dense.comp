@@ -1,0 +1,42 @@
+#version 460
+// Cast KV activations into a DENSE KV cache: -DDST_F32 (f32 cache) or -DDST_BF16 (bf16 cache), from
+// an f16 source (-DSRC_F16, the roped K) or f32 (V). One thread per element, at element offset `off`.
+// The read side expands these back to an f16 scratch (f32→f16 reuses store_f16; bf16→f16 uses the
+// dequant_kv FMT_BF16 path), so the standard f16 attention runs on them — GPU attention is f16, so
+// f32/bf16 KV is a storage/format choice bounded by the f16 query precision (bf16→f16 is lossless
+// in-range).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// #74: write the dense KV cache by 64-bit device address (kv_addr.glsl `k_addr`, d_lo/d_hi) — this
+// kernel is BDA-only (slice 5 deleted the bound-`dst` twin). The cache stays bound at the write slot
+// as an inert descriptor for the store→read barrier (see Recorder::store_kv_dense).
+layout(push_constant) uniform PC { uint n; uint off;
+    uint d_lo; uint d_hi;
+} pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
+layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
+#ifdef DST_BF16
+#define KV_STORE_U16 // bf16 store needs the int16 write block
+#endif
+#include "kv_addr.glsl"
+
+void main() {
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    float v = float(src[i]);
+#ifdef DST_BF16
+    // bf16 = top 16 bits of f32, round-to-nearest-even.
+    uint b = floatBitsToUint(v);
+    uint bf = (b + 0x7FFFu + ((b >> 16) & 1u)) >> 16;
+    kv_store_u16(k_addr, pc.off + i, bf);
+#else
+    kv_store_f32(k_addr, pc.off + i, v);
+#endif
+}

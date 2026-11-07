@@ -1,0 +1,1570 @@
+//! The compute backend seam — the ONLY device-aware trait. Everything above is generic over it.
+//!
+//! Object-safe on purpose so the engine can hold `Arc<dyn Backend>` and stay blind to whether
+//! Vulkan / CPU / Metal is underneath. See docs/plan.md.
+//!
+//! ## Execution model
+//!
+//! 1. The model builds a [`Graph`] (op-list) once per forward *shape* and `compile`s it to a
+//!    [`Plan`] (pipelines, buffer-size planning, recorded command buffer for Vulkan).
+//! 2. The model owns long-lived buffers (weights, KV cache) and per-step input/output buffers,
+//!    and binds them to the graph's `Input`/`Weight`/`Output` handles via [`Bindings`].
+//! 3. `execute(plan, bindings)` allocates the graph's `Internal` scratch, runs the ops, and
+//!    writes results into the bound `Output` buffers. `Internal`/`Output` scratch is transient.
+
+use crate::error::{Error, Result};
+use crate::graph::Graph;
+use crate::tensor::TensorId;
+
+/// Maximum active rows in one layer-synchronous Decode cohort (not the KV slot pool size).
+pub const MAX_DECODE_ROWS: usize = 8;
+
+/// Bounds-check a [`Backend::copy_buffer`] prefix request: the copied prefix (`bytes`) must fit
+/// inside the source buffer (`src_len`). Returns a `Backend` error rather than letting a downstream
+/// slice/download panic on an oversize `bytes`. Extracted as a pure helper so the check is unit-
+/// testable without standing up a full mock backend.
+pub fn check_copy_bytes(bytes: usize, src_len: usize) -> Result<()> {
+    if bytes > src_len {
+        return Err(Error::backend(format!(
+            "copy_buffer: requested prefix of {bytes} bytes exceeds source buffer of {src_len} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The 16x16x16 (M,N,K) cooperative-matrix tile every production coopmat shader is built for
+/// (RADV/RDNA3+, NVIDIA — every `coopmat<...,16,16,...>` declaration across
+/// gemm_warp/native_gemm*/attn_*/deltanet_prep).
+pub const COOPMAT_TILE_16: (u32, u32, u32) = (16, 16, 16);
+/// The 8x8x16 (M,N,K) tile Intel Arc (Mesa ANV, XMX) enumerates for f16 — the ONLY non-16x16x16
+/// shape any kernel here is built for, and only `native_gemm_warp`'s `_cm8` variants at that
+/// (opt-in via `INFR_CM_8X8=1`; see the Vulkan backend's shape selection).
+pub const COOPMAT_TILE_8: (u32, u32, u32) = (8, 8, 16);
+
+/// Device capabilities the graph compiler queries to pick fast vs fallback kernels.
+#[derive(Clone, Debug, Default)]
+pub struct Capabilities {
+    pub name: String,
+    // ── per-type compute capabilities ───────────────────────────────────────────────────────────
+    // Naming: `f16`/`f8`/`i8` are the infr spelling for the numeric types (== fp16/fp8/int8). Two
+    // ORTHOGONAL axes, expressed as flat `<type>` + `<type>_<primitive>` bools (a device can have
+    // one without the other — e.g. coopmat with only f16 components, or f16 ALU without coopmat):
+    //   • `<type>`          — the device supports this type for scalar/vector storage & math
+    //                         (f16 = shaderFloat16, f8 = the float8 storage/convert ext,
+    //                         i8 = shaderInt8). Drives the scalar / non-coopmat fallback kernels.
+    //   • `<type>_<prim>`   — the type is usable by a matrix/dot PRIMITIVE: `_coopmat` = accepted as
+    //                         a cooperative-matrix component (enumerated from the device's coopmat
+    //                         config list); `i8_dot` = packed dp4a integer dot.
+    // infr's coopmat GEMM dequants any on-disk weight dtype to f16 IN-SHADER before the multiply,
+    // so today's GEMM keys off `f16_coopmat` specifically; `f8_coopmat` is the (pending) fp8 tier.
+    // (No `f32` capability flag: f32 ALU is universal — every device has it — so a flag would gate
+    // nothing. f32 weights that DO ship in some GGUFs, e.g. qwen3moe's router, run on the
+    // unconditional `linear_f32` GEMV. And no target GPU enumerates an f32-operand coopmat config.)
+    /// f16 (== fp16) scalar/vector ALU (`shaderFloat16`) — the non-coopmat f16 warp/GEMV fallback.
+    pub f16: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for f16 components (f16×f16→f16/f32),
+    /// picked from the device's enumerated config list by preference order: [`COOPMAT_TILE_16`]
+    /// first (the production shape every coopmat shader is built for), then [`COOPMAT_TILE_8`]
+    /// (Intel Arc XMX — only honored when the `INFR_CM_8X8=1` opt-in is set, since only the
+    /// `native_gemm_warp` `_cm8` builds exist at that shape). `None` = no usable f16 coopmat
+    /// (route to the non-coopmat tiers). Call sites that mean "the full 16x16x16 kernel set is
+    /// live" use the [`f16_coopmat`](Self::f16_coopmat) accessor, which is EXACTLY the pre-shape-
+    /// table boolean.
+    pub coopmat_f16: Option<(u32, u32, u32)>,
+    /// f8 (== fp8, E4M3/E5M2) storage/convert support (`VK_EXT_shader_float8`-class). infr has no
+    /// scalar f8 math path today; this exists for symmetry / future use. False on RDNA3.
+    pub f8: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for f8 (E4M3/E5M2) A/B components —
+    /// the fp8 coopmat GEMM tier. Detected by enumerating the device's coopmat configs; NOT a
+    /// subset of `coopmat_f16` (a unit can do f16 components but not f8). Only
+    /// [`COOPMAT_TILE_16`] is ever selected (no f8 8x8x16 kernels exist). `None` on all
+    /// pre-RDNA4/pre-Ada HW.
+    pub coopmat_f8: Option<(u32, u32, u32)>,
+    /// i8 (== int8) storage & math in shaders (`shaderInt8`) — the scalar integer path.
+    pub i8: bool,
+    /// The device advertises packed i8 dot-product (`VK_KHR_shader_integer_dot_product` /
+    /// `dotPacked4x8AccSat`, core in Vulkan 1.3) — the decode i8 `mmv` path's dp4a accumulate. A
+    /// SEPARATE primitive from coopmat (hence not `coopmat_i8`). False = route to the scalar
+    /// dequant GEMV (needs no extension). Independent of `f16`/`coopmat_f16`.
+    pub i8_dot: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for SINT8×SINT8→SINT32 components
+    /// (enumerated from the device's coopmat config list, same discipline as `coopmat_f16`; only
+    /// [`COOPMAT_TILE_16`] is ever selected — the shape every int8 coopmat shader is hardcoded
+    /// to). DETECTION ONLY — Some on this RX 7900 XTX (Mesa 26.1.4), but int8 coopmat previously
+    /// HUNG the GPU on an older Mesa (commit ad82a77; the standalone `coopmat_int8_test` harness
+    /// confirmed the fix). The kernel is therefore an ADDITIONAL opt-in gate on top of this:
+    /// the adapter only dispatches it when `INFR_I8_COOPMAT=1` is also set (default off) — see
+    /// adapter.rs's `Op::Linear` GEMM branch. The Vulkan backend adds a third gate the other
+    /// tiers have no equivalent of: the kernel reads its accumulator elements at a (row,col)
+    /// mapping the cooperative-matrix spec fixes per IMPLEMENTATION, so that mapping is checked
+    /// against a known-answer product on the actual device before the tier is armed
+    /// (`VulkanBackend::verify_i8_coopmat_layout`).
+    pub coopmat_i8: Option<(u32, u32, u32)>,
+    /// bf16 (bfloat16) scalar storage/convert support (`VK_KHR_shader_bfloat16`-class). Distinct
+    /// from `f16` (IEEE half): same 16 bits but 8 exponent / 7 mantissa. False on RDNA3.
+    pub bf16: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for bf16 components
+    /// (bf16×bf16→bf16/f32). Enumerated from the device's coopmat config list (raw
+    /// `VK_COMPONENT_TYPE_BFLOAT16_KHR`, confirmed on RDNA4/Navi44). NOT a subset of
+    /// `coopmat_f16`. Only [`COOPMAT_TILE_16`] is ever selected. `None` on all pre-RDNA4 HW.
+    pub coopmat_bf16: Option<(u32, u32, u32)>,
+    /// Supported subgroup-size range (`VkPhysicalDeviceSubgroupSizeControlProperties`). The coopmat
+    /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
+    /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =
+    /// subgroup-size-control unsupported (can't pin at all — use the driver's default subgroup).
+    pub subgroup_min: u32,
+    pub subgroup_max: u32,
+    /// PREFERRED pinned subgroup size for the bandwidth-critical decode GEMV/reduction kernel
+    /// family (the `_sg16` SPIR-V twins: `native_gemv_sg` / `native_gemv_id_multi_sg` /
+    /// `native_mmv_mw` / `mul_mat_vec_q` / `quant_q8_row`). Capability-driven: devices where
+    /// `subgroup_min <= 16` (SIMD8/SIMD16 EUs — Intel Arc, future small-subgroup GPUs) default
+    /// to 16, everything else (RADV wave32, NVIDIA warp32) defaults to 32. Every OTHER pinned-32
+    /// kernel (rmsnorm/softmax/coopmat GEMM/attention…) is unaffected by this field.
+    /// `INFR_SG=16|32` overrides for A/B; a request the device can't pin falls back to 32.
+    /// 0 on backends without subgroup pinning (CPU/Metal — the field gates Vulkan shader picks).
+    pub sg_pref: u32,
+    /// `VkPhysicalDeviceProperties.deviceType == INTEGRATED_GPU` — an iGPU/APU sharing the CPU's
+    /// memory controller and carrying one to two ORDERS OF MAGNITUDE less compute than the
+    /// discrete cards every dispatch shape here is tuned for (a Ryzen 9950X3D's RDNA2 iGPU is
+    /// ~2 CU against a 7900 XTX's 96).
+    ///
+    /// The load-bearing consequence is the GPU WATCHDOG, not throughput: amdgpu resets a `gfx`-ring
+    /// job that runs past ~10 s (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`), and infr
+    /// submits ONE command buffer per forward pass — so a whole prefill chunk is a SINGLE watchdog
+    /// job. A default 1024-row chunk measures 0.78-1.12 s of GPU on a 7900 XTX in the NON-COOPMAT
+    /// tier an iGPU is forced onto (RDNA2 has no cooperative matrix), which at the ~32x slowdown
+    /// calibrated from a real iGPU run lands at 25-36 s — a guaranteed TDR. Devices that set this
+    /// get a smaller default prefill chunk (see the seam's `ubatch_rows`), the one knob that
+    /// bounds per-submit GPU time. Discrete devices leave it false and every shape stays as tuned.
+    pub integrated: bool,
+    /// Shader/compute-unit count when the device advertises one (`VK_AMD_shader_core_properties`),
+    /// else 0 = UNKNOWN. ADVISORY only — it scales the `integrated` chunk budget where present.
+    /// Never gate correctness on it: most drivers report nothing.
+    pub compute_units: u32,
+    /// `VkPhysicalDeviceVulkan12Features.bufferDeviceAddress` — the device can hand a shader a
+    /// 64-bit `VkDeviceAddress` for a buffer (`GL_EXT_buffer_reference`), so a kernel may read a
+    /// buffer LARGER than `maxStorageBufferRange` (one SSBO binding's ~4 GiB reach on RADV). infr's
+    /// paged-MoE expert arena REQUIRES this: a per-role pool now spans as much VRAM as the budget
+    /// allows, addressed by a raw pointer rather than a bound SSBO. Core in Vulkan 1.2, so every
+    /// real 1.3 target sets it — the Vulkan backend hard-errors at init when it is absent rather
+    /// than keeping a u32 fallback. Backends without a device-address concept (CPU/Metal) leave
+    /// this false; nothing there reads it.
+    pub buffer_device_address: bool,
+    /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
+    /// 16 KiB; RADV gives 64 KiB, NVIDIA 48 KiB, MoltenVK/mobile often 32 KiB. The flash-attention tile
+    /// height is picked to fit this (and flash is skipped entirely if even the smallest tile won't).
+    pub max_shared_memory_bytes: u32,
+    pub unified_memory: bool,
+    /// The backend records a single-token decode graph ONCE and replays it per token, reading the
+    /// position from a device-side params buffer (Vulkan seam) instead of the graph's baked `pos`.
+    /// When set, the runner may compile the decode graph once (pos=0) and reuse it across the whole
+    /// decode loop. Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
+    pub decode_replay: bool,
+    /// The backend prefers the dense FFN's gate+up weights CONCATENATED into one `[2*nff, ne]`
+    /// tensor (one GEMV/GEMM + `Op::GatedActFused` instead of two Linears + `Op::GatedAct`).
+    /// Costs an owned copy of both weights at load, so zero-copy mmap backends (CPU) leave this
+    /// false and keep the separate-tensor form.
+    pub combined_gu: bool,
+    /// The backend lowers [`crate::Op::QsaPrepare`] and can therefore consume the concatenated
+    /// Qwen3.8 indexer query/key projection used by that experimental fusion.
+    pub qsa_prepare: bool,
+    /// The backend executes [`crate::Op::EmbedGather`] (dequantize embedding-table rows selected
+    /// by a device-side id buffer). When set, the runner uploads TOKEN IDS (4 bytes each) instead
+    /// of host-dequantized f32 embedding rows — decode feeds 4B/token, prefill 4B/token instead
+    /// of `4*n_embd`. Backends without a table-row dequant kernel leave this false and keep the
+    /// host embed path.
+    pub embed_gather: bool,
+    /// The backend executes [`crate::Op::Sample`] (device-side temperature + top-k + top-p
+    /// sampling; only the 4-byte token id reads back). False = the runner downloads the logits
+    /// and samples on the host.
+    pub gpu_sample: bool,
+    /// The backend executes [`crate::Op::Sample`] with `rows > 1`, producing one sampled token id
+    /// per logits row. Backends with a single-row sampler leave this false.
+    pub sample_rows: bool,
+    /// The backend executes [`crate::Op::Argmax`] with `rows > 1` (per-row greedy argmax over
+    /// `[rows, n]` logits — the MTP speculative-verify accept reads back m 4-byte ids instead of
+    /// the m×vocab logits, issue #31). Every backend handles `rows == 1` (the decode loop);
+    /// backends whose kernel is single-row-only (Metal) leave this false and the runner keeps
+    /// the host-logits accept path there.
+    pub argmax_rows: bool,
+    /// The backend executes [`crate::Op::ArgmaxProb`] (fused single-row argmax + softmax top-1
+    /// probability — the MTP draft-loop accept, issue #33 follow-up: only 8 bytes read back
+    /// instead of the `[vocab]` logits + host argmax/softmax scan). Backends without the kernel
+    /// leave this false and the MTP driver keeps the host-logits `top1_softmax` path.
+    pub argmax_prob: bool,
+    /// The backend executes [`crate::Op::GatedRmsNorm`] (fused per-head RMSNorm + SiLU/Sigmoid
+    /// gate multiply, one dispatch instead of `QkNorm`→`GatedAct`'s two).
+    /// False = the runner keeps emitting the split pair (identical math, one extra
+    /// read-after-write barrier on backends that have one).
+    pub gated_rmsnorm: bool,
+    /// The backend executes two same-shape F32 projections from one activation as one dispatch.
+    /// This saves one command and the inter-op scheduling boundary; it does not concatenate or
+    /// duplicate either weight and adds no persistent device allocation.
+    pub linear_pair_f32: bool,
+    /// The backend accepts [`crate::Op::LinearPair`] with two same-shape Q8_0 weights and F32
+    /// activation/outputs for one row. Other row counts keep ordinary two-Linear graph nodes,
+    /// including their multi-row selection; this does not promise fusion for every shape.
+    /// Independent from `linear_pair_f32`, false by default, and advertised only when the
+    /// backend's paired-Q8 implementation and device policy are enabled.
+    pub linear_pair_q8: bool,
+    /// The backend executes Qwen3.8's one-row Q8_0 HC down projection, scaled SiLU, and tiny F32
+    /// inject projection in one dispatch. Multi-row Prefill/Verify and other weight types retain
+    /// the split graph.
+    pub qwen_hc_down_inject: bool,
+    /// The backend treats every KV cache buffer as a RING over its allocated row count: `WriteKv`
+    /// lands row `pos % cap_rows` and `Attention` reads key/value position `j` at row
+    /// `j % cap_rows`, where `cap_rows = declared cache elements / row width`. A full-context
+    /// cache (`cap_rows >= every kv_len`) makes the modulo an identity, so setting this only
+    /// matters when the runner allocates a sliding-window layer's cache at window size instead of
+    /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
+    /// by position (Metal) leave this false and get full-context allocations for every layer.
+    pub kv_swa_ring: bool,
+    /// What the ops write into a bound f32 [`TensorKind::Input`] is visible to the NEXT `execute`
+    /// that binds the same buffer — either because the backend dispatches straight against the
+    /// caller's buffer (Vulkan: only `Internal` handles get backend scratch) or because the
+    /// executor copies every mutated f32 Input back at the end of the call
+    /// ([`crate::exec::writes_back`] — the CPU reference and Metal). FALSE is for a backend that
+    /// rewrites or redistributes the graph and hands the results between its own buffers (the
+    /// multi-GPU TP/EP/pipeline wrappers), where the caller's copy is only ever an entry value.
+    ///
+    /// Only a caller that threads state ACROSS executes needs this — within one call every backend
+    /// behaves the same, which is why `hidden` has always been a bound Input on the host-embed
+    /// path. The seam's layer-major prefill is the consumer: it carries the residual stream from
+    /// one layer's dispatch to the next through exactly such a buffer, and keeps the chunk-major
+    /// order on a backend that answers false.
+    pub graph_input_inplace: bool,
+}
+
+/// The DEFAULT prefill chunk (rows) for an INTEGRATED GPU with `cu` compute units (0 = unknown).
+///
+/// This bounds the cost of ONE DISPATCH, which is the one thing a backend cannot split: the GPU
+/// hang watchdog kills a whole submit, and a submit can be cut into more command buffers (that is
+/// [`Backend::submit_dispatch_cap`]'s job), but a single dispatch is indivisible, so its own
+/// runtime has to stay well inside the budget on its own.
+///
+/// It is NOT the watchdog bound. It used to be sold as one, and that was measured WRONG on the
+/// surveyed 2-CU RDNA2 part (Ryzen 9 9950X3D / RAPHAEL_MENDOCINO), where a Qwen3-8B Q4_K_M
+/// prefill chunk is one command buffer of 757 dispatches and 684 barriers, and its GPU time is
+/// nearly FLAT in the row count:
+///
+///   rows |   8    |  16    |  32    |  64    | 128
+///   ─────┼────────┼────────┼────────┼────────┼───────
+///   time | 1163ms | 1199ms | 1861ms | 2047ms | 2048ms
+///
+/// A 16x cut in rows buys 1.76x of submit time and bottoms out around 1.15 s, because what the
+/// forward actually costs on a 2-CU part is per-dispatch launch + barrier overhead and one sweep
+/// of the model's weights — neither of which shrinks with rows. Since that part kills a submit at
+/// ~2.06 s, NO row cap can put a whole-forward command buffer safely under the watchdog. Shrinking
+/// rows here to dodge a TDR is cargo cult; splitting the submit is the fix.
+pub fn integrated_ubatch_rows(cu: u32) -> usize {
+    /// The surveyed iGPU (RDNA2 Raphael/Mendocino) — the part the 128-row figure is calibrated on.
+    const BASE_CU: u32 = 2;
+    /// Rows at BASE_CU: the largest chunk whose heaviest single dispatch (`native_gemm_mmq_q6k`,
+    /// measured at 15.0 ms/dispatch here) stays two orders of magnitude inside the watchdog.
+    const BASE_ROWS: usize = 128;
+    /// Never exceed the discrete default — this is a hardening cap, not a tuning knob.
+    const MAX_ROWS: usize = 1024;
+    if cu == 0 {
+        return BASE_ROWS; // unknown: assume the weakest part we have measured
+    }
+    (BASE_ROWS * (cu as usize).div_ceil(BASE_CU as usize).max(1)).clamp(BASE_ROWS, MAX_ROWS)
+}
+
+/// Target GPU time for ONE submit, in nanoseconds — the budget the submit splitter aims at.
+///
+/// The surveyed iGPU kills a submit at ~2.06 s (measured: a job submitted at T is ring-reset at
+/// T+2.06 s, and its fence is force-signaled so the wait even returns "successfully"). 150 ms
+/// leaves a ~13x margin, which absorbs the run-to-run jitter that made the un-split 2.05 s forward
+/// a coin flip against that budget.
+pub const SUBMIT_BUDGET_NS: u64 = 150_000_000;
+
+/// Stable fallback cap on DISPATCHES PER SUBMIT. `0` = unlimited (never split).
+///
+/// Vulkan's transient/static path normally calibrates from a safer cap using GPU timestamps. This
+/// fallback remains for queues without timestamp support and for persistent decode command buffers,
+/// which are recorded once and therefore cannot follow a cap that changes during calibration.
+///
+/// 128 comes from the surveyed 2-CU part: 757 dispatches ≈ 2.05 s ⇒ ~2.7 ms/dispatch ⇒ 128
+/// dispatches ≈ 0.35 s, well below the measured ~2 s watchdog timeout. This fixed fallback is
+/// independent of the tighter calibrated [`SUBMIT_BUDGET_NS`] target. It is deliberately NOT
+/// scaled by CU count: a bigger iGPU takes proportionally more rows (`integrated_ubatch_rows`), so
+/// its per-dispatch cost lands in the same place, and the same dispatch count lands in the same
+/// segment time.
+///
+/// PRIOR ART (independent confirmation of both the diagnosis and the shape of the fix):
+/// llama.cpp's Vulkan backend splits its graph the same way, and its comment says the same thing —
+/// "On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid
+/// this" (ggml-vulkan.cpp). It submits on `submitted_nodes >= max_nodes_per_submit` (100, every
+/// device) OR on a per-submit FLOP budget that scales with the CU count
+/// (`2e9 * shader_core_count` for a non-GCN AMD part under 24 CUs — i.e. ~4 GFLOP/submit on this
+/// 2-CU iGPU). Bounding WORK per submit rather than dispatches is the more general form of this
+/// and would also stay correct if a caller forced a much larger `INFR_UBATCH` on an iGPU (each
+/// dispatch then gets heavier while the count stays put). Worth adopting if this ever needs to be
+/// tighter.
+pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
+    if integrated {
+        128
+    } else {
+        0
+    }
+}
+
+/// Given actual GPU time (`elapsed_ns` across `dispatches`), return the dispatch cap that would
+/// place each submit near [`SUBMIT_BUDGET_NS`]. `0` = unlimited. Vulkan feeds this with bounded
+/// startup calibration samples from timestamp queries, excluding host I/O and queue-wait time.
+///
+/// This is what makes the splitter hardware-agnostic instead of a table of magic numbers: it does
+/// not care whether the GPU is a 2-CU iGPU, a 96-CU dGPU, or something that does not exist yet —
+/// it divides the budget by the per-dispatch cost this device just demonstrated. A fast GPU
+/// produces a cap far larger than any forward's dispatch count, which never splits anything (and
+/// is reported as unlimited); a slow one converges to segments of ~[`SUBMIT_BUDGET_NS`].
+pub fn submit_cap_from_measurement(elapsed_ns: u64, dispatches: usize) -> usize {
+    submit_cap_from_measurement_with_budget(elapsed_ns, dispatches, SUBMIT_BUDGET_NS)
+}
+
+/// [`submit_cap_from_measurement`] with an explicit per-submit GPU-time target. Automatic
+/// performance profiles use this to explore a wider cap while retaining the same measured,
+/// hardware-independent calculation. A zero budget is treated as a degenerate sample.
+pub fn submit_cap_from_measurement_with_budget(
+    elapsed_ns: u64,
+    dispatches: usize,
+    budget_ns: u64,
+) -> usize {
+    /// Never split below this: submits are not free, and individual dispatches are indivisible.
+    const MIN_CAP: usize = 16;
+    /// A cap at or above this covers any forward we record, so it means "never split".
+    const UNLIMITED_ABOVE: usize = 1 << 20;
+    if dispatches == 0 || elapsed_ns == 0 || budget_ns == 0 {
+        return 0;
+    }
+    let ns_per_dispatch = (elapsed_ns / dispatches as u64).max(1);
+    let cap = (budget_ns / ns_per_dispatch) as usize;
+    if cap >= UNLIMITED_ABOVE {
+        0
+    } else {
+        cap.max(MIN_CAP)
+    }
+}
+
+/// Legacy whole-forward wall-clock threshold retained for API compatibility.
+///
+/// Vulkan's automatic splitter no longer consumes this value: it calibrates from bounded GPU
+/// timestamp samples instead. External users that imported the constant continue to compile.
+#[doc(hidden)]
+pub const SUBMIT_DANGER_NS: u64 = 1_000_000_000;
+
+impl Capabilities {
+    /// The full 16x16x16 f16 coopmat kernel set is live (`coopmat_f16 == COOPMAT_TILE_16`) —
+    /// byte-for-byte the boolean every pre-shape-table gate keyed on. All existing coopmat
+    /// shaders (GEMM warptiles, flash attention, deltanet_prep) are built ONLY at this shape,
+    /// so they must stay dark when the device's tile is 8x8x16.
+    pub fn f16_coopmat(&self) -> bool {
+        self.coopmat_f16 == Some(COOPMAT_TILE_16)
+    }
+    /// The 8x8x16 f16 tile was selected (Intel Arc XMX under `INFR_CM_8X8=1`) — gates ONLY the
+    /// `native_gemm_warp` `_cm8` builds; every other coopmat family has no kernel at this shape.
+    pub fn f16_coopmat_8x8(&self) -> bool {
+        self.coopmat_f16 == Some(COOPMAT_TILE_8)
+    }
+    /// 16x16x16 f8 coopmat GEMM tier available (see `coopmat_f8`).
+    pub fn f8_coopmat(&self) -> bool {
+        self.coopmat_f8 == Some(COOPMAT_TILE_16)
+    }
+    /// 16x16x16 i8 coopmat available — DETECTION ONLY, the adapter additionally requires
+    /// `INFR_I8_COOPMAT=1` (see `coopmat_i8`).
+    pub fn i8_coopmat(&self) -> bool {
+        self.coopmat_i8 == Some(COOPMAT_TILE_16)
+    }
+    /// 16x16x16 bf16 coopmat GEMM tier available (see `coopmat_bf16`).
+    pub fn bf16_coopmat(&self) -> bool {
+        self.coopmat_bf16 == Some(COOPMAT_TILE_16)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferUsage {
+    Weights,
+    Activations,
+    /// Persistent per-layer, per-side KV cache buffers (`kbufs`/`vbufs` and their forks/
+    /// checkpoints/MTP-draft twins) — and, on qwen35, the DeltaNet conv/S recurrent-state buffers
+    /// that repurpose the same slots. Distinct from `Activations` ONLY so a backend can opt these
+    /// specific long-lived buffers into a 64-bit device address (see `Buffer::device_addr`)
+    /// without handing one to every scratch/partial/logits `Activations` allocation too. Slice 0
+    /// of the KV/u64 migration (issue #74): allocation-only, no kernel reads this address yet — a
+    /// backend that doesn't distinguish it (CPU, Metal today) may simply treat it like
+    /// `Activations`.
+    KvCache,
+    /// Host→device staging (host-visible, mapped): `upload` is a direct memcpy.
+    Staging,
+    /// Device→host readback (host-visible, mapped): `download` is a direct memcpy.
+    Readback,
+    /// Weights pinned in HOST memory but device-readable (GTT) — the MoE auto-fit's offloaded
+    /// expert banks. On ReBAR systems `Staging` (CpuToGpu) lands in device-local host-visible
+    /// VRAM, which defeats offloading; this class guarantees system RAM. The GPU reads it over
+    /// the bus. Backends without the distinction (CPU, unified-memory Metal) treat it as Weights.
+    HostWeights,
+}
+
+/// Opaque device-memory handle owned by a backend.
+/// RAII scope for a weight-load progress display (see [`Backend::weight_progress`]). Purely a
+/// lifetime marker: constructing it starts the display, dropping it finishes/clears it.
+pub trait ProgressScope: Send {}
+
+/// Optional upfront reservation for an ordered sequence of `BufferUsage::Weights` allocations.
+/// Keep this guard alive while allocating/uploading those buffers through the same backend.
+/// Dropping it without a successful [`finish`](Self::finish) rolls back the reservation; already
+/// returned buffers must retain their backing storage until their own last reference drops.
+pub trait WeightAllocationBatch {
+    /// Verify that every declared allocation was consumed and retain the packed storage.
+    /// An incomplete batch returns an error and remains active until completed or dropped.
+    fn finish(&mut self) -> Result<()>;
+}
+
+pub trait Buffer: Send + Sync {
+    /// The LOGICAL extent of the tensor this buffer holds — the byte count the model asked for —
+    /// NOT a per-device shard of it. A multi-device wrapper that splits one logical buffer across
+    /// `W` devices (`infr-vulkan`'s `TpBuffer` of kind `Kv`/`Weight`) must report the SUM over its
+    /// per-rank buffers and shard byte counts at its own `alloc`/`copy_buffer` boundary, exactly
+    /// once. The rule exists because backend-agnostic callers mix the two sources: `SeamKv`'s MTP
+    /// checkpoint sizes an alloc from `len_bytes()` while `seed_from` derives its copy length from
+    /// the model config. When `len_bytes()` returned the per-rank size, the first double-sharded
+    /// (`full/W²` buffers) and the second did not shard at all (a `W`-fold overrun) — both only
+    /// caught because Vulkan's `check_extent` bounds-checks every transfer.
+    fn len_bytes(&self) -> usize;
+    /// Downcast hook so a backend can recover its concrete buffer type from a `&dyn Buffer`
+    /// bound by the model (every buffer a backend sees was allocated by itself).
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// `Some(addr)` when this buffer's contents live inside a `bufferDeviceAddress` arena block at
+    /// device address `addr` (a resident-weight sub-tensor — see `infr-vulkan`'s
+    /// `INFR_RESIDENT_BDA`), rather than being its own independently-bound buffer object. A big
+    /// matmul weight reads such a buffer through its 64-bit device address via a `-DSTREAMED` shader
+    /// twin instead of a descriptor bind — required once the tensor's range would exceed
+    /// `maxStorageBufferRange`/4 GiB, and the preferred path for the big matmul families regardless.
+    /// A small weight tensor with no streamed twin (a norm gamma, bias, or rope table) may instead
+    /// be BOUND as a descriptor: the bind must cover only this tensor's own `(sub_offset, range)`,
+    /// never `(0, WHOLE_SIZE)` — a `WHOLE_SIZE` bind describes the WHOLE arena block, not this
+    /// tensor's byte range within it (see `infr-vulkan`'s `Recorder::vkb`, the sole choke point that
+    /// builds such binds correctly). `None` (the default) for every ordinary buffer, which is every
+    /// buffer today outside `INFR_RESIDENT_BDA=1`.
+    fn device_addr(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Geometry of a logically contiguous KV buffer whose physical storage is committed in fixed
+/// segments. `logical_bytes` preserves the graph-visible full-context extent; `segment_bytes`
+/// and `max_segments` describe the bounded physical backing grown on demand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentedKvSpec {
+    pub logical_bytes: usize,
+    pub segment_bytes: usize,
+    /// Logical tensor elements represented by one segment. This excludes format-local side data
+    /// such as the planar Q8 scale plane and is always a power of two for the 32K Qwen geometry.
+    pub segment_elements: usize,
+    pub max_segments: usize,
+}
+
+/// A compiled, ready-to-run graph (pipelines + command buffers for Vulkan, an op schedule for CPU).
+pub trait Plan: Send + Sync {
+    /// Downcast hook so a backend can recover its concrete plan type from a `&dyn Plan`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Optionally precompute immutable layout/metadata using CPU work only. The default is a no-op;
+    /// callers opt in explicitly, and `compile` need not call this method.
+    ///
+    /// Implementations must not allocate GPU resources, read or write bound buffers, touch KV
+    /// state, or acquire/change resource leases. Repeated calls must be idempotent; failed analysis
+    /// must remain retryable. Concurrent use with `execute` requires the backend's explicit
+    /// [`Backend::supports_async_compile`] guarantee.
+    fn prepare(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The trivial [`Plan`] both current backends share: it just carries a clone of the [`Graph`] — the
+/// CPU interpreter and the Vulkan adapter each re-walk the ops every `execute`, so "compiling" is
+/// only storing the graph. A backend's `compile` returns [`GraphPlan::boxed`]; its `execute` recovers
+/// the graph via `plan.as_any().downcast_ref::<GraphPlan>()`. (Was duplicated as `CpuPlan`/`VkPlan`.)
+pub struct GraphPlan {
+    pub graph: crate::graph::Graph,
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl GraphPlan {
+    pub fn boxed(graph: &crate::graph::Graph) -> Box<dyn Plan> {
+        Box::new(GraphPlan {
+            graph: graph.clone(),
+        })
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl Plan for GraphPlan {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Binds a [`Graph`]'s `Input`/`Weight`/`Output` handles to concrete backend buffers for one
+/// `execute`. The model holds the buffers; this only borrows them, so re-binding per step is cheap
+/// and the graph/plan is reused across steps without recompilation.
+///
+/// Backed by a `Vec` indexed by `TensorId.0` (a DENSE `u32` handle into one graph's tensor list),
+/// not a `HashMap` — `bind`/`get` are then hash-free O(1), which matters because decode rebinds
+/// every step. `bind`/`get` semantics are identical to the old map: `get` on an unbound (or
+/// never-grown-to) id returns `None`, and re-binding an id overwrites.
+#[derive(Clone)]
+enum BoundBuffer<'a> {
+    Single(&'a dyn Buffer),
+    Rows(Vec<&'a dyn Buffer>),
+}
+
+#[derive(Clone, Default)]
+pub struct Bindings<'a> {
+    /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
+    /// highest id bound (bounded by the graph's tensor count).
+    slots: Vec<Option<BoundBuffer<'a>>>,
+}
+
+/// One consecutive part of a forward. Bindings and their buffers stay alive until the entire
+/// staged call returns; a later stage may consume an earlier stage's outputs.
+#[derive(Clone, Copy)]
+pub struct ExecutionStage<'a> {
+    pub plan: &'a dyn Plan,
+    pub bindings: &'a Bindings<'a>,
+    /// Optional declaration for this stage's input-ready callback. See
+    /// [`Self::with_independent_host_inputs`]; tensor IDs alone do not prove physical isolation.
+    pub independent_host_inputs: Option<&'a [TensorId]>,
+}
+
+impl<'a> ExecutionStage<'a> {
+    pub fn new(plan: &'a dyn Plan, bindings: &'a Bindings<'a>) -> Self {
+        Self {
+            plan,
+            bindings,
+            independent_host_inputs: None,
+        }
+    }
+
+    /// Declare that this stage's input-ready callback is independent of prior GPU results.
+    /// The callback must not read those results, and its backend-buffer writes must be
+    /// limited to the declared external `Input` buffers. It must not submit GPU work or
+    /// mutate bindings, allocations, or buffer layouts.
+    ///
+    /// This declares CPU input readiness only, not stage execution independence. Before
+    /// overlapping the callback with prior GPU work, a backend must validate the declared
+    /// inputs and prove their physical storage does not alias any storage still in use by
+    /// that work. Backends may ignore this declaration and keep their ordinary ordering.
+    pub fn with_independent_host_inputs(mut self, inputs: &'a [TensorId]) -> Self {
+        self.independent_host_inputs = Some(inputs);
+        self
+    }
+}
+
+/// Unsubmitted stages of the next forward. Inputs may receive new values only after the
+/// current forward drains; recording never authorizes execution or consumes those values.
+#[derive(Clone, Copy)]
+pub struct ExecutionLookahead<'a> {
+    pub stages: &'a [ExecutionStage<'a>],
+    pub positions: &'a [usize],
+}
+
+impl<'a> ExecutionLookahead<'a> {
+    pub fn new(stages: &'a [ExecutionStage<'a>], positions: &'a [usize]) -> Self {
+        Self { stages, positions }
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl<'a> Bindings<'a> {
+    pub fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Bind a graph handle to a buffer the model owns.
+    pub fn bind(&mut self, id: TensorId, buf: &'a dyn Buffer) -> &mut Self {
+        let i = id.0 as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        self.slots[i] = Some(BoundBuffer::Single(buf));
+        self
+    }
+
+    /// Bind one persistent buffer per independent graph row. Ordinary graphs never use this;
+    /// layer-synchronous batching uses it while keeping stateless activations row-major.
+    pub fn bind_rows(&mut self, id: TensorId, bufs: Vec<&'a dyn Buffer>) -> &mut Self {
+        let i = id.0 as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        self.slots[i] = Some(BoundBuffer::Rows(bufs));
+        self
+    }
+
+    /// Look up a bound buffer (backend uses this while executing).
+    pub fn get(&self, id: TensorId) -> Option<&'a dyn Buffer> {
+        match self.slots.get(id.0 as usize)?.as_ref()? {
+            BoundBuffer::Single(buf) => Some(*buf),
+            BoundBuffer::Rows(_) => None,
+        }
+    }
+
+    /// Look up the per-row binding of a stateful tensor in an independent-row graph.
+    pub fn get_rows(&self, id: TensorId) -> Option<&[&'a dyn Buffer]> {
+        match self.slots.get(id.0 as usize)?.as_ref()? {
+            BoundBuffer::Rows(bufs) => Some(bufs),
+            BoundBuffer::Single(_) => None,
+        }
+    }
+}
+
+/// Optional idle residency that can be dropped before retrying a failed logical allocation.
+/// Called under the shared device execution gate: implementations must not submit GPU work,
+/// wait for another execution gate, or block on request-owned locks. Return false if busy.
+pub trait IdleResourceReclaimer: Send + Sync {
+    fn try_reclaim_idle(&self) -> bool;
+}
+
+/// A compute device. Implementations: `infr-vulkan`, `infr-cpu`, `infr-metal`.
+pub trait Backend: Send + Sync {
+    fn name(&self) -> &str;
+    fn capabilities(&self) -> Capabilities;
+
+    // ---- memory ----
+    /// Prepare storage for the exact ordered byte sizes subsequently passed to `alloc` or
+    /// `alloc_uninit` with `BufferUsage::Weights`. Other buffer usages do not consume the batch.
+    /// While active, an unexpected weight allocation must fail rather than use a fallback.
+    /// The scope is backend-wide: callers must serialize weight loading on this backend.
+    /// `None` means unsupported (or a weight path that should retain its ordinary allocator).
+    fn begin_weight_allocation_batch(
+        &self,
+        _sizes: &[usize],
+    ) -> Result<Option<Box<dyn WeightAllocationBatch + '_>>> {
+        Ok(None)
+    }
+
+    /// Allocate a buffer of `bytes`, **guaranteed zero-initialized** (calloc semantics). This is the
+    /// safe default: code that reads a buffer before fully writing it (accumulators, recurrent state,
+    /// KV caches, padding rows) behaves identically on every backend. GPU backends return recycled,
+    /// uninitialized VRAM otherwise, so relying on implicit zeroing is a silent CPU-works/GPU-garbage
+    /// trap — always `alloc` unless you can prove every element is written before it's read.
+    fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>>;
+    /// Allocate WITHOUT zero-initialization — an explicit opt-out for hot buffers whose full extent is
+    /// provably written before any read (e.g. weights, which are immediately uploaded). Faster (skips
+    /// the zero-fill) but UNSAFE if misused. In debug builds the returned memory is POISONED (filled
+    /// with a non-zero pattern) so a read-before-write surfaces loudly in tests instead of silently
+    /// working on CPU. The default forwards to [`alloc`](Self::alloc) (safe); backends override for
+    /// the perf win.
+    fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        self.alloc(bytes, usage)
+    }
+
+    /// Allocate a lazily committed KV buffer when this backend supports segmented device
+    /// addressing. `None` keeps the caller on its existing flat-buffer path.
+    fn alloc_segmented_kv(&self, _spec: SegmentedKvSpec) -> Result<Option<Box<dyn Buffer>>> {
+        Ok(None)
+    }
+
+    /// Whether segmented KV allocations can currently borrow from a pre-reserved elastic pool.
+    /// This is runtime state, not a static device capability: Vulkan returns true only after the
+    /// paged-MoE arena has been established.
+    fn segmented_kv_available(&self) -> bool {
+        false
+    }
+
+    /// Ensure that `buffer` owns at least `segments` physical KV segments. Backends that returned
+    /// `Some` from [`Backend::alloc_segmented_kv`] must accept that buffer here.
+    fn ensure_segmented_kv(&self, _buffer: &dyn Buffer, _segments: usize) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV is not supported by this backend",
+        ))
+    }
+    /// Batch form used at one logical context-growth boundary. Backends with transactional arena
+    /// allocation can override this so every layer/plane becomes visible together; the default
+    /// preserves the existing per-buffer behavior for backends without such an allocator.
+    fn ensure_segmented_kv_batch(&self, buffers: &[&dyn Buffer], segments: usize) -> Result<()> {
+        for buffer in buffers {
+            self.ensure_segmented_kv(*buffer, segments)?;
+        }
+        Ok(())
+    }
+    /// Clear every committed physical segment. Used by synthetic-depth benchmarks, whose logical
+    /// history must be deterministic even though it was not produced by a real prefill.
+    fn clear_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV is not supported by this backend",
+        ))
+    }
+    /// Physical bytes currently backing `buffer`. Ordinary buffers are fully committed, while a
+    /// segmented KV buffer may expose a much larger logical [`Buffer::len_bytes`] than it owns.
+    /// Session spill code uses this value so it never reads uncommitted virtual rows.
+    fn buffer_committed_bytes(&self, buffer: &dyn Buffer) -> Result<usize> {
+        Ok(buffer.len_bytes())
+    }
+    /// Read one byte range without materializing the whole buffer on the host. The default keeps
+    /// every established backend correct; backends with segmented or directly addressable storage
+    /// override it to avoid the prefix-sized temporary.
+    fn download_range(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| crate::error::Error::backend("download_range offset overflow"))?;
+        if end > self.buffer_committed_bytes(src)? {
+            return Err(crate::error::Error::backend(format!(
+                "download_range: byte range {offset}..{end} exceeds committed buffer size"
+            )));
+        }
+        if offset == 0 {
+            return self.download(src, dst);
+        }
+        let mut prefix = vec![0u8; end];
+        self.download(src, &mut prefix)?;
+        dst.copy_from_slice(&prefix[offset..end]);
+        Ok(())
+    }
+    /// Write one byte range without replacing bytes outside it. See [`Self::download_range`].
+    /// The fallback preserves the existing prefix, patches it, then uploads that prefix; Vulkan
+    /// overrides this with an offset copy and segmented-buffer traversal.
+    fn upload_range(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| crate::error::Error::backend("upload_range offset overflow"))?;
+        if end > self.buffer_committed_bytes(dst)? {
+            return Err(crate::error::Error::backend(format!(
+                "upload_range: byte range {offset}..{end} exceeds committed buffer size"
+            )));
+        }
+        if offset == 0 {
+            return self.upload(dst, src);
+        }
+        let mut prefix = vec![0u8; end];
+        self.download(dst, &mut prefix)?;
+        prefix[offset..end].copy_from_slice(src);
+        self.upload(dst, &prefix)
+    }
+    /// Return all physical segments owned by one lazily committed KV buffer while retaining its
+    /// logical object/address table for a later restore. Non-segmented backends reject the call.
+    fn release_segmented_kv(&self, _buffer: &dyn Buffer) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV release is not supported by this backend",
+        ))
+    }
+    /// Return only unused tail segments, keeping the prefix and frozen physical layout stable.
+    /// Unlike release, this is a capacity trim, not a session-spill operation.
+    fn trim_segmented_kv(&self, _buffer: &dyn Buffer, _keep: usize) -> Result<()> {
+        Err(crate::error::Error::backend(
+            "segmented KV trimming is not supported by this backend",
+        ))
+    }
+    fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
+    fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
+    /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
+    /// `INFR_KV_OVERFLOW` path): how many `BufferUsage::KvCache` buffers landed in device-local VRAM
+    /// vs spilled to system RAM. The runner calls this ONCE, right after the per-layer KV allocation
+    /// loop, so the user sees the resident/spilled split. Default no-op (backends without host spill,
+    /// or with the flag off, print nothing).
+    fn kv_overflow_report(&self) {}
+    /// Bytes a new device-local allocation may still take RIGHT NOW, as this backend's own
+    /// allocation guard sees it — the live answer to "what is left?", including everything a
+    /// pre-load estimate cannot know: allocator block tails, retained upload staging, the driver's
+    /// own pipeline/descriptor/command-buffer memory, and other processes on the same device.
+    ///
+    /// `None` (the default) means this backend has no such budget to report, and every caller must
+    /// keep whatever estimate it already had. A `Some` is a MEASUREMENT and outranks any estimate
+    /// of the same bytes: the runner re-sizes the KV cache against it once the weights are resident
+    /// (`generate_dense_backend`'s cold init), which is the one moment the device can be asked
+    /// instead of predicted.
+    fn device_alloc_room(&self) -> Option<u64> {
+        None
+    }
+    /// Bytes already committed to an elastic device arena that an activation allocation may
+    /// reclaim without consuming [`Self::device_alloc_room`]. Persistent allocations such as KV
+    /// must not spend this allowance. Backends without such an arena return `None`.
+    fn device_elastic_activation_room(&self) -> Option<u64> {
+        None
+    }
+    /// High-water mark of concurrently-live [`BufferUsage::Activations`] bytes since this backend
+    /// was created, and `None` from a backend that does not track it. The oracle for the seam's
+    /// activation reserve: the reserve is a PREDICTION of this number, so a session that ends with
+    /// a peak above what it reserved has a reserve that is wrong, and says so
+    /// (`generate_dense_backend`'s post-generation check) instead of waiting to fail an allocation
+    /// on some other model.
+    fn activation_peak(&self) -> Option<u64> {
+        None
+    }
+    /// Release retained transient graph workspace at an explicit serial handoff. Persistent model
+    /// state, KV and weights remain resident. Backends without a phase arena keep this as a no-op.
+    ///
+    /// This is narrower than ending a request: the next graph is about to run immediately, so an
+    /// elastic backend should leave expert slots borrowed instead of eagerly refilling them into
+    /// space the next graph will need.
+    fn release_transient_runtime(&self) {}
+    /// Register caller-owned, independently evictable residency. The backend retains only a weak
+    /// reference and must exclude the allocating client. Backends without pressure recovery ignore it.
+    fn register_idle_reclaimer(&self, _reclaimer: std::sync::Weak<dyn IdleResourceReclaimer>) {}
+    /// Select a Prefill chunk from tallest-first `(rows, runtime reserve bytes)` candidates after the prompt's
+    /// persistent KV is resident. Called only at a serial phase boundary, before chunk buffers
+    /// exist. Backends without a shared expert arena leave the caller's chunk unchanged.
+    fn prepare_prefill(&self, _candidates: &[(usize, u64)]) -> Result<Option<usize>> {
+        Ok(None)
+    }
+    /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
+    /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
+    /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so
+    /// no loader can forget a tensor — a loader only opens the scope around its upload loop.
+    /// Backends without a display (the CPU interpreter has no backend upload phase) keep this
+    /// default no-op scope.
+    fn weight_progress(&self, _total_bytes: Option<u64>) -> Box<dyn ProgressScope> {
+        struct NoProgress;
+        impl ProgressScope for NoProgress {}
+        Box::new(NoProgress)
+    }
+    /// Copy the first `bytes` of `src` into the start of `dst` (both buffers this backend's).
+    /// The KV prefix-sharing primitive: a new chat slot seeds its cache from another slot's
+    /// common prefix instead of re-prefilling it. Default is a host bounce (download ONLY the
+    /// prefix, then upload it) — correct everywhere; backends override with a device-side copy.
+    /// Errors (rather than panics) if `bytes` exceeds `src`'s length.
+    fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        check_copy_bytes(bytes, src.len_bytes())?;
+        // Only the prefix crosses the bus — NOT the whole (potentially `max_ctx`) `src` buffer.
+        let mut tmp = vec![0u8; bytes];
+        self.download(src, &mut tmp)?;
+        self.upload(dst, &tmp)
+    }
+
+    /// Copy several independent buffer prefixes as one logical batch. The default preserves the
+    /// established backend behavior; command-buffer backends can override this to amortize submit
+    /// and synchronization overhead across the whole batch.
+    fn copy_buffers(&self, copies: &[(&dyn Buffer, &dyn Buffer, usize)]) -> Result<()> {
+        for &(src, dst, bytes) in copies {
+            self.copy_buffer(src, dst, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Copy materialized KV elements, including their quantization metadata. The default uses
+    /// contiguous storage; backends with planar or segmented caches own the physical layout.
+    fn copy_kv_prefixes(
+        &self,
+        copies: &[(&dyn Buffer, &dyn Buffer, crate::tensor::DType, usize)],
+    ) -> Result<()> {
+        let ranges = copies
+            .iter()
+            .map(|&(src, dst, dtype, elements)| {
+                let (block_elements, block_bytes) = crate::decode_spec::block_layout(dtype);
+                if !elements.is_multiple_of(block_elements) {
+                    return Err(Error::backend("unaligned KV prefix format"));
+                }
+                let bytes = (elements / block_elements)
+                    .checked_mul(block_bytes)
+                    .ok_or_else(|| Error::backend("KV prefix size overflow"))?;
+                Ok((src, 0, dst, 0, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.copy_buffer_ranges(&ranges)
+    }
+
+    /// Copy several arbitrary buffer ranges as one logical batch. The default is a bounded host
+    /// bounce per range; command-buffer backends override it so restoring a speculative recurrent
+    /// checkpoint remains one submission even when every model layer owns separate state.
+    fn copy_buffer_ranges(
+        &self,
+        copies: &[(&dyn Buffer, usize, &dyn Buffer, usize, usize)],
+    ) -> Result<()> {
+        for &(src, src_offset, dst, dst_offset, bytes) in copies {
+            let src_end = src_offset
+                .checked_add(bytes)
+                .ok_or_else(|| Error::backend("copy source range overflow"))?;
+            let dst_end = dst_offset
+                .checked_add(bytes)
+                .ok_or_else(|| Error::backend("copy destination range overflow"))?;
+            check_copy_bytes(src_end, src.len_bytes())?;
+            check_copy_bytes(dst_end, dst.len_bytes())?;
+            let mut tmp = vec![0u8; bytes];
+            self.download_range(src, src_offset, &mut tmp)?;
+            self.upload_range(dst, dst_offset, &tmp)?;
+        }
+        Ok(())
+    }
+
+    // ---- execution (compile once per shape, execute per token/step) ----
+    /// Opt in only when both `compile` and the returned [`Plan::prepare`] perform CPU-only work
+    /// and may safely run concurrently with `execute` on this backend. Neither may allocate GPU
+    /// resources, access bound buffers or KV state, or acquire/change resource leases.
+    ///
+    /// The default keeps callers on the synchronous path. Wrappers must establish this guarantee
+    /// for their own compile/prepare paths before opting in; an inner backend's opt-in is not enough.
+    fn supports_async_compile(&self) -> bool {
+        false
+    }
+
+    /// Can record a bounded next-step command prefix while the current forward executes.
+    /// This is distinct from CPU-only compile/prepare: no future GPU work may be submitted.
+    fn supports_execution_lookahead(&self) -> bool {
+        false
+    }
+
+    fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
+    fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
+    /// Synchronous forward plus optional recording of the next forward. All preparation workers
+    /// must join before returning; binding buffers may be rebound/dropped immediately afterwards.
+    /// The next plan is only submitted by its later, explicitly authorized execute call.
+    fn execute_with_lookahead(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        _next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        self.execute(plan, bindings)
+    }
+
+    /// Execute consecutive plans with a caller-thread input handoff before each stage. The
+    /// callback receives the zero-based stage index, including zero, exactly once in order. It
+    /// may wait for CPU-produced inputs and upload into already allocated buffers using this
+    /// backend. It must not execute another graph, allocate device resources, or wait for a
+    /// worker that needs this backend's execution/resource gate. Backends must not call it from
+    /// a preparation worker or while holding pager/workspace locks.
+    /// Uploads may change only caller-owned stage inputs after their preceding readers drained;
+    /// the callback must not mutate active GPU residency tables, copy journals or pager state.
+    ///
+    /// Backends may reserve combined resources before stage zero and prepare immutable CPU-only
+    /// metadata for later stages concurrently with execution. They must keep the overall resource
+    /// lease until all stages, callbacks, submitted work and preparation workers have drained.
+    /// Each stage completes before the next callback; `next` is lookahead for the last stage only.
+    ///
+    /// The default preserves sequential execute behavior. Any error stops immediately and may
+    /// follow partial execution, including a partially submitted failing stage. NEVER retry the
+    /// entire forward or fall back to ordinary execute after an error: earlier stages may already
+    /// have modified KV/recurrent state. An empty list does no work and invokes no callbacks.
+    fn execute_staged(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<(&dyn Plan, &Bindings, &[usize])>,
+    ) -> Result<()> {
+        for (index, stage) in stages.iter().enumerate() {
+            input_ready(index)?;
+            if index + 1 == stages.len() {
+                self.execute_with_lookahead(stage.plan, stage.bindings, next)?;
+            } else {
+                self.execute(stage.plan, stage.bindings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record compatible future stages while this staged forward executes. Every worker must
+    /// join before returning. Each future stage remains gated by its later authorized call and
+    /// input callback; EOS, cancellation or a failed forward must discard all unused packets.
+    /// Backends without multi-stage recording keep their existing first-prefix lookahead.
+    fn execute_staged_lookahead(
+        &self,
+        stages: &[ExecutionStage<'_>],
+        input_ready: &mut dyn FnMut(usize) -> Result<()>,
+        next: Option<ExecutionLookahead<'_>>,
+    ) -> Result<()> {
+        let first = next.and_then(|next| {
+            next.stages
+                .first()
+                .map(|stage| (stage.plan, stage.bindings, next.positions))
+        });
+        self.execute_staged(stages, input_ready, first)
+    }
+    /// Chained decode: run the record-once decode plan `n` times in ONE submission, the sampled
+    /// token id flowing device-side from each iteration's `Op::Argmax`/`Op::Sample` into the next
+    /// iteration's `Op::EmbedGather` — the caller MUST have bound the sampler output and the
+    /// embed-gather ids input to the SAME buffer, seeded with the first token to feed. Returns
+    /// the `n` sampled ids, or `None` when this backend/plan can't chain (the caller falls back
+    /// to per-token `execute`). Positions/params self-advance (a chaining backend implies the
+    /// device-side pos increment).
+    fn execute_chain(
+        &self,
+        _plan: &dyn Plan,
+        _bindings: &Bindings,
+        _n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// The longest chain [`Backend::execute_chain`] may be asked for on this device.
+    ///
+    /// A chain is ONE submit carrying `n` back-to-back decode steps, and a GPU's hang watchdog is
+    /// armed per SUBMIT — so on a slow device an unbounded chain is a device-lost waiting to
+    /// happen (on the surveyed 2-CU integrated part a decode step is ~213 ms, so the default chain
+    /// of 8 would be ~1.7 s in a single command buffer, against a device that kills a job at
+    /// ~2.06 s).
+    ///
+    /// The CALLER must clamp with this before it commits to `n` — not `execute_chain` itself,
+    /// because the runner draws one sampling uniform per chained step BEFORE the call, so a
+    /// backend that quietly shortened the chain would advance the RNG stream further than the
+    /// tokens it returned consumed. Default `usize::MAX`: no bound (every backend whose forward is
+    /// nowhere near a watchdog, which is all of them except a slow iGPU).
+    fn max_decode_chain(&self) -> usize {
+        usize::MAX
+    }
+
+    fn sync(&self) -> Result<()>;
+
+    /// Whether the currently loaded model is running any MoE expert layer through a paged VRAM
+    /// cache (an expert bank too big to keep fully resident — see `infr_vulkan::pager::GpuPager`).
+    /// Paged execution needs a host readback of the router's chosen expert ids BETWEEN a layer's
+    /// GEMV stages (to resolve/upload cache misses before the id-indexed GEMV reads them), which a
+    /// cached record-once decode replay can't express (the whole point of replay is recording
+    /// every position-dependent op ONCE with no host round-trip in between). The seam's decode-loop
+    /// gate and the Vulkan adapter's own `execute`/`execute_chain` both check this and force the
+    /// per-execute static path instead — see `infr_vulkan::adapter::execute`'s doc.
+    /// `false` for every backend but Vulkan, and for Vulkan whenever no paged model is loaded (the
+    /// overwhelming common case: MoE experts that fit VRAM are fully resident with zero change).
+    fn moe_paged(&self) -> bool {
+        false
+    }
+
+    /// Notify the backend that a cold session has finished its resident/fixed allocation phase.
+    /// Backends may use this boundary to release load-only reservations or preload lower tiers.
+    /// A backend whose elastic arena is finalized from measured room may receive it after fixed
+    /// recurrent state; other paths retain the traditional post-weight boundary. Default no-op.
+    fn finish_weight_load(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Notify the backend that every cold-session persistent allocation is resident: weights,
+    /// KV/recurrent state and permanent IO buffers. A backend may now admit optional lower-tier
+    /// aliases without risking that they consume resources required by the model itself. Default
+    /// no-op.
+    fn finish_session_allocations(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the currently loaded DENSE model streams per-layer weight blocks through a paged
+    /// VRAM cache (dense layer streaming — the `crate::pager::Pager::schedule` policy; see
+    /// `infr_vulkan::pager`'s dense session). Unlike [`Backend::moe_paged`] no host readback is
+    /// ever needed (dense layer order is deterministic, every "miss" is known in advance), but
+    /// the record-once decode replay still can't express the per-token ring staging +
+    /// arena-offset rebinding, so the same gates that force a paged-MoE model onto the
+    /// per-execute static path check this too. `false` for every backend but Vulkan, and for
+    /// Vulkan whenever the loaded model's dense weights fit VRAM (the overwhelming common case —
+    /// zero change there).
+    fn dense_paged(&self) -> bool {
+        false
+    }
+
+    /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
+    /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
+    /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded
+    /// CDF-inversion target draw — reproducibility rides the SAME host RNG as the CPU sampler,
+    /// only the reduction itself moves to the GPU). On success, writes:
+    ///   - `argmax_out[r]` (u32): argmax token id over `raw[r,:] * temp_inv`.
+    ///   - `entropy_out[r]` (f32): entropy of `softmax(raw[r,:] * temp_inv)`.
+    ///   - `sampled_out[r]` (u32): one multinomial draw from that softmax via forward (vocab-
+    ///     order) CDF inversion against `u[r]` — matches the host sampler's algorithm exactly
+    ///     (same order, same target), NOT bit-identical (GPU float reduction order differs).
+    ///
+    /// Returns `Ok(false)` (default: every backend but Vulkan) when unsupported — the caller falls
+    /// back to a full `download` + host reduction. Never partially writes the outputs on `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn eb_sample_reduce(
+        &self,
+        logits: &dyn Buffer,
+        u: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        temp_inv: f32,
+        argmax_out: &dyn Buffer,
+        entropy_out: &dyn Buffer,
+        sampled_out: &dyn Buffer,
+    ) -> Result<bool> {
+        let _ = (
+            logits,
+            u,
+            rows,
+            dim,
+            temp_inv,
+            argmax_out,
+            entropy_out,
+            sampled_out,
+        );
+        Ok(false)
+    }
+}
+
+/// Fan [`Backend::kv_overflow_report`] out over the per-device backends a multi-device wrapper
+/// owns. Each rank made its OWN placement decision against its OWN card's budget, so each prints
+/// its own banner — the wrapper has nothing to add and nothing to merge.
+///
+/// A three-line loop, but it was the three-line loop written three times (`TensorParallelBackend`,
+/// `ExpertParallelBackend`, `PipelineBackend`), which is how the report gained a fourth spelling
+/// while the body it forwards to had two.
+pub fn kv_overflow_report_each<B: Backend>(backends: &[B]) {
+    for b in backends {
+        b.kv_overflow_report();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_prepare_defaults_to_noop() {
+        let graph = Graph::new();
+        let plan = GraphPlan::boxed(&graph);
+        plan.prepare().unwrap();
+        plan.prepare().unwrap();
+        let graph = &plan.as_any().downcast_ref::<GraphPlan>().unwrap().graph;
+        assert!(graph.tensors.is_empty());
+        assert!(graph.ops.is_empty());
+    }
+
+    #[test]
+    fn async_compile_defaults_to_disabled() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let backend: &dyn Backend = &backend;
+        assert!(!backend.supports_async_compile());
+    }
+
+    /// The integrated chunk policy. The load-bearing property is the CEILING: this may only ever
+    /// SHRINK the discrete default (1024), never grow it — it is a watchdog guard, not a tuning
+    /// knob — and it must never return 0 (a zero-row prefill chunk would not terminate).
+    #[test]
+    fn integrated_ubatch_rows_is_a_bounded_shrink() {
+        // Unknown CU count takes the conservative floor — the ~2-CU RDNA2 iGPU the 128-row figure
+        // is calibrated on. Still reachable: `caps::shader_core_count` covers AMD, NVIDIA and the
+        // Intel parts in its table, but a device outside all three sources reports nothing.
+        assert_eq!(integrated_ubatch_rows(0), 128);
+        assert_eq!(integrated_ubatch_rows(2), 128); // the calibrated part
+        assert_eq!(integrated_ubatch_rows(1), 128); // never below the floor
+                                                    // Linear in CU count, so a beefier iGPU is not needlessly throttled.
+        assert_eq!(integrated_ubatch_rows(4), 256);
+        assert_eq!(integrated_ubatch_rows(12), 768); // Radeon 780M class
+                                                     // ...but clamped at the DISCRETE default: this can only shrink the chunk, never grow it.
+        assert_eq!(integrated_ubatch_rows(16), 1024);
+        assert_eq!(integrated_ubatch_rows(64), 1024);
+        assert_eq!(integrated_ubatch_rows(u32::MAX), 1024);
+        for cu in [0, 1, 2, 3, 7, 8, 33, 96, 1024, u32::MAX] {
+            let r = integrated_ubatch_rows(cu);
+            assert!((128..=1024).contains(&r), "cu={cu} -> {r} out of bounds");
+        }
+    }
+
+    /// The stable fallback used by persistent replay and queues without timestamp support.
+    #[test]
+    fn initial_submit_cap_splits_only_integrated() {
+        assert_eq!(initial_submit_dispatch_cap(false), 0); // discrete: never split
+        assert_eq!(initial_submit_dispatch_cap(true), 128); // integrated: the measured default
+    }
+
+    /// The GPU-time calibration formula. The property that matters is that the cap it returns puts
+    /// a segment inside the budget on whatever device produced the sample.
+    #[test]
+    fn submit_cap_tracks_measured_dispatch_cost() {
+        // The surveyed 2-CU iGPU: 757 dispatches, ~2.05 s ⇒ ~2.7 ms/dispatch. The cap it yields
+        // must hold a segment inside the 150 ms budget...
+        let cap = submit_cap_from_measurement(2_050_000_000, 757);
+        assert!(cap > 0, "a 2 s forward must be split");
+        let ns_per_dispatch = 2_050_000_000u64 / 757;
+        assert!(
+            cap as u64 * ns_per_dispatch <= SUBMIT_BUDGET_NS,
+            "cap {cap} x {ns_per_dispatch}ns overruns the budget"
+        );
+        // ...and must cut that forward into a handful of segments, not one and not hundreds.
+        assert!((2..=32).contains(&757usize.div_ceil(cap)), "cap={cap}");
+
+        // A discrete GPU (same graph, ~30 ms) yields a cap so far above the forward's own
+        // dispatch count that nothing is split.
+        let dcap = submit_cap_from_measurement(30_000_000, 757);
+        assert!(
+            dcap > 757,
+            "a 30 ms forward must never be split (cap={dcap})"
+        );
+        // A truly trivial per-dispatch cost reports "unlimited" outright.
+        assert_eq!(submit_cap_from_measurement(1_000, 757), 0);
+
+        // Degenerate samples never produce a nonsense cap.
+        assert_eq!(submit_cap_from_measurement(0, 757), 0);
+        assert_eq!(submit_cap_from_measurement(2_050_000_000, 0), 0);
+        // A pathologically slow sample still never splits below the floor (submits are not free).
+        assert!(submit_cap_from_measurement(u64::MAX / 2, 4) >= 16);
+
+        let conservative =
+            submit_cap_from_measurement_with_budget(100_000_000, 100, SUBMIT_BUDGET_NS);
+        let aggressive =
+            submit_cap_from_measurement_with_budget(100_000_000, 100, SUBMIT_BUDGET_NS * 2);
+        assert_eq!(aggressive, conservative * 2);
+    }
+
+    /// A DISCRETE GPU must be untouched by any of this: `integrated` defaults false, so the seam's
+    /// `default_ubatch_rows` takes its profile-selected dGPU branch.
+    #[test]
+    fn discrete_is_the_default() {
+        let caps = Capabilities::default();
+        assert!(!caps.integrated);
+        assert_eq!(caps.compute_units, 0);
+    }
+
+    #[test]
+    fn quantized_linear_pair_is_not_implied_by_f32_support() {
+        let mut caps = Capabilities::default();
+        assert!(!caps.linear_pair_q8);
+        caps.linear_pair_f32 = true;
+        assert!(!caps.linear_pair_q8);
+    }
+
+    /// The `copy_buffer` bounds-check helper: an oversize prefix errors instead of panicking, and
+    /// any prefix up to the source length is accepted.
+    #[test]
+    fn check_copy_bytes_rejects_oversize_prefix() {
+        assert!(check_copy_bytes(0, 16).is_ok());
+        assert!(check_copy_bytes(16, 16).is_ok()); // whole buffer is a valid prefix
+        assert!(check_copy_bytes(8, 16).is_ok());
+        assert!(check_copy_bytes(17, 16).is_err()); // one past the end
+        assert!(check_copy_bytes(usize::MAX, 16).is_err());
+    }
+
+    /// A host-backed mock backend just large enough to exercise the DEFAULT `copy_buffer`: it must
+    /// transfer ONLY the requested prefix (not the whole `src`) and it must NOT panic on an oversize
+    /// `bytes` — it returns an `Err`.
+    struct MockBuffer(std::sync::Mutex<Vec<u8>>);
+    impl Buffer for MockBuffer {
+        fn len_bytes(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Records how many bytes the last `download` was asked for, to prove the whole `src` never
+    /// crosses the bus for a small prefix copy.
+    struct MockBackend {
+        last_download_len: std::sync::Mutex<usize>,
+    }
+    impl Backend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+            Ok(Box::new(MockBuffer(std::sync::Mutex::new(vec![
+                0u8;
+                bytes
+            ]))))
+        }
+        fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
+            let dst = dst.as_any().downcast_ref::<MockBuffer>().unwrap();
+            dst.0.lock().unwrap()[..src.len()].copy_from_slice(src);
+            Ok(())
+        }
+        fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
+            *self.last_download_len.lock().unwrap() = dst.len();
+            let src = src.as_any().downcast_ref::<MockBuffer>().unwrap();
+            dst.copy_from_slice(&src.0.lock().unwrap()[..dst.len()]);
+            Ok(())
+        }
+        fn compile(&self, _graph: &Graph) -> Result<Box<dyn Plan>> {
+            unimplemented!()
+        }
+        fn execute(&self, plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
+            let plan = plan.as_any().downcast_ref::<StageTestPlan>().unwrap();
+            plan.events.lock().unwrap().push(("execute", plan.index));
+            if plan.fail {
+                return Err(crate::error::backend("stage partially submitted"));
+            }
+            Ok(())
+        }
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StageTestPlan {
+        index: usize,
+        fail: bool,
+        events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, usize)>>>,
+    }
+
+    impl Plan for StageTestPlan {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn staged_host_input_declaration_is_opt_in_and_preserves_default_callback_order() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plans = [0, 1].map(|index| StageTestPlan {
+            index,
+            fail: false,
+            events: std::sync::Arc::clone(&events),
+        });
+        let bindings = Bindings::new();
+        let inputs = [TensorId(3), TensorId(7)];
+        let first = ExecutionStage::new(&plans[0], &bindings);
+        let main = ExecutionStage::new(&plans[1], &bindings);
+        assert!(first.independent_host_inputs.is_none());
+        assert!(main.independent_host_inputs.is_none());
+        let main = main.with_independent_host_inputs(&inputs);
+        assert_eq!(main.independent_host_inputs, Some(inputs.as_slice()));
+        assert!(std::ptr::eq(
+            main.plan.as_any().downcast_ref::<StageTestPlan>().unwrap(),
+            &plans[1]
+        ));
+        assert!(std::ptr::eq(main.bindings, &bindings));
+        let copied = main;
+        assert_eq!(copied.independent_host_inputs, main.independent_host_inputs);
+
+        backend
+            .execute_staged(
+                &[first, main],
+                &mut |index| {
+                    events.lock().unwrap().push(("ready", index));
+                    Ok(())
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [("ready", 0), ("execute", 0), ("ready", 1), ("execute", 1)]
+        );
+    }
+
+    #[test]
+    fn staged_default_orders_ready_and_execute_and_stops_after_errors() {
+        // Exercise through a trait object, including failure in a later callback and partial
+        // execution of either stage. No earlier execute may be repeated on any error path.
+        for (callback_failure, execution_failure, expected) in [
+            (
+                None,
+                None,
+                vec![("ready", 0), ("execute", 0), ("ready", 1), ("execute", 1)],
+            ),
+            (Some(0), None, vec![("ready", 0)]),
+            (
+                Some(1),
+                None,
+                vec![("ready", 0), ("execute", 0), ("ready", 1)],
+            ),
+            (None, Some(0), vec![("ready", 0), ("execute", 0)]),
+            (
+                None,
+                Some(1),
+                vec![("ready", 0), ("execute", 0), ("ready", 1), ("execute", 1)],
+            ),
+        ] {
+            let backend = MockBackend {
+                last_download_len: std::sync::Mutex::new(0),
+            };
+            let backend: &dyn Backend = &backend;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let plans = [0, 1].map(|index| StageTestPlan {
+                index,
+                fail: execution_failure == Some(index),
+                events: std::sync::Arc::clone(&events),
+            });
+            let bindings = Bindings::new();
+            let stages = plans
+                .each_ref()
+                .map(|plan| ExecutionStage::new(plan, &bindings));
+            let caller = std::thread::current().id();
+            let result = backend.execute_staged(
+                &stages,
+                &mut |index| {
+                    assert_eq!(std::thread::current().id(), caller);
+                    events.lock().unwrap().push(("ready", index));
+                    if callback_failure == Some(index) {
+                        Err(crate::error::backend("input not ready"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                None,
+            );
+            assert_eq!(
+                result.is_err(),
+                callback_failure.is_some() || execution_failure.is_some()
+            );
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn staged_default_empty_and_single_stage_are_compatible() {
+        let backend = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let backend: &dyn Backend = &backend;
+        backend
+            .execute_staged(&[], &mut |_| panic!("empty forward"), None)
+            .unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan = StageTestPlan {
+            index: 0,
+            fail: false,
+            events: std::sync::Arc::clone(&events),
+        };
+        let bindings = Bindings::new();
+        backend
+            .execute_staged(
+                &[ExecutionStage::new(&plan, &bindings)],
+                &mut |index| {
+                    events.lock().unwrap().push(("ready", index));
+                    Ok(())
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(*events.lock().unwrap(), vec![("ready", 0), ("execute", 0)]);
+    }
+
+    #[test]
+    fn copy_buffer_default_copies_only_the_prefix() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..64).collect()));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 64]));
+
+        be.copy_buffer(&src, &dst, 8).unwrap();
+        // Only the 8-byte prefix crossed the bus — NOT the whole 64-byte source.
+        assert_eq!(*be.last_download_len.lock().unwrap(), 8);
+        let out = dst.0.lock().unwrap();
+        assert_eq!(&out[..8], &[0, 1, 2, 3, 4, 5, 6, 7]); // prefix copied
+        assert!(out[8..].iter().all(|&b| b == 0xAA)); // tail untouched
+    }
+
+    #[test]
+    fn copy_buffers_default_copies_each_prefix() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src_a = MockBuffer(std::sync::Mutex::new((0u8..16).collect()));
+        let src_b = MockBuffer(std::sync::Mutex::new((16u8..32).collect()));
+        let dst_a = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 16]));
+        let dst_b = MockBuffer(std::sync::Mutex::new(vec![0xBBu8; 16]));
+
+        be.copy_buffers(&[(&src_a, &dst_a, 4), (&src_b, &dst_b, 8)])
+            .unwrap();
+        assert_eq!(&dst_a.0.lock().unwrap()[..6], &[0, 1, 2, 3, 0xAA, 0xAA]);
+        assert_eq!(
+            &dst_b.0.lock().unwrap()[..10],
+            &[16, 17, 18, 19, 20, 21, 22, 23, 0xBB, 0xBB]
+        );
+    }
+
+    #[test]
+    fn kv_prefix_copy_default_respects_dtype_and_bounds() {
+        use crate::tensor::DType;
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..64).collect()));
+        for (dtype, elements, bytes) in [
+            (DType::F16, 12, 24),
+            (DType::F32, 9, 36),
+            (DType::Q8_0, 32, 34),
+            (DType::Bf16, 12, 24),
+            (DType::Q4_0, 32, 18),
+            (DType::Q4_1, 32, 20),
+            (DType::Q5_0, 32, 22),
+            (DType::Q5_1, 32, 24),
+            (DType::Iq4Nl, 32, 18),
+            (DType::Turbo2, 128, 34),
+        ] {
+            let dst = MockBuffer(std::sync::Mutex::new(vec![0xaa; 64]));
+            be.copy_kv_prefixes(&[(&src, &dst, dtype, elements)])
+                .unwrap();
+            let out = dst.0.lock().unwrap();
+            assert_eq!(&out[..bytes], &src.0.lock().unwrap()[..bytes]);
+            assert!(out[bytes..].iter().all(|&value| value == 0xaa));
+        }
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xaa; 64]));
+        assert!(be
+            .copy_kv_prefixes(&[(&src, &dst, DType::Q8_0, 31)])
+            .is_err());
+        assert!(be
+            .copy_kv_prefixes(&[(&src, &dst, DType::F16, 33)])
+            .is_err());
+        assert!(be
+            .copy_kv_prefixes(&[(&src, &dst, DType::F32, usize::MAX)])
+            .is_err());
+        be.copy_kv_prefixes(&[(&src, &dst, DType::F16, 0)]).unwrap();
+        assert!(dst.0.lock().unwrap().iter().all(|&value| value == 0xaa));
+    }
+
+    #[test]
+    fn copy_buffer_ranges_default_honors_both_offsets() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..32).collect()));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 24]));
+
+        be.copy_buffer_ranges(&[(&src, 7, &dst, 11, 6)]).unwrap();
+        let out = dst.0.lock().unwrap();
+        assert!(out[..11].iter().all(|&byte| byte == 0xAA));
+        assert_eq!(&out[11..17], &[7, 8, 9, 10, 11, 12]);
+        assert!(out[17..].iter().all(|&byte| byte == 0xAA));
+        drop(out);
+        assert!(be.copy_buffer_ranges(&[(&src, 28, &dst, 0, 5)]).is_err());
+        assert!(be.copy_buffer_ranges(&[(&src, 0, &dst, 20, 5)]).is_err());
+    }
+
+    #[test]
+    fn bindings_vec_backed_get_matches_old_map_semantics() {
+        // Distinguishable lengths so `get` can be checked to return the exact buffer bound.
+        let a = MockBuffer(std::sync::Mutex::new(vec![0u8; 4]));
+        let b = MockBuffer(std::sync::Mutex::new(vec![0u8; 8]));
+        let c = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let mut binds = Bindings::new();
+        // Sparse, out-of-order binds (as a real graph does — handles aren't bound in id order).
+        binds.bind(TensorId(5), &a).bind(TensorId(2), &b);
+        // Bound ids resolve to the exact buffer; the gap (ids 0,1,3,4) and any id past the
+        // high-water mark are None — identical to the old HashMap miss.
+        assert_eq!(binds.get(TensorId(5)).unwrap().len_bytes(), 4);
+        assert_eq!(binds.get(TensorId(2)).unwrap().len_bytes(), 8);
+        assert!(binds.get(TensorId(0)).is_none());
+        assert!(binds.get(TensorId(3)).is_none());
+        assert!(binds.get(TensorId(99)).is_none());
+        // Re-binding an id overwrites (identical to the old HashMap::insert semantics).
+        binds.bind(TensorId(5), &c);
+        assert_eq!(binds.get(TensorId(5)).unwrap().len_bytes(), 16);
+    }
+
+    #[test]
+    fn bindings_keep_single_and_independent_row_buffers_distinct() {
+        let a = MockBuffer(std::sync::Mutex::new(vec![0u8; 4]));
+        let b = MockBuffer(std::sync::Mutex::new(vec![0u8; 8]));
+        let c = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let mut binds = Bindings::new();
+
+        binds.bind_rows(TensorId(3), vec![&a, &b]);
+        assert!(binds.get(TensorId(3)).is_none());
+        let rows = binds.get_rows(TensorId(3)).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len_bytes(), 4);
+        assert_eq!(rows[1].len_bytes(), 8);
+
+        binds.bind(TensorId(3), &c);
+        assert_eq!(binds.get(TensorId(3)).unwrap().len_bytes(), 16);
+        assert!(binds.get_rows(TensorId(3)).is_none());
+    }
+
+    #[test]
+    fn copy_buffer_default_errors_on_oversize_bytes() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0u8; 64]));
+        // 32 > src's 16 bytes: an Err, not a panic, and nothing was downloaded.
+        assert!(be.copy_buffer(&src, &dst, 32).is_err());
+        assert_eq!(*be.last_download_len.lock().unwrap(), 0);
+    }
+}

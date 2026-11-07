@@ -1,0 +1,138 @@
+#version 460
+// RMSNorm: y[i] = x[i] * inversesqrt(mean(x²) + eps) * w[i], one workgroup per row.
+// -DGATE build (`rmsnorm_gate`): fuses in the qwen35 DeltaNet SiLU z-gate multiply
+// -DGATE -DGATE_SIGMOID build (`rmsnorm_gate_sigmoid`): qwen4exp's Sigmoid z-gate
+// -DADD build (`rmsnorm_add`): fuses in an in-place add to dst: dst[i] += norm_result[i]
+// -DF16IO build (`rmsnorm_f16`): x/y are f16 instead of f32 (llama4's post-rope weightless Q/K
+// L2-norm, `Op::QkNorm` on the f16 rope scratch — `w` stays f32 either way). Mutually exclusive
+// with GATE/ADD (no in-tree caller needs the combination).
+// -DNO_WEIGHT build (`rmsnorm_nw`): NO `w` binding and no multiply — `y[i] = x[i] * scale`
+// (`Op::QkNorm { weight: None }`, DeepSeek V4's bare per-head `ggml_rms_norm` on Q). `y` moves up
+// to binding 1, so the recorder's trailing-binding-is-the-write convention still holds. f32 only:
+// the adapter refuses a weightless f16 QkNorm rather than build a variant nothing dispatches.
+// Mutually exclusive with GATE/ADD/F16IO/WIDE.
+//
+// -DWIDE build (`rmsnorm_wide`): the DECODE norm. This kernel is one-workgroup-per-row, so at
+// decode (rows==1) the whole dispatch is a SINGLE 256-thread workgroup — one WGP of 48 — and the
+// row is only ~21 KiB, so it is pure memory-LATENCY bound with almost no requests in flight. It
+// measured 10.5 us/dispatch on gemma-4-31B (dim 5376) against ~1.2 us for `add` over the SAME
+// vector (which fans out to dim/64 workgroups): 8.9% of ALL decode GPU time, 301 dispatches/token,
+// ~10x the cost of an equal-sized elementwise op. WIDE keeps the single workgroup (a cross-row
+// reduction cannot be split without a second dispatch) but buys back the memory-level parallelism
+// inside it: 1024 threads (32 wave32s on the WGP, 4x the waves) x vec4 loads (4x the bytes per
+// request) = up to 16x more bytes in flight, which is what actually hides the latency. Host gates
+// it to rows==1 && dim>=2048 && dim%4==0 — prefill (rows>1, already fills the GPU with row-
+// workgroups) and the per-head V/Q/K norms (rows=n_head, small dim) keep the 256-thread build.
+// Mutually exclusive with GATE/ADD/F16IO.
+// Requires requiredSubgroupSize=32 (wave32 → 8 subgroups, or 32 under WIDE).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef F16IO
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#ifdef WIDE
+#define NTHREAD 1024u
+#define NSGMAX 32
+#else
+#define NTHREAD 256u
+#define NSGMAX 8
+#endif
+
+layout(local_size_x = NTHREAD, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint dim; float eps; } pc;
+#ifdef WIDE
+// Same three bindings as the base build, viewed as vec4 (host guarantees dim%4==0 and the row
+// base r*dim is therefore 16 B-aligned).
+layout(binding = 0) readonly buffer XB { vec4 x4[]; };
+layout(binding = 1) readonly buffer WB { vec4 w4[]; };
+layout(binding = 2) buffer YB { vec4 y4[]; };
+#else
+#ifdef F16IO
+layout(binding = 0) readonly buffer XB { float16_t x[]; };
+#else
+layout(binding = 0) readonly buffer XB { float x[]; };
+#endif
+#ifdef NO_WEIGHT
+layout(binding = 1) buffer YB { float y[]; };
+#else
+layout(binding = 1) readonly buffer WB { float w[]; };
+#endif
+#ifdef GATE
+layout(binding = 2) readonly buffer ZB { float z[]; };
+layout(binding = 3) buffer YB { float y[]; };
+#elif defined(ADD)
+layout(binding = 2) buffer DB { float dst[]; };
+#elif defined(F16IO)
+layout(binding = 2) buffer YB { float16_t y[]; };
+#elif !defined(NO_WEIGHT)
+layout(binding = 2) buffer YB { float y[]; };
+#endif
+#endif
+
+shared float part[NSGMAX];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+
+#ifdef WIDE
+    uint n4 = pc.dim >> 2u;      // dim % 4 == 0 (host-gated)
+    uint base4 = r * n4;
+
+    // Pass 1: sum of squares, vec4-wide. dot(v,v) is one 4-way FMA chain.
+    float ss = 0.0;
+    for (uint i = t; i < n4; i += NTHREAD) {
+        vec4 v = x4[base4 + i];
+        ss += dot(v, v);
+    }
+#else
+    uint base = r * pc.dim;
+
+    float ss = 0.0;
+#ifdef F16IO
+    for (uint i = t; i < pc.dim; i += NTHREAD) { float v = float(x[base + i]); ss += v * v; }
+#else
+    for (uint i = t; i < pc.dim; i += NTHREAD) { float v = x[base + i]; ss += v * v; }
+#endif
+#endif
+
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) { part[gl_SubgroupID] = ss; }
+    barrier();
+
+    float tot = 0.0;
+    uint nsg = gl_NumSubgroups;
+    for (uint s = 0u; s < nsg; s++) { tot += part[s]; }
+    float scale = inversesqrt(tot / float(pc.dim) + pc.eps);
+
+#ifdef WIDE
+    // Pass 2: re-read x from L2 (it was just streamed in — cheaper than spilling it to LDS or
+    // holding a variable-length register array) and store the normalized row.
+    for (uint i = t; i < n4; i += NTHREAD) {
+        y4[base4 + i] = x4[base4 + i] * scale * w4[i];
+    }
+#elif defined(GATE)
+    for (uint i = t; i < pc.dim; i += NTHREAD) {
+        float zv = z[base + i];
+#ifdef GATE_SIGMOID
+        float gate = 1.0 / (1.0 + exp(-zv));
+#else
+        float gate = zv / (1.0 + exp(-zv));
+#endif
+        y[base + i] = x[base + i] * scale * w[i] * gate;
+    }
+#elif defined(ADD)
+    for (uint i = t; i < pc.dim; i += NTHREAD) { dst[base + i] += x[base + i] * scale * w[i]; }
+#elif defined(F16IO)
+    for (uint i = t; i < pc.dim; i += NTHREAD) {
+        y[base + i] = float16_t(float(x[base + i]) * scale * w[i]);
+    }
+#elif defined(NO_WEIGHT)
+    for (uint i = t; i < pc.dim; i += NTHREAD) { y[base + i] = x[base + i] * scale; }
+#else
+    for (uint i = t; i < pc.dim; i += NTHREAD) { y[base + i] = x[base + i] * scale * w[i]; }
+#endif
+}

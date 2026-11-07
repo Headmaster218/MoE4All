@@ -1,0 +1,45 @@
+#version 460
+// DEBUG: GEMV-only version of e2b_gate. Writes raw GEMV result without gelu or multiply.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { float w[]; };
+layout(binding = 1) readonly buffer XB { float x[]; };
+layout(binding = 2) buffer YB { float y[]; };
+
+#define MROW 4
+shared float red[64 * MROW];
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row_groups = (pc.m + uint(MROW) - 1u) / uint(MROW);
+    if (unit >= pc.out_f * row_groups) { return; }
+    uint o = unit % pc.out_f;
+    uint r0 = (unit / pc.out_f) * uint(MROW);
+    uint t = gl_LocalInvocationID.x;
+
+    uint wbase = o * pc.in_f;
+    float acc[MROW];
+    for (uint j = 0u; j < uint(MROW); j++) { acc[j] = 0.0; }
+    for (uint i = t; i < pc.in_f; i += 64u) {
+        float wv = w[wbase + i];
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.m) { acc[j] += wv * x[r * pc.in_f + i]; }
+        }
+    }
+    for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] = acc[j]; }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] += red[j * 64u + t + stride]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.m) { y[r * pc.out_f + o] = red[j * 64u]; }
+        }
+    }
+}

@@ -1,0 +1,299 @@
+#version 460
+// K02 prototype: -DPACKED_DECODE changes integer weight staging only; default is baseline.
+// Keep dp4a, sub-block order, floating-point expressions, tile sizes and barriers unchanged.
+// Activation layout requires k%32 == 0; output columns require n%BN == 0.
+// Tiled dp4a (mmq) GEMM for stacked Q3_K experts (Llama-4-Scout's shipped down-projection MoE
+// bank): C[m,n] = A[m,k]·W[ids]ᵀ via hardware int8 dot-product. Q3_K is SYMMETRIC (no min term,
+// unlike Q2_K/Q4_K/Q5_K) — y = d·(sc6−32)·(q3u−4) — so this mirrors native_gemm_mmq_q6k exactly:
+// bake the (q3u−4) centering into a signed int8 weight and fold d·(sc6−32) into a per-sub-block
+// float scale; no `sact`/Bmm, no min accumulation. BLK=16 (one 6-bit scale per 16 elements, 16
+// sub-blocks per 256-elem superblock — same granularity as Q6_K, just 3-bit codes instead of
+// 6-bit). Block (110 bytes): [uint8 hmask[32]][uint8 qs[64]][uint8 scales_raw[12]][half d].
+// q3u (0..7) = 2 low bits from `qs` (SAME byte/shift mapping as Q2_K's 2-bit field: byte =
+// qs_base + 32*(si/8) + 16*(si%2) + l, shift = 2*((si%8)>>1)) OR'd with a high bit from `hmask`
+// (byte = 16*(si%2) + l, bit = 4*(si/8) + ((si%8)>>1)) — ground-truthed against infr-gguf's
+// dequant.rs Q3_K CPU reference (the hmask bit position `m` cycles through all 8 positions of a
+// byte as (n,j) advance, one hmask byte thus covering 8 elements sharing the same (half,l)).
+// sc6(si) is the 6-bit packed scale (llama.cpp's 4-word bit-interleave, ported byte-wise — no
+// need for the CPU reference's SIMD-style u32 vectorization since each shader invocation reads
+// one scalar sc6 per column per sub-block): index si (0..15) picks k=si/4 (which of 4 "aux"
+// words), bi=si%4 (byte within it); k∈{0,1} take 4 low bits from scales_raw[bi]/[4+bi] plus 2
+// high bits from scales_raw[8+bi]; k∈{2,3} take the same bytes' TOP nibble plus a different
+// 2-bit slice of scales_raw[8+bi] — see `sc6()` below, a direct byte-wise port of llama.cpp's
+// aux[0..3] reconstruction (ggml-quants.c dequantize_row_q3_K). Requires n%64, k%16.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef BM_TILE
+#define BM_TILE 64u
+#endif
+const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE callers may
+                         // override smaller (e.g. 32) to fit small per-expert row counts
+
+const uint BN = 64u;
+const uint BLK = 16u;       // Q3_K scale sub-block granularity
+const uint WPB = BLK / 4u;  // 4 packed-int8 u32 words per 16-block
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN); // 256
+const uint SP = WPB + 1u;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+#ifdef PAGED
+// -DPAGED appends the arena's 64-bit base address (lo/hi) + per-slot byte stride — see
+// native_weight_addr.glsl. pc.w_base carries the layer's LUT window base; pc.m is unused.
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#elif defined(STREAMED)
+// -DSTREAMED (resident-BDA): the stacked weight tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi — same rb() pointer read as PAGED but with NO LUT and NO slot
+// stride (the base already points at THIS tensor). Under EXPERT_GRID, pc.m is the per-expert
+// BYTE stride applied on the pointer; pc.w_base keeps only the small within-bank element offset.
+// Additive: non-STREAMED builds are byte-identical.
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
+layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32]
+#if !defined(PAGED) && !defined(STREAMED)
+layout(binding = 2) readonly buffer WB { uint nw[]; };          // stacked Q3_K weight bytes
+#endif
+#ifdef PAGED
+// PAGED (implies EXPERT_GRID): `nw` is a GpuPager arena of uniform slots; the extra LUT binding
+// maps GLOBAL expert ids to arena WORD bases — see native_gemm_mmq_q2_k.comp's PAGED doc (word
+// base not slot index, pc.w_base = layer_base, pc.m unused, rb() chokepoint).
+layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#elif defined(EXPERT_GRID)
+// Batched-MoE all-experts-in-one-dispatch: gl_WorkGroupID.y = expert id; the packed activation
+// rows for expert e live at [offsets[e], offsets[e]+counts[e]) (bucket layout). pc.m is repurposed
+// as the per-expert weight stride (elements). Row tiles past the segment exit immediately; row
+// stores are clipped to the segment (rows are packed — no per-expert padding to stomp). The two
+// extra readonly inputs sit before `c` so the recorder's inputs-first/outputs-last order holds.
+layout(binding = 3) readonly buffer CNT { uint counts[]; };
+layout(binding = 4) readonly buffer OFF { uint offsets[]; };
+layout(binding = 5) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#else
+layout(binding = 3) writeonly buffer CB { float c[]; };         // [m, n]
+#endif
+
+shared uint As[BM * SP];
+shared uint Bs[BN * SP];
+shared float Bdl[BN];
+
+#if defined(PAGED) || defined(STREAMED)
+// Arena read via 64-bit device address (see native_weight_addr.glsl): `w_addr` (set in main) is
+// this expert's slot byte base; rb() reads a byte through it. The LUT stores the SLOT INDEX,
+// scaled onto the arena base with a 64-bit multiply (replaces the u32 word-base SSBO read).
+#include "native_weight_addr.glsl"
+uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+#else
+uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#endif
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+
+// 6-bit signed sub-block scale, si ∈ 0..15. `sr` = byte offset of the 12-byte scales_raw field.
+// Direct byte-wise port of llama.cpp's aux[0..3] bit-interleave (dequantize_row_q3_K): k = si/4
+// selects which reconstructed 32-bit "aux" word, bi = si%4 the byte within it.
+int sc3(uint sr, uint si) {
+    uint k = si >> 2u;
+    uint bi = si & 3u;
+    uint a = rb(sr + bi);
+    uint b = rb(sr + 4u + bi);
+    uint c = rb(sr + 8u + bi);
+    uint val;
+    if (k == 0u) {
+        val = (a & 0xFu) | ((c & 3u) << 4u);
+    } else if (k == 1u) {
+        val = (b & 0xFu) | (((c >> 2u) & 3u) << 4u);
+    } else if (k == 2u) {
+        val = ((a >> 4u) & 0xFu) | (((c >> 4u) & 3u) << 4u);
+    } else {
+        val = ((b >> 4u) & 0xFu) | (((c >> 6u) & 3u) << 4u);
+    }
+    return int(val) - 32;
+}
+
+
+#ifdef PACKED_DECODE
+#if defined(PAGED) && !defined(EXPERT_GRID)
+#error PACKED_DECODE PAGED requires EXPERT_GRID
+#endif
+#if defined(PAGED) && defined(STREAMED)
+#error PAGED and STREAMED are mutually exclusive
+#endif
+// Four consecutive bytes, including the +2 alignment of odd 110/210-byte blocks.
+// Aligned reads touch one word only; the covering pair stays within the GGUF block.
+uint k02_word(uint byte) {
+    uint wi = byte >> 2u;
+    uint sh = (byte & 3u) * 8u;
+#if defined(PAGED) || defined(STREAMED)
+    if (sh == 0u) { return arena_word(wi); }
+    uvec2 words = arena_word2(wi);
+#else
+    if (sh == 0u) { return nw[wi]; }
+    uvec2 words = uvec2(nw[wi], nw[wi + 1u]);
+#endif
+    return (words.x >> sh) | (words.y << (32u - sh));
+}
+#endif
+
+void main() {
+#ifdef STREAMED
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address; NO LUT/slot multiply
+#endif
+    uint nsub = pc.k / BLK;       // 16-element sub-blocks along k
+    uint nblk32 = pc.k / 32u;     // activation 32-blocks along k
+    uint kw = pc.k / 4u;
+    uint tilesN = pc.n / BN;
+#ifdef EXPERT_GRID
+    uint ex = gl_WorkGroupID.y;
+    uint cnt = counts[ex];
+    if ((gl_WorkGroupID.x / tilesN) * BM >= cnt) { return; }
+    uint wgRow = offsets[ex] + (gl_WorkGroupID.x / tilesN) * BM;
+    uint rowEnd = offsets[ex] + cnt;
+#ifdef PAGED
+    // Resolved AFTER the count early-exit: a bucket with count 0 was never routed, so its LUT
+    // entry may be stale/absent — no workgroup that would read it gets here.
+    w_addr = arena_base(lut[pc.w_base + ex].x, lut[pc.w_base + ex].y);
+    uint wbase = 0u;
+#elif defined(STREAMED)
+    // Expert base scaled onto the 64-bit pointer — pc.m is REPURPOSED as the per-expert BYTE
+    // stride in this build (same convention as native_gemv_id.comp's STREAMED arm); pc.w_base
+    // keeps its small within-bank element offset. Kills the u32 `ex * stride` element multiply.
+    w_addr += uint64_t(ex) * uint64_t(pc.m);
+    uint wbase = pc.w_base;
+#else
+    uint wbase = pc.w_base + ex * pc.m;
+#endif
+#else
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+#ifdef PACKED_DECODE
+    uint rowEnd = pc.m;
+#endif
+    uint wbase = pc.w_base;
+#endif
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN);
+    uint tc = li % (BN / TN);
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint sub = 0u; sub < nsub; sub++) {
+        uint blk32 = sub >> 1u; // the 32-block this 16-sub-block lives in (for dact)
+        // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
+        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
+            uint r = idx / WPB;
+            uint p = idx % WPB;
+#ifdef PACKED_DECODE
+            As[r * SP + p] = (wgRow + r < rowEnd)
+                ? qa[(wgRow + r) * kw + sub * WPB + p] : 0u;
+#else
+            As[r * SP + p] = qa[(wgRow + r) * kw + sub * WPB + p];
+#endif
+        }
+        // per-col scale d·(sc6−32) for this sub-block (constant across the 16 elements). `si`
+        // (the 16-sub-block's index within its 256-elem superblock) is derived from the COLUMN's
+        // own element offset — a row's start is only 256-aligned when k%256==0, so `sub & 15`
+        // would be wrong for the k%16-but-not-%256 shapes this kernel otherwise supports.
+        for (uint cc = li; cc < BN; cc += THREADS) {
+            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
+            uint bd = (gstart / 256u) * 110u;
+            uint si = (gstart >> 4u) & 15u;
+            float d = f16tof32(ru16(bd + 108u));
+            int s = sc3(bd + 96u, si);
+            Bdl[cc] = d * float(s);
+        }
+        // stage weights: BN cols × WPB words — 2 low bits from `qs` (same byte/shift mapping as
+        // Q2_K) OR'd with the high bit from `hmask`, then centered by −4 into a signed int8.
+        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
+            uint cc = idx / WPB;
+            uint p = idx % WPB;
+            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
+            uint bd = (gstart / 256u) * 110u;
+            uint si = (gstart >> 4u) & 15u;
+            uint qs_base = bd + 32u + 32u * (si >> 3u) + 16u * (si & 1u);
+            uint hm_base = bd + 16u * (si & 1u);
+            uint shift = 2u * ((si & 7u) >> 1u);
+            uint hbit = (si >> 3u) * 4u + ((si & 7u) >> 1u);
+#ifdef PACKED_DECODE
+            uint qbytes = k02_word(qs_base + p * 4u);
+            uint hbytes = k02_word(hm_base + p * 4u);
+            uint codes = ((qbytes >> shift) & 0x03030303u)
+                | (((hbytes >> hbit) & 0x01010101u) << 2u);
+            // Guard bits prevent cross-byte borrows: each byte is exactly int(q3u)-4.
+            uint packed = ((codes | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+#else
+            uint packed = 0u;
+            [[unroll]] for (uint b = 0u; b < 4u; b++) {
+                uint l = p * 4u + b;
+                uint qbyte = rb(qs_base + l);
+                uint hbyte = rb(hm_base + l);
+                uint low2 = (qbyte >> shift) & 3u;
+                uint high = (hbyte >> hbit) & 1u;
+                uint q3u = low2 | (high << 2u);
+                packed |= (uint(int(q3u) - 4) & 0xFFu) << (b * 8u);
+            }
+#endif
+            Bs[cc * SP + p] = packed;
+        }
+        barrier();
+
+        int qsum[TM][TN];
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+            [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
+        [[unroll]] for (uint p = 0u; p < WPB; p++) {
+            int av[TM];
+            int bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++)
+                    qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
+        }
+
+        float dval[TM];
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+#ifdef PACKED_DECODE
+            dval[i] = (wgRow + tr * TM + i < rowEnd) ? float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]) : 0.0;
+#else
+            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+#endif
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            float dl = Bdl[tc * TN + j];
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                acc[i][j] += dval[i] * dl * float(qsum[i][j]);
+            }
+        }
+        // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
+        // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete
+        // before any thread loops around and restages — a barrier between qsum and this block let
+        // a fast thread overwrite Bdl/Bmm while a slow one was still reading them (data race,
+        // exposed by the BN=128 wide tile's fuller occupancy; nondeterministic expert GEMM output).
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        uint rr = wgRow + tr * TM + i;
+#if defined(EXPERT_GRID) || defined(PACKED_DECODE)
+        if (rr >= rowEnd) { continue; }
+#endif
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
+        }
+    }
+}

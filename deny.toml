@@ -1,0 +1,91 @@
+# cargo-deny configuration — the supply-chain gate for `cargo deny check`.
+#
+# Run per-PR by nothing today and weekly by `.github/workflows/cron.yml`, whose
+# point is the advisory database rather than this file: a repo can sit quiet for
+# a month while a new RustSec advisory lands against a dependency that has not
+# changed. The weekly run re-checks against a freshly fetched DB, so the finding
+# does not wait for the next commit.
+#
+# Every setting here is a GATE. `warn` exits 0, which makes a check that reports
+# instead of one that enforces — so anything not gated below says so, and says
+# why, rather than sitting at `warn` and looking like coverage.
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# A yanked crate is one its author withdrew, most often as broken or unsound. A
+# `--locked` build would keep using it forever, so a warning nobody reads is the
+# wrong response. Nothing in `Cargo.lock` is yanked today, so this is green on
+# arrival.
+yanked = "deny"
+# Each entry is a advisory with NO safe upgrade available — both are
+# `unmaintained`, not vulnerabilities, and both arrive through a dependency we
+# do not choose. Anything else, including a new advisory against either crate,
+# fails the job. Re-derive with `cargo deny check advisories`.
+ignore = [
+  # `paste`, archived by its author with no successor selected. Reaches us
+  # through `tokenizers` (via `macro_rules_attribute`) and `metal`; the
+  # suggested replacements are other people's crates to adopt, not ours.
+  "RUSTSEC-2025-0119",
+  # `number_prefix`, unmaintained. A transitive dependency of `indicatif`, the
+  # progress-bar crate the weight loader draws with.
+  "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# The policy, not an inventory of today's graph — it may legitimately be broader
+# than what is currently linked. Every license below is permissive; a copyleft
+# one arriving in the tree is meant to fail here and be a decision.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  # `webpki-roots` ships Mozilla's CA bundle under a data licence, not a code
+  # one; it arrives with `reqwest`'s TLS stack (the hub downloader).
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# Removing a dependency must not turn the job red just because its licence is
+# now unused — the list is a policy and outlives any one crate.
+unused-allowed-license = "allow"
+
+[bans]
+# NOT gated, and the reason is a limitation rather than a judgement. A `*` on a
+# REGISTRY crate is worth failing over — it resolves to whatever exists at build
+# time, so a semver-major can land with no diff. But this workspace's own members
+# are declared `{ path = ... }` with no version, which cargo-deny also reads as a
+# wildcard, and `allow-wildcard-paths` does not help: it applies only to crates
+# marked `publish = false`, and only `infr-testkit` is. Marking the other members
+# unpublishable would fix it and is a claim about intent nobody has made yet, so
+# it is a decision in `docs/backlog.md` rather than a change made in passing.
+#
+# The graph has no registry wildcard today (`grep '= "\*"' crates/*/Cargo.toml`),
+# so what is lost is a guard against a future one, not cover for a current one.
+wildcards = "allow"
+# NOT gated, deliberately, and this is the one place worth explaining rather
+# than pretending. The duplicate set is dominated by pairs we do not control:
+# `tokenizers` 0.20 and 0.21 are both in the graph because `infr-chat` pins one
+# and `llguidance`'s `toktrie_hf_tokenizers` pins the other, and each drags its
+# own `rayon-cond`, `itertools`, `rand`, `getrandom` and `base64`. The Windows
+# `windows-sys` families duplicate for the same reason one layer down. Turning
+# this to `deny` today means a ~20-entry skip list that is mostly other
+# people's version pins, which is a list nobody would keep honest. Revisit when
+# the tokenizers split resolves upstream — `cargo deny check bans` prints the
+# current set.
+multiple-versions = "allow"
+
+[sources]
+# A dependency from somewhere other than crates.io is a supply-chain decision,
+# so it should be one somebody made on purpose. The workspace has no git or
+# alternate-registry dependencies today.
+unknown-registry = "deny"
+unknown-git = "deny"
