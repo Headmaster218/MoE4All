@@ -2311,7 +2311,10 @@ impl Backend for CpuBackend {
                     let state_rows = if overlap { 2 * ratio } else { ratio };
                     let value = &vals[values.0 as usize];
                     let score = &vals[scores.0 as usize];
-                    let ape = weight(ape);
+                    // `None` = this arch ships no APE table (every V4.1 file: 0 of 1008 tensors).
+                    // The term is then exactly zero, so the score ring takes the projection
+                    // unchanged — the same thing an all-zero table would do, without one.
+                    let ape = ape.map(|id| weight(id));
                     let norm = weight(norm);
                     let ff = freq_factors.map(|id| &vals[id.0 as usize]);
                     let buf = bindings
@@ -2326,7 +2329,11 @@ impl Backend for CpuBackend {
                     sf[vo + state_row * width..vo + (state_row + 1) * width]
                         .copy_from_slice(&value[..width]);
                     for i in 0..width {
-                        sf[so + state_row * width + i] = score[i] + ape[ape_row + i];
+                        sf[so + state_row * width + i] = score[i]
+                            + match &ape {
+                                Some(t) => t[ape_row + i],
+                                None => 0.0,
+                            };
                     }
 
                     let mut out = vec![0.0f32; dim];
