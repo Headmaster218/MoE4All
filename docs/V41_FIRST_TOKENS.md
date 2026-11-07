@@ -741,3 +741,58 @@ Round 1 就查明：`batched_prefill_ok` 里有一项 `!is_dsv4_family(c)`（run
 需要解决的具体问题：让 **`hc_mult` 宽的残差能跨 chunk 携带**。
 这是 Round 1 撞墙的那堵墙，也是 `batched_prefill_ok` 里那句
 「no batch > 1 V4 graph has ever been executed」的含义。
+
+---
+
+## Round 9：批量预填充真正打通，预填充 6 → 12 t/s（2026-11-08 06:32）
+
+### 根因：那个开关从来没被实现过
+
+`batched_prefill_ok` 的注释从 Round 1 起就写着
+「V4.1 is behind `INFR_DSV41_BATCHED_PREFILL` while that path is being brought up」。
+
+**但那个字符串只存在于注释里。** 判据是无条件的 `... && !is_dsv4_family(c)`，
+没有任何读环境变量的代码。所以此前每一次"设置这个变量去测批量路径"，
+实际跑的都是 per-token 路径。
+
+**破绽在数字上**：变量设上去后，ubatch 32/64/128/256 **全部报 6-7 t/s**。
+批量预填充必须随 ubatch 变化；一个不随 ubatch 变化的速率，按定义就是 per-token。
+
+### 接通后
+
+```rust
+let dsv41_batched_prefill = is_dsv4_family(c)
+    && std::env::var_os("INFR_DSV41_BATCHED_PREFILL").is_some_and(|v| v != "0");
+((c.moe.is_none() || moe_batched_ok) && !is_dsv4_family(c)) || dsv41_batched_prefill
+```
+
+实测（731-token prompt，ctx 4096，Vulkan1）：
+
+| 配置 | t/s | 耗时 |
+|---|---:|---:|
+| per-token（默认） | 6 | 117 s |
+| batched ub=64 | **10** | 73 s |
+| batched ub=256 | **12** | 62 s |
+| batched ub=512 | **12** | 63 s |
+| batched ub=1024 | **12** | 63 s |
+
+**3131-token prompt @ ub=512：12 t/s（270 s），无设备丢失。**
+
+- **预填充 6 → 12 t/s，2.0×**
+- ubatch ≥ 64 后饱和（chunk 内专家复用已达上限，再加行数没有额外收益）
+- **Round 1 记录的 2032-token 丢设备没有再复现**（3131 token 稳定跑完）
+
+### 仍然存在的差距
+
+poorseek 8192 token 是 244-248 t/s，我们 12 t/s，**仍差约 20×**。
+但那条差距的性质已经不同了：
+- 它用 **int8 tensor core MMQ** 计算，我们用 **dp4a id-GEMV**
+- 它的专家是 **PTQ1_0 三进制 / Q2_0**，我们是 IQ2_XXS
+
+这不再是"路径没走通"，而是"走的路径本身算力利用不同"，属于另一个量级的工程。
+
+### 下一步
+
+1. 把 `ubatch` 的自动策略在 V4.1 上设到 ≥256（现在默认走到 32）——**一行改动，可能再拿 2×**
+2. Round 2 写的 `native_gemm_mmq_iq1_m` kernel 现在**有意义了**：批量预填充一旦走通，
+   `moe_batched_ok` 相关的 MMQ 路径才是真正的算力出口
