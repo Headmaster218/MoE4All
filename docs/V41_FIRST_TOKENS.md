@@ -276,3 +276,55 @@ perf-impl 建议把 `moe_batched_ok` 从「全有或全无」改成逐 tensor �
 
 所以本轮**不动** `moe_batched_ok`：改判据形状换不来速度，只会把一处「保守但正确」变成
 「复杂但不快」。这个结论已写进 `runner.rs` 的注释。
+
+---
+
+## Round 2：写了 IQ1_M 的 MMQ kernel，但它现在调用不到（2026-11-08 02:10）
+
+### 做了什么
+
+`crates/infr-vulkan/shaders/native_gemm_mmq_iq1_m.comp`（新，~290 行）+ 4 个变体接线。
+
+**为什么需要它**：V4.1 的 `ffn_down_exps` 有 **28/40 层是 IQ1_M**，而 IQ1_M 被排除在 `MOE_MMQ_DTYPES`
+之外，因为它的 min 项最难缠——**每个 8 元素子块都有自己的带符号 ±0.125 delta**，
+`Σ(grid+delta)·x` 无法像 Q4_K/Q5_K 那样塌缩成 `scale · sact`。
+
+**解法**（照 `native_gemm_mmq_q2_k` 的先例再细一档）：每个 32 元素激活块保留**两个** dp4a 累加器
+（l=0,1 配 `dl1`，l=2,3 配 `dl2`，缩放不同所以不能先合并），外加**四个**按 l 自算的激活部分和：
+
+```
+Σ y_j x_j = dl1·(D_01 + d0·S_0 + d1·S_1) + dl2·(D_23 + d2·S_2 + d3·S_3)
+```
+
+`S_l` 直接从已 staged 的 `As` 码算出，**不需要 `sact` 缓冲，不额外读全局**。
+
+### 验证到什么程度
+
+| 项 | 状态 |
+|---|---|
+| shader 编译（4 变体 xp/xp32/xpg/xpg32） | ✅ 通过 |
+| 索引推导 vs `dequant.rs` 的 CPU 参考 | ✅ 逐项一致（`qh0/qh1`、`qs[4*ib+l]`、`l=p>>1`、高低 32 位） |
+| 缩放链路 vs `q2_k` 的先例 | ✅ 一致（`Bdl=d·sc`，`dval` 单独乘） |
+| 真实模型输出 | ✅ 仍正确（"Answer: Paris"），无崩坏 |
+| **GPU↔CPU parity 测试** | ❌ **未做** |
+| **速度提升** | ❌ **没有**（6.7 vs 6.5 t/s，噪声内） |
+
+### 为什么没有速度提升 —— 这是本轮最重要的发现
+
+profile 显示跑的仍然是 `native_idm_iq1m_paged`，**新 kernel 一次都没被调用**。
+
+原因：`moe_batched_ok` 是**全有或全无**判据（每一层的 gate/up/down 三项都必须合格）。
+现在 IQ1_M 合格了，但 **`IQ2_XXS` 仍不合格**（没有 shader、不在 `MOE_MMQ_DTYPES` 里），
+而 `ffn_gate_exps`/`ffn_up_exps` 里各**有 17 层是 IQ2_XXS**。所以整条判据依然 0/40 通过。
+
+**更要命的是**：`moe_batched_ok` 唯一的下游是 `batched_prefill_ok`，而_V4.1 的批量预填充在 Round 1
+已实测会被关掉（开长 prompt 会丢设备）_。所以**就算把判据改成逐 tensor，V4.1 还是走不到 MMQ 路径**。
+
+这条 kernel 目前是**为未来准备好的资产**，不是本轮的提速。
+
+### 下一步（按依赖顺序）
+
+1. `IQ2_XXS` 的 MMQ kernel（17 层 gate/up 卡在这里；格式与 IQ2_XS 同族，有现成 shader 可参照）
+2. 把 `moe_batched_ok` 改成逐 tensor 判定
+3. **修好批量预填充的 device-lost**（`hc_mult` 宽残差跨 chunk 携带）—— 这是 1、2 之后收益能否兑现的前提
+4. 给 IQ1_M kernel 补一个 GPU↔CPU parity 测试（照 `moe_mmq_fp4_parity.rs`）
