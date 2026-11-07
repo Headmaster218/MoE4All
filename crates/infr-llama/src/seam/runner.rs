@@ -1381,10 +1381,17 @@ fn session_stable(
     // made every DeepSeek prefill run one token per submit (see the CHANGELOG entry for the
     // before/after prefill throughput that fixing it bought).
     let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
-    // V4.1's expert banks are a 3-way dtype mix (IQ1_M / IQ2_XXS / IQ2_XS) and this gate is
-    // all-or-nothing, so on the real file only 1 of 40 layers qualifies it. Making it per-tensor
-    // would let IQ2_XXS/IQ2_XS layers take their already-shipped MMQ kernels; see
-    // docs/V41_FIRST_TOKENS.md.
+    // V4.1's expert banks are a 3-way dtype mix and this gate is all-or-nothing, so on the real
+    // file only 1 of 40 layers qualifies. Making it PER-TENSOR was considered and measured in
+    // practice (dtype census, 2026-11-08) — it buys almost nothing here:
+    //   gate/up: IQ1_M x16, IQ2_XXS x17, IQ2_XS x7
+    //   down   : IQ1_M x28, IQ2_XXS x8, IQ2_XS x4
+    // and MOE_MMQ_DTYPES holds neither `Iq1M` nor `Iq2Xxs` (only `Iq2S` / `Iq2Xs`), with no
+    // `iq2_xxs` or `iq1_m` MMQ shader in `shaders/`. So ALL 40 down projections must stay on
+    // id-GEMV and only 7 layers' gate+up could ever take MMQ: the ceiling is the down dtype, not
+    // the shape of this predicate. Do not reshape it without first shipping an IQ1_M MMQ kernel —
+    // that one needs TWO sign-keyed activation sums per 8-element sub-block, so it cannot reuse
+    // MOE_MMQ_SACT_DTYPES' single-scalar scheme. See docs/V41_FIRST_TOKENS.md.
     let moe_batched_ok = c.moe.is_some() && {
         let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
         let moe_layers = || (0..c.n_layer).filter(|&l| c.is_moe_layer(l));
