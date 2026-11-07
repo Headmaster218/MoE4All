@@ -240,3 +240,39 @@ WARN infr_vulkan::pcache: [infr] the GPU device was lost during this run
 
 **这是本轮最有价值的否定结论**：省掉了后来人重踩一次的时间，也说明「少预填充一个 token」
 并不是与 poorseek 差距 150x 的原因（41-token prompt 上批量只带来 7→8 t/s）。
+
+---
+
+## 专家 MMQ 路径：逐 tensor 化也救不了这个文件（2026-11-08 00:53）
+
+perf-impl 建议把 `moe_batched_ok` 从「全有或全无」改成逐 tensor 判定，以便让已有 MMQ shader 的层跑起来。
+**实测这个建议在真实 V4.1 文件上收益近乎为零**，原因是我自己核对 dtype 时发现的：
+
+### 真实每层专家 dtype（40 层全扫）
+
+| 位置 | IQ1_M | IQ2_XXS | IQ2_XS |
+|---|---:|---:|---:|
+| `ffn_gate_exps` / `ffn_up_exps` | 16 | **17** | 7 |
+| `ffn_down_exps` | **28** | 8 | 4 |
+
+### `MOE_MMQ_DTYPES`（`crates/infr-core/src/tensor.rs:172`）实际收录
+
+`Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2K Q3K Q4K Q5K Q6K Iq4Nl Iq4Xs Iq2S Iq2Xs Iq3S Iq3Xxs Mxfp4 Nvfp4 Q2_0`
+
+**`Iq1M` 不在里面 —— `Iq2Xxs` 也不在里面**（只有 `Iq2S` 和 `Iq2Xs`）。
+
+### 于是
+
+- `down` **40/40 层都不合格**（28 IQ1_M + 8 IQ2_XXS + 4 IQ2_XS，一个都没进名单）
+- `gate/up` 只有 **7 层**的 IQ2_XS 合格
+- shader 侧也印证：`shaders/` 里有 `native_gemm_mmq_iq2_s` 和 `native_gemm_mmq_iq_xs`，
+  **没有 `iq2_xxs`、没有 `iq1_m`**，且 `native_gemm_mmq_iq_xs.comp` 头注释写明它处理的是
+  `IQ2_XS [f16 d][u16 qs[32]][u8 scales[8]] = 74 bytes / 256 values`
+
+**结论：把 gate 改成逐 tensor，最多让 7/40 层的 gate+up 走 MMQ，而每一层的 down 仍必须走 id-GEMV。
+这类模型的速度上限卡在 IQ1_M/IQ2_XXS 的 down 投影上，不在判据形状上。**
+要真正解决，需要写一个 **IQ1_M MMQ kernel**，而这需要对每个 8 元素子块维护**两路**激活和
+（按符号位分开），不能复用 `MOE_MMQ_SACT_DTYPES` 的单标量方案 —— 这是一个独立的、有实质工作量的项目。
+
+所以本轮**不动** `moe_batched_ok`：改判据形状换不来速度，只会把一处「保守但正确」变成
+「复杂但不快」。这个结论已写进 `runner.rs` 的注释。
