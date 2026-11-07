@@ -328,3 +328,43 @@ profile 显示跑的仍然是 `native_idm_iq1m_paged`，**新 kernel 一次都�
 2. 把 `moe_batched_ok` 改成逐 tensor 判定
 3. **修好批量预填充的 device-lost**（`hc_mult` 宽残差跨 chunk 携带）—— 这是 1、2 之后收益能否兑现的前提
 4. 给 IQ1_M kernel 补一个 GPU↔CPU parity 测试（照 `moe_mmq_fp4_parity.rs`）
+
+---
+
+## Round 3：又排除三个假设，仍未找到正解（2026-11-08 02:52）
+
+### 目标：定位 179 ms/token 里那 ~140 ms 的等待
+
+已知：一次 forward 只有 **69 次 dispatch、约 40 ms 设备时间**（40 层 × ~1 ms），
+但 `exec(record+submit+gpu) = 179–205 ms/token`。设备空闲约 78%。
+
+### 本轮排除的
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| **专家 cache 命中率低** | `--ctx 4096`（专家 VRAM 21.66 GiB） | hit 0.649 → **0.740**（+14%），decode **6.4 不变** ❌ |
+| **decode 回放磁带开销** | `no_replay=true` vs `false` | 6.9 vs **7.0**，噪声内 ❌ |
+| **冷启动/预热** | 8 tok vs 48 tok | 6.5 vs **6.7**，稳态一致，非冷启动 ❌ |
+
+### 一个被我推翻的中间结论
+
+我先从 pager 统计算出「每 token 要搬 3.556 GiB」，反推需要 19.86 GB/s——
+**比 PCIe 实测 9.5 GB/s 还快**，物理上不成立。
+
+查证后：专家 pool 是 **`DEVICE_LOCAL|HOST_VISIBLE` 的 ReBAR 映射内存**，
+miss 只是换 slot 索引，**不是每次全量 PCIe 拷贝**（`native_weight_addr.glsl` 用设备地址直读）。
+所以我那个"带宽瓶颈"的推论是错的，已撤回。
+
+### 当前状态：未定位
+
+已排除：专家命中率、回放磁带、冷启动、submit 批次大小（Round 1）、
+dispatch 数量（Round 2 撤回）、图构建开销（0.073 ms）。
+
+**剩下最可能的方向**（都未验证）：
+- 每层之间的 fence / 同步等待（40 层 × 4.5 ms/层，而单次 submit 只要 3–10 µs，差 2 个数量级）
+- `GPU-resident paged Decode controller` 的 16 层分片提交策略
+- host 侧逐层准备激活（`quant_q8` 等）与 GPU 串行
+
+**下一步该做的不是继续猜参数，而是给 decode 加逐层计时**——
+在 `submit` 前后打点，直接看 40 层里哪一层/哪几层吃掉了那 140 ms。
+这需要改代码（新增 prof 打点），但比继续盲试开关有价值得多。
