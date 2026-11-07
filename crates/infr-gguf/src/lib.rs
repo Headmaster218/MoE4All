@@ -715,8 +715,8 @@ impl Gguf {
             // complete iff declared == retained + dropped; comparing against `tensors.len()` alone
             // would reject every shard set that carries a skipped entry.
             let retained = tensors.len() as u64;
-            let stated = declared.saturating_add(skipped);
-            if retained != stated {
+            let stated = retained.saturating_add(skipped);
+            if stated != declared {
                 return Err(Error::Loader(format!(
                     "GGUF: the {} shards hold {} tensors between them (plus {skipped} skipped) \
                      but the model declares {KEY_SPLIT_TENSORS_COUNT} = {declared} — the set is \
