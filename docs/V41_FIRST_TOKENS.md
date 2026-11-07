@@ -368,3 +368,74 @@ dispatch 数量（Round 2 撤回）、图构建开销（0.073 ms）。
 **下一步该做的不是继续猜参数，而是给 decode 加逐层计时**——
 在 `submit` 前后打点，直接看 40 层里哪一层/哪几层吃掉了那 140 ms。
 这需要改代码（新增 prof 打点），但比继续盲试开关有价值得多。
+
+---
+
+## Round 3 后半：瓶颈找到了 —— `paging_sync` 占 80%（2026-11-08 03:14）
+
+### 关键：诊断数据一直存在，只是被挡在门外
+
+`profile_single = c.qwen4exp && pager_profile::active()`（runner.rs:12305）——
+**只有 qwen4exp 家族能开这套逐层计时**，DSv4.1 永远进不去。
+放开这个 `c.qwen4exp` 后，`--set prof.pager_profile=true` 立刻给出了完整分解。
+
+（这个改动是安全的：`pager_profile::active()` 才是真正的开关，不设就零开销。
+`profile_single` 下面读的全是 pager 自己的计数器与设备时间线，与架构无关。）
+
+### 实测（6 个 decode token）
+
+```
+[single-decode-summary] tokens=6 wall=931.855ms setup=1.490ms exec=929.413ms
+[single-decode-pager]   hits=3337 misses=983 evictions=983 dma=2697.715MiB dma_submits=177
+  submits=599 submit_cpu=13.140ms record=138.970ms sync=747.792ms
+  paging_calls=240 paging_sync=743.521ms
+[single-decode-device]  main_busy=623.663ms dma_busy=0.000ms
+```
+
+| 项 | 时间 | 占 wall |
+|---|---:|---:|
+| **paging_sync** | **743.5 ms** | **79.8%** |
+| record | 139.0 ms | 14.9% |
+| submit_cpu | 13.1 ms | 1.4% |
+| backend_setup | 5.5 ms | 0.6% |
+
+逐层看（每层 6 次调用，40 层 → **240 次 paging 调用/token**）：
+```
+layer=1 calls=6 wall=28.825ms paging_sync=27.122ms record=3.453ms
+layer=2 calls=6 wall=27.630ms paging_sync=25.616ms record=3.896ms
+```
+**每层 wall 的 92% 是 paging_sync，record 只占 12%。**
+
+### 根因
+
+`Pager::ensure_resident` 的 miss 分支（`crates/infr-vulkan/src/pager.rs:1229-1246`）：
+
+```rust
+Resolution::Miss { slot, evicted } => {
+    vk.upload(staging, bytes)?;                 // 上传
+    copy_into_slot(vk, staging, arena, ...)?;   // <-- 同步 one-shot
+}
+```
+
+`copy_into_slot` 内部是 `vk.one_shot(...)` —— **一次独立提交并阻塞等待完成**。
+240 次串行 one-shot × 3.1 ms = 743 ms/token。
+
+`dma_busy=0.000ms` 说明这些拷贝走的是普通队列而非专用 DMA 队列，
+**每一个都单独提交、单独等待**，完全没有批量或被后续计算重叠。
+
+### 这解释了此前所有的"排除"
+
+- 命中率无关：miss 数只影响**次数**，每次都同步等，所以提高命中率 14% 只是少了 14% 的等待——被噪声淹没（实测 6.4 不变）
+- 带宽无关：不是传不动，是**每次都阻塞**
+- dispatch 数无关：69 次 dispatch 是真的少
+- 回放磁带无关：它省的是 record 时间（139ms，只占 15%）
+
+### 下一步（明确、可验证）
+
+把 miss 的拷贝从**逐个同步 one-shot** 改成**批量异步**：
+1. 一次 collect 整批需要换入的 ids
+2. 用已有的 `BackgroundTransferExecutor`（`pager.rs` 里就有 `execute_on_background`）一次提交
+3. 在 batch 末尾统一等一次
+
+这正是 poorseek 那边 `DS4_PROMPT_SYNC` 教训的反面——**它每次都等，你也要每次都等**；
+把"240 次等待"变成"1 次等待"应该能拿到数量级收益。

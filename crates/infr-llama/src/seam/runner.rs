@@ -12302,7 +12302,14 @@ fn generate_dense_backend_inner(
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
     // EVERY decode step (R6/§10.9).
-    let profile_single = c.qwen4exp && infr_core::pager_profile::active();
+    // Gated on `qwen4exp` only because that was the family it was written for. Nothing in the
+    // sampling path below assumes Qwen — it reads the pager's own counters and device timeline,
+    // both of which are arch-agnostic — so the gate only served to hide a decode split from every
+    // other MoE family. DSv4.1 is the case that most needs it (a forward is ~69 dispatches and
+    // tens of ms of device time, yet exec measures ~180 ms/token, so most of a token is NOT on
+    // the device and only this split can say where it went). Relaxing the gate costs nothing
+    // unless `INFR_PROF_PAGER` is set, since `pager_profile::active()` is the real switch.
+    let profile_single = infr_core::pager_profile::active();
     let prof_dec = ec.prof.stages || profile_single;
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;
