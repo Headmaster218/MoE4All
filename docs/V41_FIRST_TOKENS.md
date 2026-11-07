@@ -635,3 +635,62 @@ native_idm_iq1m_paged     6.7 us   6.5 us     6.4 us
    如果是这样，**这个对比从一开始就不是同类比较**，需要先确认 poorseek 的模型规格与显存占用。
 2. 若模型确实同级：需要在 `adapter.rs` 里做出**跨层 pipeline**
    （层 n 的 sync 与层 n+1 的计算重叠），这是真正的架构改动，不是开关。
+
+---
+
+## Round 7：27.7 t/s 的出处找到了，而且它不是同类比较（2026-11-08 04:51）
+
+上一轮我提的问题（"poorseek 的 V4.1-XXS 是不是更小"）**答案是反的**，
+但顺着它找到了真正的原因。原始文档：`poorseek/xolotl-sycl/docs/DEEPSEEK_V41.md:121`。
+
+### 那个 27.7 的原始上下文
+
+> **Results (RTX 4090 24 GB · Ryzen 7 5700X · 90 GB DDR4 · NVMe, 2026-10-12)**
+>
+> | Decode (256-token prompt, 256 tokens) | 3.4 tok/s | **25.5-26.3 tok/s**
+> (27.7 with the opt-in ggml patch) |
+>
+> * **Decode routes with two selection-only biases** (`--route-bias 1.0`,
+>   `--route-bias-file 0.6`, both defaults): a bonus for experts already in VRAM and a
+>   penalty for experts that would be read from NVMe. ...
+>   `--route-bias 0 --route-bias-file 0` = **exact routing at ~3.5 tok/s**.
+> * Cost on 4096-token perplexity: code **2.38 → 2.87**.
+
+**四点关键差异，逐条对照：**
+
+| | poorseek 的 27.7 | 本机 |
+|---|---|---|
+| 硬件 | RTX 4090 24 GB + 90 GB DDR4 + NVMe | Arc Pro B70 31.9 GiB + 系统内存 |
+| 模型 | GSQ 自研量化（PTQ1_0 三进制 1.75 bpw / Q2_0 2.25 bpw），**246 GiB 分片** | IQ2_XXS `-00001-of-00004`，**129 GiB** |
+| **路由** | **被 route-bias 主动偏置**（偏好已在 VRAM 的专家、惩罚要读 NVMe 的专家）——**不是精确路由** | **精确路由** |
+| 27.7 的附加条件 | 还要开 opt-in ggml patch；不开是 25.5-26.3 | — |
+
+### 最重要的一条
+
+**同一个文档写明：关掉 route-bias（精确路由）只有 ~3.5 tok/s。**
+
+也就是说 25.5-27.7 这个数，是**用路由准确性换来的**，代价是 4096-token code ppl 从 2.38 劣化到 2.87。
+
+**按精确路由口径比：本机 6.4-6.5 t/s vs poorseek 3.5 t/s —— 我们是它的 1.8 倍。**
+之前"差 4 倍"的判断，建立在拿我们的精确路由去比人家的偏置路由上。
+
+### 但也不能就此宣称"我们赢了"
+
+它的 decode 分解（38 ms/token）是 **dense ~19 ms + expert tier ~16 ms**；
+本机是 **层内 135 ms，其中 paging_sync 124 ms**。
+
+**它的 expert tier 16 ms，我们的 expert 路径 124 ms —— 这一项我们慢了近 8 倍，是真实的差距。**
+差别在于：它有 90 GB 系统内存 + NVMe 做专家后备，且用 route-bias 把命中率推到极高；
+本机 21.66 GiB 的 ReBAR arena 在 123 GiB 专家面前命中率只有 0.65-0.74。
+
+所以正确的结论是：
+
+1. **"对标 27.7" 这个目标本身口径不对**——应该在"同为精确路由"下比（我们已领先），
+   或者在"允许 route-bias"下比（那要先实现 route-bias，并且接受 ppl 劣化）。
+2. **真正值得做的优化仍然是 expert 搬运**（124 ms vs 16 ms），
+   但不是靠改 `paging_sync` 的同步结构——而是**提高命中率本身**，
+   这需要一个显存感知的路由偏置（即 route-bias 的等价物），
+   或者更大的 expert 后备带宽。
+3. 本轮的 `Vulkan0`（核显 141 GiB UMA）路线**已实测不可行**：
+   加载时 97.24 GiB 已被物理占用，只剩 43.09 GiB，装不下 129 GiB 模型，
+   且这次尝试**触发了一次 device lost**。
