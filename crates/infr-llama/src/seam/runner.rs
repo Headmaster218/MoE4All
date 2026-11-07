@@ -41,6 +41,21 @@ use infr_gguf::Gguf;
 /// this one, so it lives here beside its only consumers (`wload`/`wpush`) instead of widening the
 /// config API: the map is already the whole truth, and "`[il] == il` means 'layer il publishes'" is
 /// the same test the other two helpers spell out. `false` for every other arch.
+/// Whether `c` is a DeepSeek V4-FAMILY model — V4 or V4.1 — i.e. shares the attention skeleton
+/// (single-head MQA KV, grouped low-rank output projection, attention sinks, hyper-connections, the
+/// mixed-FP8/MXFP4 cache planes, the sliding-window-every-layer pattern).
+///
+/// `Config::deepseek4` is deliberately NOT aliased to include V4.1 (see `arch::DEEPSEEK41`: folding
+/// the two would route a V4.1 file through V4's `{0,4,128}` ratio checks and V4's hyper-connection
+/// timing without a word). But the SEAM has to branch on the shared skeleton all the same, and it
+/// must do so consistently: `wload` and `wpush` consume weight specs sequentially, so a mismatch
+/// between them binds every later weight one buffer off, silently. Every skeleton-level decision in
+/// this file therefore reads this predicate, and every decision that genuinely differs between the
+/// two arches tests `c.deepseek41` on its own.
+fn is_dsv4_family(c: &Config) -> bool {
+    c.deepseek4 || c.deepseek41
+}
+
 fn is_dsv41_index_key_source(c: &Config, il: usize) -> bool {
     c.dsv41_index_key_source.get(il).copied() == Some(il as i32)
 }
@@ -2318,12 +2333,21 @@ pub(super) fn cold_weight_plan(
         // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
         // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
         let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
+        // DeepSeek V4 **and V4.1** share the attention SKELETON: single-head MQA KV, a low-rank
+        // grouped output projection, attention sinks, hyper-connections. Both are neither MLA nor
+        // plain attention, and both must land in the arm below — a V4.1 file carries
+        // `attn_q_a`/`attn_q_b`/`attn_kv`/`attn_output_{a,b}`, and none of `attn_q`/`attn_output`
+        // that the generic and MLA arms would demand. `deepseek41` is deliberately NOT folded into
+        // `deepseek4` (see `arch::DEEPSEEK41`), so this is the one place the two must be OR'd, and
+        // everything INSIDE the arm that differs between them is gated explicitly.
+        let is_dsv4 = is_dsv4_family(c);
+        // ⚠️ ARM ORDER IS LOAD-BEARING, and it is not the order the flags suggest. `is_mla_layer`
+        // returns `deepseek2 || bailing`, which V4.1 does not set, so `is_mla` is already false for
+        // it — but the generic plain-attention fallthrough at the bottom of this block is caught by
+        // `is_dsv4` instead, and that is only true because `is_dsv4` now includes V4.1. V4.1 must
+        // never reach the `is_mla` or plain-attention arms: it has none of their tensors.
         let is_mla = c.is_mla_layer(l);
         let is_kda = c.bailingmoe3 && !is_mla;
-        // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
-        // output projection, attention sinks, hyper-connections and up to two compressor blocks
-        // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
-        let is_dsv4 = c.deepseek4;
         if c.qwen4exp {
             for name in [
                 "hc_attn_norm.weight",
@@ -2518,7 +2542,12 @@ pub(super) fn cold_weight_plan(
             wload(&[&p("attn_k.bias")])?;
             wload(&[&p("attn_v.bias")])?;
         }
-        if qk_norm && !is_delta && !is_mla && !is_kda {
+        // `!is_dsv4` is required here as well as `!is_mla`: V4 and V4.1 carry no `attn_q_norm`/
+        // `attn_k_norm`. V4's Q goes through the WEIGHTLESS per-head RMS norm (`Op::QkNorm` with
+        // `None`), which is why `dsv4_model` in the synthetic tests never writes those tensors.
+        // `is_mla` does NOT cover them (V4 sets neither `deepseek2` nor `bailing`), so without this
+        // the guard reads as correct and is not.
+        if qk_norm && !is_delta && !is_mla && !is_kda && !is_dsv4 {
             wload(&[&p("attn_q_norm.weight")])?;
             wload(&[&p("attn_k_norm.weight")])?;
         }
@@ -4742,7 +4771,7 @@ fn generate_dense_backend_inner(
                 qsa_block_cache.push(None);
                 continue;
             }
-            if c.deepseek4 {
+            if is_dsv4_family(c) {
                 let layout = crate::seam::dsv4_layer_layout(c, l, max_ctx);
                 k_cache.push(g.input(TensorDesc::new(
                     vec![layout.raw_bytes.div_ceil(4)],
@@ -4821,7 +4850,10 @@ fn generate_dense_backend_inner(
             let is_delta = (c.qwen35 || c.qwen4exp) && !c.is_qwen_hybrid_attn_layer(l);
             let is_mla = c.is_mla_layer(l);
             let is_kda = c.bailingmoe3 && !is_mla;
-            let mixer = if c.deepseek4 {
+            // MUST mirror the `wload` arm's `is_dsv4` test EXACTLY (both spell `is_dsv4_family`):
+            // `wpush` consumes `wspecs` sequentially, so if one side takes the Dsv4 arm and the
+            // other does not, every weight after the mixer binds one buffer off — silently.
+            let mixer = if is_dsv4_family(c) {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
                 // silently. The two hyper-connection triples are pushed right after `wo_b` for the
@@ -4990,7 +5022,7 @@ fn generate_dense_backend_inner(
             };
             // DeepSeek V4's two hyper-connection triples, in `wload`'s order: attn `(fn, base,
             // scale)` then ffn `(fn, base, scale)`.
-            let hc = c.deepseek4.then(|| LayerHcW {
+            let hc = is_dsv4_family(c).then(|| LayerHcW {
                 attn: HcTriple {
                     w_fn: wpush(&mut g, &mut weights),
                     base: wpush(&mut g, &mut weights),
@@ -5002,7 +5034,7 @@ fn generate_dense_backend_inner(
                     scale: wpush(&mut g, &mut weights),
                 },
             });
-            let dsv4_compressed = if c.deepseek4 {
+            let dsv4_compressed = if is_dsv4_family(c) {
                 if c.deepseek41 {
                     // EXACT order of the `wload` deepseek41 arm: per-role, not per-ratio.
                     let (kv_src, key_src, topk_src) = (
@@ -5252,7 +5284,10 @@ fn generate_dense_backend_inner(
         // `{hc_dim, hc}` rather than `{hc_dim, (2+hc)*hc}`: the head has no sublayer to wrap, so
         // its `mixes` IS the `pre` chunk and `Op::HyperConnectMix { gates: None }` reads it at the
         // same `scale[0]`/`base[0..hc]` indices.
-        let hc_head = c.deepseek4.then(|| HcTriple {
+        // **V4.1 has no learned head triple.** It collapses with the last layer's FFN mix — see
+        // the emit below — so `hc_head` is `None` there and the matching `wload` above asks for no
+        // `output_hc_*` tensors. A file that correctly omits them must not be asked for them.
+        let hc_head = (c.deepseek4 && !c.deepseek41).then(|| HcTriple {
             w_fn: wpush(&mut g, &mut weights),
             base: wpush(&mut g, &mut weights),
             scale: wpush(&mut g, &mut weights),
@@ -5331,9 +5366,9 @@ fn generate_dense_backend_inner(
             None
         };
         // DeepSeek V4's `hc_mult*n_embd`-wide ones-vector for the weightless RMSNorm that feeds
-        // every hyper-connection mixing matmul — upload order matches the `if c.deepseek4` block
+        // every hyper-connection mixing matmul — upload order matches the `if is_dsv4_family` block
         // at the end of the weight loop above.
-        let hc_ones = if c.deepseek4 {
+        let hc_ones = if is_dsv4_family(c) {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -5428,7 +5463,7 @@ fn generate_dense_backend_inner(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
-        let (hcr, hc_normed) = if c.deepseek4 {
+        let (hcr, hc_normed) = if is_dsv4_family(c) {
             (
                 [
                     g.internal(f32d(batch * hcw.max(1))),
@@ -5448,6 +5483,20 @@ fn generate_dense_backend_inner(
         let hc_mixes = g.internal(f32d(batch * ((2 + c.hc_mult) * c.hc_mult).max(1)));
         let hc_hmixes = g.internal(f32d(batch * c.hc_mult.max(1)));
         let hc_pre = g.internal(f32d(batch * c.hc_mult.max(1)));
+        // DeepSeek V4.1 holds the collapse weights one sublayer BEHIND (`deepseek41.cpp` 843-886).
+        // The pair ping-pongs in step with `hcr`, so the parity is fixed rather than a running
+        // index: every ATTENTION sublayer writes [1] and reads [0], every FFN writes [0] and reads
+        // [1]. That also leaves the final layer's FFN mix — the one nothing consumes — in [0],
+        // exactly where the head collapse below reads it. Every other graph aliases both to
+        // `hc_pre`, so V4's scheduling is unchanged.
+        let hc_pre_lag = if c.deepseek41 {
+            [
+                g.internal(f32d(batch * c.hc_mult.max(1))),
+                g.internal(f32d(batch * c.hc_mult.max(1))),
+            ]
+        } else {
+            [hc_pre, hc_pre]
+        };
         let hc_post = g.internal(f32d(batch * c.hc_mult.max(1)));
         let hc_comb = g.internal(f32d(batch * (c.hc_mult * c.hc_mult).max(1)));
         //   d4_qa      [batch, q_lora_rank]     the normed low-rank query intermediate
@@ -5458,7 +5507,7 @@ fn generate_dense_backend_inner(
         //   d4_og      [batch, o_lora_rank]     that group's low-rank output
         //   d4_oa      [batch, o_group_count*o_lora_rank]  all groups' outputs, concatenated
         let d4_qa = g.internal(f32d(batch * c.q_lora_rank.max(1)));
-        let (d4_kv, d4_rq, d4_rkv) = if c.deepseek4 {
+        let (d4_kv, d4_rq, d4_rkv) = if is_dsv4_family(c) {
             (
                 g.internal(f32d(batch * c.head_dim.max(1))),
                 g.internal(f32d(batch * (nh.max(c.indexer_n_head) * c.rope_dim).max(1))),
@@ -5502,7 +5551,7 @@ fn generate_dense_backend_inner(
         let d4_hca_rows = (start_pos + batch) / 128;
         let d4_comp_selected = d4_hca_rows.max(d4_top_k);
         let d4_gather_rows = d4_raw_rows + d4_comp_selected;
-        let d4_gather = if c.deepseek4 {
+        let d4_gather = if is_dsv4_family(c) {
             g.internal(f16d((d4_gather_rows * c.head_dim).max(1)))
         } else {
             g.internal(f16d(1))
@@ -5645,7 +5694,12 @@ fn generate_dense_backend_inner(
         // `post`/`comb` stay in `hc_post`/`hc_comb` for the matching `Op::HyperConnectPost` that
         // closes this wrap. The two wraps of a layer are strictly sequential (attention's Post runs
         // before the FFN's Mix overwrites them), which is what lets one pair of buffers serve both.
-        let hc_wrap_pre = |g: &mut Graph, t: &HcTriple, res: TensorId, dst: TensorId| {
+        //
+        // The MATMUL and the COLLAPSE are separate closures because DeepSeek V4.1 consumes a mix one
+        // sublayer BELOW the one that computes it: a sublayer runs the matmul but collapses `res`
+        // with its PREDECESSOR's weights (`deepseek41.cpp` 843-886). V4 does both in the same
+        // sublayer, which is why `hc_wrap_pre` passes the same `hc_pre` on both sides for it.
+        let hc_mix = |g: &mut Graph, t: &HcTriple, res: TensorId, mix_pre: TensorId| {
             let ones = hc_ones.expect("deepseek4 build always declares hc_ones");
             g.push(Op::RmsNorm {
                 x: res,
@@ -5668,7 +5722,7 @@ fn generate_dense_backend_inner(
                 mixes: hc_mixes,
                 scale: t.scale,
                 base: t.base,
-                pre: hc_pre,
+                pre: mix_pre,
                 gates: Some(HyperGates {
                     post: hc_post,
                     comb: hc_comb,
@@ -5678,14 +5732,23 @@ fn generate_dense_backend_inner(
                 eps: c.hc_eps,
                 n_iter: c.hc_sinkhorn_iters as u32,
             });
+        };
+        // The collapse half, shared by the wraps and by V4.1's head — which has no learned
+        // `output_hc_fn` and reuses the last layer's FFN mix instead (`deepseek41.cpp` 919-923).
+        let hc_pre_collapse = |g: &mut Graph, res: TensorId, read_pre: TensorId, dst: TensorId| {
             g.push(Op::HyperConnectPre {
                 x: res,
-                weights: hc_pre,
+                weights: read_pre,
                 dst,
                 rows: batch as u32,
                 hc: c.hc_mult as u32,
                 n_embd: ne as u32,
             });
+        };
+        // DeepSeek V4's form: compute this sublayer's mix and consume it here, in the same frame.
+        let hc_wrap_pre = |g: &mut Graph, t: &HcTriple, res: TensorId, dst: TensorId| {
+            hc_mix(g, t, res, hc_pre);
+            hc_pre_collapse(g, res, hc_pre, dst);
         };
         let qwen_hc_mix =
             |g: &mut Graph,
@@ -6006,7 +6069,7 @@ fn generate_dense_backend_inner(
         // widened stream. Replicating the input across streams is what the hyper-connections
         // formulation calls for and what makes the head's collapse a partition of unity at depth 0;
         // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC.
-        if c.deepseek4 {
+        if is_dsv4_family(c) {
             for h in 0..c.hc_mult {
                 g.push(Op::CopyStrided {
                     src: hidden,
@@ -6036,6 +6099,13 @@ fn generate_dense_backend_inner(
             }
         }
 
+        // DeepSeek V4.1 HC lag: tracks whether lag slot [0] has been written since the loop began.
+        // The FFN sublayer of each layer is its only writer, and the ATTENTION sublayer of the NEXT
+        // layer its only reader (`deepseek41.cpp` 843-886), so "written by the previous iteration"
+        // is the whole correctness condition for the schedule. Reset per build; a LAYER-SPAN build
+        // starting past 0 legitimately begins with the flag false and takes the copy path.
+        #[allow(unused_mut)]
+        let mut dsv41_lag_slot0_written = false;
         for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
             if let Some(pw) = &lw.ple {
                 let wide = qwen_wide.expect("a qwen4exp PLE layer needs qwen_wide");
@@ -6130,7 +6200,7 @@ fn generate_dense_backend_inner(
             let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
             let rope_dim = c.layer_rope_dim(l);
             // EVERY deepseek4 layer is sliding-window (`set_swa_pattern(0)`) — never `Causal`.
-            let swa = (gemma || c.deepseek4) && c.is_swa_layer(l);
+            let swa = (gemma || is_dsv4_family(c)) && c.is_swa_layer(l);
             // llama4 iRoPE: NoPE (global) layers skip rope entirely; rope (local) layers apply a
             // weightless per-head L2-norm to Q/K AFTER rope (`Llama4TextL2Norm`). `l2norm` is the
             // ones-vector handle on llama4 rope layers, `None` on NoPE layers and every other model.
@@ -6167,7 +6237,7 @@ fn generate_dense_backend_inner(
             // because its GGUF omits both optional keys. `infr_core::graph::swiglu_clamp` owns the
             // `limit > 1e-6` disabled gate; passing a non-clamping layer's raw 0.0 through as
             // `Some(0.0)` would clamp that whole FFN to zero. `None` for every other arch.
-            let (clamp_exp, clamp_shexp) = if c.deepseek4 || c.bailingmoe3 {
+            let (clamp_exp, clamp_shexp) = if is_dsv4_family(c) || c.bailingmoe3 {
                 (
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_exp[l]),
                     infr_core::graph::swiglu_clamp(c.swiglu_clamp_shexp[l]),
@@ -6183,7 +6253,43 @@ fn generate_dense_backend_inner(
                 qwen_hc_mix(&mut g, &hcl.attn, wide, hn, None);
                 hn
             } else if let Some(hcl) = &lw.hc {
-                hc_wrap_pre(&mut g, &hcl.attn, hcr[0], hn);
+                if c.deepseek41 {
+                    // V4.1: this sublayer's matmul feeds the FFN below, and the collapse reads the
+                    // PREVIOUS sublayer's. Layer 0 has none — the reference hands it a one-hot that
+                    // selects the first copy (`deepseek41.cpp` 828-832), and a one-hot collapse is
+                    // exactly a copy of stream 0.
+                    //
+                    // ⚠️ THE INVARIANT THIS DEPENDS ON, checked below rather than argued: slot [0]
+                    // must have been written by the PREVIOUS layer's FFN sublayer before this read.
+                    // The whole lag scheme is a raw-buffer dependency with no shape to get wrong, so
+                    // a refactor that reorders two of these pushes would silently change the model.
+                    // Layer 0 is the one layer with no predecessor, which is exactly why it takes
+                    // the copy path instead of a collapse.
+                    debug_assert!(
+                        l == 0 || dsv41_lag_slot0_written,
+                        "deepseek41 layer {l}: the attention collapse reads lag slot [0] before \
+                         layer {}'s FFN sublayer wrote it — the HC lag schedule is broken, and \
+                         every layer but the first would silently consume a stale mix",
+                        l - 1
+                    );
+                    hc_mix(&mut g, &hcl.attn, hcr[0], hc_pre_lag[1]);
+                    if l == 0 {
+                        g.push(Op::CopyStrided {
+                            src: hcr[0],
+                            src_off: 0,
+                            src_stride: hcw as u32,
+                            dst: hn,
+                            dst_off: 0,
+                            dst_stride: ne as u32,
+                            rows: batch as u32,
+                            n: ne as u32,
+                        });
+                    } else {
+                        hc_pre_collapse(&mut g, hcr[0], hc_pre_lag[0], hn);
+                    }
+                } else {
+                    hc_wrap_pre(&mut g, &hcl.attn, hcr[0], hn);
+                }
                 hn
             } else {
                 hidden
@@ -8037,7 +8143,16 @@ fn generate_dense_backend_inner(
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                 });
-                hc_wrap_pre(&mut g, &hcl.ffn, hcr[1], hn);
+                if c.deepseek41 {
+                    // The FFN's mix is the one the NEXT layer's attention collapses with; this
+                    // frame consumes the attention mix the top of this layer just produced.
+                    hc_mix(&mut g, &hcl.ffn, hcr[1], hc_pre_lag[0]);
+                    hc_pre_collapse(&mut g, hcr[1], hc_pre_lag[1], hn);
+                    // Slot [0] now holds a defined mix; the next layer's attention read is legal.
+                    dsv41_lag_slot0_written = true;
+                } else {
+                    hc_wrap_pre(&mut g, &hcl.ffn, hcr[1], hn);
+                }
                 g.push(Op::RmsNorm {
                     x: hn,
                     weight: lw.ffn_norm,
@@ -8657,6 +8772,17 @@ fn generate_dense_backend_inner(
                 hc: c.hc_mult as u32,
                 n_embd: ne as u32,
             });
+        } else if c.deepseek41 && l_end == c.n_layer {
+            // V4.1 ships no `output_hc_*` (see the load side): the last layer's FFN mix is the one
+            // nothing consumed, and collapsing with it is exactly what a learned head does in V4
+            // (`deepseek41.cpp` 919-923 — "the last layer's FFN mix is the one nothing has
+            // consumed"). The FFN of the final layer is the only writer of lag slot [0] since the
+            // loop began, so it still holds that mix here.
+            //
+            // Guarded on `l_end == c.n_layer`: a LAYER-SPAN build (`span`, the seam's layer-major
+            // prefill) stops early, and its last span's FFN mix is a legitimate slot-[0] writer, so
+            // collapsing there would be a partial-stream read of a model that is not finished.
+            hc_pre_collapse(&mut g, hcr[0], hc_pre_lag[0], hidden);
         }
         if l_end == c.n_layer {
             if let Some(t) = &qwen_hc_head {
@@ -12089,7 +12215,7 @@ fn generate_dense_backend_inner(
             && matches!(v_fmt, DType::F16 | DType::Q8_0)
             && (be.moe_paged() || moe_batched_ok)
     } else {
-        (c.moe.is_none() || moe_batched_ok) && !c.deepseek4
+        (c.moe.is_none() || moe_batched_ok) && !is_dsv4_family(c)
     };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
@@ -12700,7 +12826,7 @@ fn generate_dense_backend_inner(
         // decayed with prompt length (1.0 at one token, 0.95 at two, 0.67 at three) while a
         // `sliding_window = 1` model — where attending only your own row IS the right answer —
         // stayed exact and hid it.
-        && !c.deepseek4
+        && !is_dsv4_family(c)
         // Qwen3.8 is intentionally two submissions in v1: layer 0 overlaps the host PLE gather,
         // then layer 1..end consumes its result. A one-plan replay cannot represent that handoff.
         && !c.qwen4exp

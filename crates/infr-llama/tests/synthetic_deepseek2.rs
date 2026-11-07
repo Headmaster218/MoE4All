@@ -67,6 +67,11 @@ enum Meta {
     I32Arr(Vec<i32>),
     /// An array of FLOAT32s — `deepseek4.swiglu_clamp_exp` / `_shexp` in their per-layer form.
     F32Arr(Vec<f32>),
+    /// An array of UINT64s — DeepSeek V4.1's `engram.{multipliers,primes,offsets,token_map}`
+    /// hash tables, which the hash reads as `u64` (crate::engram). `gguf-py` writes a Python
+    /// `list[int]` as INT32, but these tables are u64-valued in the real file and the engram hash
+    /// is 64-bit, so a U32/I32 array would silently truncate the primes.
+    U64Arr(Vec<u64>),
 }
 
 fn push_u32(b: &mut Vec<u8>, v: u32) {
@@ -121,6 +126,14 @@ impl Meta {
             Meta::F32Arr(a) => {
                 push_u32(b, 9);
                 push_u32(b, 6); // element type: FLOAT32
+                push_u64(b, a.len() as u64);
+                for v in a {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            Meta::U64Arr(a) => {
+                push_u32(b, 9);
+                push_u32(b, 10); // element type: UINT64
                 push_u64(b, a.len() as u64);
                 for v in a {
                     b.extend_from_slice(&v.to_le_bytes());
@@ -3399,5 +3412,452 @@ fn gpu_synthetic_deepseek4_mechanisms_execute() {
     assert!(
         scale > 1e-3,
         "window-1 logits are degenerate (rms {scale:e})"
+    );
+}
+
+// ─── deepseek41 (V4.1) ───────────────────────────────────────────────────────────
+//
+// V4.1 is NOT a reskin of V4 (see `docs/deepseek.md` and `arch::DEEPSEEK41`'s doc comment), so this
+// fixture is deliberately not `dsv4_model` with a different arch string. The four things it pins,
+// each of which `dsv4_model` would get wrong:
+//
+//   1. `compress_ratios` is a ROLE map `{0,1,2}`, not V4's `{0,4,128}` ratio. Role 0 = pure
+//      sliding window, role 1 = an unpooled compressed source, role 2 = a pooled/reuse layer.
+//   2. Compressor tensors exist only on the KV SOURCE layers, and the role-1 source carries NO
+//      `attn_compressor_gate` — it pools one token per row, so softmax over one element is 1.0.
+//   3. NO layer carries `attn_compressor_ape` or `indexer_compressor_*`; the index-key owners
+//      carry `indexer.attn_k` + `indexer.k_norm` instead.
+//   4. NO model-level `output_hc_*` triple exists — the head reuses the last layer's FFN mix.
+
+/// The role sequence of the synthetic V4.1 model.
+///
+/// Chosen so that every branch of the loader and the CSA2 topology is reachable in 6 layers:
+///
+/// | layer | role | KV source | index-key | top-k | tensor set                      |
+/// |------:|-----:|:---------:|:---------:|:-----:|---------------------------------|
+/// |     0 |    0 |           |           |       | sliding window only             |
+/// |     1 |    2 |           |           |       | reuse (attrs its source)        |
+/// |     2 |    2 |     yes   |    yes    |  yes  | compressor + gate + attn_k      |
+/// |     3 |    2 |           |           |       | reuse                           |
+/// |     4 |    2 |     yes   |    yes    |  yes  | compressor + gate + attn_k      |
+/// |     5 |    1 |      yes  |    yes    |  yes  | compressor, **no gate** (ratio1)|
+///
+/// Layer 5 is the load-bearing one: it is the only role-1 source, so it is the only place the
+/// "a compressor with no gate means the plain unweighted projection" invariant can be exercised.
+fn dsv41_roles() -> Vec<usize> {
+    vec![0, 2, 2, 2, 2, 1]
+}
+
+/// The layers of [`dsv41_roles`] that publish a compressed KV stream, an index-key stream and a
+/// top-k projection. Derived from the role sequence the way the real file's tensor presence does,
+/// so the fixture cannot drift from its own topology.
+fn dsv41_sources() -> (Vec<usize>, Vec<usize>) {
+    let roles = dsv41_roles();
+    // The last non-zero role before each step is the publisher, exactly as `Config`'s
+    // pointer-chasing derivation finds it. Here every previewed step starts a new source.
+    let kv: Vec<usize> = (0..roles.len()).filter(|&l| roles[l] != 0).collect();
+    let key = kv.clone();
+    (kv, key)
+}
+
+/// Build the whole GGUF description for a synthetic `deepseek41` model.
+///
+/// Deliberately shares no code path with [`dsv4_model`] beyond the tiny tensor shapes: every tensor
+/// SET difference above is the specification, and routing it through a shared helper is how the two
+/// would quietly converge.
+fn dsv41_model(d: &Dsv4Dims) -> SyntheticModel {
+    let arch = infr_llama::arch::DEEPSEEK41;
+    let (kv_src, key_src) = dsv41_sources();
+    let u = |k: &str, v: usize| (format!("{arch}.{k}"), Meta::U32(v as u32));
+    let f = |k: &str, v: f32| (format!("{arch}.{k}"), Meta::F32(v));
+
+    // Engram: one slot, 2-gram (the minimum `Config` accepts), `engram_n_head` buckets.
+    let engram_layers: Vec<u64> = vec![1, 4];
+    let engram_n_head = 2usize;
+    let engram_ngram = 2usize;
+    let n_bucket = (engram_ngram - 1) * engram_n_head;
+    let engram_key_length = 8usize;
+    let multipliers: Vec<u64> = (0..engram_layers.len() * engram_ngram)
+        .map(|i| 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1) | 1)
+        .collect();
+    let primes: Vec<u64> = (0..engram_layers.len() * n_bucket)
+        .map(|i| 0x1000_0000_1b3u64.wrapping_add(i as u64 * 2))
+        .collect();
+    let offsets: Vec<u64> = (0..engram_layers.len() * n_bucket).map(|i| i as u64).collect();
+    // Identity-ish token map: every token hashes to itself, so a hash that ignores the map still
+    // produces a legal (if different) index rather than an out-of-bounds one.
+    let token_map: Vec<u64> = (0..d.vocab).map(|i| i as u64).collect();
+
+    let mut meta = vec![
+        (
+            "general.architecture".to_string(),
+            Meta::Str(arch.to_string()),
+        ),
+        u("block_count", d.n_layer()),
+        u("embedding_length", d.n_embd),
+        u("attention.head_count", d.n_head),
+        u("attention.head_count_kv", d.n_kv),
+        u("attention.key_length", d.head_dim),
+        u("rope.dimension_count", d.rope_dim),
+        f("rope.freq_base", 10000.0),
+        u("context_length", 256),
+        f("attention.layer_norm_rms_epsilon", 1e-5),
+        u("attention.sliding_window", d.swa_window),
+        u("attention.q_lora_rank", d.q_lora_rank),
+        u("attention.output_group_count", d.o_group_count),
+        u("attention.output_lora_rank", d.o_lora_rank),
+        // Present on V4.1 exactly as on V4 (`Config` reads it for both arches). A zero here is
+        // the silent-wrong-angle failure `runner.rs`'s tripwire refuses, so the fixture must
+        // carry a real value or it would be testing the tripwire instead of the model.
+        f("attention.compress_rope_freq_base", d.compress_rope_theta),
+        (
+            format!("{arch}.attention.compress_ratios"),
+            Meta::I32Arr(d.compress_ratios.iter().map(|r| *r as i32).collect()),
+        ),
+        u("hyper_connection.count", d.hc_mult),
+        u("hyper_connection.sinkhorn_iterations", d.hc_sinkhorn_iters),
+        f("hyper_connection.epsilon", d.hc_eps),
+        u("attention.indexer.head_count", dsv4_indexer().n_head),
+        u("attention.indexer.key_length", dsv4_indexer().head_size),
+        u("attention.indexer.top_k", dsv4_indexer().top_k),
+        u("hash_layer_count", 0),
+        u("expert_count", d.n_expert),
+        u("expert_used_count", d.n_used),
+        u("expert_feed_forward_length", d.n_ff_exp),
+        u("expert_shared_count", d.n_expert_shared),
+        u("expert_gating_func", d.expert_gating_func as usize),
+        (format!("{arch}.expert_weights_norm"), Meta::Bool(true)),
+        f("expert_weights_scale", 1.5),
+        (
+            format!("{arch}.swiglu_clamp_exp"),
+            Meta::F32Arr(d.swiglu_clamp_exp.clone()),
+        ),
+        // ── the candidate-block selector (`Config` requires all three) ────────────
+        u("attention.candidate_source_layer_id", 2),
+        u("attention.candidate_block_size", 8),
+        u("attention.candidate_topk_blocks", 8),
+        // ── engram (`deepseek41.cpp::load_arch_hparams`) ──────────────────────────
+        (format!("{arch}.engram.present"), Meta::Bool(true)),
+        (format!("{arch}.engram.layer_ids"), Meta::U64Arr(engram_layers.clone())),
+        u("engram.head_count", engram_n_head),
+        u("engram.key_length", engram_key_length),
+        u("engram.max_ngram_size", engram_ngram),
+        u("engram.pad_id", 0),
+        (
+            format!("{arch}.engram.multipliers"),
+            Meta::U64Arr(multipliers),
+        ),
+        (format!("{arch}.engram.primes"), Meta::U64Arr(primes)),
+        (format!("{arch}.engram.offsets"), Meta::U64Arr(offsets)),
+        (
+            format!("{arch}.engram.token_map"),
+            Meta::U64Arr(token_map),
+        ),
+        (
+            "tokenizer.ggml.model".to_string(),
+            Meta::Str("gpt2".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            Meta::StrArr((0..d.vocab).map(|i| format!("t{i}")).collect()),
+        ),
+        (
+            "tokenizer.ggml.merges".to_string(),
+            Meta::StrArr(Vec::new()),
+        ),
+        ("tokenizer.ggml.eos_token_id".to_string(), Meta::U32(2)),
+    ];
+    meta.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let w = Fill::Rand(0.25);
+    let ix = dsv4_indexer();
+    // NO `output_hc_fn/base/scale`: V4.1's head collapses the streams with the final layer's FFN
+    // mix. A fixture that carried them would let a loader that (wrongly) demands them pass.
+    let mut tensors = vec![
+        TensorSpec::new("token_embd.weight", vec![d.n_embd, d.vocab], w.clone()),
+        TensorSpec::new("output_norm.weight", vec![d.n_embd], Fill::Gain),
+        TensorSpec::new("output.weight", vec![d.n_embd, d.vocab], w.clone()),
+    ];
+    for (l, &role) in d.compress_ratios.iter().enumerate() {
+        let p = |s: &str| format!("blk.{l}.{s}");
+        tensors.push(TensorSpec::new(
+            p("attn_norm.weight"),
+            vec![d.n_embd],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_sinks.weight"),
+            vec![d.n_head],
+            Fill::Rand(0.1),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_q_a.weight"),
+            vec![d.n_embd, d.q_lora_rank],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_q_a_norm.weight"),
+            vec![d.q_lora_rank],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_q_b.weight"),
+            vec![d.q_lora_rank, d.n_head * d.head_dim],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_kv.weight"),
+            vec![d.n_embd, d.head_dim],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_kv_a_norm.weight"),
+            vec![d.head_dim],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_output_a.weight"),
+            vec![
+                d.n_head * d.head_dim / d.o_group_count,
+                d.o_lora_rank * d.o_group_count,
+            ],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_output_b.weight"),
+            vec![d.o_group_count * d.o_lora_rank, d.n_embd],
+            w.clone(),
+        ));
+        for kind in ["attn", "ffn"] {
+            tensors.push(TensorSpec::new(
+                p(&format!("hc_{kind}_fn.weight")),
+                vec![d.hc_dim(), d.hc_mix_dim()],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p(&format!("hc_{kind}_base.weight")),
+                vec![d.hc_mix_dim()],
+                Fill::Rand(0.1),
+            ));
+            tensors.push(TensorSpec::new(
+                p(&format!("hc_{kind}_scale.weight")),
+                vec![3],
+                Fill::Gain,
+            ));
+        }
+        // ── the CSA2 role sets ───────────────────────────────────────────────────
+        if kv_src.contains(&l) {
+            // Role 1 pools ONE token per row, so `coff = 1` and there is nothing to gate.
+            let coff = if role == 1 { 1 } else { Dsv4Dims::coff(4) };
+            tensors.push(TensorSpec::new(
+                p("attn_compressor_kv.weight"),
+                vec![d.n_embd, coff * d.head_dim],
+                w.clone(),
+            ));
+            if role != 1 {
+                tensors.push(TensorSpec::new(
+                    p("attn_compressor_gate.weight"),
+                    vec![d.n_embd, coff * d.head_dim],
+                    w.clone(),
+                ));
+            }
+            // NO `attn_compressor_ape.weight` — V4.1 ships none, anywhere.
+            tensors.push(TensorSpec::new(
+                p("attn_compressor_norm.weight"),
+                vec![d.head_dim],
+                Fill::Gain,
+            ));
+        }
+        if key_src.contains(&l) {
+            // The index-KEY stream: `attn_k` maps the pre-rope latent (head_dim) to the key row.
+            tensors.push(TensorSpec::new(
+                p("indexer.attn_k.weight"),
+                vec![d.head_dim, ix.head_size],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.k_norm.weight"),
+                vec![ix.head_size],
+                Fill::Gain,
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.proj.weight"),
+                vec![d.n_embd, ix.n_head],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.attn_q_b.weight"),
+                vec![d.q_lora_rank, ix.n_head * ix.head_size],
+                w.clone(),
+            ));
+            // NO `indexer_compressor_*` — V4.1 has none.
+        }
+        // ── MoE (V4.1 is not hash-routed: `hash_layer_count = 0`) ─────────────────
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_inp.weight"),
+            vec![d.n_embd, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("exp_probs_b.bias"),
+            vec![d.n_expert],
+            Fill::Rand(0.5),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_norm.weight"),
+            vec![d.n_embd],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_exps.weight"),
+            vec![d.n_embd, d.n_ff_exp, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_up_exps.weight"),
+            vec![d.n_embd, d.n_ff_exp, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_down_exps.weight"),
+            vec![d.n_ff_exp, d.n_embd, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_shexp.weight"),
+            vec![d.n_embd, d.shexp_ff()],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_up_shexp.weight"),
+            vec![d.n_embd, d.shexp_ff()],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_down_shexp.weight"),
+            vec![d.shexp_ff(), d.n_embd],
+            w.clone(),
+        ));
+        // ── engram projectors, on the engram layers only ──────────────────────────
+        if engram_layers.contains(&(l as u64)) {
+            let eng_in = engram_n_head * engram_key_length;
+            tensors.push(TensorSpec::new(
+                p("engram_wkv.weight"),
+                vec![eng_in, d.hc_dim() + d.n_embd],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("engram_k.weight"),
+                vec![d.hc_dim()],
+                Fill::Gain,
+            ));
+            tensors.push(TensorSpec::new(
+                p("engram_q.weight"),
+                vec![d.hc_dim()],
+                Fill::Gain,
+            ));
+        }
+    }
+    SyntheticModel { meta, tensors }
+}
+
+/// The canonical V4.1 fixture: the V4 dims with V4.1's role map.
+fn dsv41_dims() -> Dsv4Dims {
+    Dsv4Dims {
+        compress_ratios: dsv41_roles(),
+        hash_layer_count: 0,
+        swiglu_clamp_exp: vec![7.0; dsv41_roles().len()],
+        compress_rope_theta: 160000.0,
+        ..dsv4_ratio0_dims()
+    }
+}
+
+/// **The V4.1 hyper-connection lag is load-bearing, and the collapse weights provably travel.**
+///
+/// V4.1 consumes a sublayer's hyper-connection mix ONE SUBLAYER LATER than V4 (`deepseek41.cpp`
+/// 843-886), so the weights that collapse layer `l`'s attention input were computed by layer
+/// `l-1`'s FFN matmul. This is the silent-wrong-answer class: the shapes are identical under both
+/// schedules, so nothing errors — there is no load-time gate that can catch it, and the only thing
+/// that can is a *differential* test of exactly this shape.
+///
+/// The perturbation is chosen so the two schedules must disagree:
+///
+/// * Bump ONE element of layer 4's `hc_ffn_fn` — a row of the FFN mixing matmul that produces the
+///   `pre` chunk. Under the LAG schedule that mix is what layer 5's ATTENTION collapses with, so
+///   the bump must reach the logits.
+/// * Under the immediate-consume schedule layer 4's FFN mix collapses layer 4's own FFN input, and
+///   layer 5's attention reads a mix from layer 5 itself — so the same bump must still move things,
+///   but **differently**.
+///
+/// So the assertion is two-sided: the bump must move the logits (it is load-bearing), AND a V4.1
+/// build must not produce the same numbers as the immediate schedule (the two are not the same
+/// model). A port that forgot the lag fails the second half while passing the first, which is
+/// precisely the failure mode this change exists to prevent.
+#[test]
+fn synthetic_deepseek41_hc_lag_moves_the_logits() {
+    let d = dsv41_dims();
+    let base = dsv41_model(&d);
+
+    // Layer 4 is a KV source AND the predecessor of the role-1 source at layer 5, so its FFN mix is
+    // consumed by a layer that exists and that runs a different tier — the strongest wiring.
+    let bump = |m: SyntheticModel| -> SyntheticModel {
+        let mut n = 0;
+        let mut m = m;
+        for t in m.tensors.iter_mut() {
+            if t.name == "blk.4.hc_ffn_fn.weight" {
+                if let Fill::Rand(scale) = t.fill {
+                    t.fill = Fill::Rand(scale * 3.0);
+                    n += 1;
+                }
+            }
+        }
+        assert_eq!(n, 1, "expected exactly one blk.4.hc_ffn_fn.weight to perturb");
+        m
+    };
+
+    let a = cpu_logits("ds41-hc-base", &base);
+    let b = cpu_logits("ds41-hc-bump", &bump(base));
+
+    assert!(
+        a.len() == d.vocab && a.iter().all(|v| v.is_finite()),
+        "the V4.1 fixture must produce finite logits, got {a:?} — a load or emit failure here \
+         means the CSA2 route never ran at all"
+    );
+    assert_moves(
+        "deepseek41 layer-4 FFN mix",
+        &a,
+        &b,
+        "the hyper-connection collapse, which under V4.1's lag reads the PREVIOUS sublayer's mix",
+    );
+}
+
+/// **V4.1 refuses to rope at an unusable base rather than emit plausible garbage.**
+///
+/// `theta = 0` gives every position the same angle (`exp(-2*0/rope_dim) == 1`): no error, no shape
+/// mismatch, just wrong logits forever. `Config::from_gguf` hard-requires
+/// `attention.compress_rope_freq_base`, so the realistic way to reach the seam with a bad base is a
+/// parse regression — which is exactly what a tripwire is for. This pins that the tripwire fires
+/// and, critically, that it names the layer.
+#[test]
+fn synthetic_deepseek41_refuses_a_zero_rope_base() {
+    let mut d = dsv41_dims();
+    d.compress_rope_theta = 0.0;
+    let m = dsv41_model(&d);
+    let tmp = TempGguf::write("ds41-theta0", &m);
+    let err = match infr_llama::SeamModel::load_with(
+        tmp.path(),
+        None,
+        std::sync::Arc::new(infr_llama::EngineConfig::default()),
+    ) {
+        Ok(model) => match model.prefill_logits_cpu(PROMPT) {
+            Ok(logits) => panic!("a zero rope base must be refused, got logits {logits:?}"),
+            Err(e) => format!("{e:#}"),
+        },
+        Err(e) => format!("{e:#}"),
+    };
+    // The message must be actionable: a layer number and the reason, not a bare assert.
+    assert!(
+        err.contains("deepseek41") && err.contains("theta"),
+        "the refusal must name the arch and the offending base, got: {err}"
     );
 }
