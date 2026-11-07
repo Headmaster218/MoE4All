@@ -306,17 +306,29 @@ pub struct EngramTensorInfo {
     pub nbytes: u64,
 }
 
-/// Bytes per element and elements per block for the two types this reader accepts, and an error
-/// naming the type for anything else.
+/// `(bytes_per_element, elements_per_block)` for the two types this reader accepts.
 ///
-/// Only types 32 and 34 are here by design: an engram table that quotes any other type is not an
+/// Both of this file's types are **1 byte per stored element**; they differ only in WHAT an
+/// element is:
+///
+/// * type 32 stores one E4M3 code per element of the embedding, so `numel` elements = `numel`
+///   bytes (1 element per block).
+/// * type 34 stores one E8M0 exponent per BLOCK OF 32 embedding elements, but the tensor's own
+///   `numel` is already the count of those exponents (this file declares `[rows, 8]` for a
+///   256-wide key). So `numel` elements = `numel` bytes here too — the 32-to-1 relationship was
+///   already applied by whoever wrote the shape.
+///
+/// Getting that backwards is the trap: treating type 34 as "1 byte per 32 numel" shrinks the
+/// tensor to `numel/32` bytes and every bounds check then rejects valid rows.
+///
+/// Only types 32 and 34 are here by design: an engram table quoting any other type is not an
 /// MXFP8 table, and pretending to decode it would produce 202 GB of noise with no error.
 pub fn ggml_type_layout(ggml_type: u32) -> Result<(u64, u64)> {
     match ggml_type {
-        // 1 byte per element, 1 element per block.
+        // E4M3 codes, one per embedding element.
         GGML_TYPE_ENGRAM_E4M3 => Ok((1, 1)),
-        // 1 byte per block of 32 elements (the OCP MX block size).
-        GGML_TYPE_ENGRAM_E8M0 => Ok((1, MX_BLOCK_ELEMS as u64)),
+        // E8M0 exponents, one per stored element (each already covers 32 embedding values).
+        GGML_TYPE_ENGRAM_E8M0 => Ok((1, 1)),
         other => Err(Error::Unsupported(format!(
             "engram table tensor has ggml type {other}; this reader decodes only type \
              {GGML_TYPE_ENGRAM_E4M3} (E4M3 codes) and {GGML_TYPE_ENGRAM_E8M0} (E8M0 scales)"
@@ -324,22 +336,17 @@ pub fn ggml_type_layout(ggml_type: u32) -> Result<(u64, u64)> {
     }
 }
 
-/// Tensor byte length for `ggml_type` and `numel`, rounded up to whole blocks (ggml's own rule).
-/// `blocks * elem_bytes` — one block of `block_elems` elements carries `block_elems * elem_bytes`
-/// bytes, so type 32 (1 B/elem, 1 elem/block) is `numel` bytes and type 34 (1 B per 32 elems) is
-/// `ceil(numel / 32)` bytes. Rounding UP, never down: a short byte count is the direction that
-/// makes a downstream bounds check pass while the data it describes is not there.
+/// Tensor byte length for `ggml_type` and `numel` — `ceil(numel / block_elems) * bytes_per_elem`.
+///
+/// For both engram types this is exactly `numel`, and [`tests::ggml_type_size_matches_the_real_file`]
+/// pins the two shapes that matter against the published byte totals of the shipped table.
 pub fn ggml_type_size(ggml_type: u32, numel: u64) -> Result<u64> {
-    let (elem_bytes, block_elems) = ggml_type_layout(ggml_type)?;
-    let blocks = numel.div_ceil(block_elems);
-    blocks
-        .checked_mul(block_elems)
-        .and_then(|n| n.checked_mul(elem_bytes))
-        .ok_or_else(|| {
-            Error::Loader(format!(
-                "engram table: {numel} elements of ggml type {ggml_type} overflow u64"
-            ))
-        })
+    let (bytes_per_elem, block_elems) = ggml_type_layout(ggml_type)?;
+    numel.div_ceil(block_elems).checked_mul(bytes_per_elem).ok_or_else(|| {
+        Error::Loader(format!(
+            "engram table: {numel} elements of ggml type {ggml_type} overflow u64"
+        ))
+    })
 }
 
 // ─── table ───────────────────────────────────────────────────────────────────
@@ -578,12 +585,21 @@ fn index_engram_layers(
         })?;
         if info.shape.len() != 2 {
             return Err(Error::Loader(format!(
-                "engram table: '{}' is {:?}, expected [key_length, rows]",
+                "engram table: '{}' is {:?}, expected a 2-D [rows, key_length]",
                 info.name, info.shape
             )));
         }
-        // GGUF dim order: ne[0] is the fastest-varying axis.
-        let (key_length, rows) = (info.shape[0], info.shape[1]);
+        // DIM ORDER FOR THIS FILE: `ne[0]` is the ROW count and `ne[1]` is the key width. The
+        // shipped table declares `[384006168, 256]` for the codes and `[384006168, 8]` for the
+        // scales, and 8 = 256/32 is only consistent under this reading — under the usual
+        // "ne[0] is fastest-varying = columns" convention the scale tensor would have had to be
+        // `[8, 384006168]`. The byte offsets agree: 384006168 * 256 = 98_305_579_008, exactly the
+        // gap between `blk.1.engram_embd.weight` (offset 0) and `blk.1.engram_embd.scale`.
+        //
+        // So `rows` is ne[0] here, the opposite of the generic ggml convention. That is not a
+        // bug in the reader to "fix" — it is what this converter wrote, and it is what makes a
+        // row (one gathered unit) contiguous, which is the property the gather depends on.
+        let (rows, key_length) = (info.shape[0], info.shape[1]);
         if info.ggml_type != GGML_TYPE_ENGRAM_E4M3 {
             return Err(Error::Unsupported(format!(
                 "engram table: '{}' is ggml type {}, expected {GGML_TYPE_ENGRAM_E4M3} (E4M3)",
@@ -616,11 +632,31 @@ fn index_engram_layers(
             )));
         }
         let scale_row_bytes = key_length / MX_BLOCK_ELEMS as u64;
-        if scale.shape != vec![scale_row_bytes, rows] {
+        if scale.shape != vec![rows, scale_row_bytes] {
             return Err(Error::Loader(format!(
-                "engram table: '{scale_name}' is {:?}, expected [{scale_row_bytes}, {rows}] — one \
+                "engram table: '{scale_name}' is {:?}, expected [{rows}, {scale_row_bytes}] — one \
                  E8M0 byte per {MX_BLOCK_ELEMS} elements of '{}'",
                 scale.shape, info.name
+            )));
+        }
+        // The weight plane's declared size must be exactly the codes of `rows` rows; the scale
+        // plane must follow it immediately (the shipped file lays them back to back).
+        let want_weight = rows * key_length;
+        if info.nbytes != want_weight {
+            return Err(Error::Loader(format!(
+                "engram table: '{}' declares {} bytes but {rows} rows x {key_length} codes needs \
+                 {want_weight}",
+                info.name, info.nbytes
+            )));
+        }
+        if scale.offset != info.offset + info.nbytes {
+            return Err(Error::Loader(format!(
+                "engram table: '{scale_name}' starts at {} but '{}' occupies {}..{} — the scale \
+                 plane must follow the code plane",
+                scale.offset,
+                info.name,
+                info.offset,
+                info.offset + info.nbytes
             )));
         }
         for t in [info, scale] {
@@ -635,20 +671,18 @@ fn index_engram_layers(
                 )));
             }
         }
-        let entry = EngramLayerTable {
+        if out.iter().any(|l| l.layer_id == layer_id) {
+            return Err(Error::Loader(format!(
+                "engram table: block {layer_id} appears twice"
+            )));
+        }
+        out.push(EngramLayerTable {
             layer_id,
             rows,
             row_bytes: key_length,
             scale_row_bytes,
             key_length,
-        };
-        if let Some(prev) = out.iter().find(|l| l.layer_id == layer_id) {
-            return Err(Error::Loader(format!(
-                "engram table: block {layer_id} appears twice ({:?} and {})",
-                prev, info.name
-            )));
-        }
-        out.push(entry);
+        });
     }
     if out.is_empty() {
         return Err(Error::Loader(format!(
@@ -1326,19 +1360,25 @@ mod tests {
         b.extend_from_slice(&KV_UINT32.to_le_bytes());
         b.extend_from_slice(&32u32.to_le_bytes());
 
+        // Planes are sized in BYTES: the weight plane is `rows * key_length` bytes (type 32 is
+        // 1 B/elem) and the scale plane is `rows * scale_row` bytes (type 34 is 1 B per 32 elems).
+        // Keeping them as separate named quantities is what stops a later edit from mixing up
+        // "elements of the weight" with "bytes of the scale".
         let scale_row = key_length / MX_BLOCK_ELEMS as u64;
+        let weight_bytes = rows * key_length;
+        let scale_bytes = rows * scale_row;
         let weight_off = 0u64;
-        let scale_off = rows * key_length;
+        let scale_off = weight_bytes;
         for (name, dims, ty, off) in [
             (
                 format!("blk.{layer}.engram_embd.weight"),
-                vec![key_length, rows],
+                vec![rows, key_length],
                 GGML_TYPE_ENGRAM_E4M3,
                 weight_off,
             ),
             (
                 format!("blk.{layer}.engram_embd.scale"),
-                vec![scale_row, rows],
+                vec![rows, scale_row],
                 GGML_TYPE_ENGRAM_E8M0,
                 scale_off,
             ),
@@ -1354,6 +1394,7 @@ mod tests {
         while b.len() % 32 != 0 {
             b.push(0);
         }
+        let data_start = b.len() as u64;
         // weight: row r, element j -> code 0x38 (1.0) + a per-row delta, so a stride error moves
         // the value rather than hiding.
         for r in 0..rows {
@@ -1369,6 +1410,15 @@ mod tests {
                 b.push(127u8 + (r % 2) as u8);
             }
         }
+        // The fixture must contain exactly the bytes its own directory entry declares. Without
+        // this, a malformed fixture makes the reader's out-of-bounds check fire and the failure
+        // reads as a reader bug — which is precisely what happened the first time this was run.
+        let declared = weight_bytes + scale_bytes;
+        let written = (b.len() as u64) - data_start;
+        assert_eq!(
+            written, declared,
+            "fixture wrote {written} data bytes but its directory declares {declared}"
+        );
         b
     }
 
@@ -1429,6 +1479,29 @@ mod tests {
         let err = EngramTable::open(&bad).expect_err("48 is not a multiple of 32");
         let msg = format!("{err}");
         assert!(msg.contains("multiple of 32"), "{msg}");
+    }
+
+    #[test]
+    fn ggml_type_size_matches_the_real_file() {
+        // The shipped table's two shapes and their published byte totals. If the type-34
+        // semantics were "1 byte per 32 numel" instead of "1 byte per stored scale", the scale
+        // total would come out 32x too small and every real gather would be rejected.
+        let (r1, r14) = (384_006_168u64, 384_016_682u64);
+        let w = |rows: u64| ggml_type_size(GGML_TYPE_ENGRAM_E4M3, rows * 256).unwrap();
+        let s = |rows: u64| ggml_type_size(GGML_TYPE_ENGRAM_E8M0, rows * 8).unwrap();
+        assert_eq!(w(r1), r1 * 256);
+        assert_eq!(w(r14), r14 * 256);
+        assert_eq!(s(r1), r1 * 8);
+        assert_eq!(s(r14), r14 * 8);
+        // 196,613,849,600 weight bytes + 6,144,182,800 scale bytes = 202,758,032,400.
+        let total = w(r1) + w(r14) + s(r1) + s(r14);
+        assert_eq!(total, 202_758_032_400);
+        // The file is 352 B larger: header + alignment.
+        assert_eq!(202_758_032_752 - total, 352);
+        // Rounding is UP to a whole block and never down.
+        assert_eq!(ggml_type_size(GGML_TYPE_ENGRAM_E4M3, 3).unwrap(), 3);
+        // Unknown types are refused by name rather than silently sized.
+        assert!(ggml_type_size(10, 256).is_err());
     }
 
     // ── real file (opt-in) ──────────────────────────────────────────────────
