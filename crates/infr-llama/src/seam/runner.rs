@@ -12414,6 +12414,19 @@ fn generate_dense_backend_inner(
         } else {
             crate::seam::ubatch_rows(ec)
         };
+        // MEASURED, 2026-11-08: a DSv4.1 chunk of 3072 rows LOSES THE DEVICE ("wait segment
+        // fence: The logical device has been lost"), reproduced on the wired-up path at
+        // --ubatch 3072 with a 3131-token prompt. That matters because 3072 is exactly what the
+        // automatic policy picks here (the placement probe lowers 4096 to 3072 for this model's
+        // 21.67 GiB arena), so wiring the switch without a cap would hand every user a crash.
+        //
+        // 512 rows is both SAFE and already at the plateau: measured prefill on a 731-token
+        // prompt is 10 tok/s at 64, 12 at 256, and 12 at 512/1024 - the chunk stops buying
+        // throughput once the routed experts are reused across its rows, so there is nothing to
+        // lose by capping below the failing size.
+        if is_dsv4_family(c) {
+            ubatch = ubatch.min(512);
+        }
         let pf_end = prompt.len() - 1;
         let mut prefill_runtime_reserve = None;
         if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
