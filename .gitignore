@@ -1,5 +1,7 @@
 # Rust
 /target
+/Start-INFR-Wizard.exe
+/MoE4All Engine.exe
 /dist/
 /test-kv-cache/
 /scripts/__pycache__/

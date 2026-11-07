@@ -22,6 +22,7 @@ mod host_ready_combined_test_support;
 pub(crate) mod indirect_copy;
 pub mod linear;
 mod matmul;
+mod narrow_projection;
 mod ops;
 pub mod p2p;
 pub mod pager;
@@ -432,7 +433,7 @@ fn use_qsa_topk_scan(
 
 const AUTO_SUBMIT_SAMPLES_PER_CAP: usize = 2;
 const AUTO_SUBMIT_MAX_ROUNDS: usize = 12;
-const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 500_000_000;
+const AGGRESSIVE_SUBMIT_BUDGET_NS: u64 = 300_000_000;
 const AGGRESSIVE_SUBMIT_EXPLORE_CAP: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
@@ -736,6 +737,11 @@ struct VulkanShared {
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
     exact_silu_quant_order: bool,
+    narrow_f32_device: bool,
+    /// VK_DRIVER_ID_AMD_PROPRIETARY (amdvlk / LLPC) — read once from the probed driver, because the
+    /// shader-compiler defects it has (see `attn_flash_warp_hd256.comp`) are driver properties, not
+    /// device capabilities. `driver_id_reported` guards the default-valued case.
+    amd_proprietary_driver: bool,
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
@@ -3471,17 +3477,19 @@ impl VulkanBackend {
         self.shared.caps.max_shared_memory_bytes
     }
 
-    /// Whether the device positively reported `VK_DRIVER_ID_AMD_PROPRIETARY`. A device that never
-    /// reported a driverID reads `false` (ash's default would otherwise be misread as amdvlk).
-    pub(crate) fn is_amd_proprietary_driver(&self) -> bool {
-        self.shared.driver_id_reported && self.shared.driver_id == vk::DriverId::AMD_PROPRIETARY
-    }
-
     /// Borrowed capabilities — the kernel-tier fallback ladder's gate (`caps.f16_coopmat`,
     /// `caps.f16`, `caps.i8_dot`). Cheap: a reference, not the [`Backend::capabilities`] clone (which
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
         &self.shared.caps
+    }
+
+    /// True on the AMD proprietary Windows driver (amdvlk / LLPC). Kernel-tier picks use this to
+    /// dodge driver compiler faults — the hd256 fused flash build is the current case, see
+    /// `attn_flash_warp_hd256.comp`'s UNROLL macro. RADV (`AMD_OPEN_SOURCE`) and every other vendor
+    /// get the default build.
+    pub(crate) fn is_amd_proprietary_driver(&self) -> bool {
+        self.shared.amd_proprietary_driver
     }
 
     /// The measured Windows/RDNA3 decode policy. Keep the unmeasured Linux/RADV path unchanged,
@@ -5356,6 +5364,14 @@ impl VulkanBackend {
                 exact_silu_quant_order: device_probe.driver_id_reported
                     && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY
                     && props.driver_version == 8_389_003,
+                narrow_f32_device: crate::narrow_projection::device_eligible(
+                    &device_probe,
+                    device_arch,
+                    has_bda,
+                    cfg!(target_os = "windows"),
+                ),
+                amd_proprietary_driver: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
                 device,
                 queue,
                 queue_family_index,
@@ -10835,6 +10851,19 @@ mod tests {
     }
 
     #[test]
+    fn submit_auto_profiles_use_reduced_time_budgets() {
+        use infr_core::config::AutoProfile;
+        assert_eq!(
+            SubmitAutoSettings::for_profile(AutoProfile::Conservative).budget_ns,
+            150_000_000
+        );
+        assert_eq!(
+            SubmitAutoSettings::for_profile(AutoProfile::Aggressive).budget_ns,
+            300_000_000
+        );
+    }
+
+    #[test]
     fn submit_auto_policy_samples_then_grows_geometrically() {
         let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
         let sample = submit_sample(16_000_000, 160); // 100 us/dispatch, far below budget
@@ -10879,11 +10908,16 @@ mod tests {
 
     #[test]
     fn submit_auto_policy_tightens_immediately_on_over_budget_submit() {
-        let mut policy = submit_policy(infr_core::config::AutoProfile::Conservative);
-        policy.cap = 64;
-        let done = policy.observe_round(submit_sample(500_000_000, 64), 1);
-        assert_eq!(done.cap, 32);
-        assert_eq!(done.stop, Some(SubmitTuneStop::Budget));
+        for profile in [
+            infr_core::config::AutoProfile::Conservative,
+            infr_core::config::AutoProfile::Aggressive,
+        ] {
+            let mut policy = submit_policy(profile);
+            policy.cap = 64;
+            let done = policy.observe_round(submit_sample(policy.settings.budget_ns * 2, 64), 1);
+            assert_eq!(done.cap, 32);
+            assert_eq!(done.stop, Some(SubmitTuneStop::Budget));
+        }
     }
 
     #[test]

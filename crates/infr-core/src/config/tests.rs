@@ -22,6 +22,39 @@ fn env_layer(pairs: &[(&str, &str)]) -> PartialConfig {
 }
 
 #[test]
+fn amdvlk_hd256_flash_has_value_aware_env_and_config_fallbacks() {
+    assert!(Config::default().kernels.vulkan.amdvlk_hd256_flash);
+    for (value, expected) in [("", false), ("0", false), ("1", true)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_AMDVLK_HD256_FLASH", value)])]);
+        assert_eq!(cfg.kernels.vulkan.amdvlk_hd256_flash, expected);
+    }
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[("INFR_AMDVLK_HD256_FLASH", "1")]),
+        cli_layer(&["kernels.vulkan.amdvlk_hd256_flash=false"]),
+    ]);
+    assert!(!cfg.kernels.vulkan.amdvlk_hd256_flash);
+}
+
+#[test]
+fn narrow_f32_gemv_default_and_presence_inverted_fallback() {
+    assert!(Config::default().kernels.vulkan.narrow_f32_gemv);
+    for value in ["", "0", "1"] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_NO_NARROW_F32_GEMV", value)])]);
+        assert!(!cfg.kernels.vulkan.narrow_f32_gemv);
+    }
+    let mut layer = PartialConfig::default();
+    layer
+        .set_path("kernels.vulkan.narrow_f32_gemv", "false")
+        .unwrap();
+    assert!(
+        !Config::load_from_layers(&[layer])
+            .kernels
+            .vulkan
+            .narrow_f32_gemv
+    );
+}
+
+#[test]
 fn next_step_preparation_defaults_on_and_has_explicit_sync_fallback() {
     assert!(Config::default().device.decode_prepare_ahead);
     let mut layer = PartialConfig::default();
@@ -1542,6 +1575,10 @@ fn no_infr_env_reads_outside_the_config_layer() {
         // trace output only, carry no runtime semantics, and are accounted in NOT_MIGRATED.
         "INFR_TIMELINE_RAW_KERNELS",
         "INFR_TIMELINE_RAW_UNKNOWN",
+        // Ignored native Melo reference parity fixtures, not inference settings.
+        "INFR_MELO_MODEL",
+        "INFR_MELO_REFERENCE",
+        "INFR_MELO_NATIVE_OUTPUT",
     ];
 
     let Some(crates) = repo_crates_dir() else {
@@ -2167,6 +2204,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MEM_GUARD_HEADROOM",
         "INFR_MEM_GUARD_RAM_HEADROOM",
         "INFR_MEM_GUARD_POLL_MS",
+        "INFR_NO_NARROW_F32_GEMV",
         "INFR_RAM_BUDGET",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",

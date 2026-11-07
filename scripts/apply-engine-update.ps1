@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ExpectedVersion,
     [int]$ParentProcessId = 0,
     [int]$LauncherProcessId = 0,
+    [ValidateSet('console', 'window')][string]$RelaunchEntry = 'console',
     [string]$CleanupRoot = '',
     [switch]$DeleteSelf,
     [switch]$NoRelaunch,
@@ -34,6 +35,19 @@ function Stop-StartedWizardTree {
     }
 }
 
+function Test-WindowLauncherProcess {
+    param($Process, [string]$Root)
+
+    # Match the full installed path, never a process name alone.
+    foreach ($name in @('MoE4All Engine.exe', 'Start-INFR-Wizard.exe')) {
+        if ([string]$Process.Name -ieq $name -and
+            [string]::Equals([string]$Process.ExecutablePath, (Join-Path $Root $name), [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Start-UpdatedWizard {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -44,6 +58,14 @@ function Start-UpdatedWizard {
 
     if ($NoRelaunch) { return $false }
     $launcher = Join-Path $Root 'Start-INFR-Wizard.cmd'
+    $windowLauncher = Join-Path $Root 'MoE4All Engine.exe'
+    # A failed migration restores the old filename; older update targets can
+    # also still ship it. Prefer the new entry whenever both are present.
+    if (-not (Test-Path -LiteralPath $windowLauncher -PathType Leaf)) {
+        $windowLauncher = Join-Path $Root 'Start-INFR-Wizard.exe'
+    }
+    $useWindow = $RelaunchEntry -eq 'window' -and (Test-Path -LiteralPath $windowLauncher -PathType Leaf)
+    if ($useWindow) { $launcher = $windowLauncher }
     if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
         throw "The updated launcher is missing: $launcher"
     }
@@ -62,28 +84,46 @@ function Start-UpdatedWizard {
         if ($RelaunchProbeOnly) { $launcherArguments.Add('-ExitAfterPostUpdateProbe') }
     }
 
-    $quotedLauncher = '"' + $launcher.Replace('"', '""') + '"'
-    $commandLine = '/d /s /c "' + $quotedLauncher + ' ' + ($launcherArguments -join ' ') + '"'
-    $process = Start-Process -FilePath $env:ComSpec -ArgumentList $commandLine -WorkingDirectory $Root -WindowStyle Normal -PassThru
+    if ($useWindow) {
+        $startParameters = @{
+            FilePath = $launcher
+            WorkingDirectory = $Root
+            WindowStyle = 'Hidden'
+            PassThru = $true
+        }
+        if ($launcherArguments.Count -gt 0) { $startParameters.ArgumentList = $launcherArguments -join ' ' }
+        $process = Start-Process @startParameters
+    } else {
+        $quotedLauncher = '"' + $launcher.Replace('"', '""') + '"'
+        $commandLine = '/d /s /c "' + $quotedLauncher + ' ' + ($launcherArguments -join ' ') + '"'
+        $process = Start-Process -FilePath $env:ComSpec -ArgumentList $commandLine -WorkingDirectory $Root -WindowStyle Normal -PassThru
+    }
     if (-not $RequireReadinessProbe) { return $true }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds(20)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if (Test-Path -LiteralPath $probePath -PathType Leaf) { break }
-        if ($process.HasExited) {
-            throw "The updated launcher exited before reporting readiness (exit code $($process.ExitCode))."
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
-        Stop-StartedWizardTree -Process $process
-        throw 'The updated launcher did not report readiness within 20 seconds.'
-    }
-
     try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-Path -LiteralPath $probePath -PathType Leaf) { break }
+            if ($process.HasExited) {
+                throw "The updated launcher exited before reporting readiness (exit code $($process.ExitCode))."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not (Test-Path -LiteralPath $probePath -PathType Leaf)) {
+            throw 'The updated launcher did not report readiness within 20 seconds.'
+        }
+
         $probe = Get-Content -LiteralPath $probePath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($ExpectedVersion -and [string]$probe.version -ne $ExpectedVersion) {
             throw "The updated launcher reported v$($probe.version); expected v$ExpectedVersion."
+        }
+        $expectedEntry = if ($useWindow) { 'window' } else { 'console' }
+        $entryProperty = $probe.PSObject.Properties['entry']
+        # Legacy console packages predate the entry field. Window packages must
+        # positively confirm that the EXE selected the native window entry.
+        if (($null -eq $entryProperty -and $useWindow) -or
+            ($null -ne $entryProperty -and [string]$entryProperty.Value -ne $expectedEntry)) {
+            throw "The updated launcher did not confirm the expected '$expectedEntry' entry."
         }
         if ($RelaunchProbeOnly -and -not $process.WaitForExit(10000)) {
             throw 'The probe-only updated launcher did not exit after reporting readiness.'
@@ -120,7 +160,10 @@ if ($LauncherProcessId -le 0 -and $ParentProcessId -gt 0) {
         $wizardProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ParentProcessId" -ErrorAction Stop
         $launcherProcess = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$wizardProcess.ParentProcessId)" -ErrorAction Stop
         $launcherCommandLine = [string]$launcherProcess.CommandLine
-        if ([string]$launcherProcess.Name -ieq 'cmd.exe' -and $launcherCommandLine -match '(?i)(?:^|\s)/c(?:\s|$)' -and $launcherCommandLine -match '(?i)Start-INFR-Wizard\.cmd') {
+        $installedCmdPattern = '(?i)(?:"|\s)' + [regex]::Escape((Join-Path $InstallRoot 'Start-INFR-Wizard.cmd')) + '(?:"|\s|$)'
+        if ([string]$launcherProcess.Name -ieq 'cmd.exe' -and $launcherCommandLine -match '(?i)(?:^|\s)/c(?:\s|$)' -and $launcherCommandLine -match $installedCmdPattern) {
+            $LauncherProcessId = [int]$launcherProcess.ProcessId
+        } elseif (Test-WindowLauncherProcess -Process $launcherProcess -Root $InstallRoot) {
             $LauncherProcessId = [int]$launcherProcess.ProcessId
         }
     } catch {
@@ -143,11 +186,11 @@ if ($LauncherProcessId -gt 0) {
     try {
         $launcherProcess = Get-Process -Id $LauncherProcessId -ErrorAction Stop
         if (-not $launcherProcess.WaitForExit(30000)) {
-            throw 'The previous CMD launcher did not exit within 30 seconds.'
+            throw 'The previous wizard launcher did not exit within 30 seconds.'
         }
     } catch {
         if (Get-Process -Id $LauncherProcessId -ErrorAction SilentlyContinue) { throw }
-        # The transient cmd.exe launcher may already have exited.
+        # The transient CMD or EXE launcher may already have exited.
     }
 }
 Start-Sleep -Milliseconds 1200

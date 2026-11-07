@@ -1,216 +1,254 @@
-# MoE4All
-
-**让游戏显卡跑起远超显存容量的大模型。AMD、NVIDIA、Intel，均已跑通。**
-
-Windows、Linux 免安装，约 17 MiB 即下即用；Apple Silicon 同步提供实验性 Metal 发行包。选择推荐的模型或自备模型，自动配置参数，即可立即开始聊天，
-或通过 OpenAI 兼容API接入现有客户端。显存、内存与 SSD 三级流动，协同加载权重运行。
-
-**1.0.0 性能参考**：Win 11 + RX 7900 XTX 24 GiB + Ryzen 5 5600X + 64 GiB DDR4，
-自动激进配置，Q8 K/V，关闭 MTP 与 CPU miss。速度单位均为 tok/s。
-
-| 模型 | 4K Decode 总均速 x1 / x2 / x3 | 30K 单路 Prefill | 30K Decode 总均速 x1 / x2 / x3 | 150K 单路 Prefill | 150K Decode 总均速 x1 / x2 / x3 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | — | **1,414.75** | **50.44 / 66.19 / 71.20** | **1,445.50** | **44.16 / 49.50 / 45.47** |
-| Qwen3.6 35B Balanced | **120.98 / 164.64 / 201.28** | **2,749.06** | **80.49 / 118.34 / 110.78** | **1,169.40** | **41.91 / 50.87 / 49.27** |
-
-<sub>Decode 为 1 / 2 / 3 路同时生成时的总平均吞吐；Prefill 为单路完整区间平均速度。完整条件见 [1.0.0 实测](#10030k--150k-平均性能2026-10-14)。</sub>
-
-**同机 Strata v0.1.44.1 参考**：使用其自动配置、不启用 MTP；`x2` 为两路总吞吐。
-
-| 模型 | 30K 单路 Prefill | 30K Decode x1 / x2 | 150K 单路 Prefill | 150K Decode x1 |
-| --- | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 576.15 | 30.17 / 48.14 | 650.01 | 36.52 |
-| Qwen3.6 35B Balanced | 1,325.32 | 19.37 / 未支持 | 436.51 | 11.00 |
-
-<sub>这是同一台机器上的方向性对照，兼容转换和测试差异见 [Strata 对照说明](#strata-v01441-同机对照2026-10-15)。</sub>
-
-[下载已发布版本](https://github.com/Headmaster218/MoE4All/releases/latest) |
-[快速使用](#快速使用) |
-[实测结果](#实测结果) |
-[社区实测](#社区实测) |
-[English](README_EN.md) |
-[技术文档](documentation/README.md) |
-[低权重专家跳过实验](documentation/evidence/campaigns/qwen38/2026-10-11-low-weight-expert-omission.md) |
-[专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)
-
 <p align="center">
-  <a href="https://buymeacoffee.com/headmaster218">
-    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="45">
-  </a>
+  <a href="https://moe4all.com/"><img src="scripts/moe4all-icon.svg" width="72" height="72" alt="MoE4All"></a>
 </p>
 
-## 快速使用
+<h1 align="center"><a href="https://moe4all.com/">MoE4All.com</a></h1>
 
-### 1. 下载程序
+<p align="center"><strong>All-in-one 本地推理引擎：多路 LLM、视觉、Embedding、语音识别与语音合成，高效集成。</strong></p>
 
-打开 [MoE4All Releases](https://github.com/Headmaster218/MoE4All/releases)，
-Windows 下载 `MoE4All-Windows-x86_64-v*.zip`，Linux x86_64 下载对应的
-`.tar.gz` 包；Apple Silicon 可试用 `MoE4All-macOS-arm64-v*.tar.gz` 实验包。
+<p align="center">约 20 MB · Vulkan 跨设备、跨平台 · 跑起远超显存容量的 MoE 大模型</p>
 
+<p align="center">
+  <sub>DSH 接入插件已收录于：</sub><br>
+  <a href="https://awesome-dsh-plugin.com/p/Headmaster218/dsh-llm-moe4all/"><img alt="Awesome DSH Plugin: Listed" src="https://img.shields.io/badge/Awesome_DSH_Plugin-Listed-fc60a8?logo=awesomelists"></a>
+  <a href="https://www.dsh.so/zh/artifact/dsh-llm-moe4all/"><img alt="DSH.so: Listed" src="https://img.shields.io/badge/DSH.so-Listed-547da0"></a>
+  <a href="https://dshmarket.com/p/Headmaster218/dsh-llm-moe4all/"><img alt="DSH Market: Listed" src="https://img.shields.io/badge/DSH_Market-Listed-4e8063"></a>
+</p>
 
-### 2. 解压
+<p align="center">
+  <a href="https://github.com/Headmaster218/MoE4All/releases/latest"><strong>下载 Engine</strong></a> ·
+  <a href="#性能实测">性能实测</a> ·
+  <a href="https://moe4all.com/community/">排行榜</a> ·
+  <a href="documentation/README.md">开发文档</a> ·
+  <a href="RESEARCH.md">理论研究</a> ·
+  <a href="README_EN.md">English</a>
+</p>
 
-将发行包**完整解压**到一个目录，例如 Windows 的 `D:\MoE4All`。
+**RX 7900 XTX 24 GB，搭配 64 GB DDR4 内存：**
 
-### 3. 运行
+- **1.3.0 · Qwen3.6 35B 5.91bpw**：6K 上下文，单路 **154.6 tok/s**，四路合计 **248.3 tok/s**。
+- **Qwen3.8 Flash-Next 4.27bpw 既有实测**：30K 上下文，单路 **50.44 tok/s**，三路合计 **71.20 tok/s**。
 
-1. Windows 双击 **`Start-INFR-Wizard.cmd`**；Linux 运行 `bash Start-INFR-Wizard-Linux.sh`；Apple Silicon 运行 `./Start-INFR-Wizard-macOS.sh`。
-2. 选择“终端聊天”或“OpenAI 兼容 API”。模型列表先显示本地已保存模型，下面的 `D` 是下载入口；进入后可自行选择一个或多个主模型，Windows/Linux 还可选择视觉或 Embedding 组件。下载完成后会回到本地模型列表，不会替用户默认选定某个模型。Windows 也可将已有 GGUF 拖入窗口后按 Enter。
-3. 选择运行设备与自动配置档位。**激进性能**是本页实测使用的档位；**保守**适合首次试运行或后台程序较多时使用。
-4. Windows/Linux API 模式可按需启用视觉和 Embedding。macOS Metal 实验版目前为单槽文本服务，不提供视觉与 Embedding。设置上下文和 API 后确认启动。
+[查看实测条件与完整结果 ↓](#性能实测)
 
-三个发行版的自动下载都会显示进度，失败重试并从 `.part` 文件续传，文件统一保存在安装目录的 `models`。Linux 向导不依赖 Python 或 jq；macOS 向导只依赖系统 `zsh`、`curl` 和标准 Apple 工具，无需 Homebrew、Python、jq 或 Rust。自动档默认使用 Q8 K/V，由引擎规划可用资源。终端聊天当前为纯文本；图片请通过 Windows/Linux 上启用视觉的 OpenAI 兼容 API 发送。
+MoE4All 是一个轻量的本地推理引擎。显存、内存与 SSD 三级协同，让 GPU 跑起远超显存容量的 MoE 大模型。解压程序、准备模型，就能在本机聊天，或提供 API 服务。
 
-macOS 实验包使用临时签名，尚未 Apple 公证。若 Gatekeeper 拦截首次运行，请在终端对解压目录执行 `xattr -dr com.apple.quarantine /path/to/MoE4All-macOS-arm64-v*`，再启动向导。
+- **跨设备运行。** Windows、Linux，AMD、NVIDIA、Intel 均已跑通；Apple Silicon 提供实验性 Metal 版本。
+- **多个模块，共享资源。** 文本、视觉、Embedding 统一管理 GPU 资源，按需申请与释放；语音转录和合成使用独立 CPU 模块。需要什么就启用什么，也可以单独启动辅助服务。
+- **从直接使用到深度配置。** 提供图形向导、命令行、多路生成、会话 KV 持久缓存和 OpenAI 兼容 API；日常使用自动配置，需要时再展开高级设置。
 
-组合能力和限制见[模型能力矩阵](documentation/reference/model-capabilities.md)。API 默认地址为 `http://127.0.0.1:8080/v1`；请求示例见[API 使用](documentation/guide/serving/api-quickstart.md)，完整配置项见[配置参考](documentation/reference/configuration.md)。
+## 下载与启动
 
-## 推荐模型与下载
+### 1. 下载程序，完整解压
 
-Windows 与 Linux 启动向导可从统一下载菜单选择下列主模型和组件；macOS Metal 实验版当前只列出两个主模型。也可使用链接自行下载到本地 SSD，自动下载统一保存到解压目录的 `models` 文件夹。
+打开 [最新发行版](https://github.com/Headmaster218/MoE4All/releases/latest)，下载对应系统的压缩包。**无需额外安装** ROCm、PyTorch 或 CUDA 工具链；GPU 推理需要可用的显卡驱动。
 
-| 模型 / 组件 | 下载链接 | 文件与用途 |
+| 系统 | 发行包 | 解压后打开 |
 | --- | --- | --- |
-| **Qwen3.6 35B 本体** | [下载 APEX-I-Balanced](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) | `Qwen3.6-35B-A3B-APEX-I-Balanced.gguf`；35B 下载这一个文件即可 |
-| **Flash-Next 主模型** | [下载 AD-4.27bpw-Q4_K_M-M64 全部分片](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64) | 该目录下的 **33 个 GGUF 分片**，全部放在同一文件夹；启动时选择第一片 |
-| **Flash-Next 视觉** | [下载 F16 视觉文件](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) | `mmproj-Qwen3.8-Flash-Next-F16.gguf`；API 图片理解时加载 |
-| **Qwen3 Embedding 0.6B** | [下载 Q8_0 GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) | `Qwen3-Embedding-0.6B-Q8_0.gguf`；提供 `/v1/embeddings` |
+| **Windows x86_64** | `MoE4All-Windows-x86_64-v*.zip` | 双击 **`MoE4All Engine.exe`**；经典命令行入口 `Start-INFR-Wizard.cmd` 也保留 |
+| **Linux x86_64** | `MoE4All-Linux-x86_64-v*.tar.gz` | `bash Start-INFR-Wizard-Linux.sh` |
+| **Apple Silicon** | `MoE4All-macOS-arm64-v*.tar.gz`，实验版 | `zsh Start-INFR-Wizard-macOS.sh` |
 
-Flash-Next 第一片为 `Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf`。视觉文件会自动放到同一模型目录，便于向导发现。
+### 2. 打开向导，启动引擎
 
+选择用途、模型、计算设备与资源策略，确认后启动。**自动保守**适合后台还有其他程序的情况；**自动激进**会更充分地使用机器资源，优先追求性能。Windows 可以全程在窗口中完成配置和运行：
 
-## 实测结果
+<p align="center">
+  <a href="assets/readme/engine-home-zh-dark.png">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/readme/engine-home-zh-dark.png">
+      <img src="assets/readme/engine-home-zh-light.png" width="640" alt="MoE4All Engine Windows 启动界面：本机聊天、API 连接应用、Benchmark 测速">
+    </picture>
+  </a><br>
+  <sub>Windows 原生启动界面，点击查看大图。</sub>
+</p>
 
-### 1.0.0：30K / 150K 平均性能（2026-10-14）
+<details>
+<summary>还没有模型？展开推荐模型与组件下载</summary>
 
-测试硬件为 RX 7900 XTX 24 GiB、Ryzen 5 5600X、64 GiB DDR4、Windows 11。
-使用自动激进配置、Q8 K/V、`ctx=163840`，关闭 MTP 与 CPU miss。Decode 分别同时
-占用 1 / 2 / 3 个槽位，数值为所有活跃路合计的完整区间平均吞吐；Prefill 为单路平均速度。
+向导内可以选择下载位置，也可以导入现有模型。以下主模型与视觉、Embedding、转录组件均提供文件直链。分片模型需下载全部分片，放在同一目录，启动时选择第一片。
 
-| 模型 | 输入长度 | 单路 Prefill | Decode x1 总均速 | Decode x2 总均速 | Decode x3 总均速 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Flash-Next 4.27bpw | 30K | **1,414.75** | **50.44** | **66.19** | **71.20** |
-| Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | **49.50** | **45.47** |
-| Qwen3.6 35B Balanced | 4K | **3,604.71** | **120.98** | **164.64** | **201.28** |
-| Qwen3.6 35B Balanced | 30K | **2,749.06** | **80.49** | **118.34** | **110.78** |
-| Qwen3.6 35B Balanced | 150K | **1,169.40** | **41.91** | **50.87** | **49.27** |
+| 模型 / 组件 | 用途 | 来源 |
+| --- | --- | --- |
+| **Qwen3.6 35B APEX-I-Balanced · 5.91bpw** | 日常对话、推理、工具任务 | [下载主模型](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true) · [下载视觉 mmproj](https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/mmproj.gguf?download=true) |
+| **Qwen3.8 Flash-Next 4.27bpw** | 大型 MoE 模型与长上下文 | 下载分片 [1](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/f5b0b790eebb89033c48091c26abf74c1b385940/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf?download=true) / [2](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/f5b0b790eebb89033c48091c26abf74c1b385940/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00002-of-00003.gguf?download=true) / [3](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/f5b0b790eebb89033c48091c26abf74c1b385940/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00003-of-00003.gguf?download=true) · [下载视觉 mmproj](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true) |
+| **Qwen3 Embedding 0.6B Q8_0** | 向量检索与知识库 | [下载模型](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true) |
+| **SenseVoice Small Q8_0** | 中文、英文等语音转录 | [下载模型](https://huggingface.co/lovemefan/sense-voice-gguf/resolve/main/sense-voice-small-q8_0.gguf?download=true) |
+| **MeloTTS Chinese** | 本地语音合成 | 需要原生格式转换，见[模型准备脚本](scripts/convert_melotts_chinese.py)；向导提供对应版本的安装说明 |
 
-### Strata v0.1.44.1 同机对照（2026-10-15）
+引擎还实现了其他 Qwen、Llama、Gemma、Ling、DeepSeek 等模型家族的运行路径。各家族的视觉、KV、MTP 等能力不同，详见[模型运行家族](documentation/architecture/models/runtime-families.md)与[能力矩阵](documentation/reference/model-capabilities.md)。
 
-本次额外在同一台 RX 7900 XTX / Ryzen 5 5600X / 64 GiB Windows 主机上运行 Strata 官方 v0.1.44.1 HIP 发行版。使用 `ctx=163840`、INT8 K/V，以及 Strata 的自动 expert-cache 和 Prefill 策略；关闭 prompt cache，不使用 MTP。每项先预热，再记录完整 Prefill 和较长 Decode 区间。
+</details>
 
-| 模型 | 输入长度 | 单路 Prefill | Decode x1 均速 | Decode x2 总均速 | 备注 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Flash-Next 4.27bpw | 30K | 576.15 | 30.17 | 48.14 | 双路为同步重叠区间总吞吐 |
-| Flash-Next 4.27bpw | 150K | 650.01 | 36.52 | 未测试 | Decode 前 / 中 / 后为 21.28 / 40.88 / 45.71 |
-| Qwen3.6 35B Balanced | 30K | 1,325.32 | 19.37 | 当前构建不支持 | Prefill 为预热后三轮中位数；Decode 范围 18.51–21.61 |
-| Qwen3.6 35B Balanced | 150K | 436.51 | 11.00 | 当前构建不支持 | 一次完整 Prefill，随后生成 512 token |
+<details>
+<summary>Linux / macOS 的启动说明</summary>
 
-为让模型被该版本 Strata 接受，Flash-Next 的 363 个固定投影张量转换为 BF16；35B 补充了兼容 metadata，并将 60 个很小的 GDN alpha/beta 状态张量从 Q6_K 转为 F32。两者的 routed expert 量化均未改变，原模型文件也未修改，但固定权重已不再逐位一致，因此这些数字只能作为方向性对照。
+Apple Silicon 的 Metal 版本仍为实验版，功能覆盖以对应 Release 说明为准。实验包目前尚未 Apple 公证；确认来源后，可对解压目录移除隔离标记：
 
-Strata 自动模式为完整专家分配约 47.17 GiB Host arena；Flash-Next 单路另使用约 13 GiB GPU expert cache，miss 可在 CPU 计算或经 PCIe 搬运。测试时 Windows 总提交量接近 95 GiB，且 Strata 没有套用 MoE4All 的 48 GiB 进程总 RAM 预算。其混合 CPU/GPU 路径在更强 CPU 上可能表现不同。两边测试 prompt、固定权重格式、内存策略和统计脚本并不完全一致，不能把差值归因于某一个 kernel 或单项设计。
-
-## 社区实测
-
-**AMD、NVIDIA RTX 和 Intel Arc 均已有用户实测，具体配置与速度如下。**
-
-
-| GPU / CPU 与内存 | 模型与条件 | Prefill | Decode | 版本与来源 |
-| --- | --- | ---: | ---: | --- |
-| **AMD R9700 + Ryzen 9 9950X3D + 48GB RAM** | Flash-Next，量化与上下文未注明 | **800–1,100 tok/s** | **20–50 tok/s** | v0.10.0，用户反馈 |
-| **Intel Arc A770 16GB + 64GB DDR4-3200** | Flash-Next，三次测试，量化与上下文未注明 | 未提供 | **17.44 / 17.30 / 17.45 tok/s** | v0.10.0，用户反馈 |
-| **AMD RX 7700 XT 12GB + 64GB RAM** | Ornith 1.5 35B-A3B，`serve`，131K 上下文容量 | 未提供 | **41.5–42.7 tok/s** | v0.5.2 社区基线，[PR #21](https://github.com/Headmaster218/MoE4All/pull/21) |
-| **Intel Arc A770 16GB + 64GB DDR4-3200** | Ornith 1.5 35B Q4_K_M，F16 KV，96K 上下文容量，REAL 负载三次测试 | 未提供 | **30.15–30.28 tok/s** | v0.6.0-beta.1，[Issue #41](https://github.com/Headmaster218/MoE4All/issues/41) |
-| **NVIDIA RTX 3090 Ti + 64GB RAM** | 社区成功运行反馈；原评论未注明模型、量化和上下文 | 未提供 | **约 29 tok/s** | 版本未注明，[B站用户反馈](https://www.bilibili.com/video/BV1ALha63Eyd/)（rpid `318146261056`） |
-
-社区速度保留用户原始口径，未独立复测；未说明是否为均值或峰值，不能直接与上方最快分段速度表比较。
-
-
-欢迎在 [Discussions](https://github.com/Headmaster218/MoE4All/discussions) 分享成功配置，
-或通过 [Issues](https://github.com/Headmaster218/MoE4All/issues) 报告问题。
-附上 GPU/显存、RAM、系统与驱动、程序版本、模型量化、上下文、自动档位或启动命令，
-以及 Prefill/Decode 速度，就能帮助更多相同硬件的用户复现。
-
-## 它能做什么
-
-- **让大模型跨显存运行**：按需使用 VRAM、RAM 和 SSD，协同缓存与加载 MoE 专家权重。
-- **Vulkan 推理**：在 Windows 下直接通过显卡驱动执行 Vulkan 计算；
-  AMD 主力验证，NVIDIA 与 Intel 已有社区实测。
-- **直接聊天**：终端中保持上下文进行多轮对话，可选择模型默认、开启或关闭
-  思考模式。
-- **兼容现有客户端**：提供 OpenAI 兼容的聊天与 Embedding API。
-- **并发服务**：多个独立 K/V 槽可处理先后到达、上下文长度不同的请求；
-  Qwen3.5 / Qwen3.6 MoE 可将同时活跃的文本请求合入层同步批量 Decode。
-- **会话持久化**：可选的 SSD 缓存能转存空闲文本 K/V，并在服务重启后恢复。
-- **长上下文**：支持量化 KV Cache、KV 溢出和长上下文性能测试。
-- **Qwen3.8 MTP**：可选的单路与双槽机会式投机解码，收益取决于草稿接受率，
-  当前保留为手动 CLI / 配置功能，不在 Windows 发行版启动向导中提供。
-- **实验性 CPU miss 计算**：默认关闭，支持 AVX2 + FMA3 CPU；Ryzen 5 5600X 使用
-  4 核处理 1 miss 时，端到端速度与 GPU 路径基本相同，更强 CPU 可能提速，需本机实测。
-- **可测量、可调试**：内置 prefill/decode benchmark、synthetic depth 和分页
-  统计工具。
-
-
-## 当前模型支持
-
-| 模型家族                | GGUF 架构                          | 状态                                                                  |
-| ----------------------- | ---------------------------------- | --------------------------------------------------------------------- |
-| Llama、Llama 4          | `llama`、`llama4`              | Dense 与 MoE Vulkan 推理                                              |
-| Qwen2 / Qwen2.5 / Qwen3 | `qwen2`、`qwen3`、`qwen3moe` | Dense 与 Qwen3 MoE                                                    |
-| Qwen3.5 / Qwen3.6       | `qwen35`、`qwen35moe`          | Gated DeltaNet、Attention、分页 MoE 与层同步并发生成                   |
-| Qwen3.8 Flash Next      | `qwen4exp`                       | Vulkan 文本与视觉推理、并发生成、Hyper-Connection、DeltaNet、PLE、QSA 与分页 MoE |
-| Gemma 3 / Gemma 4       | `gemma3`、`gemma4`             | Dense、MoE 与 E2B 变体                                                |
-| Ling 3.0 Flash          | `bailingmoe3`                    | KDA、gated MLA、512 experts 与 RAM/SSD 分页                           |
-| DeepSeek V4 Flash       | `deepseek4`                      | FP8 KV、MXFP4 indexer cache 与分页 MoE                                |
-| DiffusionGemma          | `diffusion-gemma`                | 文本扩散推理                                                          |
-| Embedding GGUF          | 受支持的 Embedding 架构            | 原生 CPU/Vulkan OpenAI Embedding API                                  |
-
-同一架构上的微调模型通常可以复用现有实现。兼容性取决于 GGUF metadata、
-量化格式与 chat template，模型文件应包含完整的推理元数据。
-
-
-## 为什么能跑超过显存的模型
-
-大型 MoE 每个 token 通常只激活全部专家中的一小部分。MoE4All 维护三级存储：
-
-```text
-SSD 上的完整 GGUF
-        ↓
-完整 Host store 或有上限的 RAM cache
-        ↓
-弹性 GPU expert cache
-        ↓
-Vulkan GPU 计算
+```sh
+xattr -dr com.apple.quarantine /path/to/MoE4All-macOS-arm64-vVERSION
 ```
 
-常用专家尽量留在显存，RAM 作为更大的热数据层，剩余内容继续由 SSD 提供。
-显存中的模型固定部分、KV Cache、运行时 scratch 和专家缓存由统一预算协调，
-prefill 与 decode 切换时可以重新分配弹性空间。
+[Linux 使用指南](documentation/guide/linux-build-and-run.md)
 
-更深入的实现说明见[技术文档索引](documentation/README.md)；历史优化和取舍见[变化记录](documentation/evidence/changes/README.md)。
+</details>
 
-专家缓存留多少显存才够、多张不同 PCIe 带宽的显卡该怎样分层？参见 [FlashNext 专家缓存与多卡配比](documentation/evidence/benchmarks/2026-10-11-flashnext-expert-cache-capacity.md)：包含真实访问序列的 0.5～48 GiB 离线回放曲线、连续分段指数函数，以及基于曲线的多卡层数分配公式和适用限制。
+## 一个引擎，多种能力
 
-## Star History
+除了运行语言模型，MoE4All 也能为应用提供看图、向量检索与语音能力。模块可以组合启用，Embedding、转录与合成也可以独立运行，无需先加载一个大语言模型。
 
-<a href="https://www.star-history.com/#Headmaster218/MoE4All&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date&theme=dark">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date">
-    <img alt="MoE4All Star History" src="https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date">
-  </picture>
-</a>
+| 能力 | 用来做什么 | 使用方式 |
+| --- | --- | --- |
+| **文本与推理** | 对话、推理、工具调用 | 本机聊天或聊天 API，多路请求各有独立 KV |
+| **视觉理解** | 图片问答与图文任务 | 在聊天 API 中发送图片，使用配套视觉权重 |
+| **Embedding** | 文本检索与知识库 | 独立向量 API，也可与语言模型一起服务 |
+| **语音转录** | 将录音转换为文字 | SenseVoice Small，CPU 运行，支持长 WAV 分段处理 |
+| **语音合成** | 将文字转换为语音 | 原生 MeloTTS，CPU 运行，需配套模型与语言资源 |
 
-## 项目与署名
+视觉权重按请求加载，Embedding 可在空闲后释放，二者与语言模型共用统一显存管理。这样可以在同一进程中周转资源，而不必为每种能力再起一套长期占用显存的引擎。
 
-MoE4All 由 John / [Headmaster218](https://github.com/Headmaster218) 维护。
-项目基于 kryptic.sh 的 Pure-Rust、Vulkan-first 推理引擎
-[infr](https://github.com/kryptic-sh/infr)。上游项目的原始说明请直接阅读
-[infr README](https://github.com/kryptic-sh/infr#readme)。
+语音模块独立管理 CPU 资源，不会额外申请语言模型的显存池。[转录格式与接口说明](crates/infr-audio/README.md) · [语音合成模型准备](scripts/convert_melotts_chinese.py)
 
-本项目的架构决策、性能调查和验收由维护者主导，并广泛使用 AI coding agents
-辅助 Rust、Vulkan、测试和文档工作。
+## 连接应用与 Agent
 
-MoE4All 的修改与整体发行采用 [Apache License 2.0](LICENSE)。继承自上游
-infr 的代码保留其原始 [MIT License](LICENSE-MIT) 和版权声明；详细归属见
-[NOTICE](NOTICE)。两个许可证文件分别记录本项目与上游代码的许可来源。
+### 连接已有客户端
+
+在向导中启动 **API 服务**，把启动后显示的地址填入支持 OpenAI 兼容 API 的客户端。默认 Base URL 为：
+
+```text
+http://127.0.0.1:8080/v1
+```
+
+模型 ID 从客户端模型列表或 `GET /v1/models` 获取。局域网使用时，在向导中设置监听地址与 API key。
+
+已经在用 **DeepSeek Harness（DSH）**？安装 [MoE4All 接入插件](https://awesome-dsh-plugin.com/p/Headmaster218/dsh-llm-moe4all/)，即可在 DSH 内管理引擎、下载和选择模型、配置推理并查看速度，也可连接已经运行的服务。插件内自动安装引擎目前支持 Windows，其他系统可以连接已有 API。
+
+<details>
+<summary>开发者：API 与请求示例</summary>
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /v1/chat/completions` | 文本、工具调用与图片请求 |
+| `POST /v1/embeddings` | 文本向量 |
+| `POST /v1/audio/transcriptions` | WAV 转录，支持分段 SSE 返回 |
+| `POST /v1/audio/speech` | 语音合成 |
+
+将 `YOUR_MODEL_ID` 替换为 `/v1/models` 返回的模型 ID。下面是 Bash 示例，Windows 用户也可以直接在客户端中填写 Base URL。
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "YOUR_MODEL_ID",
+    "messages": [{"role": "user", "content": "介绍一下你能帮我做什么。"}],
+    "stream": true
+  }'
+```
+
+</details>
+
+### MoE4All Agent：从对话到工作台
+
+**Engine 负责模型推理，Agent 把模型、工具与插件组织成日常工作环境。** MoE4All Agent 提供桌面工作台、会话和插件引导，可以搭配记忆、定时任务、远程访问等能力。
+
+Agent 当前提供 Windows 桌面版。它使用独立的 `MoE4All.exe` 入口，Engine 与模型可以安装或导入；已有其他客户端也可以继续直接使用引擎。
+
+**[到官网认识 Agent 与插件 →](https://moe4all.com/technical.html#agent)**　[体验网页演示 →](https://moe4all.com/index.html#partner)
+
+## 性能实测
+
+下面是 **RX 7900 XTX 24 GiB · Ryzen 5 5600X · 64 GiB DDR4 · Windows 11** 的实测参考，使用自动激进配置、Q8 K/V，关闭 MTP 与 CPU miss。
+
+**Prefill** 是处理输入的速度，**Decode** 是生成回答的速度。单位均为 tok/s；`x2 / x3 / x4` 表示对应并发下的**合计生成速度**。
+
+| 模型 | 上下文 | Prefill | Decode x1 | Decode x2 | Decode x3 | Decode x4 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Qwen3.6 35B Balanced** | 6K | **3,023.5** | **154.6** | 195.3 | 229.4 | 248.3 |
+| Qwen3.6 35B Balanced | 30K | **2,988.7** | **125.7** | 152.0 | 180.1 | 192.2 |
+| Qwen3.6 35B Balanced | 150K | **1,213.5** | **65.1** | 70.5 | 78.0 | 81.0 |
+| **Flash-Next 4.27bpw** | 30K | **1,414.75** | **50.44** | 66.19 | 71.20 | — |
+| Flash-Next 4.27bpw | 150K | **1,445.50** | **44.16** | 49.50 | 45.47 | — |
+
+**[打开交互性能页 →](https://moe4all.com/technical.html#engine)**　**[按模型和硬件查排行榜 →](https://moe4all.com/community/)**
+
+<details>
+<summary>展开 35B 的前段、中段、后段明细</summary>
+
+Decode 排除每路前 512 个预热 token，正式生成 1,024 token，按 341 / 341 / 342 token 分段。
+
+| 上下文 | 测试 | 前段 | 中段 | 后段 | 总均速 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 6K | Decode x1 | 155.1 | 152.5 | 156.2 | 154.6 |
+| 6K | Decode x2 | 197.0 | 195.4 | 193.5 | 195.3 |
+| 6K | Decode x3 | 232.9 | 231.4 | 224.1 | 229.4 |
+| 6K | Decode x4 | 253.2 | 250.2 | 242.0 | 248.3 |
+| 30K | Decode x1 | 125.6 | 124.7 | 126.9 | 125.7 |
+| 30K | Decode x2 | 153.6 | 154.4 | 148.2 | 152.0 |
+| 30K | Decode x3 | 180.7 | 181.3 | 178.2 | 180.1 |
+| 30K | Decode x4 | 194.4 | 193.0 | 189.2 | 192.2 |
+| 150K | Decode x1 | 65.9 | 62.6 | 67.1 | 65.1 |
+| 150K | Decode x2 | 72.4 | 70.8 | 68.4 | 70.5 |
+| 150K | Decode x3 | 76.5 | 79.5 | 78.0 | 78.0 |
+| 150K | Decode x4 | 80.3 | 80.9 | 81.8 | 81.0 |
+
+</details>
+
+### 看其他硬件，或留下你的结果
+
+[社区排行榜](https://moe4all.com/community/)可以按模型、GPU、内存和上下文筛选实测，查看配置与原始报告；[官网性能图表](https://moe4all.com/technical.html#engine)提供交互展示。
+
+向导内置 **Benchmark**：快速测 6K，标准测 6K / 30K，完整测 6K / 30K / 150K；可选择并发，也可手动安排测试。自动方案每路预热 512 token，正式测 1,024 token，结果展示前、中、后三段和总均速，完整方案每项一次。
+
+测试结束后可以保存本地报告，也可以按引导上传。报告经维护者审核合入后，由 CI 自动更新排行榜数据库。**是否分享由你决定，无需为本地测试注册账号。**
+
+[查看排行榜 →](https://moe4all.com/community/)　[上传已有报告](https://moe4all.com/community/upload.html)　[测量方法](documentation/development/performance/benchmarking.md)
+
+## 显存有限，模型不必
+
+MoE 模型每一步只使用一部分专家。MoE4All 将常用专家留在显存，其余专家按需从 RAM 或 SSD 获取，模型计算仍由 GPU 执行。
+
+<p align="center">
+  <a href="https://moe4all.com/technical.html#engine"><img src="https://moe4all.com/assets/readme/expert-flow.gif?v=ram-800" width="800" alt="MoE 专家流转示意：SSD、RAM 与显存协同，GPU 执行计算"></a><br>
+  <sub>专家流转原理示意。点击打开官网交互演示。</sub>
+</p>
+
+<details>
+<summary>开发者：资源管理与执行路径</summary>
+
+固定权重与必要控制资源先分配，其余可变化的专家缓存、KV、运行时和辅助模块由统一显存池管理。核显使用共享物理内存，需要合并计算预算，不把“显存容量”和“系统内存容量”当作两份独立资源。
+
+在支持的 GPU 驻留 Decode 路径中，GPU 负责专家驻留与 LRU；可以自行取得的专家由 GPU 搬运，否则通知 CPU 上传。Prefill 则结合分块、专家加载与计算重叠，提高大段输入的处理效率。
+
+</details>
+
+因此，性能不只取决于模型总大小：**激活参数量、量化格式、显存命中率、上下文长度，以及 PCIe / RAM / SSD 的实际速度**都会影响结果。
+
+**[到官网看专家流转动画 →](https://moe4all.com/technical.html#engine)**　[深入阅读资源生命周期](documentation/architecture/memory/runtime-resource-lifecycle.md)
+
+## 文档与开发
+
+| 你关心的内容 | 阅读入口 |
+| --- | --- |
+| Linux 使用、编译与启动 | [Linux 指南](documentation/guide/linux-build-and-run.md) |
+| API、客户端与会话缓存 | [API 快速开始](documentation/guide/serving/api-quickstart.md) · [服务与会话缓存](documentation/architecture/services/server-and-session-cache.md) |
+| 配置项与自动资源规划 | [配置参考](documentation/reference/configuration.md) |
+| 命中率、资源配比与性能分析 | [理论研究摘要](RESEARCH.md) |
+| 调度、并发与显存生命周期 | [并行调度](documentation/architecture/runtime/parallel-scheduler.md) · [资源管理](documentation/architecture/memory/runtime-resource-lifecycle.md) |
+| 模型适配与计算路径 | [模型家族](documentation/architecture/models/runtime-families.md) · [代码地图](documentation/architecture/codebase-map.md) |
+| 构建、测试与贡献代码 | [源码构建](documentation/development/building-from-source.md) · [开发文档](documentation/development/README.md) |
+| Agent 与网站开发 | [Agent 源码](https://github.com/Headmaster218/MoE4All-Agent) · [网站源码](https://github.com/Headmaster218/moe4all-website) |
+| 实验与历史数据 | [实测证据](documentation/evidence/README.md) |
+
+[打开完整文档目录 →](documentation/README.md)
+
+## 参与和支持
+
+使用中发现问题，可以提交 [Issue](https://github.com/Headmaster218/MoE4All/issues)。模型名称、运行配置、启动与报错日志，以及可复现步骤，会让定位更快。欢迎贡献适配、测试、文档和有证据的性能优化。
+
+MoE4All 由 **John / Headmaster218** 维护，基于 [kryptic-sh/infr](https://github.com/kryptic-sh/infr) 持续开发。感谢原项目作者、贡献者、上游社区，以及分享实测和问题反馈的用户。
+
+本项目采用 [Apache-2.0](LICENSE)；继承代码与第三方组件的许可和版权信息见仓库中的许可证文件及 [NOTICE](NOTICE)。模型使用各自的许可证。
+
+<a href="https://buymeacoffee.com/headmaster218"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="42"></a>
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Headmaster218/MoE4All&type=Date)](https://www.star-history.com/#Headmaster218/MoE4All&Date)

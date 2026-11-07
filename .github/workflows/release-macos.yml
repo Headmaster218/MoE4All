@@ -51,8 +51,18 @@ jobs:
           echo "archive=MoE4All-macOS-arm64-v$version.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Test zsh launcher, package validation, update and rollback
         run: /bin/zsh scripts/smoke-macos-wizard.zsh
+      - name: Test independent CPU modules and speech setup
+        env:
+          MOE4ALL_WORK_ROOT: ${{ runner.temp }}/moe4all-work
+        run: |
+          /bin/zsh scripts/test-wizard-modular-services.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/release/modules" macos
+          /bin/zsh scripts/test-wizard-transcription.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/release/transcription" macos
+          /bin/zsh scripts/test-wizard-speech.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/release/speech" macos
+          mkdir -p "$MOE4ALL_WORK_ROOT/tmp/moe4all/release/startup-guide"
+          /bin/zsh scripts/test-benchmark-startup-guide.sh macos "$MOE4ALL_WORK_ROOT/tmp/moe4all/release/startup-guide"
+          /bin/zsh scripts/test-wizard-reminders.sh "$MOE4ALL_WORK_ROOT/tmp/moe4all/release/reminders" macos
       - name: Build portable Apple Silicon engine
-        run: cargo build --release --locked -p infr-cli --config 'build.rustflags=[]'
+        run: cargo build --release --locked -p infr-cli --features tts --config 'build.rustflags=[]'
       - name: Show sccache statistics
         if: always()
         run: sccache --show-stats

@@ -481,6 +481,18 @@ pub(crate) trait TransferExecutor: Sync {
 
     fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)>;
 
+    /// Fill a host-visible staging allocation in place, without submitting or waiting. Returns
+    /// its owner, mapped address and dedicated-queue compatibility, as for `materialize_staging`.
+    /// A failed fill must release the new allocation without exposing it as a prepared copy.
+    /// Executors without this capability reject the request before invoking the callback.
+    fn materialize_filled_staging(
+        &self,
+        _len: usize,
+        _fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        Err(be("transfer executor does not support filled staging"))
+    }
+
     fn complete_copies_now(
         &self,
         copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
@@ -566,6 +578,33 @@ impl SessionTransferPlan {
             source_ptr,
             target: target.clone(),
             len: src.len(),
+            dedicated: dedicated && target.dedicated_compatible,
+        });
+        Ok(())
+    }
+
+    /// Fill a mapped target directly, or retain one staging copy for later batch completion.
+    /// Preparation never submits or waits. On failure, existing prepared copies remain intact;
+    /// a mapped target may contain partial writes and must not be published by the caller.
+    pub(crate) fn prepare_fill(
+        &self,
+        executor: &impl TransferExecutor,
+        target: &DeviceTransferTarget,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+        prepared: &mut PreparedTransfer,
+    ) -> Result<()> {
+        if let Some(ptr) = target.mapped_ptr() {
+            let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, target.len()) };
+            return fill(bytes);
+        }
+        let (source, source_ptr, dedicated) =
+            executor.materialize_filled_staging(target.len(), fill)?;
+        prepared.copies.push(PreparedCopy {
+            source,
+            source_offset: 0,
+            source_ptr,
+            target: target.clone(),
+            len: target.len(),
             dedicated: dedicated && target.dedicated_compatible,
         });
         Ok(())
@@ -780,8 +819,8 @@ struct PreparedCopy {
     source_ptr: usize,
     target: DeviceTransferTarget,
     len: usize,
-    /// Imported host memory and unified device arenas can use the session's transfer-family
-    /// queue. Temporary staging remains exclusive to the main queue.
+    /// Both endpoints must support the session's transfer-family queue. Host staging reports
+    /// compatibility only when its allocation is shared across the compute and transfer families.
     dedicated: bool,
 }
 
@@ -855,6 +894,20 @@ impl TransferExecutor for BackgroundTransferExecutor {
 
     fn materialize_staging(&self, src: &[u8]) -> Result<(Arc<dyn Buffer>, usize, bool)> {
         self.stage_host_bytes(src)
+    }
+
+    fn materialize_filled_staging(
+        &self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        let staging = make_dedicated_host_transfer_buffer(&self.shared, len)?;
+        let ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("background transfer staging allocation is not mapped"))?;
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        fill(bytes)?;
+        Ok((Arc::new(staging), ptr as usize, true))
     }
 
     fn complete_copies_now(
@@ -1561,6 +1614,20 @@ impl TransferExecutor for VulkanBackend {
         VulkanBackend::stage_host_bytes(self, src)
     }
 
+    fn materialize_filled_staging(
+        &self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<(Arc<dyn Buffer>, usize, bool)> {
+        let (staging, dedicated) = self.make_host_transfer_buffer(len)?;
+        let ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("host transfer staging allocation is not mapped"))?;
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        fill(bytes)?;
+        Ok((Arc::new(staging), ptr as usize, dedicated))
+    }
+
     fn complete_copies_now(
         &self,
         copies: &[(Arc<dyn Buffer>, usize, DeviceTransferTarget, usize)],
@@ -1587,6 +1654,10 @@ impl TransferExecutor for VulkanBackend {
 #[cfg(test)]
 #[path = "transfer_retirement_tests.rs"]
 mod retirement_tests;
+
+#[cfg(test)]
+#[path = "transfer_fill_tests.rs"]
+mod fill_tests;
 
 #[cfg(test)]
 mod tests {

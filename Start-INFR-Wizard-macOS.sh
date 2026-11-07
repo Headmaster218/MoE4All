@@ -570,7 +570,7 @@ BANNER
 defaults() {
     local key
     S=(
-        [launch_mode]=run [setup_mode]=conservative [model]='' [model_history]='' [device]='' [context]=''
+        [launch_mode]=run [setup_mode]=conservative [model]='' [model_history]='' [download_dir]="$ROOT/models" [device]='' [context]=''
         [ubatch]='' [threads]='' [config_path]='' [kv_preset]=auto [kv_type_k]='' [kv_type_v]=''
         [configure_memory]=false [vram_budget]='' [vram_reserve]='' [expert_cache]='' [ram_budget]=''
         [host_dma]=true [pager_ring]='' [pager_ring_slots]='' [kv_overflow]=false [kv_overflow_vram_mb]='' [kv_overflow_reserve_mb]=''
@@ -579,7 +579,9 @@ defaults() {
         [configure_sampling]=false [temperature]='' [top_k]='' [top_p]='' [seed]=''
         [server_addr]=127.0.0.1:8080 [server_parallel]=1 [server_auth]=false [server_session_cache]=false
         [session_cache_dir]="$ROOT/kv-sessions" [session_idle_secs]=120 [session_cache_max]=5GiB [session_cache_ttl_hours]=24
-        [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
+        [server_llm_enabled]=true [server_vision]=false [vision_projector]='' [server_embedding]=false [embedding_model]='' [embedding_idle_timeout]=300
+        [server_transcription]=false [transcription_model]='' [transcription_threads]=4 [transcription_idle_timeout]=300 [transcription_upload_dir]="$CONFIG_DIR/audio-uploads"
+        [server_speech]=false [speech_model]='' [speech_lexicon]='' [speech_threads]=4 [speech_idle_timeout]=300 [speech_max_output_seconds]=30
         [mtp_enabled]=false [mtp_model]='' [mtp_verify_tokens]=4 [cpu_miss_enabled]=false [cpu_miss_max]=1 [cpu_miss_cores]=''
         [bench_kind]=manual [bench_parallel]=1 [manual_bench_kind]=decode [prompt_tokens]=6144 [gen_tokens]=512 [depth_mode]=none [depth_tokens]=0 [reps]=1 [json_output]=false
         [custom_sets]='' [auto_overrides]='' [benchmark_upload]=false [benchmark_upload_has_github]=true [benchmark_upload_gh_auth]=true [error_upload]=false [submission_browser_action]=later [submission_failure_action]=later [submission_pending_retry]=true
@@ -587,9 +589,14 @@ defaults() {
     DEFAULTS=(); for key in "${(@k)S[@]}"; do DEFAULTS[$key]=${S[$key]}; done
 }
 load_state() {
-    local key raw value state_path
+    local key raw value state_path source_state='' source_conf=''
     if [[ -f $STATE ]]; then
-        json_load "$STATE" || { fail "Invalid saved settings: $STATE"; return 1; }
+        source_state=$STATE
+    elif [[ -n ${LEGACY_STATE-} && -f $LEGACY_STATE ]]; then
+        source_state=$LEGACY_STATE
+    fi
+    if [[ -n $source_state ]]; then
+        json_load "$source_state" || { fail "Invalid saved settings: $source_state"; return 1; }
         [[ $JSON_KIND == object ]] || { fail 'Saved settings must be a JSON object.'; return 1; }
         for key in "${(@k)S[@]}"; do
             state_path="[\"$key\"]"; [[ -v "J[$state_path]" ]] || continue; raw=${J[$state_path]}
@@ -601,12 +608,19 @@ load_state() {
         done
         state_path='["configure_thinking"]'
         if [[ ! -v "J[$state_path]" && (${S[think_mode]} != default || ${S[reasoning_effort]} != default) ]]; then S[configure_thinking]=true; fi
-    elif [[ -f $CONFIG_DIR/wizard.conf ]]; then
+    else
+        if [[ -f $CONFIG_DIR/wizard.conf ]]; then
+            source_conf=$CONFIG_DIR/wizard.conf
+        elif [[ -n ${LEGACY_CONFIG_DIR-} && -f $LEGACY_CONFIG_DIR/wizard.conf ]]; then
+            source_conf=$LEGACY_CONFIG_DIR/wizard.conf
+        fi
+    fi
+    if [[ -n $source_conf ]]; then
         local -A names=([MODE]=launch_mode [MODEL]=model [PROFILE]=setup_mode [CTX]=context [UBATCH]=ubatch [KV_K]=kv_type_k [KV_V]=kv_type_v
             [RAM]=ram_budget [VRAM]=vram_budget [MTP]=mtp_model [MTP_K]=mtp_verify_tokens [ADDR]=server_addr [PARALLEL]=server_parallel [MMPROJ]=vision_projector [EMBEDDING]=embedding_model)
         while IFS= read -r value; do
             [[ $value == *=* ]] || continue; key=${value%%=*}; [[ ! -v "names[$key]" ]] || S[${names[$key]}]=${value#*=}
-        done < "$CONFIG_DIR/wizard.conf"
+        done < "$source_conf"
         [[ -z ${S[mtp_model]} ]] || S[mtp_enabled]=true
         [[ -z ${S[vision_projector]} ]] || S[server_vision]=true
         [[ -z ${S[embedding_model]} ]] || S[server_embedding]=true
@@ -616,35 +630,83 @@ load_state() {
     case ${S[launch_mode]} in chat) S[launch_mode]=run ;; server) S[launch_mode]=serve ;; benchmark) S[launch_mode]=bench ;; esac
 }
 benchmark_guide_now() { date +%s; }
+reminder_interactive() {
+    # json_output is a saved report-export preference, not an automation flag.
+    [[ ${INTERACTIVE-false} == true && ${DRY_RUN-false} == false && ${HEADLESS-false} == false &&
+        -z ${CI-} ]]
+}
+reminder_state_file() {
+    REPLY="$CONFIG_DIR/private/$1"
+    if [[ ! -f $REPLY && -n ${LEGACY_CONFIG_DIR-} && -f $LEGACY_CONFIG_DIR/private/$1 ]]; then
+        REPLY="$LEGACY_CONFIG_DIR/private/$1"
+    fi
+}
+benchmark_installed_version() {
+    local -h value
+    REPLY=''
+    value=$("$BINARY" --version 2>/dev/null) || return 0
+    [[ $value == 'infr '* ]] || return 0
+    value=${value#infr }
+    if installed_version_valid "$value"; then REPLY=$value; fi
+}
 benchmark_guide_read() {
     GUIDE_SUBMITTED=false; GUIDE_NEXT_REMIND_AT=0
-    local -h path=$CONFIG_DIR/private/benchmark-first-submission.json raw
-    [[ -f $path ]] || return 0
-    json_load "$path" 2>/dev/null || return 0
-    json_get '["submitted"]' || return 0
-    [[ $REPLY != true ]] || GUIDE_SUBMITTED=true
-    json_get '["next_remind_at"]' || return 0
-    raw=$REPLY
-    [[ $raw =~ ^(0|[1-9][0-9]{0,11})$ ]] || return 0
-    GUIDE_NEXT_REMIND_AT=$raw
+    GUIDE_LAST_PROMPT_VERSION=''; GUIDE_LAST_SUBMITTED_VERSION=''; GUIDE_REMINDER_REASON=''
+    local -h file raw
+    reminder_state_file benchmark-first-submission.json; file=$REPLY
+    [[ -f $file ]] || return 0
+    json_load "$file" 2>/dev/null || return 0
+    if json_get '["submitted"]' && [[ $REPLY == true ]]; then GUIDE_SUBMITTED=true; fi
+    if json_get '["next_remind_at"]' && [[ $REPLY =~ ^(0|[1-9][0-9]{0,11})$ ]]; then GUIDE_NEXT_REMIND_AT=$REPLY; fi
+    if json_get '["last_prompt_version"]' && installed_version_valid "$REPLY"; then GUIDE_LAST_PROMPT_VERSION=$REPLY; fi
+    if json_get '["last_submitted_version"]' && installed_version_valid "$REPLY"; then GUIDE_LAST_SUBMITTED_VERSION=$REPLY; fi
+    if json_get '["reminder_reason"]'; then
+        case $REPLY in first_use|new_version) GUIDE_REMINDER_REASON=$REPLY ;; esac
+    fi
+    return 0
 }
 benchmark_guide_write() {
-    local -h submitted=$1 next=$2 directory=$CONFIG_DIR/private temporary
-    [[ ${DRY_RUN-false} == false && ${HEADLESS-false} == false && ${INTERACTIVE-false} == true ]] || return 0
+    local -h submitted=$1 next=$2 directory=$CONFIG_DIR/private temporary q_prompt q_submitted q_reason
+    reminder_interactive || return 0
     benchmark_guide_read
+    local -h prompt_version=${3-$GUIDE_LAST_PROMPT_VERSION} submitted_version=${4-$GUIDE_LAST_SUBMITTED_VERSION} reason=${5-$GUIDE_REMINDER_REASON}
     [[ $GUIDE_SUBMITTED != true ]] || submitted=true
-    ((next >= GUIDE_NEXT_REMIND_AT)) || next=$GUIDE_NEXT_REMIND_AT
+    installed_version_valid "$prompt_version" || prompt_version=''
+    installed_version_valid "$submitted_version" || submitted_version=''
+    case $reason in first_use|new_version) ;; *) reason=first_use ;; esac
+    json_quote "$prompt_version"; q_prompt=$REPLY
+    json_quote "$submitted_version"; q_submitted=$REPLY
+    json_quote "$reason"; q_reason=$REPLY
     mkdir -p -- "$directory" || return 1
     chmod 700 "$directory" 2>/dev/null || true
     temporary=$(umask 077; mktemp "$directory/.benchmark-guide.XXXXXX") || return 1
-    if ! printf '{"schema_version":1,"submitted":%s,"next_remind_at":%s}\n' "$submitted" "$next" > "$temporary" ||
+    if ! printf '{"schema_version":2,"submitted":%s,"next_remind_at":%s,"last_prompt_version":%s,"last_submitted_version":%s,"reminder_reason":%s}\n' \
+        "$submitted" "$next" "$q_prompt" "$q_submitted" "$q_reason" > "$temporary" ||
         ! mv -f -- "$temporary" "$directory/benchmark-first-submission.json"; then
         rm -f -- "$temporary"; return 1
     fi
 }
 benchmark_submission_succeeded() {
     [[ $1 == benchmark ]] || return 0
-    benchmark_guide_write true 0 || printf 'Could not save the benchmark reminder.\n' >&2
+    reminder_interactive || return 0
+    local -h report_version
+    if (($# >= 2)); then report_version=$2
+    else benchmark_installed_version; report_version=$REPLY; fi
+    installed_version_valid "$report_version" || report_version=''
+    benchmark_guide_read
+    # Unknown/older pending reports preserve both the current-version success and its cooldown.
+    if [[ -z $report_version ]]; then report_version=$GUIDE_LAST_SUBMITTED_VERSION; fi
+    benchmark_installed_version
+    if [[ -n $REPLY && $GUIDE_LAST_SUBMITTED_VERSION == "$REPLY" ]]; then report_version=$REPLY; fi
+    benchmark_guide_write true "$GUIDE_NEXT_REMIND_AT" "$GUIDE_LAST_PROMPT_VERSION" "$report_version" "$GUIDE_REMINDER_REASON" ||
+        printf 'Could not save the benchmark reminder.\n' >&2
+}
+benchmark_report_version() {
+    # submission verify has already checked this header against payload.engine_version.
+    local -h file=$1
+    REPLY=''
+    if submission_header "$file" engine && installed_version_valid "$REPLY"; then return 0; fi
+    REPLY=''
 }
 benchmark_body_receipt_valid() {
     local -h receipt=$1 field
@@ -663,22 +725,54 @@ benchmark_body_receipt_valid() {
 }
 benchmark_startup_guide() {
     BENCHMARK_GUIDE_ACTIVE=false
-    [[ ${INTERACTIVE-false} == true && ${DRY_RUN-false} == false && ${HEADLESS-false} == false &&
-        ${S[json_output]-false} != true && -z ${CI-} ]] || return 0
-    local -h receipt now answer
+    reminder_interactive || return 0
+    local -h receipt receipt_directory now answer current receipt_version history submitted_version reason delay changed=false
+    benchmark_installed_version; current=$REPLY
     benchmark_guide_read
-    [[ $GUIDE_SUBMITTED == false ]] || return 0
-    # Globbing through find also works in zsh when there are no receipts.
-    if [[ -d $CONFIG_DIR/private/submission-receipts ]]; then
-        while IFS= read -r receipt; do
-            if benchmark_body_receipt_valid "$receipt"; then benchmark_submission_succeeded benchmark; return 0; fi
-        done < <(find "$CONFIG_DIR/private/submission-receipts/." ! -name . -prune -type f -name '*.private-receipt.json' -print 2>/dev/null)
+    history=$GUIDE_SUBMITTED; submitted_version=$GUIDE_LAST_SUBMITTED_VERSION
+    # A legacy receipt proves history, never the current version unless its version is explicit.
+    if [[ -z $current || $submitted_version != "$current" ]]; then
+        local -a receipt_directories=("$CONFIG_DIR/private/submission-receipts")
+        [[ -z ${LEGACY_CONFIG_DIR-} || $LEGACY_CONFIG_DIR == "$CONFIG_DIR" ]] || receipt_directories+=("$LEGACY_CONFIG_DIR/private/submission-receipts")
+        for receipt_directory in "${receipt_directories[@]}"; do
+            [[ -d $receipt_directory ]] || continue
+            while IFS= read -r receipt; do
+                if benchmark_body_receipt_valid "$receipt"; then
+                    history=true; receipt_version=''
+                    if json_get '["engine_version"]' && installed_version_valid "$REPLY"; then receipt_version=$REPLY; fi
+                    if [[ -n $receipt_version && ( -z $submitted_version || $receipt_version == "$current" ) ]]; then submitted_version=$receipt_version; fi
+                fi
+            done < <(find "$receipt_directory/." ! -name . -prune -type f -name '*.private-receipt.json' -print 2>/dev/null)
+        done
     fi
+    if [[ $history != "$GUIDE_SUBMITTED" || $submitted_version != "$GUIDE_LAST_SUBMITTED_VERSION" ]]; then
+        benchmark_guide_write "$history" "$GUIDE_NEXT_REMIND_AT" "$GUIDE_LAST_PROMPT_VERSION" "$submitted_version" "$GUIDE_REMINDER_REASON" ||
+            printf 'Could not save the benchmark reminder.\n' >&2
+        benchmark_guide_read
+    fi
+    [[ -z $current || $current != "$GUIDE_LAST_SUBMITTED_VERSION" ]] || return 0
+    [[ -n $current || $GUIDE_SUBMITTED != true ]] || return 0
+    reason=first_use; delay=172800
+    if [[ -n $current && -n $GUIDE_LAST_PROMPT_VERSION && $GUIDE_LAST_PROMPT_VERSION != "$current" ]]; then
+        reason=new_version; changed=true
+    elif [[ $GUIDE_SUBMITTED == true && -z $GUIDE_LAST_PROMPT_VERSION ]]; then
+        reason=new_version; changed=true
+    elif [[ $GUIDE_LAST_PROMPT_VERSION == "$current" && $GUIDE_REMINDER_REASON == new_version ]]; then
+        reason=new_version
+    elif [[ $GUIDE_SUBMITTED == true ]]; then reason=new_version
+    fi
+    [[ $reason != new_version ]] || delay=604800
     now=$(benchmark_guide_now)
-    ((now >= GUIDE_NEXT_REMIND_AT)) || return 0
-    # Save before input so cancellation, EOF and benchmark failure also get 48 hours.
-    benchmark_guide_write false "$((now + 172800))" || printf 'Could not save the benchmark reminder.\n' >&2
-    printf '\n邀请你跑一次快速 Benchmark，分享成绩到 MoE4All.com 排行榜！\nRun a quick benchmark and share your result on the MoE4All.com leaderboard!\n'
+    [[ $now =~ ^[0-9]{1,12}$ ]] || return 0
+    if [[ $changed != true ]] && ((now < GUIDE_NEXT_REMIND_AT)); then return 0; fi
+    # Save before input: cancellation, EOF and benchmark failure receive the same cooldown.
+    benchmark_guide_write "$GUIDE_SUBMITTED" "$((now + delay))" "$current" "$GUIDE_LAST_SUBMITTED_VERSION" "$reason" ||
+        printf 'Could not save the benchmark reminder.\n' >&2
+    if [[ $reason == new_version ]]; then
+        printf '\n已更新到v%s，要不要再测一次，看看这次的表现？\nUpdated to v%s. Run another quick benchmark to see how it performs?\n' "$current" "$current"
+    else
+        printf '\n欢迎！想试试快速 Benchmark，分享成绩到 MoE4All.com 排行榜吗？\nWelcome! Try a quick benchmark and share your result on the MoE4All.com leaderboard!\n'
+    fi
     printf '上传前仍会征求同意。You will be asked before uploading.\n  [1] 试试！ / Try it!\n* [2] 后面再说~ / Maybe later~\n'
     while true; do
         prompt '选择 / Select' 2 || return 1
@@ -721,19 +815,31 @@ save_benchmark_upload_preferences() {
 }
 save_state() {
     if [[ ${BENCHMARK_GUIDE_ACTIVE-false} == true ]]; then save_benchmark_upload_preferences; return; fi
-    local temporary key sep=''
+    local temporary key raw state_path flat source_state=$STATE sep='' top_level='^\["[^"]*"\]$'
+    local -A values=()
+    if ! llm_enabled; then
+        # Auxiliary-only launches preserve unknown/future LLM settings as JSON too.
+        if [[ ! -f $source_state && -n ${LEGACY_STATE-} && -f $LEGACY_STATE ]]; then source_state=$LEGACY_STATE; fi
+        if [[ -f $source_state ]]; then
+            flat=$(LC_ALL=C awk -v BRIEF=0 "$JSON_PARSER" "$source_state") || return 1
+            while IFS=$'\t' read -r state_path raw; do
+                if [[ $state_path =~ $top_level ]]; then key=${state_path:1:${#state_path}-2}; values[$key]=$raw; fi
+            done <<< "$flat"
+        fi
+    fi
+    for key in "${(@k)S[@]}"; do
+        case ${DEFAULTS[$key]} in true|false) raw=${S[$key]} ;; *) json_quote "${S[$key]}"; raw=$REPLY ;; esac
+        json_quote "$key"; values[$REPLY]=$raw
+    done
     mkdir -p -- "$CONFIG_DIR"; temporary=$(mktemp "$CONFIG_DIR/.wizard-state.XXXXXX")
     {
         printf '{\n'
-        for key in "${(@k)S[@]}"; do
-            printf '%s  "%s": ' "$sep" "$key"
-            case ${DEFAULTS[$key]} in true|false) printf '%s' "${S[$key]}" ;; *) json_quote "${S[$key]}"; printf '%s' "$REPLY" ;; esac
-            sep=$',\n'
-        done
+        for key in "${(@k)values[@]}"; do printf '%s  %s: %s' "$sep" "$key" "${values[$key]}"; sep=$',\n'; done
         printf '\n}\n'
     } > "$temporary"
     chmod 600 "$temporary"; mv -f -- "$temporary" "$STATE"
 }
+
 prompt() {
     local value
     while true; do
@@ -756,7 +862,7 @@ yes() {
 }
 ask_yes() { yes "$2" "${S[$1]}"; S[$1]=$REPLY; }
 valid_uint() { [[ $1 =~ ^[0-9]{1,9}$ ]] && ((10#$1 >= ${2-0} && 10#$1 <= ${3-999999999})); }
-integer() {
+ask_integer() {
     while true; do
         prompt "$2" "${S[$1]}"
         if [[ -z $REPLY && ${5-false} == true ]] || valid_uint "$REPLY" "${3-0}" "${4-999999999}"; then S[$1]=$REPLY; return; fi
@@ -802,26 +908,79 @@ absolute() {
     [[ $value == /* ]] || value="$ROOT/$value"
     REPLY=${value:A}
 }
-CATALOG_IDS=(qwen35-balanced flashnext-427)
+CATALOG_IDS=(qwen35-balanced flashnext-427 flashnext-vision qwen3-embedding-06b-q8 sensevoice-small-q8 qwen35-vision melotts-chinese-native)
+speech_release_url() {
+    local output='' engine_version=''
+    if [[ -x ${BINARY-} ]]; then output=$("$BINARY" --version 2>/dev/null) || output=''; fi
+    [[ $output != 'infr '* ]] || engine_version=${output#infr }
+    if installed_version_valid "$engine_version"; then REPLY="https://github.com/Headmaster218/MoE4All/releases/tag/release-$engine_version"
+    else REPLY='https://github.com/Headmaster218/MoE4All/releases/latest'; fi
+}
+show_speech_release_notes() {
+    speech_release_url
+    local url=$REPLY
+    printf '\nMeloTTS-Chinese：下载与转换指南 / Download and conversion guide\n%s\n' "$url"
+    printf '%s\n' '请按发行说明准备本地模型和资源目录；不自动安装 Python 或 Torch。Follow the release notes to prepare local model/assets; Python and Torch are not installed automatically.'
+    if [[ -z ${SSH_TTY-}${SSH_CONNECTION-} ]]; then open_submission_url "$url" || true; fi
+    return 0
+}
+download_directory() { absolute "${S[download_dir]:-$ROOT/models}"; }
+choose_download_directory() {
+    download_directory
+    prompt '下载目录 / Download directory' "$REPLY" true || return 1
+    local directory=$REPLY temporary key raw state_path flat source_state=$STATE sep='' top_level='^\["[^"]*"\]$'
+    [[ $directory != \"*\" ]] || directory=${directory:1:${#directory}-2}
+    absolute "$directory"; directory=$REPLY
+    local -A values=()
+    if [[ -f $source_state ]]; then
+        flat=$(LC_ALL=C awk -v BRIEF=0 "$JSON_PARSER" "$source_state") || return 1
+        while IFS=$'\t' read -r state_path raw; do
+            if [[ $state_path =~ $top_level ]]; then key=${state_path:1:${#state_path}-2}; values[$key]=$raw; fi
+        done <<< "$flat"
+    fi
+    json_quote download_dir; key=$REPLY; json_quote "$directory"; values[$key]=$REPLY
+    mkdir -p -- "$CONFIG_DIR"; temporary=$(mktemp "$CONFIG_DIR/.wizard-download-dir.XXXXXX") || return 1
+    {
+        printf '{\n'
+        for key in "${(@k)values[@]}"; do printf '%s  %s: %s' "$sep" "$key" "${values[$key]}"; sep=$',\n'; done
+        printf '\n}\n'
+    } > "$temporary"
+    chmod 600 "$temporary"; mv -f -- "$temporary" "$STATE" || return 1
+    S[download_dir]=$directory
+}
+catalog_size() {
+    REPLY=$(LC_ALL=C awk -v bytes="$CATALOG_BYTES" 'BEGIN { if (bytes >= 1073741824) printf "%.2f GiB", bytes/1073741824; else printf "%.2f MiB", bytes/1048576 }')
+}
 catalog_load() {
-    CATALOG_ID=$1 CATALOG_KIND='' CATALOG_NAME='' CATALOG_INFO='' CATALOG_PRIMARY='' CATALOG_COUNT=0
+    CATALOG_ID=$1 CATALOG_KIND='' CATALOG_NAME='' CATALOG_INFO='' CATALOG_PRIMARY='' CATALOG_COUNT=0 CATALOG_BYTES=0 CATALOG_ACTION=download
     case $1 in
         flashnext-427)
-            CATALOG_KIND=llm; CATALOG_NAME='Qwen3.8 Flash-Next AD-4.27bpw-Q4_K_M-M64 (33 shards)'
-            CATALOG_INFO='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'
-            CATALOG_PRIMARY='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00033.gguf'; CATALOG_COUNT=33 ;;
+            CATALOG_KIND=llm; CATALOG_NAME='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64'; CATALOG_BYTES=94525391424
+            CATALOG_INFO='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/tree/f5b0b790eebb89033c48091c26abf74c1b385940'
+            CATALOG_PRIMARY='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64/Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf'; CATALOG_COUNT=3 ;;
         qwen35-balanced)
-            CATALOG_KIND=llm; CATALOG_NAME='Qwen3.6 35B APEX-I-Balanced'
+            CATALOG_KIND=llm; CATALOG_NAME='Qwen3.6-35B-A3B-APEX-I-Balanced'; CATALOG_BYTES=25624957632
             CATALOG_INFO='https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/blob/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'
             CATALOG_PRIMARY='Qwen3.6-35B-A3B-APEX-I-Balanced/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf'; CATALOG_COUNT=1 ;;
         flashnext-vision)
-            CATALOG_KIND=vision; CATALOG_NAME='Qwen3.8 Flash-Next F16 vision projector'
+            CATALOG_KIND=vision; CATALOG_NAME='mmproj-Qwen3.8-Flash-Next-F16'; CATALOG_BYTES=904003840
             CATALOG_INFO='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/blob/main/mmproj-Qwen3.8-Flash-Next-F16.gguf'
             CATALOG_PRIMARY='Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64/mmproj-Qwen3.8-Flash-Next-F16.gguf'; CATALOG_COUNT=1 ;;
+        qwen35-vision)
+            CATALOG_KIND=vision; CATALOG_NAME='Qwen3.6-35B-A3B · mmproj.gguf'; CATALOG_BYTES=902822624
+            CATALOG_INFO='https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/blob/main/mmproj.gguf'
+            CATALOG_PRIMARY='Qwen3.6-35B-A3B-APEX-I-Balanced/mmproj.gguf'; CATALOG_COUNT=1 ;;
         qwen3-embedding-06b-q8)
-            CATALOG_KIND=embedding; CATALOG_NAME='Qwen3-Embedding 0.6B Q8_0'
+            CATALOG_KIND=embedding; CATALOG_NAME='Qwen3-Embedding-0.6B-Q8_0'; CATALOG_BYTES=639150592
             CATALOG_INFO='https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/blob/main/Qwen3-Embedding-0.6B-Q8_0.gguf'
             CATALOG_PRIMARY='Qwen3-Embedding-0.6B-Q8_0/Qwen3-Embedding-0.6B-Q8_0.gguf'; CATALOG_COUNT=1 ;;
+        sensevoice-small-q8)
+            CATALOG_KIND=audio; CATALOG_NAME='sense-voice-small-q8_0'; CATALOG_BYTES=291985952
+            CATALOG_INFO='https://huggingface.co/lovemefan/sense-voice-gguf/blob/main/sense-voice-small-q8_0.gguf'
+            CATALOG_PRIMARY='SenseVoice-Small-Q8_0/sense-voice-small-q8_0.gguf'; CATALOG_COUNT=1 ;;
+        melotts-chinese-native)
+            CATALOG_KIND=speech; CATALOG_NAME='MeloTTS-Chinese'; CATALOG_BYTES=155780558; CATALOG_ACTION=release-note
+            speech_release_url; CATALOG_INFO=$REPLY ;;
         *) fail "Unknown recommended download: $1"; return 1 ;;
     esac
 }
@@ -831,18 +990,24 @@ catalog_file() {
     valid_uint "$index" 1 "$CATALOG_COUNT" || { fail "Invalid catalog file index: $index"; return 1; }
     case $1 in
         flashnext-427)
-            printf -v file 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-%05d-of-00033.gguf' "$index"
+            printf -v file 'Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-%05d-of-00003.gguf' "$index"
             DOWNLOAD_RELATIVE="$directory/$file"
-            DOWNLOAD_URL="https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/$directory/$file?download=true" ;;
+            DOWNLOAD_URL="https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/f5b0b790eebb89033c48091c26abf74c1b385940/$file?download=true" ;;
         qwen35-balanced)
             DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
             DOWNLOAD_URL='https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/Qwen3.6-35B-A3B-APEX-I-Balanced.gguf?download=true' ;;
         flashnext-vision)
             DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
             DOWNLOAD_URL='https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-F16.gguf?download=true' ;;
+        qwen35-vision)
+            DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
+            DOWNLOAD_URL='https://huggingface.co/mudler/Qwen3.6-35B-A3B-APEX-GGUF/resolve/main/mmproj.gguf?download=true' ;;
         qwen3-embedding-06b-q8)
             DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
             DOWNLOAD_URL='https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf?download=true' ;;
+        sensevoice-small-q8)
+            DOWNLOAD_RELATIVE=$CATALOG_PRIMARY
+            DOWNLOAD_URL='https://huggingface.co/lovemefan/sense-voice-gguf/resolve/main/sense-voice-small-q8_0.gguf?download=true' ;;
     esac
 }
 recommendations() {
@@ -851,15 +1016,18 @@ recommendations() {
     for id in "${CATALOG_IDS[@]}"; do
         catalog_load "$id"
         [[ $kind == all || $CATALOG_KIND == "$kind" ]] || continue
-        printf ' %s\n   %s\n' "$CATALOG_NAME" "$CATALOG_INFO"
+        catalog_size
+        printf ' %s | %s (%s bytes)\n   %s\n' "$CATALOG_NAME" "$REPLY" "$CATALOG_BYTES" "$CATALOG_INFO"
     done
-    printf '在模型选择中按 D，可将一个或多个项目下载到 %s/models。\nChoose D in a model prompt to download one or more items into %s/models.\n' "$ROOT" "$ROOT"
+    download_directory
+    printf '在模型选择中按 D 下载；可修改下载目录。\nChoose D in a model prompt to download; the folder can be changed.\n目录 / Folder: %s\n' "$REPLY"
 }
 catalog_candidates() {
-    local kind=$1 id candidate_path found existing
+    local kind=$1 id candidate_path found existing directory
+    download_directory; directory=$REPLY
     for id in "${CATALOG_IDS[@]}"; do
-        catalog_load "$id"; [[ $CATALOG_KIND == "$kind" ]] || continue
-        candidate_path="$ROOT/models/$CATALOG_PRIMARY"; [[ -f $candidate_path ]] || continue
+        catalog_load "$id"; [[ $CATALOG_KIND == "$kind" && $CATALOG_ACTION == download ]] || continue
+        candidate_path="$directory/$CATALOG_PRIMARY"; [[ -f $candidate_path ]] || continue
         found=false; for existing in "${CANDIDATES[@]}"; do [[ $existing != "$candidate_path" ]] || found=true; done
         [[ $found == true ]] || CANDIDATES+=("$candidate_path")
     done
@@ -890,40 +1058,53 @@ model_download_file() {
     fail '下载重试 3 次后仍失败。Download failed after 3 attempts.'
 }
 download_bundle() {
-    local id=$1 i destination
+    local id=$1 i destination directory
     catalog_load "$id" || return 1
-    printf '\n下载 / Download: %s\n目录 / Folder: %s/models\n' "$CATALOG_NAME" "$ROOT"
+    if [[ $CATALOG_ACTION == release-note ]]; then show_speech_release_notes; return; fi
+    [[ ${2-false} == true ]] || choose_download_directory || return 1
+    download_directory; directory=$REPLY
+    catalog_load "$id" || return 1
+    catalog_size
+    printf '\n下载 / Download: %s | %s (%s bytes)\n目录 / Folder: %s\n' "$CATALOG_NAME" "$REPLY" "$CATALOG_BYTES" "$directory"
     for ((i=1;i<=CATALOG_COUNT;i++)); do
         catalog_file "$id" "$i"
-        destination="$ROOT/models/$DOWNLOAD_RELATIVE"
+        destination="$directory/$DOWNLOAD_RELATIVE"
         model_download_file "$DOWNLOAD_URL" "$destination" "[$i/$CATALOG_COUNT] ${destination##*/}" || return 1
     done
     catalog_load "$id"
-    [[ -s $ROOT/models/$CATALOG_PRIMARY ]] || { fail "Downloaded primary file is missing: $ROOT/models/$CATALOG_PRIMARY"; return 1; }
-    printf '下载完成 / Download complete: %s/models/%s\n' "$ROOT" "$CATALOG_PRIMARY"
+    [[ -s $directory/$CATALOG_PRIMARY ]] || { fail "Downloaded primary file is missing: $directory/$CATALOG_PRIMARY"; return 1; }
+    printf '下载完成 / Download complete: %s/%s\n' "$directory" "$CATALOG_PRIMARY"
 }
 download_menu() {
-    local raw token number index id primary i valid; local -a selected=(); local -A seen=()
+    local raw token number index id primary i valid directory kind=${1-all}; local -a selected=() available=(); local -A seen=()
+    for id in "${CATALOG_IDS[@]}"; do
+        catalog_load "$id"
+        [[ $kind != all && $CATALOG_KIND != "$kind" ]] || available+=("$id")
+    done
     while true; do
         printf '\n下载模型与组件 / Download models and components\n'
-        for ((i=0;i<${#CATALOG_IDS[@]};i++)); do
-            catalog_load "${CATALOG_IDS[i]}"; primary="$ROOT/models/$CATALOG_PRIMARY"
-            if [[ -s $primary ]]; then printf ' [%d] %s [已安装 / installed]\n' "$((i+1))" "$CATALOG_NAME"; else printf ' [%d] %s\n' "$((i+1))" "$CATALOG_NAME"; fi
-            printf '     %s\n' "$CATALOG_INFO"
+        download_directory; directory=$REPLY
+        printf '目录 / Folder: %s\n' "$directory"
+        for ((i=0;i<${#available[@]};i++)); do
+            catalog_load "${available[i]}"; primary="$directory/$CATALOG_PRIMARY"
+            if [[ -n $CATALOG_PRIMARY && -s $primary ]]; then printf ' [%d] %s [已安装 / installed]\n' "$((i+1))" "$CATALOG_NAME"; else printf ' [%d] %s\n' "$((i+1))" "$CATALOG_NAME"; fi
+            catalog_size
+            printf '     %s (%s bytes)\n     %s\n' "$REPLY" "$CATALOG_BYTES" "$CATALOG_INFO"
+            [[ $CATALOG_ACTION != release-note ]] || printf '     参考包大小；打开发行说明与转换指南 / Reference package size; open release notes and conversion guide\n'
         done
-        printf ' [A] 全部 / All\n [B] 返回 / Back\n选择一个或多个编号，用逗号分隔 / Select one or more numbers, comma-separated: '
+        printf ' [P] 下载目录 / Download folder\n [A] 全部 / All\n [B] 返回 / Back\n选择一个或多个编号，用逗号分隔 / Select one or more numbers, comma-separated: '
         IFS= read -r raw || { fail '下载选择已取消：输入已结束。Download selection cancelled: input ended.'; return 1; }; trim "$raw"; raw=$REPLY
-        case ${raw:l} in b|back) return 0 ;; a|all) selected=(0 1 2 3) ;; *)
+        case ${raw:l} in p|folder|dir) choose_download_directory || return 1; continue ;; b|back) return 0 ;; a|all) selected=(); for ((i=0;i<${#available[@]};i++)); do selected+=("$i"); done ;; *)
             raw=${raw//,/ }; raw=${raw//;/ }; selected=(); seen=(); valid=true
             for token in $raw; do
-                if ! valid_uint "$token" 1 "${#CATALOG_IDS[@]}"; then valid=false; break; fi
+                if ! valid_uint "$token" 1 "${#available[@]}"; then valid=false; break; fi
                 number=$((10#$token)); index=$((number-1))
                 [[ -v "seen[$index]" ]] || { selected+=("$index"); seen[$index]=1; }
             done
             if [[ $valid != true || ${#selected[@]} == 0 ]]; then printf '请选择列表中的编号，并用逗号分隔。Choose listed numbers separated by commas.\n'; continue; fi ;;
         esac
-        yes '现在开始或继续所选下载？/ Start or resume the selected downloads now?' true; [[ $REPLY == true ]] || return 0
-        for index in "${selected[@]}"; do id=${CATALOG_IDS[index]}; download_bundle "$id" || return 1; done
+        yes '打开指南或开始/继续下载？/ Open guide or start/resume downloads?' true; [[ $REPLY == true ]] || return 0
+        for index in "${selected[@]}"; do id=${available[index]}; download_bundle "$id" true || return 1; done
         return 0
     done
 }
@@ -971,12 +1152,15 @@ model_path() {
         for ((i=0;i<${#nearby[@]};i++)); do printf ' [%d] %s\n' "$((i+1))" "${nearby[i]}"; done
         printf ' [D] 下载模型或组件 / Download models or components\n [R] 显示官方下载链接 / Show official download links\n [N] 输入新路径 / Enter a new path\n'
         value=$saved; [[ -n $value || ${#nearby[@]} == 0 ]] || value=1
-        [[ -n $value || ${#nearby[@]} != 0 ]] || value=D
+        # Audio downloads require an explicit D; Enter must not download a model.
+        [[ -n $value || ${#nearby[@]} != 0 || $kind == audio || $kind == speech ]] || value=D
         prompt '选择模型、命令或 GGUF 路径 / Select a model, command, or GGUF path' "$value" true; value=$REPLY
         if [[ ${value:l} == d || ${value:l} == download ]]; then
             case $kind in
-                vision) download_bundle flashnext-vision || continue ;;
+                vision) download_menu vision || continue ;;
                 embedding) download_bundle qwen3-embedding-06b-q8 || continue ;;
+                audio) download_bundle sensevoice-small-q8 || continue ;;
+                speech) download_bundle melotts-chinese-native || continue ;;
                 *) download_menu || continue ;;
             esac
             CANDIDATES=("${nearby[@]}"); catalog_candidates "$kind"; nearby=("${CANDIDATES[@]}")
@@ -998,7 +1182,96 @@ model_path() {
     done
 }
 
+# Chat and benchmarks always use the LLM; API modules can run independently.
+llm_enabled() { [[ ${S[launch_mode]} != serve || ${S[server_llm_enabled]} == true ]]; }
+device_needed() { llm_enabled || [[ ${S[server_embedding]} == true ]]; }
+reset_legacy_mtp() {
+    # Never migrate or clear settings belonging to a disabled LLM.
+    if llm_enabled && [[ ! -v 'OVERRIDES[mtp_model]' ]]; then
+        S[mtp_enabled]=false; S[mtp_model]=''; S[mtp_verify_tokens]=4
+    fi
+}
+configure_api_modules() {
+    while true; do
+        ask_yes server_llm_enabled '启用大语言模型 API？/ Enable the language model API?'
+        ask_yes server_embedding '启用 Embedding API？/ Enable the Embedding API?'
+        ask_yes server_transcription '启用本地语音转录 API？/ Enable the local transcription API?'
+        ask_yes server_speech '启用本地语音合成 API？/ Enable the local speech synthesis API?'
+        [[ ${S[server_llm_enabled]} == true || ${S[server_embedding]} == true || ${S[server_transcription]} == true || ${S[server_speech]} == true ]] && break
+        printf '%s\n' '请至少启用一个 API 模块。/ Enable at least one API module.'
+    done
+}
+configure_embedding() {
+    [[ ${S[server_embedding]} == true ]] || return 0
+    printf '%s\n' 'Embedding 模型与 Backend 在首次请求时加载，空闲超时后卸载整个实例。/ The Embedding model and backend load on the first request; the entire instance unloads after the idle timeout.'
+    model_path embedding embedding_model
+    ask_integer embedding_idle_timeout 'Embedding 空闲释放秒数，0 为服务期间常驻 / Idle eviction seconds, 0 keeps resident'
+}
+configure_transcription() {
+    [[ ${S[launch_mode]} == serve ]] || return 0
+    [[ ${S[server_transcription]} == true ]] || return 0
+    printf '%s\n' '语音转录固定使用 CPU，默认 4 线程；模型载入后约占 300 MiB RAM。/ Transcription uses the CPU with 4 threads by default; the loaded model uses about 300 MiB RAM.' \
+        '语音模型在首次请求时载入；不额外占用 GPU 权重，无需外部 runtime。/ The transcription model loads on the first request; no extra GPU weights or external runtime are needed.' \
+        '首版支持 WAV/PCM；不支持全格式或真正逐 token 流式。/ First release: WAV/PCM; no all-format support or true token-by-token streaming.'
+    model_path audio transcription_model
+    ask_integer transcription_threads '语音 CPU 线程数 / Transcription CPU threads' 1 256
+    ask_integer transcription_idle_timeout '语音空闲释放秒数，0 为服务期间常驻 / Transcription idle eviction seconds, 0 keeps resident'
+    ask transcription_upload_dir '语音上传目录 / Transcription upload directory' true
+}
+add_transcription_arguments() {
+    [[ ${S[launch_mode]} == serve && ${S[server_transcription]} == true ]] || return 0
+    local upload_dir="${S[transcription_upload_dir]}"
+    if [[ $upload_dir == \"*\" || $upload_dir == \'*\' ]]; then upload_dir=${upload_dir:1:${#upload_dir}-2}; fi
+    absolute "${S[transcription_model]}"; S[transcription_model]=$REPLY
+    [[ -f $REPLY && ${REPLY:l} == *.gguf ]] || { fail '未找到语音 GGUF 文件。Transcription GGUF file not found.'; return 1; }
+    valid_uint "${S[transcription_threads]}" 1 256 && valid_uint "${S[transcription_idle_timeout]}" 0 && [[ -n $upload_dir ]] || { fail '语音参数无效。Invalid transcription settings.'; return 1; }
+    absolute "$upload_dir"; S[transcription_upload_dir]=$REPLY
+    add_arg --transcription-model transcription_model; COMMAND+=(--transcription-dev cpu)
+    add_arg --transcription-threads transcription_threads; add_arg --transcription-idle-timeout transcription_idle_timeout
+    add_arg --transcription-upload-dir transcription_upload_dir
+}
+show_transcription_api() {
+    [[ ${S[launch_mode]} == serve && ${S[server_transcription]} == true ]] || return 0
+    printf '本地语音转录 API / Local transcription API: /v1/audio/transcriptions (WAV/PCM, CPU)\n'
+}
+valid_speech_seconds() {
+    [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] && LC_ALL=C awk -v value="$1" 'BEGIN { exit !(value >= 1 && value <= 120) }'
+}
+configure_speech() {
+    [[ ${S[launch_mode]} == serve && ${S[server_speech]} == true ]] || return 0
+    printf '%s\n' '语音合成固定使用 CPU，默认 4 线程；模型在首次请求时载入，空闲后卸载。Speech synthesis uses CPU, 4 threads by default; loads on first request and unloads after idle timeout.' \
+        '需要启用 TTS 的引擎；不支持的构建会由引擎明确报错。A TTS-enabled engine is required; unsupported builds report an explicit backend error.'
+    model_path speech speech_model
+    while true; do
+        ask speech_lexicon '资源目录（lexicon.txt、tokens.txt、config.json；D 打开指南）/ Assets directory (D opens guide)' true
+        case ${S[speech_lexicon]:l} in d|download) show_speech_release_notes; S[speech_lexicon]=''; continue ;; esac
+        absolute "${S[speech_lexicon]}"; [[ -d $REPLY ]] && { S[speech_lexicon]=$REPLY; break; }
+        printf '未找到资源目录。Assets directory not found.\n'
+    done
+    ask_integer speech_threads '语音合成 CPU 线程数 / Speech CPU threads' 1 256
+    ask_integer speech_idle_timeout '语音合成空闲释放秒数，0 为常驻 / Speech idle seconds, 0 keeps resident' 0
+    while true; do ask speech_max_output_seconds '每次合成最长秒数（1-120）/ Maximum seconds per clip (1-120)' true; valid_speech_seconds "${S[speech_max_output_seconds]}" && break; printf '请输入 1 到 120 秒。Enter 1 to 120 seconds.\n'; done
+}
+add_speech_arguments() {
+    [[ ${S[launch_mode]} == serve && ${S[server_speech]} == true ]] || return 0
+    local assets="${S[speech_lexicon]}"
+    if [[ $assets == \"*\" || $assets == \'*\' ]]; then assets=${assets:1:${#assets}-2}; fi
+    [[ -n ${S[speech_model]} && -n $assets ]] || { fail '语音合成需要模型和资源目录。Speech requires model and assets directory.'; return 1; }
+    absolute "${S[speech_model]}"; S[speech_model]=$REPLY
+    [[ -f $REPLY && ${REPLY:l} == *.gguf ]] || { fail '未找到合成 GGUF 文件。Speech GGUF file not found.'; return 1; }
+    absolute "$assets"; S[speech_lexicon]=$REPLY
+    [[ -d $REPLY ]] || { fail '未找到合成资源目录。Speech assets directory not found.'; return 1; }
+    valid_uint "${S[speech_threads]}" 1 256 && valid_uint "${S[speech_idle_timeout]}" 0 && valid_speech_seconds "${S[speech_max_output_seconds]}" || { fail '语音合成参数无效。Invalid speech settings.'; return 1; }
+    add_arg --speech-model speech_model; add_arg --speech-lexicon speech_lexicon; add_arg --speech-threads speech_threads
+    add_arg --speech-idle-timeout speech_idle_timeout; add_arg --speech-max-output-seconds speech_max_output_seconds
+}
+show_speech_api() {
+    [[ ${S[launch_mode]} == serve && ${S[server_speech]} == true ]] || return 0
+    printf '本地语音合成 API / Local speech synthesis API: /v1/audio/speech (CPU)\n'
+}
+
 remember_model() {
+    llm_enabled || return 0
     local current=${S[model]} value candidate_path count=0 history='' found existing
     [[ -n $current ]] || return 0
     if hub_reference "$current"; then return 0; fi
@@ -1182,6 +1455,7 @@ save_submission_receipt() {
         json_quote "$SUBMISSION_API_BASE"; printf '  "api_version": 1,\n  "api_base": %s,\n' "$REPLY"
         json_quote "$receipt_id"; printf '  "receipt_id": %s,\n' "$REPLY"
         json_quote "$receipt_token"; printf '  "receipt_token": %s,\n' "$REPLY"
+        json_quote "${11-}"; printf '  "engine_version": %s,\n' "$REPLY"
         json_quote "$kind"; printf '  "kind": %s,\n' "$REPLY"
         json_quote "$report_id"; printf '  "report_id": %s,\n' "$REPLY"
         json_quote "$file_hash"; printf '  "file_sha256": %s,\n' "$REPLY"
@@ -1336,9 +1610,10 @@ website_submission_upload() {
     public_url=''
     local public_path='["public_url"]'
     if [[ -v "J[$public_path]" && ${J[$public_path]} == \"*\" ]]; then json_get "$public_path"; public_url=$REPLY; fi
-    save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$original_hash" "$payload_hash" "$status" "$received_at" "$public_url" "$file_hash"
+    benchmark_report_version "$path"; local report_version=$REPLY
+    save_submission_receipt "$receipt_id" "$receipt_token" "$kind" "$report_id" "$original_hash" "$payload_hash" "$status" "$received_at" "$public_url" "$file_hash" "$report_version"
     local receipt_path=$REPLY
-    if benchmark_body_receipt_valid "$receipt_path"; then benchmark_submission_succeeded "$kind"; fi
+    if benchmark_body_receipt_valid "$receipt_path"; then benchmark_submission_succeeded "$kind" "$report_version"; fi
     REPLY=$receipt_path
     printf '已收到，状态 / Received, status: %s\n回执 ID / Receipt ID: %s\n私有回执 / Private receipt: %s\n' "$status" "$receipt_id" "$REPLY"
     [[ -z $public_url ]] || printf 'Public URL: %s\n' "$public_url"
@@ -1399,7 +1674,7 @@ gh_submission_upload() {
     pr_url=$(submission_gh pr create --repo "$upstream" --base main --head "$login:$branch" --title "$kind: add $report_id" --body 'User-consented public MoE4All report. Awaiting maintainer review; no automatic merge. Format validation is not an independent reproduction.' 2>/dev/null) ||
         pr_url=$(submission_gh pr list --repo "$upstream" --head "$branch" --author "$login" --base main --state all --json url --jq '.[0].url // empty' 2>/dev/null) || return 1
     [[ $pr_url =~ ^https://github.com/Headmaster218/MoE4All/pull/[0-9]+$ ]] || return 1
-    benchmark_submission_succeeded "$kind"
+    benchmark_report_version "$path"; benchmark_submission_succeeded "$kind" "$REPLY"
     printf 'PR 已创建或已存在 / PR created or already exists: %s\n' "$pr_url"
 }
 
@@ -1515,7 +1790,7 @@ offer_submission_upload() {
             submission_next_action browser || return 1
             action=$REPLY
             case $action in
-                sent) benchmark_submission_succeeded "$kind"; rm -f -- "$pending_path"; return 0 ;;
+                sent) rm -f -- "$pending_path"; return 0 ;;
                 reopen) continue ;;
                 cloudflare) channel=cloudflare ;;
                 *) break ;;
@@ -1640,54 +1915,63 @@ configure() {
         choice launch_mode '你想做什么？/ What would you like to do?' 'run|实时终端对话（推荐）/ Terminal chat (recommended)' 'serve|启动 OpenAI 兼容 API / Start OpenAI-compatible API server' 'bench|性能测试 / Benchmark' 'report|报告当前运行问题 / Report a current runtime problem'
     fi
     [[ ${S[launch_mode]} != report ]] || return 0
-    model_path llm model
-    if [[ ${S[launch_mode]} == serve ]]; then
-        S[server_vision]=false; S[vision_projector]=''
-        S[server_embedding]=false; S[embedding_model]=''
-        printf '实验性 Metal 包目前只支持文本生成；视觉与 Embedding 仍需 Vulkan。\nThe experimental Metal package currently serves text generation only; Vision and Embedding require Vulkan.\n'
-    fi
-    choose_device
-    choice setup_mode '配置方式 / Configuration' 'conservative|自动配置：保守（推荐）/ Automatic: conservative (recommended)' 'aggressive|自动配置：激进性能 / Automatic: aggressive performance' 'manual|全手动配置 / Fully manual configuration'
-    if [[ ${S[setup_mode]} == manual ]]; then
-        integer ubatch 'Ubatch，留空为自动 / Ubatch, blank for auto' 1 999999999 true; integer threads 'CPU 线程，留空为全部 / CPU threads, blank for all' 1 999999999 true
-        while true; do ask config_path '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup'; [[ -n ${S[config_path]} ]] || break; absolute "${S[config_path]}"; [[ ! -f $REPLY ]] || break; printf '未找到配置 TOML。Config TOML not found.\n'; done
-        choice kv_preset 'KV Cache 类型 / KV cache type' 'auto|引擎自动（推荐）/ Engine default (recommended)' 'q8|Q8_0 K + Q8_0 V' 'f16|F16 K + F16 V' 'custom|分别指定 / Custom K and V'
-        case ${S[kv_preset]} in custom) ask kv_type_k 'K 类型 / K dtype' true; ask kv_type_v 'V 类型 / V dtype' true ;; q8) S[kv_type_k]=q8_0; S[kv_type_v]=q8_0 ;; f16) S[kv_type_k]=f16; S[kv_type_v]=f16 ;; esac
-        ask_yes configure_memory '设置进程总 RAM 预算？/ Configure total process RAM budget?'
-        if [[ ${S[configure_memory]} == true ]]; then ask ram_budget '进程总 RAM 预算，留空为自动 / Total process RAM budget, blank for auto'; fi
-        S[vram_budget]=''; S[vram_reserve]=''; S[expert_cache]=''; S[pager_ring]=''; S[pager_ring_slots]=''
-        S[host_dma]=false; S[kv_overflow]=false; S[submit_mode]=auto; S[configure_diagnostics]=false
-        ask custom_sets '额外 --set，以分号分隔 / Extra --set entries separated by semicolons'
-    else S[kv_preset]=auto; S[kv_type_k]=''; S[kv_type_v]=''; fi
-    S[auto_overrides]=''
-    if [[ ${S[launch_mode]} != bench ]]; then
-        ask_yes configure_thinking '是否配置默认思考？API 可覆盖 / Configure default reasoning? API may override'
-        previous=${S[think_mode]}; effort=${S[reasoning_effort]}; S[think_mode]=default; S[reasoning_effort]=default
-        if [[ ${S[configure_thinking]} == true ]]; then
-            value=true; [[ $previous != no-think ]] || value=false; yes '默认开启思考？/ Enable reasoning by default?' "$value"
-            if [[ $REPLY == true ]]; then
-                S[think_mode]=think; value=$(reasoning_efforts "${S[model]}") || value=''
-                if [[ -n $value ]]; then
-                    local -a effort_options=('default|模板默认 / Template default'); local found=false
-                    for key in $value; do effort_options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
-                    [[ $found == false ]] || S[reasoning_effort]=$effort
-                    choice reasoning_effort '默认思考强度 / Default reasoning effort' "${effort_options[@]}"
-                else printf '未检测到思考强度支持，将保留模板默认值。Reasoning-effort support not detected; keeping template default.\n'; fi
-            else S[think_mode]=no-think; fi
+    if [[ ${S[launch_mode]} == serve ]]; then configure_api_modules; fi
+    reset_legacy_mtp
+    if llm_enabled; then
+        model_path llm model
+        if [[ ${S[launch_mode]} == serve ]]; then
+            S[server_vision]=false; S[vision_projector]=''
+            printf '实验性 Metal 包支持文本生成与 Embedding；视觉仍需 Vulkan。\nThe experimental Metal package supports text generation and Embedding; Vision requires Vulkan.\n'
         fi
-        integer max_new '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' 1
-        ask_yes configure_sampling '设置默认采样参数？/ Configure default sampling?'
-        if [[ ${S[configure_sampling]} == true ]]; then ask temperature '温度，留空为模型默认 / Temperature, blank for model default'; integer top_k 'Top K，留空为模型默认 / Top K, blank for model default' 0 999999999 true; ask top_p 'Top P，留空为模型默认 / Top P, blank for model default'; integer seed '随机种子，留空为模型默认 / Seed, blank for model default' 0 999999999 true; fi
     fi
-    S[cpu_miss_enabled]=false; S[cpu_miss_cores]=''; S[cpu_miss_max]=1
-    if [[ ${S[launch_mode]} == serve ]]; then
-        S[server_parallel]=1; S[server_session_cache]=false
-        printf '并发会话数 / Concurrent slots: 1（Metal 后端当前串行 / currently serialized）\n'
+    if [[ ${S[launch_mode]} == serve ]]; then configure_embedding; configure_transcription; configure_speech; fi
+    if device_needed; then
+        [[ ${S[launch_mode]} != serve ]] || printf '%s\n' 'LLM 和 Embedding 共用所选设备；语音转录和合成固定使用 CPU。/ LLM and Embedding share the selected device; transcription and speech synthesis always use CPU.'
+        choose_device
     fi
-    if [[ ${S[launch_mode]} != bench ]]; then ask context '上下文窗口，留空为自动 / Context window, blank for auto'; fi
+    if llm_enabled; then
+        choice setup_mode '配置方式 / Configuration' 'conservative|自动配置：保守（推荐）/ Automatic: conservative (recommended)' 'aggressive|自动配置：激进性能 / Automatic: aggressive performance' 'manual|全手动配置 / Fully manual configuration'
+        if [[ ${S[setup_mode]} == manual ]]; then
+            ask_integer ubatch 'Ubatch，留空为自动 / Ubatch, blank for auto' 1 999999999 true; ask_integer threads 'CPU 线程，留空为全部 / CPU threads, blank for all' 1 999999999 true
+            while true; do ask config_path '配置 TOML，留空使用默认查找 / Config TOML, blank for default lookup'; [[ -n ${S[config_path]} ]] || break; absolute "${S[config_path]}"; [[ ! -f $REPLY ]] || break; printf '未找到配置 TOML。Config TOML not found.\n'; done
+            choice kv_preset 'KV Cache 类型 / KV cache type' 'auto|引擎自动（推荐）/ Engine default (recommended)' 'q8|Q8_0 K + Q8_0 V' 'f16|F16 K + F16 V' 'custom|分别指定 / Custom K and V'
+            case ${S[kv_preset]} in custom) ask kv_type_k 'K 类型 / K dtype' true; ask kv_type_v 'V 类型 / V dtype' true ;; q8) S[kv_type_k]=q8_0; S[kv_type_v]=q8_0 ;; f16) S[kv_type_k]=f16; S[kv_type_v]=f16 ;; esac
+            ask_yes configure_memory '设置进程总 RAM 预算？/ Configure total process RAM budget?'
+            if [[ ${S[configure_memory]} == true ]]; then ask ram_budget '进程总 RAM 预算，留空为自动 / Total process RAM budget, blank for auto'; fi
+            S[vram_budget]=''; S[vram_reserve]=''; S[expert_cache]=''; S[pager_ring]=''; S[pager_ring_slots]=''
+            S[host_dma]=false; S[kv_overflow]=false; S[submit_mode]=auto; S[configure_diagnostics]=false
+            ask custom_sets '额外 --set，以分号分隔 / Extra --set entries separated by semicolons'
+        else S[kv_preset]=auto; S[kv_type_k]=''; S[kv_type_v]=''; fi
+        S[auto_overrides]=''
+        if [[ ${S[launch_mode]} != bench ]]; then
+            ask_yes configure_thinking '是否配置默认思考？API 可覆盖 / Configure default reasoning? API may override'
+            previous=${S[think_mode]}; effort=${S[reasoning_effort]}; S[think_mode]=default; S[reasoning_effort]=default
+            if [[ ${S[configure_thinking]} == true ]]; then
+                value=true; [[ $previous != no-think ]] || value=false; yes '默认开启思考？/ Enable reasoning by default?' "$value"
+                if [[ $REPLY == true ]]; then
+                    S[think_mode]=think; value=$(reasoning_efforts "${S[model]}") || value=''
+                    if [[ -n $value ]]; then
+                        local -a effort_options=('default|模板默认 / Template default'); local found=false
+                        for key in $value; do effort_options+=("$key|$key"); [[ $key != "$effort" ]] || found=true; done
+                        [[ $found == false ]] || S[reasoning_effort]=$effort
+                        choice reasoning_effort '默认思考强度 / Default reasoning effort' "${effort_options[@]}"
+                    else printf '未检测到思考强度支持，将保留模板默认值。Reasoning-effort support not detected; keeping template default.\n'; fi
+                else S[think_mode]=no-think; fi
+            fi
+            ask_integer max_new '每轮最大生成 token（思考与正文合计）/ Max generated tokens per reply (reasoning + answer)' 1
+            ask_yes configure_sampling '设置默认采样参数？/ Configure default sampling?'
+            if [[ ${S[configure_sampling]} == true ]]; then ask temperature '温度，留空为模型默认 / Temperature, blank for model default'; ask_integer top_k 'Top K，留空为模型默认 / Top K, blank for model default' 0 999999999 true; ask top_p 'Top P，留空为模型默认 / Top P, blank for model default'; ask_integer seed '随机种子，留空为模型默认 / Seed, blank for model default' 0 999999999 true; fi
+        fi
+        S[cpu_miss_enabled]=false; S[cpu_miss_cores]=''; S[cpu_miss_max]=1
+        if [[ ${S[launch_mode]} == serve ]]; then
+            S[server_parallel]=1; S[server_session_cache]=false
+            S[server_session_cache]=false
+            printf 'SSD 会话 KV 缓存 / SSD session KV cache：串行 Metal 后端暂不可用 / unavailable on the serialized Metal backend\n'
+            printf '并发会话数 / Concurrent slots: 1（Metal 后端当前串行 / currently serialized）\n'
+        fi
+        if [[ ${S[launch_mode]} != bench ]]; then ask context '上下文窗口，留空为自动 / Context window, blank for auto'; fi
+    fi
     if [[ ${S[launch_mode]} == serve ]]; then
-        S[server_session_cache]=false
-        printf 'SSD 会话 KV 缓存 / SSD session KV cache：串行 Metal 后端暂不可用 / unavailable on the serialized Metal backend\n'
         while true; do ask server_addr '监听地址（IP:端口）/ Listen address (IP:port)' true; valid_address "${S[server_addr]}" && break; printf '请输入 IP:端口，例如 127.0.0.1:8080 或 [::1]:8080。Enter an IP:port, such as 127.0.0.1:8080 or [::1]:8080.\n'; done
         ask_yes server_auth '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?'
     fi
@@ -1710,9 +1994,9 @@ configure() {
         [[ ${S[prompt_tokens]} =~ ^[1-9][0-9]*$ ]] || S[prompt_tokens]=6144
         [[ ${S[gen_tokens]} =~ ^[1-9][0-9]*$ ]] || S[gen_tokens]=512
         case ${S[manual_bench_kind]} in
-            prefill) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
-            decode) S[prompt_tokens]=0; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
-            mixed) integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; printf '已添加 / Added: Prefill %s tokens\n' "${S[prompt_tokens]}"; integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
+            prefill) ask_integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; S[gen_tokens]=0; S[depth_mode]=none; S[depth_tokens]=0 ;;
+            decode) S[prompt_tokens]=0; ask_integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
+            mixed) ask_integer prompt_tokens 'Prefill token 数 / Prefill tokens' 1; printf '已添加 / Added: Prefill %s tokens\n' "${S[prompt_tokens]}"; ask_integer gen_tokens 'Decode token 数 / Decode tokens' 1 ;;
         esac
         printf '已添加 / Added: Prefill %s, Decode %s tokens\n' "${S[prompt_tokens]}" "${S[gen_tokens]}"
         if [[ ${S[manual_bench_kind]} != prefill ]]; then
@@ -1721,11 +2005,11 @@ configure() {
                 $'real|真实上下文 / Real context|先真实 Prefill 指定长度，再开始计时。\nReally prefill the selected depth before timing.'
             if [[ ${S[depth_mode]} == none ]]; then S[depth_tokens]=0; else
                 [[ ${S[depth_tokens]} =~ ^[1-9][0-9]*$ ]] || S[depth_tokens]=6144
-                integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1
+                ask_integer depth_tokens '已有上下文 token 数 / Existing context tokens' 1
             fi
             printf '已添加 / Added: context=%s, depth=%s\n' "${S[depth_mode]}" "${S[depth_tokens]}"
         fi
-        integer reps '重复次数 / Repetitions' 1; S[json_output]=true
+        ask_integer reps '重复次数 / Repetitions' 1; S[json_output]=true
         printf '最终计划 / Final plan: Prefill %s, Decode %s, context %s/%s, repetitions %s。JSON 自动输出。/ JSON is emitted automatically.\n' \
             "${S[prompt_tokens]}" "${S[gen_tokens]}" "${S[depth_mode]}" "${S[depth_tokens]}" "${S[reps]}"
     fi
@@ -1735,75 +2019,91 @@ add_arg() { [[ -z ${S[$2]} ]] || COMMAND+=("$1" "${S[$2]}"); return 0; }
 setting() { COMMAND+=(--set "$1=$2"); }
 build_command() {
     local key entry value flag; local -a entries
-    [[ ${S[launch_mode]} =~ ^(run|serve|bench)$ && ${S[setup_mode]} =~ ^(conservative|aggressive|manual)$ ]] || { fail 'Invalid mode or profile.'; return 1; }
-    [[ -n ${S[model]} ]] || { fail 'A model is required.'; return 1; }
-    [[ ${S[device]} == metal ]] || { fail 'The macOS arm64 package supports only --dev metal.'; return 1; }
-    if [[ ${S[mtp_enabled]} == true && ${S[launch_mode]} != bench ]]; then
-        [[ -n ${S[mtp_model]} && ${S[mtp_verify_tokens]} =~ ^[234]$ ]] || { fail 'MTP requires a compatible draft head and width 2-4.'; return 1; }
-        if [[ ${S[launch_mode]} == serve ]]; then
-            [[ ${S[server_parallel]} == 1 || ${S[server_parallel]} == 2 ]] || { fail 'MTP supports one or two configured slots.'; return 1; }
-            [[ ${S[server_parallel]} != 2 ]] || S[mtp_verify_tokens]=4
+    [[ ${S[launch_mode]} =~ ^(run|serve|bench)$ ]] || { fail 'Invalid mode.'; return 1; }
+    if [[ ${S[launch_mode]} == serve ]]; then
+        [[ ${S[server_llm_enabled]} == true || ${S[server_embedding]} == true || ${S[server_transcription]} == true || ${S[server_speech]} == true ]] || { fail '请至少启用一个 API 模块。/ Enable at least one API module.'; return 1; }
+    fi
+    COMMAND=("$BINARY" "${S[launch_mode]}")
+    if device_needed; then
+        [[ ${S[device]} == '' || ${S[device]} == metal ]] || { fail 'The macOS arm64 package supports only --dev metal.'; return 1; }
+        COMMAND+=(--dev "${S[device]:-metal}")
+    else COMMAND+=(--dev cpu); fi
+    if llm_enabled; then
+        [[ ${S[setup_mode]} =~ ^(conservative|aggressive|manual)$ ]] || { fail 'Invalid profile.'; return 1; }
+        [[ -n ${S[model]} ]] || { fail 'A model is required.'; return 1; }
+        if [[ ${S[mtp_enabled]} == true && ${S[launch_mode]} != bench ]]; then
+            [[ -n ${S[mtp_model]} && ${S[mtp_verify_tokens]} =~ ^[234]$ ]] || { fail 'MTP requires a compatible draft head and width 2-4.'; return 1; }
+            if [[ ${S[launch_mode]} == serve ]]; then
+                [[ ${S[server_parallel]} == 1 || ${S[server_parallel]} == 2 ]] || { fail 'MTP supports one or two configured slots.'; return 1; }
+                [[ ${S[server_parallel]} != 2 ]] || S[mtp_verify_tokens]=4
+            fi
         fi
-    fi
-    COMMAND=("$BINARY" "${S[launch_mode]}"); add_arg --dev device
-    if [[ ${S[setup_mode]} == manual ]]; then add_arg --config config_path; add_arg --ubatch ubatch; add_arg --threads threads
-    else
-        setting device.auto_profile "${S[setup_mode]}"
-        [[ ,${S[auto_overrides]}, != *,ubatch,* ]] || add_arg --ubatch ubatch
-        if [[ ,${S[auto_overrides]}, == *,ram_budget,* && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
-    fi
-    [[ ${S[launch_mode]} == bench ]] || add_arg --ctx context
-    if [[ ${S[setup_mode]} != manual ]]; then
-        # Old automatic profiles saved Q8 as if it were explicit; retain only current CLI choices.
-        S[kv_preset]=auto
-        if [[ -v 'OVERRIDES[kv_type_k]' || -v 'OVERRIDES[kv_type_v]' ]]; then S[kv_preset]=custom; fi
-        [[ -v 'OVERRIDES[kv_type_k]' ]] || S[kv_type_k]=''
-        [[ -v 'OVERRIDES[kv_type_v]' ]] || S[kv_type_v]=''
-    fi
-    if [[ ${S[kv_preset]} != auto ]]; then
-        [[ -z ${S[kv_type_k]} ]] || setting kv.type_k "${S[kv_type_k]}"
-        [[ -z ${S[kv_type_v]} ]] || setting kv.type_v "${S[kv_type_v]}"
-    fi
-    if [[ ${S[setup_mode]} == manual ]]; then
-        if [[ ${S[configure_memory]} == true && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
-    fi
-    if [[ ${S[setup_mode]} == manual ]]; then
-        IFS=';' read -rA entries <<< "${S[custom_sets]}"
-        for entry in "${entries[@]}"; do
-            trim "$entry"; entry=$REPLY; [[ -n $entry ]] || continue
-            [[ $entry == *=* ]] || { fail 'Extra --set requires key=value.'; return 1; }
-            trim "${entry%%=*}"; key=$REPLY; trim "${entry#*=}"; value=$REPLY
-            [[ -n $key && $key != serve.api_key ]] || { fail 'Use the dedicated API-key prompt.'; return 1; }
-            case $key in
-                kernels.vulkan.*|device.vram_budget|device.vram_reserve|device.submit_dispatches|paging.host_dma|paging.cache|paging.ring|paging.ring_slots|kv.overflow|kv.overflow_*)
-                    fail 'Vulkan-only settings are not supported by the macOS Metal package.'; return 1 ;;
-            esac
-            setting "$key" "$value"
-        done
-    fi
-    if [[ ${S[launch_mode]} == bench ]]; then
-        if [[ ${S[manual_bench_kind]} == mixed ]]; then COMMAND+=(--pg "${S[prompt_tokens]},${S[gen_tokens]}"); else COMMAND+=(-p "${S[prompt_tokens]}" -n "${S[gen_tokens]}"); fi
-        case ${S[depth_mode]} in real) COMMAND+=(-d "${S[depth_tokens]}") ;; synthetic) COMMAND+=(--synthetic-depth "${S[depth_tokens]}") ;; esac
-        COMMAND+=(-r "${S[reps]}" --json)
-    else
-        setting spec.mtp "${S[mtp_enabled]}"
-        if [[ ${S[mtp_enabled]} == true ]]; then setting spec.draft "${S[mtp_model]}"; setting spec.k "${S[mtp_verify_tokens]}"; fi
-        case ${S[think_mode]} in think|no-think) COMMAND+=("--${S[think_mode]}") ;; esac
-        if [[ ${S[think_mode]} != no-think && ${S[reasoning_effort]} != default ]]; then add_arg --reasoning-effort reasoning_effort; fi
-        add_arg --max-new max_new
-        if [[ ${S[mtp_enabled]} == true ]]; then COMMAND+=(--temp 0)
-        elif [[ ${S[configure_sampling]} == true ]]; then add_arg --temp temperature; add_arg --top-k top_k; add_arg --top-p top_p; add_arg --seed seed; fi
+        if [[ ${S[setup_mode]} == manual ]]; then add_arg --config config_path; add_arg --ubatch ubatch; add_arg --threads threads
+        else
+            setting device.auto_profile "${S[setup_mode]}"
+            [[ ,${S[auto_overrides]}, != *,ubatch,* ]] || add_arg --ubatch ubatch
+            if [[ ,${S[auto_overrides]}, == *,ram_budget,* && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
+        fi
+        [[ ${S[launch_mode]} == bench ]] || add_arg --ctx context
+        if [[ ${S[setup_mode]} != manual ]]; then
+            # Old automatic profiles saved Q8 as if it were explicit; retain only current CLI choices.
+            S[kv_preset]=auto
+            if [[ -v 'OVERRIDES[kv_type_k]' || -v 'OVERRIDES[kv_type_v]' ]]; then S[kv_preset]=custom; fi
+            [[ -v 'OVERRIDES[kv_type_k]' ]] || S[kv_type_k]=''
+            [[ -v 'OVERRIDES[kv_type_v]' ]] || S[kv_type_v]=''
+        fi
+        if [[ ${S[kv_preset]} != auto ]]; then
+            [[ -z ${S[kv_type_k]} ]] || setting kv.type_k "${S[kv_type_k]}"
+            [[ -z ${S[kv_type_v]} ]] || setting kv.type_v "${S[kv_type_v]}"
+        fi
+        if [[ ${S[setup_mode]} == manual ]]; then
+            if [[ ${S[configure_memory]} == true && -n ${S[ram_budget]} ]]; then setting device.ram_budget "${S[ram_budget]}"; fi
+        fi
+        if [[ ${S[setup_mode]} == manual ]]; then
+            IFS=';' read -rA entries <<< "${S[custom_sets]}"
+            for entry in "${entries[@]}"; do
+                trim "$entry"; entry=$REPLY; [[ -n $entry ]] || continue
+                [[ $entry == *=* ]] || { fail 'Extra --set requires key=value.'; return 1; }
+                trim "${entry%%=*}"; key=$REPLY; trim "${entry#*=}"; value=$REPLY
+                [[ -n $key && $key != serve.api_key ]] || { fail 'Use the dedicated API-key prompt.'; return 1; }
+                case $key in
+                    kernels.vulkan.*|device.vram_budget|device.vram_reserve|device.submit_dispatches|paging.host_dma|paging.cache|paging.ring|paging.ring_slots|kv.overflow|kv.overflow_*)
+                        fail 'Vulkan-only settings are not supported by the macOS Metal package.'; return 1 ;;
+                esac
+                setting "$key" "$value"
+            done
+        fi
+        if [[ ${S[launch_mode]} == bench ]]; then
+            if [[ ${S[manual_bench_kind]} == mixed ]]; then COMMAND+=(--pg "${S[prompt_tokens]},${S[gen_tokens]}"); else COMMAND+=(-p "${S[prompt_tokens]}" -n "${S[gen_tokens]}"); fi
+            case ${S[depth_mode]} in real) COMMAND+=(-d "${S[depth_tokens]}") ;; synthetic) COMMAND+=(--synthetic-depth "${S[depth_tokens]}") ;; esac
+            COMMAND+=(-r "${S[reps]}" --json)
+        else
+            setting spec.mtp "${S[mtp_enabled]}"
+            if [[ ${S[mtp_enabled]} == true ]]; then setting spec.draft "${S[mtp_model]}"; setting spec.k "${S[mtp_verify_tokens]}"; fi
+            case ${S[think_mode]} in think|no-think) COMMAND+=("--${S[think_mode]}") ;; esac
+            if [[ ${S[think_mode]} != no-think && ${S[reasoning_effort]} != default ]]; then add_arg --reasoning-effort reasoning_effort; fi
+            add_arg --max-new max_new
+            if [[ ${S[mtp_enabled]} == true ]]; then COMMAND+=(--temp 0)
+            elif [[ ${S[configure_sampling]} == true ]]; then add_arg --temp temperature; add_arg --top-k top_k; add_arg --top-p top_p; add_arg --seed seed; fi
+        fi
     fi
     if [[ ${S[launch_mode]} == serve ]]; then
         valid_address "${S[server_addr]}" || { fail 'Invalid listen address.'; return 1; }
-        valid_uint "${S[server_parallel]}" 1 || { fail 'Invalid concurrent slot count.'; return 1; }
         [[ ${S[server_auth]} == true ]] || setting serve.api_key ''
-        add_arg --addr server_addr; add_arg --parallel server_parallel
-        if [[ ${S[server_session_cache]} == true ]] && ! serial_mtp; then
-            for key in session_cache_dir session_idle_secs session_cache_max session_cache_ttl_hours; do setting "kv.$key" "${S[$key]}"; done
-        else setting kv.session_cache_dir ''; fi
+        add_arg --addr server_addr
+        if llm_enabled; then
+            valid_uint "${S[server_parallel]}" 1 || { fail 'Invalid concurrent slot count.'; return 1; }
+            add_arg --parallel server_parallel
+            if [[ ${S[server_session_cache]} == true ]] && ! serial_mtp; then
+                for key in session_cache_dir session_idle_secs session_cache_max session_cache_ttl_hours; do setting "kv.$key" "${S[$key]}"; done
+            else setting kv.session_cache_dir ''; fi
+        fi
+        if [[ ${S[server_embedding]} == true ]]; then [[ -n ${S[embedding_model]} ]] || return 1; add_arg --embedding-model embedding_model; add_arg --embedding-idle-timeout embedding_idle_timeout; fi
+        add_transcription_arguments || return 1
+        add_speech_arguments || return 1
     fi
-    COMMAND+=("${S[model]}")
+    if llm_enabled; then COMMAND+=("${S[model]}"); fi
+    return 0
 }
 
 version_valid() { [[ $1 =~ $RE_VERSION ]]; }
@@ -1961,7 +2261,7 @@ fetch_url() {
 }
 select_release() {
     local i=0 j tag version name url release_path draft_path prerelease_path archive checksum
-    RELEASE_VERSION=''; RELEASE_ARCHIVE=''; RELEASE_CHECKSUM=''
+    RELEASE_VERSION=''; RELEASE_ARCHIVE=''; RELEASE_CHECKSUM=''; RELEASE_NOTES=''; RELEASE_URL=''
     while true; do
         release_path="[$i,\"tag_name\"]"; [[ -v "J[$release_path]" ]] || break
         json_get "$release_path" || return 1; tag=$REPLY
@@ -1978,6 +2278,8 @@ select_release() {
                     ((j+=1))
                 done
                 RELEASE_ARCHIVE=$archive; RELEASE_CHECKSUM=$checksum
+                RELEASE_URL="https://github.com/Headmaster218/MoE4All/releases/tag/release-$version"; RELEASE_NOTES=''
+                if json_get "[$i,\"body\"]" && [[ $REPLY != null ]]; then RELEASE_NOTES=$REPLY; fi
             fi
         fi
         ((i+=1))
@@ -2012,23 +2314,77 @@ download_update() (
     fi
     printf '更新完成。Update complete.\n'
 )
+update_reminder_now() { date +%s; }
+update_reminder_read() {
+    UPDATE_REMINDER_TAG=''; UPDATE_REMINDER_NEXT=0
+    local -h file
+    reminder_state_file update-reminder.json; file=$REPLY
+    [[ -f $file ]] || return 0
+    json_load "$file" 2>/dev/null || return 0
+    if ! json_get '["schema_version"]' || [[ $REPLY != 1 ]]; then return 0; fi
+    if json_get '["release_tag"]' && [[ $REPLY == release-* ]] && version_valid "${REPLY#release-}"; then UPDATE_REMINDER_TAG=$REPLY; fi
+    if json_get '["next_remind_at"]' && [[ $REPLY =~ ^(0|[1-9][0-9]{0,11})$ ]]; then UPDATE_REMINDER_NEXT=$REPLY; fi
+    return 0
+}
+update_reminder_snooze() {
+    reminder_interactive || return 0
+    local -h tag=$1 now directory=$CONFIG_DIR/private temporary quoted
+    now=$(update_reminder_now)
+    [[ $now =~ ^[0-9]{1,12}$ ]] || return 1
+    json_quote "$tag"; quoted=$REPLY
+    mkdir -p -- "$directory" || return 1
+    chmod 700 "$directory" 2>/dev/null || true
+    temporary=$(umask 077; mktemp "$directory/.update-reminder.XXXXXX") || return 1
+    if ! printf '{"schema_version":1,"next_remind_at":%s,"release_tag":%s}\n' "$((now + 259200))" "$quoted" > "$temporary" ||
+        ! mv -f -- "$temporary" "$directory/update-reminder.json"; then
+        rm -f -- "$temporary"; return 1
+    fi
+}
 check_updates() (
-    local mode=$1 current temp
-    if ! need curl; then printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return; fi
+    local -h mode=$1 current temp now answer
+    if [[ $mode == --automatic ]]; then reminder_interactive || return 0; fi
+    [[ ${DRY_RUN-false} == false ]] || return 0
+    if ! need curl; then printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return 0; fi
     current=$("$BINARY" --version) || return 0; current=${current##* }
     installed_version_valid "$current" || return 0
-    mkdir -p -- "$CONFIG_DIR"
-    temp=$(mktemp -d "$CONFIG_DIR/.update-check.XXXXXX"); trap 'rm -rf -- "$temp"' EXIT
+    temp=$(mktemp -d) || return 0
+    trap 'rm -rf -- "$temp"' EXIT
     if ! fetch_url 'https://api.github.com/repos/Headmaster218/MoE4All/releases?per_page=100' "$temp/releases.json" 8388608 10 || ! json_load "$temp/releases.json" || ! select_release; then
         printf '更新检查不可用，继续离线启动。Update check unavailable; continuing offline.\n'; return 0
     fi
     if ! version_newer "$RELEASE_VERSION" "$current"; then printf '更新检查 / Update check: v%s is current\n' "$current"; return 0; fi
-    printf '发现新引擎版本 / New engine release: v%s\nhttps://github.com/Headmaster218/MoE4All/releases/tag/release-%s\n' "$RELEASE_VERSION" "$RELEASE_VERSION"
+    if [[ $mode == --automatic ]]; then
+        update_reminder_read
+        now=$(update_reminder_now)
+        if [[ $UPDATE_REMINDER_TAG == "release-$RELEASE_VERSION" && $now =~ ^[0-9]{1,12}$ ]] && ((now < UPDATE_REMINDER_NEXT)); then return 0; fi
+    fi
+    printf '发现新引擎版本 / New engine release: v%s\n%s\n' "$RELEASE_VERSION" "$RELEASE_URL"
+    if [[ -n $RELEASE_NOTES ]]; then
+        printf '%s\n' "$RELEASE_NOTES" | LC_ALL=C tr -d '\000-\010\013-\037\177' | awk 'NR<=6 { print substr($0,1,200) }'
+    fi
     if [[ -z $RELEASE_ARCHIVE || -z $RELEASE_CHECKSUM || ! -f $ROOT/install-manifest.json || $BINARY != "$ROOT/infr" || -e $ROOT/.git ]]; then
         printf '源码安装或没有兼容的 macOS 包：仅检查，未修改文件。Source install or no compatible macOS package: check only; no files changed.\n'
+    elif [[ $mode == --automatic ]]; then
+        printf '  [1] 更新 / Update\n* [2] 下次更新 / Skip until next launch\n  [3] 三天后再提醒 / Remind me in three days\n  [R] 打开完整说明 / Open full release notes\n'
+        while true; do
+            prompt '选择 / Select' 2 || return 0
+            answer=$REPLY
+            case $answer in
+                # The caller restarts after this subshell exits, so the old wizard cannot resume.
+                1|update) if download_update "$ROOT" false; then return 10; fi
+                    printf '更新未完成，继续启动。Update did not complete; continuing startup.\n' >&2; return 0 ;;
+                2|skip) return 0 ;;
+                3|snooze) update_reminder_snooze "release-$RELEASE_VERSION" || printf 'Could not save the update reminder.\n' >&2; return 0 ;;
+                r|R) if ! open_submission_url "$RELEASE_URL"; then printf '请打开 / Open: %s\n' "$RELEASE_URL"; fi ;;
+                *) printf '选择无效。Invalid selection.\n' ;;
+            esac
+        done
     elif [[ $mode != --update ]]; then printf '显式更新命令 / To update explicitly: ./Start-INFR-Wizard-macOS.sh --update\n'
-    elif [[ $INTERACTIVE != true || $HEADLESS == true ]]; then printf '更新需要交互确认，未修改文件。Updating requires interactive confirmation; no files changed.\n'
-    else yes '现在更新此 macOS 安装包？/ Update this macOS package now?' false; [[ $REPLY != true ]] || download_update "$ROOT"; fi
+    elif ! reminder_interactive; then printf '更新需要交互确认，未修改文件。Updating requires interactive confirmation; no files changed.\n'
+    else yes '现在更新此 macOS 安装包？/ Update this macOS package now?' false
+        if [[ $REPLY == true ]]; then download_update "$ROOT"; return $?; fi
+    fi
+    return 0
 )
 
 usage() {
@@ -2062,7 +2418,8 @@ main() {
         fi
     done
     [[ -d $ROOT ]] || { fail 'Installation root does not exist.'; return 1; }
-    CONFIG_DIR="$HOME/Library/Application Support/MoE4All"; STATE=$CONFIG_DIR/wizard-state.json
+    CONFIG_DIR="$ROOT/gui-data"; STATE=$CONFIG_DIR/wizard-state.json
+    LEGACY_CONFIG_DIR="$HOME/Library/Application Support/MoE4All"; LEGACY_STATE=$LEGACY_CONFIG_DIR/wizard-state.json
     need awk; defaults; load_state
     while (($#)); do
         flag=$1; shift
@@ -2083,10 +2440,8 @@ main() {
                 (($#)) || { fail "$flag requires a value"; return 1; }; S[$key]=$1; OVERRIDES[$key]=1; shift ;;
         esac
     done
-    [[ ${S[device]} == '' || ${S[device]} == metal ]] || { fail 'The macOS arm64 package supports only --dev metal.'; return 1; }
-    S[device]=metal
-    if [[ -v 'OVERRIDES[vision_projector]' || -v 'OVERRIDES[embedding_model]' ]]; then
-        fail 'Vision and Embedding are not yet available in the experimental Metal package.'; return 1
+    if [[ -v 'OVERRIDES[vision_projector]' ]]; then
+        fail 'Vision is not yet available in the experimental Metal package.'; return 1
     fi
     if [[ -v 'OVERRIDES[cpu_miss_cores]' || -v 'OVERRIDES[cpu_miss_max]' ]]; then
         fail 'Vulkan CPU-miss computation is not available on Metal.'; return 1
@@ -2097,11 +2452,7 @@ main() {
     if [[ -v 'OVERRIDES[server_parallel]' && ${S[server_parallel]} != 1 ]]; then
         fail 'The Metal backend is currently serialized; --parallel must be 1.'; return 1
     fi
-    S[server_parallel]=1; S[server_session_cache]=false
     for key in ubatch ram_budget; do [[ ! -v "OVERRIDES[$key]" ]] || S[auto_overrides]+=",$key,"; done
-    # The release wizard no longer exposes MTP. Ignore stale saved MTP state,
-    # while preserving the explicit --mtp CLI for advanced/manual use.
-    if [[ ! -v 'OVERRIDES[mtp_model]' ]]; then S[mtp_enabled]=false; S[mtp_model]=''; S[mtp_verify_tokens]=4; fi
     for key in mtp_model vision_projector embedding_model; do
         case $key in mtp_model) value=mtp_enabled ;; vision_projector) value=server_vision ;; embedding_model) value=server_embedding ;; esac
         if [[ -v "OVERRIDES[$key]" ]]; then S[$value]=false; [[ -z ${S[$key]} ]] || S[$value]=true; fi
@@ -2121,7 +2472,13 @@ main() {
     [[ ! -t 0 || $DRY_RUN == true ]] || INTERACTIVE=true
     PENDING_SUBMISSION_PROMPTED=false
     if [[ -n $UPDATE_MODE ]]; then check_updates "$UPDATE_MODE"; return; fi
-    if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then check_updates --check-update; fi
+    if [[ $INTERACTIVE == true && $SKIP_UPDATE == false && ! ${MOE4ALL_NO_UPDATE_CHECK-} =~ ^(1|true|yes|on)$ ]]; then
+        if check_updates --automatic; then :
+        else
+            local update_result=$?
+            if [[ $update_result == 10 ]]; then exec /bin/zsh "$ROOT/Start-INFR-Wizard-macOS.sh" --skip-update-check; fi
+        fi
+    fi
     if [[ $INTERACTIVE == true && $HEADLESS == false ]]; then
         retry_pending_submissions
         value=$("$BINARY" --version 2>/dev/null || true); value=${value##* }
@@ -2147,7 +2504,14 @@ main() {
         fi
         [[ -n $api_key ]] || { fail 'API-key authentication requires INFR_API_KEY or hidden input.'; return 1; }
     fi
+    reset_legacy_mtp
+    if device_needed; then [[ -n ${S[device]} ]] || S[device]=metal; fi
+    if llm_enabled; then S[server_parallel]=1; S[server_session_cache]=false; fi
     for key in model mtp_model vision_projector embedding_model config_path session_cache_dir; do
+        case $key in
+            embedding_model) [[ ${S[launch_mode]} == serve && ${S[server_embedding]} == true ]] || continue ;;
+            *) llm_enabled || continue ;;
+        esac
         [[ -n ${S[$key]} ]] || continue
         if [[ $key == model ]] && hub_reference "${S[$key]}"; then continue; fi
         absolute "${S[$key]}"; S[$key]=$REPLY
@@ -2155,6 +2519,8 @@ main() {
     build_command
     if [[ $INTERACTIVE == true && $DRY_RUN == false && $HEADLESS == false ]]; then retry_pending_submissions; fi
     printf '\n最终命令 / Final command\n  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
+    show_transcription_api
+    show_speech_api
     if [[ ${S[launch_mode]} == serve && -z $api_key ]] && ! loopback "${S[server_addr]}"; then
         printf '警告：当前网络监听地址未启用 API key 鉴权。Warning: network listen address without API-key authentication.\n' >&2
         if [[ $DRY_RUN == false && $HEADLESS == false ]]; then

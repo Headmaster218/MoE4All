@@ -585,6 +585,193 @@ impl ExpertArenaLayout {
         })
     }
 
+    /// Try the unchanged contiguous planner for the complete batch before splitting any request.
+    /// The fallback is greedy: place the widest indivisible units first, then larger payloads,
+    /// keeping a whole remainder together when possible and otherwise consuming the largest gap.
+    /// It may conservatively reject a batch that would require repacking earlier spans.
+    fn plan_unit_claim(
+        &self,
+        live: &[UnifiedRange],
+        requested: &[UnitAllocationRequest],
+        class: UnifiedVramClass,
+        protected_experts: &[ExpertSlotId],
+        prefill_runtime_reserve: usize,
+    ) -> Result<UnitClaimPlan> {
+        let (mut corridor, direction) = class.placement(self)?;
+        if class == UnifiedVramClass::Prefill {
+            corridor = self.prefill_corridor_with_reserve(prefill_runtime_reserve)?;
+        }
+        if requested.is_empty() {
+            return Err(be("unit claim needs at least one request"));
+        }
+        let mut payloads = Vec::with_capacity(requested.len());
+        let mut batch_bytes = 0usize;
+        for request in requested {
+            if request.unit_bytes == 0 || request.units == 0 {
+                return Err(be("unit claim needs nonzero unit bytes and unit count"));
+            }
+            let payload = request
+                .unit_bytes
+                .checked_mul(request.units)
+                .ok_or_else(|| be("unit claim payload size overflow"))?;
+            let padded = align_up(payload, UNIFIED_ALIGN)
+                .ok_or_else(|| be("unit claim alignment overflow"))?;
+            batch_bytes = batch_bytes
+                .checked_add(padded)
+                .ok_or_else(|| be("unit claim batch size overflow"))?;
+            payloads.push(payload);
+        }
+        if let Ok(claim) = self.plan_claim(
+            live,
+            &payloads,
+            class,
+            corridor.clone(),
+            direction,
+            protected_experts,
+        ) {
+            let spans = requested
+                .iter()
+                .enumerate()
+                .map(|(request, spec)| UnitAllocationSpan {
+                    request,
+                    first_unit: 0,
+                    units: spec.units,
+                    allocation: request,
+                })
+                .collect();
+            return Ok(UnitClaimPlan { claim, spans });
+        }
+
+        let live_experts: HashSet<_> = live
+            .iter()
+            .filter(|range| range.class == UnifiedVramClass::Expert)
+            .map(|range| (range.shard, range.offset, range.len))
+            .collect();
+        let mut blockers: Vec<_> = live
+            .iter()
+            .filter(|range| range.class != UnifiedVramClass::Expert)
+            .map(|range| PlannedRange {
+                shard: range.shard,
+                offset: range.offset,
+                len: range.len,
+                requested_len: range.requested_len,
+            })
+            .collect();
+        for &id in protected_experts {
+            let slot = self
+                .slots(id.pool)
+                .and_then(|slots| slots.get(id.slot))
+                .ok_or_else(|| {
+                    be(format!(
+                        "protected Expert slot {}/{} is unknown",
+                        id.pool, id.slot
+                    ))
+                })?;
+            if live_experts.contains(&(slot.shard, slot.offset, slot.len)) {
+                blockers.push(PlannedRange {
+                    shard: slot.shard,
+                    offset: slot.offset,
+                    len: slot.len,
+                    requested_len: slot.len,
+                });
+            }
+        }
+        let mut gaps = aligned_claim_gaps(&self.physical_pieces(corridor.clone()), &blockers);
+        let mut ordered: Vec<_> = (0..requested.len()).collect();
+        // A narrow-unit bank can use holes that a wide-unit bank cannot. Reserve the latter's
+        // capacity first, even when the former's aggregate payload is larger.
+        ordered.sort_unstable_by_key(|&index| {
+            (
+                std::cmp::Reverse(requested[index].unit_bytes),
+                std::cmp::Reverse(payloads[index]),
+                index,
+            )
+        });
+        let mut planned = Vec::new();
+        for request in ordered {
+            let spec = &requested[request];
+            let mut remaining = spec.units;
+            while remaining != 0 {
+                let gap_index = gaps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, gap)| (gap.end - gap.start) / spec.unit_bytes != 0)
+                    .min_by_key(|(_, gap)| {
+                        let bytes = gap.end - gap.start;
+                        let fits = bytes / spec.unit_bytes >= remaining;
+                        let (shard, offset) = match direction {
+                            ClaimDirection::Low => (gap.shard, gap.start),
+                            ClaimDirection::High => (usize::MAX - gap.shard, usize::MAX - gap.end),
+                        };
+                        // Best fit for a complete remainder; largest gap for a split. Address
+                        // direction breaks ties without sacrificing substantial contiguous runs.
+                        (
+                            !fits,
+                            if fits { bytes } else { usize::MAX - bytes },
+                            shard,
+                            offset,
+                        )
+                    })
+                    .map(|(index, _)| index)
+                    .ok_or_else(|| {
+                        be(format!(
+                            "{class:?} cannot fit {remaining} remaining unit(s) of {} bytes for \
+                             request {request} in its frozen arena corridor (batch={batch_bytes} \
+                             padded bytes before splitting)",
+                            spec.unit_bytes,
+                        ))
+                    })?;
+                let gap = &mut gaps[gap_index];
+                // Gaps have aligned endpoints, so this capacity also prices each span's padding.
+                let units = remaining.min((gap.end - gap.start) / spec.unit_bytes);
+                let requested_len = spec
+                    .unit_bytes
+                    .checked_mul(units)
+                    .ok_or_else(|| be("unit span payload size overflow"))?;
+                let len = align_up(requested_len, UNIFIED_ALIGN)
+                    .ok_or_else(|| be("unit span alignment overflow"))?;
+                let offset = match direction {
+                    ClaimDirection::Low => {
+                        let offset = gap.start;
+                        gap.start += len;
+                        offset
+                    }
+                    ClaimDirection::High => {
+                        gap.end -= len;
+                        gap.end
+                    }
+                };
+                planned.push((
+                    UnitAllocationSpan {
+                        request,
+                        first_unit: spec.units - remaining,
+                        units,
+                        allocation: 0,
+                    },
+                    PlannedRange {
+                        shard: gap.shard,
+                        offset,
+                        len,
+                        requested_len,
+                    },
+                ));
+                remaining -= units;
+            }
+        }
+        planned.sort_unstable_by_key(|(span, _)| (span.request, span.first_unit));
+        let mut spans = Vec::with_capacity(planned.len());
+        let mut ranges = Vec::with_capacity(planned.len());
+        for (mut span, range) in planned {
+            span.allocation = ranges.len();
+            spans.push(span);
+            ranges.push(range);
+        }
+        // Reuse the exact planner's corridor, overlap, protected-slot and directory checks, and
+        // its precise victim list (including padding). No allocator state has changed yet.
+        let claim = self.plan_exact_claim(live, &ranges, class, corridor, protected_experts)?;
+        Ok(UnitClaimPlan { claim, spans })
+    }
+
     fn plan_exact_claim(
         &self,
         live: &[UnifiedRange],
@@ -717,6 +904,31 @@ pub(crate) struct PlannedRange {
     pub(crate) offset: usize,
     pub(crate) len: usize,
     pub(crate) requested_len: usize,
+}
+
+/// One logical payload of `unit_bytes * units` bytes. Units are indivisible and tightly packed
+/// inside a span; only the physical span's tail is padded to the arena alignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnitAllocationRequest {
+    pub unit_bytes: usize,
+    pub units: usize,
+}
+
+/// Consecutive logical units backed by `claim.ranges()[allocation]` (and the corresponding commit
+/// handle). Spans are returned in request order, then increasing `first_unit` order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnitAllocationSpan {
+    pub request: usize,
+    pub first_unit: usize,
+    pub units: usize,
+    pub allocation: usize,
+}
+
+/// All physical spans still commit through one existing claim transaction and common owner lease.
+#[derive(Debug)]
+pub(crate) struct UnitClaimPlan {
+    pub claim: UnifiedClaimPlan,
+    pub spans: Vec<UnitAllocationSpan>,
 }
 
 /// A side-effect-free arena mutation plan. Pager retirement happens between planning and commit;
@@ -859,6 +1071,43 @@ fn find_high_gap(
         }
     }
     None
+}
+
+/// Disjoint usable gaps; clipping both endpoints prices alignment without rounding unit strides.
+fn aligned_claim_gaps(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> Vec<ArenaPiece> {
+    let mut gaps = Vec::new();
+    for piece in pieces {
+        let mut occupied: Vec<_> = blockers
+            .iter()
+            .filter(|range| range.shard == piece.shard)
+            .map(|range| {
+                (
+                    range.offset.max(piece.start),
+                    range.offset.saturating_add(range.len).min(piece.end),
+                )
+            })
+            .filter(|&(start, end)| start < end)
+            .collect();
+        occupied.sort_unstable();
+        let mut cursor = piece.start;
+        for (start, end) in occupied
+            .into_iter()
+            .chain(std::iter::once((piece.end, piece.end)))
+        {
+            if let Some(aligned_start) = align_up(cursor, UNIFIED_ALIGN) {
+                let aligned_end = start & !(UNIFIED_ALIGN - 1);
+                if aligned_start < aligned_end {
+                    gaps.push(ArenaPiece {
+                        shard: piece.shard,
+                        start: aligned_start,
+                        end: aligned_end,
+                    });
+                }
+            }
+            cursor = cursor.max(end);
+        }
+    }
+    gaps
 }
 
 fn gap_stats(pieces: &[ArenaPiece], blockers: &[PlannedRange]) -> (usize, usize, usize) {
@@ -1601,6 +1850,28 @@ impl UnifiedVramPool {
         )
     }
 
+    /// Plan unit-granular payloads, preserving the original contiguous batch whenever it fits.
+    /// Retire `plan.claim.victims()` and pass `plan.claim` to `commit_claim` under the same unified
+    /// execution guard as other owner claims; each span indexes the resulting handle vector.
+    pub(crate) fn plan_unit_owner_claim(
+        &self,
+        requested: &[UnitAllocationRequest],
+        class: UnifiedVramClass,
+        protected_experts: &[ExpertSlotId],
+    ) -> Result<UnitClaimPlan> {
+        let layout = self
+            .expert_layout
+            .as_ref()
+            .ok_or_else(|| be("unit owner claims require an expert-aware unified VRAM layout"))?;
+        layout.plan_unit_claim(
+            &self.ranges.allocations(),
+            requested,
+            class,
+            protected_experts,
+            self.prefill_runtime_reserve.load(Ordering::Acquire),
+        )
+    }
+
     pub(crate) fn reserve_kv_layout(
         &self,
         requested: &[usize],
@@ -1884,6 +2155,603 @@ fn insert_free(free: &mut BTreeMap<usize, usize>, offset: usize, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit_request(unit_bytes: usize, units: usize) -> UnitAllocationRequest {
+        UnitAllocationRequest { unit_bytes, units }
+    }
+
+    fn plan_units(
+        layout: &ExpertArenaLayout,
+        pool: &UnifiedRangePool,
+        requested: &[UnitAllocationRequest],
+        class: UnifiedVramClass,
+        protected: &[ExpertSlotId],
+    ) -> Result<UnitClaimPlan> {
+        layout.plan_unit_claim(
+            &pool.allocations(),
+            requested,
+            class,
+            protected,
+            layout.runtime_reserve_bytes,
+        )
+    }
+
+    fn assert_unit_spans(
+        layout: &ExpertArenaLayout,
+        requested: &[UnitAllocationRequest],
+        plan: &UnitClaimPlan,
+    ) {
+        assert_eq!(plan.spans.len(), plan.claim.len());
+        let mut covered = vec![0; requested.len()];
+        for (index, span) in plan.spans.iter().enumerate() {
+            assert_eq!(span.allocation, index);
+            assert!(span.units > 0);
+            assert_eq!(span.first_unit, covered[span.request]);
+            covered[span.request] += span.units;
+            if index != 0 {
+                assert!(plan.spans[index - 1].request <= span.request);
+            }
+            let range = &plan.claim.ranges()[span.allocation];
+            let payload = requested[span.request].unit_bytes * span.units;
+            assert_eq!(range.requested_len, payload);
+            assert_eq!(range.offset % UNIFIED_ALIGN, 0);
+            assert_eq!(range.len % UNIFIED_ALIGN, 0);
+            assert!(range.len >= payload && range.len - payload < UNIFIED_ALIGN);
+            assert!(range.offset + range.len <= layout.shard_sizes()[range.shard]);
+            assert!(!plan.claim.ranges()[..index].iter().any(|other| {
+                other.shard == range.shard
+                    && ranges_overlap(other.offset, other.len, range.offset, range.len)
+            }));
+        }
+        assert_eq!(
+            covered,
+            requested.iter().map(|spec| spec.units).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.requested_len)
+                .sum::<usize>(),
+            requested
+                .iter()
+                .map(|spec| spec.unit_bytes * spec.units)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn unit_claim_contiguous_fast_path_matches_original_for_every_owner_class() {
+        let layout = ExpertArenaLayout::build(&[(256, 64, 4)], 4096, 4096, 0, 0, 1024).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        // The original planner packs request 1 first, but returns handles in caller order.
+        let requested = [
+            unit_request(300, 3),
+            unit_request(256, 6),
+            unit_request(33, 5),
+        ];
+        for class in [
+            UnifiedVramClass::KvCache,
+            UnifiedVramClass::Prefill,
+            UnifiedVramClass::LlmRuntime,
+            UnifiedVramClass::EmbeddingWeights,
+            UnifiedVramClass::EmbeddingRuntime,
+            UnifiedVramClass::VisionWeights,
+            UnifiedVramClass::VisionRuntime,
+            UnifiedVramClass::DraftWeights,
+            UnifiedVramClass::DraftRuntime,
+        ] {
+            let (corridor, direction) = class.placement(&layout).unwrap();
+            let original = layout
+                .plan_claim(&[], &[900, 1536, 165], class, corridor, direction, &[])
+                .unwrap();
+            let plan = plan_units(&layout, &pool, &requested, class, &[]).unwrap();
+            assert_eq!(plan.claim.ranges(), original.ranges());
+            assert_eq!(plan.claim.victims(), original.victims());
+            assert_eq!(plan.claim.class(), class);
+            assert_eq!(plan.spans.len(), requested.len());
+            for (index, span) in plan.spans.iter().enumerate() {
+                assert_eq!(
+                    *span,
+                    UnitAllocationSpan {
+                        request: index,
+                        first_unit: 0,
+                        units: requested[index].units,
+                        allocation: index,
+                    }
+                );
+            }
+            assert_unit_spans(&layout, &requested, &plan);
+        }
+    }
+
+    #[test]
+    fn unit_claim_crosses_shards_in_substantial_whole_unit_runs_without_mutation() {
+        let layout = ExpertArenaLayout::build(&[(256, 24, 0)], 2048, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let generation = pool.generation();
+        let requested = [unit_request(256, 20)];
+        let plan = plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.spans.iter().map(|span| span.units).collect::<Vec<_>>(),
+            vec![8, 8, 4]
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.shard)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(pool.generation(), generation);
+        assert!(pool.allocations().is_empty());
+        assert_eq!(pool.stats().free_bytes, 6144);
+    }
+
+    #[test]
+    fn unit_claim_uses_largest_live_blocker_gaps_before_small_holes() {
+        let layout = ExpertArenaLayout::build(&[(256, 24, 0)], 6144, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _kv = pool
+            .try_claim_exact(0, 256, 256, UnifiedVramClass::KvCache)
+            .unwrap();
+        let _runtime = pool
+            .try_claim_exact(0, 3584, 512, UnifiedVramClass::LlmRuntime)
+            .unwrap();
+        let before = pool.allocations();
+        let generation = pool.generation();
+        let requested = [unit_request(512, 8)];
+        let plan = plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.spans.iter().map(|span| span.units).collect::<Vec<_>>(),
+            vec![6, 2]
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.offset)
+                .collect::<Vec<_>>(),
+            vec![512, 4096]
+        );
+        for blocker in &before {
+            assert!(plan.claim.ranges().iter().all(|range| {
+                !ranges_overlap(range.offset, range.len, blocker.offset, blocker.len)
+            }));
+        }
+        assert_eq!(pool.generation(), generation);
+        assert_eq!(pool.allocations(), before);
+    }
+
+    #[test]
+    fn unit_claim_mixed_strides_reserve_wide_units_and_restore_request_order() {
+        let layout = ExpertArenaLayout::build(&[(256, 16, 0)], 4096, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _blocker = pool
+            .try_claim_exact(0, 3072, 512, UnifiedVramClass::VisionWeights)
+            .unwrap();
+        // The larger aggregate request would strand the only gap that can hold a 1536-byte unit.
+        let requested = [unit_request(256, 8), unit_request(1536, 1)];
+        let plan = plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.spans,
+            vec![
+                UnitAllocationSpan {
+                    request: 0,
+                    first_unit: 0,
+                    units: 6,
+                    allocation: 0
+                },
+                UnitAllocationSpan {
+                    request: 0,
+                    first_unit: 6,
+                    units: 2,
+                    allocation: 1
+                },
+                UnitAllocationSpan {
+                    request: 1,
+                    first_unit: 0,
+                    units: 1,
+                    allocation: 2
+                },
+            ]
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.offset)
+                .collect::<Vec<_>>(),
+            vec![1536, 3584, 0]
+        );
+    }
+
+    #[test]
+    fn unit_claim_nonaligned_payloads_price_padding_per_span_and_share_one_lease() {
+        let layout = ExpertArenaLayout::build(&[(256, 12, 0)], 1024, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let requested = [unit_request(300, 8)];
+        let plan = plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.spans.iter().map(|span| span.units).collect::<Vec<_>>(),
+            vec![3, 3, 2]
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.requested_len)
+                .collect::<Vec<_>>(),
+            vec![900, 900, 600]
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.len)
+                .collect::<Vec<_>>(),
+            vec![1024, 1024, 768]
+        );
+        let leases = pool
+            .try_claim_planned(plan.claim.class(), plan.claim.ranges())
+            .unwrap();
+        assert_eq!(
+            leases
+                .iter()
+                .map(|lease| lease.range().requested_len)
+                .sum::<usize>(),
+            2400
+        );
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 2816);
+        assert_eq!(pool.stats().free_bytes, 256);
+        let owner = Arc::new(UnifiedOwnerLease {
+            _allocations: leases,
+        });
+        let sibling = Arc::clone(&owner);
+        drop(owner);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 2816);
+        drop(sibling);
+        assert_eq!(pool.stats().free_bytes, 3072);
+    }
+
+    #[test]
+    fn unit_claim_aligns_spans_after_unaligned_live_blockers() {
+        let layout = ExpertArenaLayout::build(&[(256, 16, 0)], 4096, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _blockers: Vec<_> = [0, 1281, 2817]
+            .into_iter()
+            .map(|offset| {
+                pool.try_claim_exact(0, offset, 1, UnifiedVramClass::EmbeddingRuntime)
+                    .unwrap()
+            })
+            .collect();
+        let requested = [unit_request(300, 10)];
+        let plan = plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.spans.iter().map(|span| span.units).collect::<Vec<_>>(),
+            vec![4, 3, 3]
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.offset)
+                .collect::<Vec<_>>(),
+            vec![1536, 256, 3072]
+        );
+        for blocker in pool.allocations() {
+            assert!(plan.claim.ranges().iter().all(|range| {
+                !ranges_overlap(range.offset, range.len, blocker.offset, blocker.len)
+            }));
+        }
+    }
+
+    #[test]
+    fn unit_claim_rejects_zero_overflow_and_unplaceable_units_without_mutation() {
+        let layout = ExpertArenaLayout::build(&[(256, 12, 0)], 1024, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _live = pool
+            .try_claim_exact(0, 0, 256, UnifiedVramClass::KvCache)
+            .unwrap();
+        let before = pool.allocations();
+        let generation = pool.generation();
+        let max_aligned = usize::MAX & !(UNIFIED_ALIGN - 1);
+        let invalid = [
+            vec![],
+            vec![unit_request(0, 1)],
+            vec![unit_request(1, 0)],
+            vec![unit_request(256, 1), unit_request(0, 1)],
+            vec![unit_request(usize::MAX, 2)],
+            vec![unit_request(2, usize::MAX)],
+            vec![unit_request(usize::MAX, 1)],
+            vec![unit_request(max_aligned, 1), unit_request(256, 1)],
+            vec![unit_request(1280, 2)], // Aggregate fits, but no gap holds even one unit.
+            vec![unit_request(300, 9)],  // Payload fits; per-span padding exceeds usable capacity.
+            vec![unit_request(256, 12)], // Failure after planning several local spans.
+        ];
+        for requested in invalid {
+            assert!(
+                plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).is_err(),
+                "{requested:?}"
+            );
+            assert_eq!(pool.generation(), generation);
+            assert_eq!(pool.allocations(), before);
+            assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 0);
+        }
+        assert!(plan_units(
+            &layout,
+            &pool,
+            &[unit_request(256, 1)],
+            UnifiedVramClass::Expert,
+            &[]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unit_claim_reports_exact_expert_victims_and_protects_live_slots() {
+        let layout = ExpertArenaLayout::build(&[(256, 16, 0)], 4096, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let mut experts: HashMap<_, _> = layout
+            .slots(0)
+            .unwrap()
+            .iter()
+            .map(|slot| {
+                (
+                    slot.id,
+                    pool.try_claim_exact(
+                        slot.shard,
+                        slot.offset,
+                        slot.len,
+                        UnifiedVramClass::Expert,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let protected = [
+            ExpertSlotId { pool: 0, slot: 5 },
+            ExpertSlotId { pool: 0, slot: 10 },
+        ];
+        let before = pool.allocations();
+        let generation = pool.generation();
+        let requested = [unit_request(512, 6)];
+        let plan = plan_units(
+            &layout,
+            &pool,
+            &requested,
+            UnifiedVramClass::Prefill,
+            &protected,
+        )
+        .unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.spans.iter().map(|span| span.units).collect::<Vec<_>>(),
+            vec![2, 2, 2]
+        );
+        let expected: Vec<_> = [0, 1, 2, 3, 6, 7, 8, 9, 11, 12, 13, 14]
+            .into_iter()
+            .map(|slot| ExpertSlotId { pool: 0, slot })
+            .collect();
+        assert_eq!(plan.claim.victims(), expected);
+        assert!(pool
+            .try_claim_planned(plan.claim.class(), plan.claim.ranges())
+            .is_none());
+        assert_eq!(pool.generation(), generation);
+        assert_eq!(pool.allocations(), before);
+        for victim in plan.claim.victims() {
+            drop(experts.remove(victim).unwrap());
+        }
+        let leases = pool
+            .try_claim_planned(plan.claim.class(), plan.claim.ranges())
+            .unwrap();
+        assert!(protected.iter().all(|id| experts.contains_key(id)));
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Expert), 1024);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 3072);
+        drop(leases);
+        assert_eq!(pool.stats().free_bytes, 3072);
+    }
+
+    #[test]
+    fn unit_claim_victims_include_span_padding_and_absent_protected_slots_are_loanable() {
+        let layout = ExpertArenaLayout::build(&[(256, 6, 0)], 512, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let mut experts: Vec<_> = layout
+            .slots(0)
+            .unwrap()
+            .iter()
+            .map(|slot| {
+                pool.try_claim_exact(slot.shard, slot.offset, slot.len, UnifiedVramClass::Expert)
+                    .unwrap()
+            })
+            .collect();
+        let requested = [unit_request(129, 8)];
+        let protected = [ExpertSlotId { pool: 0, slot: 5 }];
+        assert!(plan_units(
+            &layout,
+            &pool,
+            &requested,
+            UnifiedVramClass::Prefill,
+            &protected
+        )
+        .is_err());
+        drop(experts.pop().unwrap());
+        let plan = plan_units(
+            &layout,
+            &pool,
+            &requested,
+            UnifiedVramClass::Prefill,
+            &protected,
+        )
+        .unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.len)
+                .sum::<usize>(),
+            1536
+        );
+        assert_eq!(
+            plan.claim
+                .ranges()
+                .iter()
+                .map(|range| range.requested_len)
+                .sum::<usize>(),
+            1032
+        );
+        assert_eq!(
+            plan.claim.victims(),
+            (0..5)
+                .map(|slot| ExpertSlotId { pool: 0, slot })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unit_claim_rejects_unknown_protection_and_unmapped_live_experts() {
+        let layout = ExpertArenaLayout::build(&[(256, 8, 0)], 1024, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let unknown = [ExpertSlotId { pool: 1, slot: 0 }];
+        for requested in [unit_request(256, 1), unit_request(256, 6)] {
+            let error = plan_units(
+                &layout,
+                &pool,
+                &[requested],
+                UnifiedVramClass::Prefill,
+                &unknown,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unknown"));
+        }
+        let _unmapped = pool
+            .try_claim_exact(0, 1, 255, UnifiedVramClass::Expert)
+            .unwrap();
+        let generation = pool.generation();
+        for requested in [unit_request(256, 1), unit_request(256, 6)] {
+            let error = plan_units(&layout, &pool, &[requested], UnifiedVramClass::Prefill, &[])
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("outside its frozen slot directory"));
+        }
+        assert_eq!(pool.generation(), generation);
+        assert_eq!(pool.allocations().len(), 1);
+    }
+
+    #[test]
+    fn unit_claim_prefill_uses_current_runtime_reserve_and_keeps_live_kv_runtime() {
+        let layout = ExpertArenaLayout::build(&[(256, 24, 0)], 2048, 1024, 0, 0, 1024).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let _kv = pool
+            .try_claim_exact(0, 0, 256, UnifiedVramClass::KvCache)
+            .unwrap();
+        let last_shard = layout.shard_sizes().len() - 1;
+        let _runtime = pool
+            .try_claim_exact(last_shard, 512, 512, UnifiedVramClass::LlmRuntime)
+            .unwrap();
+        let requested = [unit_request(256, 21)];
+        assert!(plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).is_err());
+        // The same reserve snapshot used by the public pool API lends only the unused suffix.
+        let plan = layout
+            .plan_unit_claim(
+                &pool.allocations(),
+                &requested,
+                UnifiedVramClass::Prefill,
+                &[],
+                512,
+            )
+            .unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        assert!(plan.claim.ranges().iter().all(|range| {
+            (range.shard != 0 || range.offset >= 256)
+                && (range.shard != last_shard || range.offset + range.len <= 512)
+        }));
+        assert!(plan
+            .claim
+            .ranges()
+            .iter()
+            .any(|range| range.shard == last_shard));
+        for reserve in [1025, usize::MAX] {
+            assert!(layout
+                .plan_unit_claim(
+                    &pool.allocations(),
+                    &requested,
+                    UnifiedVramClass::Prefill,
+                    &[],
+                    reserve
+                )
+                .is_err());
+        }
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 0);
+    }
+
+    #[test]
+    fn unit_claim_fragmented_owner_classes_stay_in_their_frozen_corridors() {
+        let layout = ExpertArenaLayout::build(&[(256, 40, 4)], 2048, 4096, 0, 0, 1024).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let requested = [unit_request(256, 12)];
+        for class in [
+            UnifiedVramClass::KvCache,
+            UnifiedVramClass::LlmRuntime,
+            UnifiedVramClass::EmbeddingWeights,
+            UnifiedVramClass::EmbeddingRuntime,
+            UnifiedVramClass::VisionWeights,
+            UnifiedVramClass::VisionRuntime,
+            UnifiedVramClass::DraftWeights,
+            UnifiedVramClass::DraftRuntime,
+        ] {
+            let plan = plan_units(&layout, &pool, &requested, class, &[]).unwrap();
+            assert_unit_spans(&layout, &requested, &plan);
+            assert_eq!(plan.claim.len(), 2);
+            let (corridor, direction) = class.placement(&layout).unwrap();
+            let pieces = layout.physical_pieces(corridor);
+            for range in plan.claim.ranges() {
+                assert!(pieces.iter().any(|piece| piece.shard == range.shard
+                    && range.offset >= piece.start
+                    && range.offset + range.len <= piece.end));
+            }
+            let first = &plan.claim.ranges()[0];
+            match direction {
+                ClaimDirection::Low => assert_eq!(first.shard, pieces.first().unwrap().shard),
+                ClaimDirection::High => assert_eq!(first.shard, pieces.last().unwrap().shard),
+            }
+        }
+    }
+
+    #[test]
+    fn unit_claim_stale_fragmented_commit_is_atomic() {
+        let layout = ExpertArenaLayout::build(&[(256, 16, 0)], 1024, 0, 0, 0, 0).unwrap();
+        let pool = UnifiedRangePool::new(layout.shard_sizes().iter().copied()).unwrap();
+        let requested = [unit_request(300, 9)];
+        let plan = plan_units(&layout, &pool, &requested, UnifiedVramClass::Prefill, &[]).unwrap();
+        assert_unit_spans(&layout, &requested, &plan);
+        let last = plan.claim.ranges().last().unwrap();
+        let intervening = pool
+            .try_claim_exact(last.shard, last.offset, 256, UnifiedVramClass::KvCache)
+            .unwrap();
+        let before = pool.allocations();
+        let generation = pool.generation();
+        assert!(pool
+            .try_claim_planned(plan.claim.class(), plan.claim.ranges())
+            .is_none());
+        assert_eq!(pool.generation(), generation);
+        assert_eq!(pool.allocations(), before);
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 0);
+        drop(intervening);
+        let leases = pool
+            .try_claim_planned(plan.claim.class(), plan.claim.ranges())
+            .unwrap();
+        assert_eq!(leases.len(), plan.spans.len());
+        assert_eq!(pool.stats().class_bytes(UnifiedVramClass::Prefill), 3072);
+    }
 
     #[test]
     fn expert_layout_interleaves_planner_selected_pool_ratios() {

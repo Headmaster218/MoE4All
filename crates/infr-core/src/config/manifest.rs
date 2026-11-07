@@ -201,6 +201,7 @@ knobs! {
 
     // ── kernels.vulkan — GEMM / GEMV tiers (§6.5) ────────────────────────────
     "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  migrated;
+    "INFR_NO_NARROW_F32_GEMV" => "kernels.vulkan.narrow_f32_gemv", PresenceInv, Ignored, "1", migrated;
     "INFR_GEMM_WIDE_TILE"   => "kernels.vulkan.gemm_wide_tile", Presence,    Ignored, "1",  migrated;
     "INFR_GEMM_DIRECT_A"    => "kernels.vulkan.gemm_direct_a",  Presence,    Ignored, "1",  migrated;
     "INFR_NO_SMALL_BM"      => "kernels.vulkan.small_bm",       PresenceInv, Ignored, "1",  migrated;
@@ -424,6 +425,18 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
         "INFR_IMAGE_CODEC_FIXTURES",
         "test-only fixture directory for ignored native image decoder parity tests.",
+    ),
+    (
+        "INFR_MELO_MODEL",
+        "test-only model path for the ignored native Melo reference parity test.",
+    ),
+    (
+        "INFR_MELO_REFERENCE",
+        "test-only reference fixture path for the ignored native Melo parity test.",
+    ),
+    (
+        "INFR_MELO_NATIVE_OUTPUT",
+        "test-only optional output directory for the ignored native Melo parity test.",
     ),
     (
         "INFR_PROFILE",

@@ -35,8 +35,14 @@ mod deferred_prepare_tests;
 #[cfg(test)]
 #[path = "adapter_dense_mmq_fallback_tests.rs"]
 mod dense_mmq_fallback_tests;
+#[cfg(test)]
+#[path = "adapter_narrow_projection_tests.rs"]
+mod narrow_projection_tests;
 #[path = "adapter_verify_pair.rs"]
 mod pair_admission;
+#[cfg(test)]
+#[path = "pr146_prefill_integration_tests.rs"]
+mod pr146_prefill_integration_tests;
 #[path = "adapter_pure_mapped_coalesce.rs"]
 mod pure_mapped_coalesce;
 #[path = "adapter_qsa_workspace.rs"]
@@ -2298,6 +2304,29 @@ fn paged_phase_scratch_requests(
     graph: &Graph,
 ) -> Result<Vec<(&'static str, usize)>> {
     let mut maxima = HashMap::<&'static str, usize>::new();
+    // Include Prefill and dense-streamed plans, not only complete Decode workspaces.
+    for op in &graph.ops {
+        if let Op::Linear {
+            weight,
+            m,
+            in_f,
+            out_f,
+            w_off,
+            ..
+        } = op
+        {
+            if let Some(bytes) = narrow_projection_scratch(
+                be_,
+                graph.desc(*weight).dtype,
+                *m as usize,
+                *in_f as usize,
+                *out_f as usize,
+                *w_off as usize,
+            ) {
+                record_scratch_max(&mut maxima, "lin_w32", bytes);
+            }
+        }
+    }
     for (tag, bytes) in paged_qsa_scratch_requests(graph)?
         .into_iter()
         .chain(qsa_workspace::requests(
@@ -4047,6 +4076,17 @@ fn lower_op(
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
                                    without offset-capable kernels"));
                 }
+                if let Some(bytes) = narrow_projection_scratch(be_, dt, m, in_f, out_f, w_off) {
+                    // The streaming seam has already emitted arena RAW/WAR barriers.
+                    let key = pooled(pool, be_, "lin_w32", bytes)?;
+                    let expanded = pool[&key].as_ref();
+                    rec.dequant_weight_f32(dt, arena_addr, w_off, xb, expanded, in_f * out_f);
+                    let expanded_addr = expanded
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(expanded_addr, expanded, xb, y, m, in_f, out_f);
+                    return Ok(());
+                }
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
                     // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
                     // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
@@ -4066,17 +4106,6 @@ fn lower_op(
                         be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
                         transient,
                     )?;
-                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
-                    // Narrow output: no tile exists, and the native per-row GEMV re-reads the whole
-                    // weight once per row. Expand it to f32 into pooled scratch and let the batched
-                    // f32r GEMV contract it — a few microseconds of cast per chunk.
-                    let elems = in_f * out_f;
-                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
-                    rec.dequant_weight_f32(dt, arena_addr, w_off, xb, pool[&w32].as_ref(), elems);
-                    let w32_addr = pool[&w32]
-                        .device_addr()
-                        .expect("lin_w32 scratch needs a BDA device address");
-                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
                 } else {
                     // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
@@ -4833,21 +4862,19 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
-                } else if narrow_f32_gemv_applies(be_, dt, m, in_f, out_f) {
-                    // Resident twin of the streamed narrow-f32 route (adapter.rs's arena branch):
-                    // expand the narrow native weight to f32 once per chunk and contract it with
-                    // the batched f32r GEMV instead of the per-row native GEMV. `w_off` rides as
-                    // an ELEMENT offset into `dq()` exactly as `linear_native` uses it.
-                    let w_addr = w.device_addr().ok_or_else(|| {
-                        be("vulkan adapter: narrow-f32 Linear needs a BDA weight address")
-                    })?;
-                    let elems = in_f * out_f;
-                    let w32 = pooled(pool, be_, "lin_w32", elems * 4)?;
-                    rec.dequant_weight_f32(dt, w_addr, w_off, xb, pool[&w32].as_ref(), elems);
-                    let w32_addr = pool[&w32]
+                } else if let Some(bytes) =
+                    narrow_projection_scratch(be_, dt, m, in_f, out_f, w_off)
+                {
+                    let addr = w
+                        .device_addr()
+                        .ok_or_else(|| be("narrow projection requires BDA"))?;
+                    let key = pooled(pool, be_, "lin_w32", bytes)?;
+                    let expanded = pool[&key].as_ref();
+                    rec.dequant_weight_f32(dt, addr, w_off, w, expanded, in_f * out_f);
+                    let expanded_addr = expanded
                         .device_addr()
                         .expect("lin_w32 scratch needs a BDA device address");
-                    rec.linear_f32_tracked(w32_addr, pool[&w32].as_ref(), xb, y, m, in_f, out_f);
+                    rec.linear_f32_tracked(expanded_addr, expanded, xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
@@ -4951,6 +4978,12 @@ fn lower_op(
             rec.scale(r(*dst)?, *s, n);
         }
         Op::Silu { x, dst, n, scale } => rec.silu_scale(r(*x)?, r(*dst)?, *n, *scale),
+        Op::Relu { .. } | Op::DepthwiseConv1d { .. } => {
+            return Err(Error::Unsupported(format!(
+                "Vulkan Op::{} is CPU-only; select CPU in the caller",
+                op.kind()
+            )));
+        }
         Op::Gelu { x, dst, rows, cols } => {
             if graph.desc(*x).dtype != infr_core::DType::F32
                 || graph.desc(*dst).dtype != infr_core::DType::F32
@@ -9120,13 +9153,6 @@ fn lower_op(
                 // discarded) — pad the packed row dimension so the LAST expert's overread stays
                 // in-bounds.
                 let npad = n_pairs.div_ceil(64) * 64 + 64;
-                // Router logits may take the 64-row tiled GEMM at prefill rows (see
-                // `moe_router_gemm_applies`): its C store covers whole row tiles.
-                let logits = alu(moe_router_logits_rows(
-                    rows,
-                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
-                ) * n_expert
-                    * 4)?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
                 // Bucket arrays index the LOCAL expert shard under EP (ids are remapped to
@@ -9160,6 +9186,13 @@ fn lower_op(
                 let dsa = pooled(pool, be_, "moe_dsa", npad * (nff / 32) * 2)?;
                 let ye = pooled(pool, be_, "moe_ye", npad * ne * 4)?;
 
+                // Router logits may take the 64-row tiled GEMM at prefill rows (see
+                // `moe_router_gemm_applies`): its C store covers whole row tiles.
+                let logits = alu(moe_router_logits_rows(
+                    rows,
+                    moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+                ) * n_expert
+                    * 4)?;
                 // Router logits for all rows (on `router_x`, NOT `x`), then GPU routing.
                 let rdt = graph.desc(*router).dtype;
                 let rw = r(*router)?;
@@ -13757,12 +13790,29 @@ fn execute_static_walk(
             match result {
                 Ok(result) => {
                     if result.is_err() {
+                        if let Err(cleanup) = pstream.finish_prefill_uploads(be_) {
+                            tracing::warn!(%cleanup, "Prefill producer cleanup after forward failure also failed");
+                        }
                         pair_windows.clear();
                     }
                     result
                 }
                 Err(panic) => {
                     // Execute/recorder leases still protect any readers while error paths drain.
+                    let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let result = pstream.finish_prefill_uploads(be_);
+                        // A synchronous producer may have unwound before clearing its marker,
+                        // even though no uploader exists. Its job has already left the scope.
+                        if let Ok(mut pager) = be_.moe_pager().lock() {
+                            if let Some(session) = pager.as_mut() {
+                                session.abort_pending_prefill_layers_cpu();
+                            }
+                        }
+                        result
+                    }));
+                    if !matches!(cleanup, Ok(Ok(()))) {
+                        tracing::warn!("Prefill producer cleanup failed while preserving the original forward panic");
+                    }
                     pair_windows.clear();
                     std::panic::resume_unwind(panic)
                 }
@@ -17617,9 +17667,17 @@ impl PagedStream {
         be_: &VulkanBackend,
         completion: PrefillUploadCompletion,
     ) -> Result<()> {
-        completion
-            .result
-            .map_err(|e| be(format!("async Prefill upload dependency failed: {e}")))?;
+        if let Err(error) = completion.result {
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("paged execution requires a session")
+                .abort_prefill_layer_cpu(completion.buf_id);
+            return Err(be(format!(
+                "async Prefill upload dependency failed: {error}"
+            )));
+        }
         be_.moe_pager()
             .lock()
             .unwrap()
@@ -17644,7 +17702,12 @@ impl PagedStream {
             let Ok(completion) = completion else {
                 break;
             };
-            self.apply_prefill_completion(be_, completion)?;
+            if let Err(error) = self.apply_prefill_completion(be_, completion) {
+                if let Err(cleanup) = self.finish_prefill_uploads(be_) {
+                    tracing::warn!(%cleanup, "Prefill producer cleanup also failed");
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -17678,12 +17741,25 @@ impl PagedStream {
                 .as_ref()
                 .ok_or_else(|| be("Prefill layer is pending without an uploader"))?
                 .rx
-                .recv()
-                .map_err(|_| be("Prefill uploader disconnected before layer became ready"))?;
+                .recv();
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(_) => {
+                    let _ = self.finish_prefill_uploads(be_);
+                    return Err(be(
+                        "Prefill uploader disconnected before layer became ready",
+                    ));
+                }
+            };
             if let Some(elapsed) = infr_core::pager_profile::elapsed(wait_t0) {
                 infr_core::pager_profile::record_staging_wait(elapsed);
             }
-            self.apply_prefill_completion(be_, completion)?;
+            if let Err(error) = self.apply_prefill_completion(be_, completion) {
+                if let Err(cleanup) = self.finish_prefill_uploads(be_) {
+                    tracing::warn!(%cleanup, "Prefill producer cleanup also failed");
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -17693,25 +17769,47 @@ impl PagedStream {
         job: crate::pager::PrefillCopyJob,
         after: Option<crate::recorder::PendingSegment>,
     ) -> Result<()> {
+        let buf_id = job.buf_id();
         if self.prefill_uploader.is_none() {
             let executor = crate::transfer::BackgroundTransferExecutor::from_backend(be_);
             self.prefill_uploader = Some(PrefillUploader::new(executor));
         }
-        self.prefill_uploader
+        let result = self
+            .prefill_uploader
             .as_ref()
             .expect("Prefill uploader was initialized")
-            .enqueue(PrefillUploadCommand { job, after })
+            .enqueue(PrefillUploadCommand { job, after });
+        if result.is_err() {
+            be_.moe_pager()
+                .lock()
+                .unwrap()
+                .as_mut()
+                .expect("paged execution requires a session")
+                .abort_prefill_layer_cpu(buf_id);
+        }
+        result
     }
 
     fn finish_prefill_uploads(&mut self, be_: &VulkanBackend) -> Result<()> {
         let Some(mut uploader) = self.prefill_uploader.take() else {
             return Ok(());
         };
+        let mut result = Ok(());
         uploader.finish();
         while let Ok(completion) = uploader.rx.try_recv() {
-            self.apply_prefill_completion(be_, completion)?;
+            if let Err(error) = self.apply_prefill_completion(be_, completion) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
         }
-        Ok(())
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .abort_pending_prefill_layers_cpu();
+        result
     }
 }
 
@@ -17869,23 +17967,28 @@ fn sync_stream_inner<'a>(
     Ok(())
 }
 
-/// Narrow-output streamed Linears at prefill rows: expand the (tiny) native weight to f32 and take
-/// the batched f32r GEMV instead of the native per-row GEMV. Shape/dtype half lives in
-/// [`crate::recorder::narrow_f32_gemm_eligible`] so the scratch reservation tracks it exactly.
-///
-/// Measured on Qwen3.8-Flash-Next base (pp4096, the two families sum to 168 dispatches): the
-/// native GEMV spent 1.5 ms per `2560x48` and 0.96 ms per `10240x4`; the same contraction on the
-/// f32 path (as the UD variant runs it natively) takes ~0.25 ms — 202 ms of a 2.15 s chunk. The
-/// Q8_0/BF16 decode is exact in f32, so this changes speed only.
-fn narrow_f32_gemv_applies(
+/// Shared admission for scratch planning and both native Linear fallbacks.
+fn narrow_projection_scratch(
     be_: &VulkanBackend,
     dt: infr_core::DType,
     m: usize,
     in_f: usize,
     out_f: usize,
-) -> bool {
-    be_.cfg().kernels.vulkan.narrow_f32_gemv
-        && crate::recorder::narrow_f32_gemm_eligible(dt, m, in_f, out_f)
+    w_off: usize,
+) -> Option<usize> {
+    let bytes = crate::narrow_projection::scratch_bytes(
+        &be_.cfg().kernels.vulkan,
+        be_.shared.narrow_f32_device,
+        dt,
+        m,
+        in_f,
+        out_f,
+        w_off,
+    )?;
+    // Only the unified activation arena guarantees addressable scratch. Ordinary
+    // standalone activation allocations deliberately lack BDA; keep their native
+    // GEMV route instead of changing the allocator's device/storage contract.
+    be_.unified_vram().map(|_| bytes)
 }
 
 /// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
@@ -17923,17 +18026,36 @@ fn streamed_gemm_applies(
 
 /// Router logits tier for prefill rows. The MoE router is a plain dense [n_expert, in_f] matrix,
 /// and every router site used to record it through the scalar GEMV family — which, past
-/// `rows == 1`, re-reads the whole router weight once per row. Measured on Qwen3.8-Flash-Next
-/// IQ3_S (`ffn_gate_inp`, bf16 2560x512 at m=4096): the streamed GEMV took 15.5 ms/layer, 48
-/// layers = 746 ms, 24.4% of the whole pp30k device time; the tiled GEMM a dense `Op::Linear` of
-/// the same shape takes runs it in ~1.4 ms (the base model's F32 router already takes its own
-/// `linear_f32` mrow tile at 1.9 ms for the same reason).
+/// `rows == 1`, re-reads the whole router weight once per row. On Qwen3.8-Flash-Next IQ3_S
+/// (`ffn_gate_inp`, bf16 2560x512) the per-row route costs ~15 ms per layer at m=4096 where the
+/// tiled GEMM of the same shape takes ~1.4 ms (the base model's F32 router already takes its own
+/// `linear_f32` mrow tile at ~1.9 ms for the same reason); the end-to-end win is the +4.4% paired
+/// pp30000 in the CHANGELOG, and bigger where the router reaches the arena-streamed GEMV, which
+/// re-reads the weight from the pager instead of a resident buffer.
 ///
-/// Gate mirrors `streamed_gemm_applies` (m > 16, n%64, k%32, coopmat f16 tiles, native dense
-/// dtype, `INFR_NO_GEMM_WARP` honored) with one deliberate difference: Q4_K is NOT excluded. That
-/// exclusion exists on the Linear path because a resident dense Q4_K GEMM would diverge from the
-/// dp4a `mmq` tier the dense arm prefers; the router has no mmq arm — its only alternative is the
-/// per-row GEMV, which even the 64x64 native-GEMM floor beats ~64x on weight traffic.
+/// Keep the original capability/debug fallback and the measured BF16/Q8 row crossovers. This
+/// integration does not qualify other router dtypes, alter F32 routing, or change chunk policy.
+fn moe_router_gemm_shape_applies(
+    dt: infr_core::DType,
+    rows: usize,
+    in_f: usize,
+    n_expert: usize,
+) -> bool {
+    // Measured crossover points, rather than routing every multi-row suffix into a GEMM.
+    // BF16 m=65 and Q8 m=256 regress on the existing module evidence; decode/verify and F32
+    // retain their old paths. Other quantization formats remain unqualified for this route.
+    let min_rows = match dt {
+        infr_core::DType::Bf16 => 256,
+        infr_core::DType::Q8_0 => 512,
+        _ => return false,
+    };
+    rows >= min_rows
+        && in_f > 0
+        && n_expert > 0
+        && n_expert.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+}
+
 fn moe_router_gemm_applies(
     be_: &VulkanBackend,
     dt: infr_core::DType,
@@ -17941,9 +18063,7 @@ fn moe_router_gemm_applies(
     in_f: usize,
     n_expert: usize,
 ) -> bool {
-    rows > 16
-        && n_expert.is_multiple_of(64)
-        && in_f.is_multiple_of(32)
+    moe_router_gemm_shape_applies(dt, rows, in_f, n_expert)
         && be_.caps().f16_coopmat()
         && native_dense_supported(dt)
         && be_.cfg().kernels.vulkan.gemm_warp
@@ -17976,11 +18096,12 @@ fn record_moe_router_logits(
     rec: &Recorder<'_>,
 ) {
     if moe_router_gemm_applies(be_, dt, rows, in_f, n_expert) {
-        let w_addr = w
-            .device_addr()
-            .expect("resident-BDA router weight: the prefill GEMM reads it by u64 address");
-        rec.matmul_native_off(dt, x, w_addr, 0, logits, rows, in_f, n_expert);
-    } else if native_dense_supported(dt) {
+        if let Some(w_addr) = w.device_addr() {
+            rec.matmul_native_off(dt, x, w_addr, 0, logits, rows, in_f, n_expert);
+            return;
+        }
+    }
+    if native_dense_supported(dt) {
         rec.linear_native(dt, w, 0, x, logits, rows, in_f, n_expert);
     } else if matches!(dt, infr_core::DType::F32) {
         // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its bytes as
@@ -18147,7 +18268,15 @@ fn stage_layer_and_window<'a>(
 
 fn run_prefill_job_sync(be_: &VulkanBackend, job: crate::pager::PrefillCopyJob) -> Result<()> {
     let buf_id = job.buf_id();
-    job.execute(be_)?;
+    if let Err(error) = job.execute(be_) {
+        be_.moe_pager()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("paged execution requires a session")
+            .abort_prefill_layer_cpu(buf_id);
+        return Err(error);
+    }
     be_.moe_pager()
         .lock()
         .unwrap()
@@ -18169,75 +18298,96 @@ fn prefetch_next_moe_layer<'a>(
     current_gate_id: usize,
     next_chunk: bool,
 ) -> Result<()> {
-    ps.finish_cpu_miss(be_, pool)?;
-    ps.wait_cpu_promotion(be_)?;
-    ps.poll_prefill_uploads(be_)?;
-    // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
-    // that cannot run on the existing host producer also takes the synchronous correctness path.
-    // This property is frozen during model setup, so previous uploads are drained before the next
-    // layer reserves a lane exactly as they were before transport was abstracted.
-    let synchronous = !be_.cfg().paging.prefill_upload_async
-        || !be_
-            .moe_pager()
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("paged execution requires a session")
-            .prefill_host_worker_ready();
-    if synchronous {
-        ps.finish_prefill_uploads(be_)?;
-    }
+    let result = (|| -> Result<()> {
+        ps.finish_cpu_miss(be_, pool)?;
+        ps.wait_cpu_promotion(be_)?;
+        ps.poll_prefill_uploads(be_)?;
+        // Dense streaming can attach staging-ring lifetime to this same segment. A transfer endpoint
+        // that cannot run on the existing host producer also takes the synchronous correctness path.
+        // This property is frozen during model setup, so previous uploads are drained before the next
+        // layer reserves a lane exactly as they were before transport was abstracted.
+        let synchronous = !be_.cfg().paging.prefill_upload_async
+            || !be_
+                .moe_pager()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("paged execution requires a session")
+                .prefill_host_worker_ready();
+        if synchronous {
+            ps.finish_prefill_uploads(be_)?;
+        }
 
-    let (initial, replacement) = {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.enter_prefill_layer(be_)?;
-        sess.prefill_successors(current_gate_id, next_chunk)?
-    };
-    let (initial_jobs, replacement_job) = {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard.as_mut().expect("paged execution requires a session");
-        let mut jobs = Vec::with_capacity(initial.len());
-        for next in initial {
-            if let Some(job) = sess.prepare_prefill_layer_cpu(be_, next)? {
-                jobs.push(job);
+        let (initial, replacement) = {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().expect("paged execution requires a session");
+            sess.enter_prefill_layer(be_)?;
+            sess.prefill_successors(current_gate_id, next_chunk)?
+        };
+        let segment = rec
+            .take()
+            .expect("segment always Some between ops")
+            .finish_nowait()
+            .map_err(|e| be(e.to_string()))?;
+        if synchronous {
+            segment.wait().map_err(|e| be(e.to_string()))?;
+            ps.cursor = 0;
+            for next in initial.into_iter().chain(replacement) {
+                let job = be_
+                    .moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("paged execution requires a session")
+                    .prepare_prefill_layer_cpu(be_, next)?;
+                if let Some(job) = job {
+                    run_prefill_job_sync(be_, job)?;
+                }
+            }
+        } else {
+            for next in initial {
+                let job = be_
+                    .moe_pager()
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .expect("paged execution requires a session")
+                    .prepare_prefill_layer_cpu(be_, next)?;
+                if let Some(job) = job {
+                    ps.enqueue_prefill_upload(be_, job, None)?;
+                }
+            }
+            let replacement_job = replacement
+                .map(|next| {
+                    be_.moe_pager()
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .expect("paged execution requires a session")
+                        .prepare_prefill_layer_cpu(be_, next)
+                })
+                .transpose()?
+                .flatten();
+            if let Some(job) = replacement_job {
+                ps.enqueue_prefill_upload(be_, job, Some(segment))?;
+            } else {
+                retain_prefill_compute(ps, segment)?;
             }
         }
-        let replacement = replacement
-            .map(|next| sess.prepare_prefill_layer_cpu(be_, next))
-            .transpose()?
-            .flatten();
-        (jobs, replacement)
-    };
 
-    let segment = rec
-        .take()
-        .expect("segment always Some between ops")
-        .finish_nowait()
-        .map_err(|e| be(e.to_string()))?;
-    if synchronous {
-        segment.wait().map_err(|e| be(e.to_string()))?;
-        ps.cursor = 0;
-        for job in initial_jobs {
-            run_prefill_job_sync(be_, job)?;
+        let compute = be_.recorder()?;
+        compute.seed_barrier();
+        *rec = Some(compute);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Resolve every already-enqueued sibling before returning the original failure. Jobs are
+        // prepared one at a time, so no unsubmitted siblings can leave phantom pending lanes.
+        if let Err(cleanup) = ps.finish_prefill_uploads(be_) {
+            tracing::warn!(%cleanup, "Prefill producer cleanup also failed");
         }
-        if let Some(job) = replacement_job {
-            run_prefill_job_sync(be_, job)?;
-        }
-    } else {
-        for job in initial_jobs {
-            ps.enqueue_prefill_upload(be_, job, None)?;
-        }
-        if let Some(job) = replacement_job {
-            ps.enqueue_prefill_upload(be_, job, Some(segment))?;
-        } else {
-            retain_prefill_compute(ps, segment)?;
-        }
+        return Err(error);
     }
-
-    let compute = be_.recorder()?;
-    compute.seed_barrier();
-    *rec = Some(compute);
     Ok(())
 }
 
@@ -18691,18 +18841,11 @@ fn execute_paged_moe<'a>(
     // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
     // split path below — is then a mapped memcpy after `sync_stream`, no one-shot copy submit
     // and no fresh readback allocation per layer.
-    // Router logits may take the 64-row tiled GEMM at prefill rows (see
-    // `moe_router_gemm_applies`): its C store covers whole row tiles.
-    let logits = pooled(
-        pool,
-        be_,
-        "moe_paged_logits",
-        moe_router_logits_rows(
-            rows,
-            moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
-        ) * n_expert
-            * 4,
-    )?;
+    let router_rows = moe_router_logits_rows(
+        rows,
+        moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, n_expert),
+    );
+    let logits = pooled(pool, be_, "moe_paged_logits", router_rows * n_expert * 4)?;
     let ids_key = pooled_usage(
         pool,
         be_,

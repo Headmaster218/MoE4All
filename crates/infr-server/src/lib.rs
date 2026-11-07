@@ -1,4 +1,4 @@
-//! OpenAI-compatible HTTP server (axum + SSE). Talks only to `infr-engine` — never the GPU.
+//! OpenAI-compatible HTTP server (axum + SSE), over engine/audio traits — never the GPU.
 //!
 //! Reference for the wire mapping (streaming, `reasoning_content`, tool_calls): the working
 //! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/plan.md "server".
@@ -15,6 +15,7 @@
 //!   GET  /v1/responses/{id}/input_items -> the items that turn was given               (auth)
 //!   POST /v1/responses/{id}/cancel      -> 400: nothing is queued to cancel            (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
+//!   POST /v1/audio/transcriptions -> native WAV transcription JSON/text or segment SSE (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
@@ -68,6 +69,9 @@ const SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(25);
 
 mod response_format;
 mod responses;
+#[cfg(feature = "tts")]
+pub mod speech;
+mod transcription;
 
 pub use response_format::ResponseFormat;
 
@@ -2194,7 +2198,9 @@ impl ModelEntry {
     }
 }
 
-/// Shared server state — a non-empty, ordered set of hosted [`ModelEntry`]s. A request is routed to
+/// Shared server state — independently composed chat, embedding and transcription capabilities.
+/// An empty state can be assembled with [`AppState::empty`] before attaching capabilities.
+/// A chat request is routed to
 /// the entry whose `id` matches its `model` field; an unknown/empty `model` falls to the DEFAULT
 /// (the first entry). The single-model server is just the one-entry case, so its behaviour — and the
 /// hot path — is byte-identical to before this became multi-model.
@@ -2206,6 +2212,10 @@ pub struct AppState {
     /// Independently routed embedding models. Their semaphores and engines do not share chat KV
     /// slots; future unified memory policy coordinates the resources below this API boundary.
     embeddings: Arc<Vec<EmbeddingEntry>>,
+    transcription: Option<transcription::Entry>,
+    #[cfg(feature = "tts")]
+    speech: Option<speech::Entry>,
+    transcription_upload_dir: Option<std::path::PathBuf>,
     /// The resolved process configuration (S7). The handler reads `serve.api_key` and
     /// `serve.max_tokens_cap` off it instead of the environment; it is an EXPLICIT constructor
     /// parameter on every entry point that can host a real model, so an embedder cannot silently
@@ -2239,6 +2249,26 @@ impl AppState {
         Arc::new(Mutex::new(store))
     }
 
+    /// Start composing a server without a placeholder chat model or chat admission slots.
+    /// Attach at least one capability before calling [`serve_state`].
+    pub fn empty(cfg: Arc<Config>) -> Self {
+        let models = Arc::new(Vec::new());
+        let embeddings = Arc::new(Vec::new());
+        Self {
+            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
+            models,
+            embeddings,
+            // Bound read off `cfg` BEFORE it moves into the struct field below.
+            response_store: Self::response_store(&cfg),
+            cfg,
+            stats: Arc::default(),
+            transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
+            transcription_upload_dir: None,
+        }
+    }
+
     /// Wrap a single loaded generator for production use with `n_parallel` concurrent slots — the
     /// single-model server (the overwhelming common case). Equivalent to a one-entry
     /// [`multi`](Self::multi).
@@ -2262,6 +2292,10 @@ impl AppState {
             response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2270,8 +2304,7 @@ impl AppState {
     /// (used for a request with an unknown or empty `model`). This is the multi-device host: pass a
     /// generator pinned to each physical GPU and the server routes by model name — see `infr multi`.
     ///
-    /// Panics if `entries` is empty (the state invariant is a non-empty model set); the CLI never
-    /// calls it with none.
+    /// Panics if `entries` is empty; use [`Self::empty`] to compose auxiliary capabilities.
     pub fn multi(entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>, cfg: Arc<Config>) -> Self {
         assert!(
             !entries.is_empty(),
@@ -2292,6 +2325,10 @@ impl AppState {
             response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2309,6 +2346,10 @@ impl AppState {
             response_store: Self::response_store(&cfg),
             cfg,
             stats: Arc::default(),
+            transcription: None,
+            #[cfg(feature = "tts")]
+            speech: None,
+            transcription_upload_dir: None,
         }
     }
 
@@ -2336,7 +2377,7 @@ impl AppState {
             .clone()
     }
 
-    /// Attach one independently loaded embedding model to an existing chat state.
+    /// Attach one independently loaded embedding model to a composed server state.
     pub fn with_embedding(
         mut self,
         generator: Arc<dyn EmbeddingGenerator>,
@@ -2357,21 +2398,7 @@ impl AppState {
         n_parallel: usize,
         cfg: Arc<Config>,
     ) -> Self {
-        let models = Arc::new(Vec::new());
-        let embeddings = Arc::new(vec![EmbeddingEntry::new(
-            &model_id.into(),
-            generator,
-            n_parallel,
-        )]);
-        Self {
-            dashboard: Arc::new(ActivityDashboard::new(&models, &embeddings)),
-            models,
-            embeddings,
-            // Bound read off `cfg` BEFORE it moves into the struct field below.
-            response_store: Self::response_store(&cfg),
-            cfg,
-            stats: Arc::default(),
-        }
+        Self::empty(cfg).with_embedding(generator, model_id, n_parallel)
     }
 
     fn route_embedding(&self, requested: &str) -> Option<EmbeddingEntry> {
@@ -2384,6 +2411,34 @@ impl AppState {
                 .clone(),
         )
     }
+
+    /// Attach an independently scheduled transcription capability. Native model load/unload
+    /// remains inside infr-audio; the transport owns only admission and request lifetime.
+    pub fn with_transcription(mut self, transcriber: Arc<dyn infr_audio::Transcriber>) -> Self {
+        self.transcription = Some(transcription::Entry::new(transcriber));
+        self
+    }
+
+    /// Attach native CPU speech with independent admission and lifecycle.
+    #[cfg(feature = "tts")]
+    pub fn with_speech(mut self, synthesizer: Arc<dyn infr_tts::Synthesizer>) -> Self {
+        self.speech = Some(speech::Entry::new(synthesizer));
+        self
+    }
+
+    /// Controlled upload directory; defaults to <executable directory>/data/audio-upload.
+    pub fn with_transcription_upload_dir(
+        mut self,
+        directory: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.transcription_upload_dir = Some(directory.into());
+        self
+    }
+
+    /// Audio-only server state, with no placeholder chat model advertised by /v1/models.
+    pub fn transcription(transcriber: Arc<dyn infr_audio::Transcriber>, cfg: Arc<Config>) -> Self {
+        Self::empty(cfg).with_transcription(transcriber)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2392,7 +2447,7 @@ impl AppState {
 
 /// Build the axum [`Router`].  Extracted so tests can call it with a [`AppState::headless`] state.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
@@ -2411,7 +2466,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/responses/:response_id/cancel", post(responses::cancel))
         .route("/v1/embeddings", post(embeddings_handler))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
-        .with_state(state)
+        // Merge after the chat body limit so audio's 128 MiB cap stays route-local.
+        .merge(transcription::router());
+    #[cfg(feature = "tts")]
+    let router = router.merge(speech::router());
+    router.with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -2482,8 +2541,15 @@ pub async fn serve_with_embedding(
 
 /// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
 /// place the listener, the graceful-shutdown latch, and `axum::serve` live.
-async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
-    let n_models = state.models.len() + state.embeddings.len();
+pub async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
+    let n_models =
+        state.models.len() + state.embeddings.len() + usize::from(state.transcription.is_some());
+    #[cfg(feature = "tts")]
+    let n_models = n_models + usize::from(state.speech.is_some());
+    anyhow::ensure!(
+        n_models > 0,
+        "server requires at least one hosted capability"
+    );
     // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
     // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
     // server ends, no task is left ticking.
@@ -2566,6 +2632,31 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
         {
             data.push(ModelCard {
                 id: model.id.to_string(),
+                object: "model",
+                owned_by: "local",
+            });
+        }
+    }
+    if let Some(audio) = &state.transcription {
+        if !data
+            .iter()
+            .any(|card| card.id == audio.transcriber.model_id())
+        {
+            data.push(ModelCard {
+                id: audio.transcriber.model_id().to_owned(),
+                object: "model",
+                owned_by: "local",
+            });
+        }
+    }
+    #[cfg(feature = "tts")]
+    if let Some(speech) = &state.speech {
+        if !data
+            .iter()
+            .any(|card| card.id == speech.synthesizer.model_id())
+        {
+            data.push(ModelCard {
+                id: speech.synthesizer.model_id().to_owned(),
                 object: "model",
                 owned_by: "local",
             });
@@ -3923,6 +4014,9 @@ fn parse_oai_tool_calls(v: &serde_json::Value) -> Option<Vec<ToolCall>> {
 
 #[cfg(test)]
 mod thinking_tests;
+
+#[cfg(test)]
+mod module_composition_tests;
 
 #[cfg(test)]
 mod tests {

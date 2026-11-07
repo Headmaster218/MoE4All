@@ -10,6 +10,29 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, VulkanBackend};
 
+/// Exact widening builds used by the measured narrow projection policy.
+pub(crate) fn weight_f32_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! variant {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match dtype {
+        infr_core::DType::Q8_0 => variant!("weight_f32_q8_0"),
+        infr_core::DType::Bf16 => variant!("weight_f32_bf16"),
+        _ => None,
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -81,32 +104,6 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'stati
 /// `res`: production dispatches fused-residual GEMVs too (the decode Linear+Add fusion,
 /// [`crate::recorder::Recorder::linear_add_native`]), so both arms are load-bearing. `None` for a
 /// dtype without a native GEMV build.
-/// Expand a NARROW-output native weight into f32 scratch (`weight_f32.comp`) so the f32r
-/// mrow8/vec4 GEMV can contract it — the formats Qwen3.8-Flash-Next's narrow inject / ssm_alpha /
-/// ssm_beta tensors ship in. See the shader's doc for why this is exact.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn weight_f32_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match dtype {
-        Q8_0 => v!("weight_f32_q8_0"),
-        Bf16 => v!("weight_f32_bf16"),
-        _ => None,
-    }
-}
-
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_streamed_build_spv(
     dtype: infr_core::DType,

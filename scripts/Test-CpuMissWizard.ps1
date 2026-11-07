@@ -22,6 +22,7 @@ Write-Host ("Live CPU topology: physical={0}, preferred={1}, detected={2}" -f $a
 
 function Get-CpuMissTopology { return $script:Topology }
 function Get-UpdatedModelHistory { param([string]$SelectedModel) return @() }
+function Get-ModelDownloadDirectory { return (Join-Path ([IO.Path]::GetTempPath()) 'cpu-miss-models') }
 function Read-Host {
     param([string]$Prompt)
     if ($script:Answers.Count -eq 0) { throw "Unexpected prompt: $Prompt" }
@@ -34,11 +35,12 @@ if ($null -eq $start) { throw 'Missing CPU wizard prompts' }
 $promptStatements = @($start.Parent.Statements)
 $promptIndex = [array]::IndexOf($promptStatements, $start)
 $prompts = [scriptblock]::Create($start.Extent.Text + "`n" + $promptStatements[$promptIndex + 1].Extent.Text)
-$argumentStart = $statements | Where-Object { $_.Extent.Text.StartsWith('Add-SetArgument $nativeArgs ''kernels.vulkan.cpu_miss_threads''') } | Select-Object -First 1
-$argumentIndex = [array]::IndexOf($statements, $argumentStart)
+$argumentStart = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text.StartsWith('Add-SetArgument $nativeArgs ''kernels.vulkan.cpu_miss_threads''') }, $true)
+$llmStatements = @($argumentStart.Parent.Parent.Statements)
+$argumentIndex = [array]::IndexOf($llmStatements, $argumentStart.Parent)
 if ($argumentIndex -lt 0) { throw 'Missing CPU command arguments' }
-$arguments = [scriptblock]::Create($argumentStart.Extent.Text + "`n" + $statements[$argumentIndex + 1].Extent.Text)
-$customStatement = $statements | Where-Object { $_.Extent.Text.StartsWith('if ($setupMode -eq ''manual'' -and -not') -and $_.Extent.Text.Contains('$customSets') } | Select-Object -First 1
+$arguments = [scriptblock]::Create($argumentStart.Extent.Text + "`n" + $llmStatements[$argumentIndex + 1].Extent.Text)
+$customStatement = $llmStatements | Where-Object { $_.Extent.Text.StartsWith('if ($setupMode -eq ''manual'' -and -not') -and $_.Extent.Text.Contains('$customSets') } | Select-Object -First 1
 if ($null -eq $customStatement) { throw 'Missing extra settings block' }
 $customArguments = [scriptblock]::Create($customStatement.Extent.Text)
 $stateStatement = $statements | Where-Object { $_.Extent.Text.StartsWith('$state = [ordered]') } | Select-Object -First 1
@@ -77,6 +79,7 @@ function Test-Case {
         )) { if ($setting -notin $sets) { throw "$Name missing $setting" } }
     }
     . $save
+    if ($state.download_dir -ne (Get-ModelDownloadDirectory)) { throw "$Name saved download directory mismatch" }
     if ($state.cpu_miss_enabled -ne ($ExpectedCores -gt 0)) { throw "$Name saved enable mismatch" }
     if ($ExpectedCores -gt 0 -and ([int]$state.cpu_miss_max -ne $ExpectedMax -or [int]$state.cpu_miss_cores -ne $ExpectedCores)) {
         throw "$Name saved limits mismatch"

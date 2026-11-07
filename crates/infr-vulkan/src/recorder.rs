@@ -46,6 +46,9 @@ mod segmented_attention_contract;
 #[cfg(test)]
 #[path = "flash_pv_reuse_contract.rs"]
 mod flash_pv_reuse_contract;
+#[cfg(test)]
+#[path = "hd256_flash_ports_contract.rs"]
+mod hd256_flash_ports_contract;
 
 #[cfg(test)]
 #[path = "g01_cold_state_contract.rs"]
@@ -3129,41 +3132,6 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
-    /// variant routing (same env escapes) so parity comparisons land on the same kernel.
-    /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
-    /// tests call it directly with an explicit arena address.
-    /// Expand a narrow native weight into f32 scratch (`weight_f32.comp`): reads the weight from the
-    /// pager arena by 64-bit address and writes `elems` f32 values to `dst`. `filler` takes binding
-    /// 0 purely so the descriptor set is fully written (the weight itself is never bound — same
-    /// convention as [`Self::dequant_kv_f16`]); `dst` is tracked as an output, so the following
-    /// f32 GEMV's [`Self::linear_f32_tracked`] filler gets the RAW barrier.
-    pub fn dequant_weight_f32(
-        &self,
-        dtype: infr_core::DType,
-        arena_addr: u64,
-        w_off: usize,
-        filler: &dyn Buffer,
-        dst: &dyn Buffer,
-        elems: usize,
-    ) {
-        let (name, spv) = crate::gemm::weight_f32_build_spv(dtype)
-            .expect("weight_f32: dtype without an expansion build");
-        let k = self.be.kernel(name, spv, 2, 16);
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(elems as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(w_off as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(filler), Self::vkb(dst)],
-            1,
-            &push,
-            (elems as u32).div_ceil(64),
-        );
-    }
-
     /// [`Self::linear_f32_at`] with the f32 weight's SOURCE scratch bound at descriptor slot 0 in
     /// place of the `x` filler. The weight itself is read by 64-bit address, which the descriptor
     /// hazard tracker cannot see; binding the buffer it lives in is what keeps the producing
@@ -3181,6 +3149,10 @@ impl<'a> Recorder<'a> {
         self.linear_f32_inner(w_addr, Some(w_track), x, y, rows, in_f, out_f);
     }
 
+    /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
+    /// variant routing (same env escapes) so parity comparisons land on the same kernel.
+    /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
+    /// tests call it directly with an explicit arena address.
     pub fn linear_f32_at(
         &self,
         arena_addr: u64,
@@ -3250,6 +3222,34 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             groups,
+        );
+    }
+
+    /// Widen a bounded native slice. For resident weights binding 0 tracks the
+    /// source; streamed callers use their existing arena RAW/WAR barriers.
+    pub(crate) fn dequant_weight_f32(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_off: usize,
+        source_track: &dyn Buffer,
+        dst: &dyn Buffer,
+        elems: usize,
+    ) {
+        let (name, spv) = crate::gemm::weight_f32_build_spv(dtype)
+            .expect("narrow F32 policy requires a widening build");
+        let kernel = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(elems as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(w_off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(source_track), Self::vkb(dst)],
+            1,
+            &push,
+            (elems as u32).div_ceil(64),
         );
     }
 
@@ -3734,7 +3734,7 @@ impl<'a> Recorder<'a> {
     /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
     /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged. The Q8_0
-    /// N64 variant also accepts `n%64==0 && n%128!=0`; all other variants still require n%128.
+    /// and BF16 N64 variants also accept `n%64==0 && n%128!=0`; other variants require n%128.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_f16a(
         &self,

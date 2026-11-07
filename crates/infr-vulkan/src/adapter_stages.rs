@@ -200,6 +200,7 @@ fn linear_scratch_requests(
             m,
             in_f,
             out_f,
+            w_off,
             ..
         } = op
         else {
@@ -207,6 +208,10 @@ fn linear_scratch_requests(
         };
         let (m, k, n) = (*m as usize, *in_f as usize, *out_f as usize);
         let dt = graph.desc(*weight).dtype;
+        if let Some(bytes) = narrow_projection_scratch(be_, dt, m, k, n, *w_off as usize) {
+            record_scratch_max(requests, "lin_w32", bytes);
+            continue;
+        }
         if m == 0 || k == 0 || n == 0 || k % 32 != 0 {
             continue;
         }
@@ -251,7 +256,7 @@ fn linear_scratch_requests(
             continue;
         }
         // Narrow-output native weights take the f32-expansion + f32r-GEMV pair at prefill rows —
-        // mirror `narrow_f32_gemv_applies` so the scratch exists exactly when the dispatcher asks.
+        // mirror `narrow_projection_scratch` so the scratch exists exactly when the dispatcher asks.
         if cfg.narrow_f32_gemv && crate::recorder::narrow_f32_gemm_eligible(dt, m, k, n) {
             add("lin_w32", k * n * 4);
             continue;
@@ -316,11 +321,12 @@ fn linear_scratch_requests(
         // reservation was previously missing those shapes' buffers).
         let use_ag = coop
             && cfg.gemm_warp
-            && k % 32 == 0
-            && if n % 128 == 0 {
+            && k.is_multiple_of(32)
+            && if n.is_multiple_of(128) {
                 crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
             } else {
-                n % 64 == 0 && crate::gemm::native_gemm_warp_n64_ag_kernel_name(dt).is_some()
+                n.is_multiple_of(64)
+                    && crate::gemm::native_gemm_warp_n64_ag_kernel_name(dt).is_some()
             };
         if use_ag
             && !(cfg.gemm_direct_a
@@ -356,6 +362,7 @@ fn small_moe_scratch_requests(
     for (index, op) in graph.ops.iter().enumerate() {
         let Op::MoeFfn {
             x,
+            router,
             ne,
             n_ff_exp,
             n_expert,
@@ -397,6 +404,13 @@ fn small_moe_scratch_requests(
             staging,
             paged_mmq_scratch_requests(be_, graph, op).is_none(),
         );
+        // The same Router route also serves paged experts. Its whole-row C tile must be priced
+        // before freezing a staged workspace, rather than allocating an unplanned tail later.
+        let logits_rows = moe_router_logits_rows(
+            rows,
+            moe_router_gemm_applies(be_, graph.desc(*router).dtype, rows, ne, experts),
+        );
+        record_scratch_max(requests, "moe_paged_logits", logits_rows * experts * 4);
     }
     Ok(())
 }

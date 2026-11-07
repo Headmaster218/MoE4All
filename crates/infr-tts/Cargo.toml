@@ -1,0 +1,28 @@
+[package]
+name = "infr-tts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["borrowed-f32", "fused-conv"]
+# CPU-only paths; --no-default-features retains Graph/Bindings.
+borrowed-f32 = []
+# Reuse convolution windows and fuse decoder elementwise epilogues.
+fused-conv = ["borrowed-f32"]
+cpu-ab-profile = ["infr-cpu/f32-gemm-profile"]
+
+[[example]]
+name = "cpu-ab"
+required-features = ["cpu-ab-profile"]
+
+[dependencies]
+infr-core.workspace = true
+infr-cpu = { workspace = true, features = ["f32-gemm"] }
+infr-gguf.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+tracing.workspace = true

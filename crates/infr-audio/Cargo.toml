@@ -1,0 +1,16 @@
+[package]
+name = "infr-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-core.workspace = true
+infr-cpu.workspace = true
+infr-gguf.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+tracing.workspace = true

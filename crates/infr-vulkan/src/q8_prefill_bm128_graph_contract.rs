@@ -4,6 +4,9 @@
 use super::*;
 use infr_core::{DType, TensorDesc};
 
+#[path = "dense_prefill_bm128_tests.rs"]
+mod dense_prefill_bm128_tests;
+
 const QUALIFIED: [(usize, usize, usize); 6] = [
     (3072, 8192, 512),
     (8192, 3072, 1024),
@@ -130,6 +133,7 @@ fn buffer(be: &VulkanBackend, bytes: &[u8], usage: BufferUsage) -> Box<dyn Buffe
 }
 
 struct Case {
+    dtype: DType,
     graph: Graph,
     plan: Box<dyn Plan>,
     x_id: TensorId,
@@ -145,9 +149,21 @@ struct Case {
 
 impl Case {
     fn new(be: &VulkanBackend, k: usize, n: usize, m: usize, internal: bool, bytes: &[u8]) -> Self {
+        Self::new_typed(be, k, n, m, internal, bytes, DType::Q8_0)
+    }
+
+    fn new_typed(
+        be: &VulkanBackend,
+        k: usize,
+        n: usize,
+        m: usize,
+        internal: bool,
+        bytes: &[u8],
+        dtype: DType,
+    ) -> Self {
         let mut graph = Graph::new();
         let x_id = graph.input(TensorDesc::new(vec![m, k], DType::F32));
-        let w_id = graph.weight(TensorDesc::new(vec![n + 1, k], DType::Q8_0));
+        let w_id = graph.weight(TensorDesc::new(vec![n + 1, k], dtype));
         let y_id = graph.output(TensorDesc::new(vec![m, n], DType::F32));
         let dst = if internal {
             graph.internal(TensorDesc::new(vec![m, n], DType::F32))
@@ -185,6 +201,7 @@ impl Case {
             BufferUsage::Readback,
         );
         Self {
+            dtype,
             graph,
             plan,
             x_id,
@@ -245,9 +262,9 @@ impl Case {
         let rec = be.recorder().unwrap();
         rec.store_f16(self.x.as_ref(), a16.as_ref(), self.m * self.k, 0);
         if let Some(partials) = &partials {
-            assert!(crate::gemm::native_gemm_warp_sk_kernel_name(DType::Q8_0).is_some());
+            assert!(crate::gemm::native_gemm_warp_sk_kernel_name(self.dtype).is_some());
             rec.matmul_native_splitk(
-                DType::Q8_0,
+                self.dtype,
                 a16.as_ref(),
                 self.w.device_addr().unwrap(),
                 self.k,
@@ -261,7 +278,7 @@ impl Case {
             );
         } else {
             rec.matmul_native_f16a(
-                DType::Q8_0,
+                self.dtype,
                 a16.as_ref(),
                 self.w.device_addr().unwrap(),
                 self.k,

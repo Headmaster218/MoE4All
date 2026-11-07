@@ -79,6 +79,8 @@ pub(crate) struct SpinPool {
     /// (converted call sites are all reached from the single-threaded `execute` op loop).
     in_run: AtomicBool,
     private_idle: bool,
+    /// An explicitly isolated backend may not spill work into the process-global pool.
+    bounded_rayon: Option<rayon::ThreadPool>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -190,6 +192,27 @@ impl SpinPool {
         Self::new_sized_min_spin(cfg, n_threads, 256)
     }
 
+    pub(crate) fn new_bounded(
+        cfg: &CpuCfg,
+        n_threads: usize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        Self::new_bounded_min_spin(cfg, n_threads, 256)
+    }
+
+    pub(crate) fn new_bounded_min_spin(
+        cfg: &CpuCfg,
+        n_threads: usize,
+        min_spin: u32,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        let fallback = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_threads.max(1))
+            .thread_name(|i| format!("infr-cpu-fallback-{i}"))
+            .build()?;
+        let mut pool = Self::new_sized_min_spin(cfg, n_threads, min_spin);
+        pool.bounded_rayon = Some(fallback);
+        Ok(pool)
+    }
+
     pub(crate) fn new_sized_min_spin(cfg: &CpuCfg, n_threads: usize, min_spin: u32) -> Self {
         Self::new_sized_impl(cfg, n_threads, min_spin, false)
     }
@@ -240,6 +263,7 @@ impl SpinPool {
             spin_limit,
             in_run: AtomicBool::new(false),
             private_idle,
+            bounded_rayon: None,
         }
     }
 
@@ -282,7 +306,11 @@ impl SpinPool {
                 .is_err()
         {
             use rayon::prelude::*;
-            (0..n_tasks).into_par_iter().for_each(f);
+            if let Some(pool) = &self.bounded_rayon {
+                pool.install(|| (0..n_tasks).into_par_iter().for_each(f));
+            } else {
+                (0..n_tasks).into_par_iter().for_each(f);
+            }
             return;
         }
         let sh = &self.shared;
@@ -677,5 +705,34 @@ mod tests {
             hits[t].fetch_add(1, Ordering::Relaxed);
         });
         assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn bounded_cpu_capability_uses_its_own_thread_budget() {
+        for threads in [1, 2, 4] {
+            for spinpool in [true, false] {
+                let cfg = CpuCfg {
+                    spinpool,
+                    ..CpuCfg::default()
+                };
+                let pool = SpinPool::new_bounded(&cfg, threads).unwrap();
+                assert_eq!(pool.workers + 1, threads);
+                assert_eq!(
+                    pool.bounded_rayon.as_ref().unwrap().current_num_threads(),
+                    threads
+                );
+                let seen = std::sync::Mutex::new(std::collections::HashSet::new());
+                let hits = AtomicU64::new(0);
+                pool.run(128, &|_| {
+                    seen.lock().unwrap().insert(std::thread::current().id());
+                    if !spinpool && threads > 1 {
+                        assert_eq!(rayon::current_num_threads(), threads);
+                    }
+                    hits.fetch_add(1, Ordering::Relaxed);
+                });
+                assert_eq!(hits.load(Ordering::Relaxed), 128);
+                assert!(seen.into_inner().unwrap().len() <= threads);
+            }
+        }
     }
 }

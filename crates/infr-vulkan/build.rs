@@ -4185,6 +4185,11 @@ fn main() {
         ),
         (
             "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_ag_bm128",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
             "native_gemm_warp_q6k_sk_ag",
             &["-DFMT_Q6K", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
         ),
@@ -4312,9 +4317,9 @@ fn main() {
         // speed while keeping bf16's full exponent range. Replaces the old standalone
         // native_gemm_bf16cm.comp measurement kernel (retired: this variant subsumes it).
         // Default-off; correctness UNVALIDATED on this box (no bf16 coopmat hardware here —
-        // compile-checked only), pending an RDNA4 run. No A_GLOBAL variant: BF16CM substitutes the
-        // coopmat operand type INSIDE the A stage, so the A_GLOBAL twins above (f16 activations)
-        // do not apply to it.
+        // compile-checked only), pending an RDNA4 run. No A_GLOBAL variant of THIS one: the bf16
+        // A_GLOBAL twins above are the f16-clamp path (plain `-DFMT_BF16`), which is what the
+        // 7900 XTX actually dispatches; a BF16CM+AGLOBAL combination has no caller yet.
         (
             "native_gemm_warp",
             "native_gemm_warp_bf16cm",

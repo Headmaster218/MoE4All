@@ -1050,6 +1050,12 @@ pub enum Op {
         n: u32,
         scale: f32,
     },
+    /// Elementwise `dst[i] = max(x[i], 0)` over exactly `n` elements (any dense shape).
+    /// NaNs propagate; negative values, including negative zero, become positive zero.
+    /// Float inputs (F32/F16/BF16), F32 output. `n` must be positive; `x == dst` is legal.
+    /// CPU in-place writes reuse a TensorId; distinct external handles sharing storage are rejected.
+    /// Initially implemented by CPU only; callers select the backend above this IR.
+    Relu { x: TensorId, dst: TensorId, n: u32 },
     /// Elementwise tanh-approximation GELU used by the Qwen3-VL vision FFN and merger.
     Gelu {
         x: TensorId,
@@ -1374,6 +1380,25 @@ pub enum Op {
         /// takes, byte-identical to before this field existed.
         expert_ids: Option<TensorId>,
     },
+    /// Stateless depthwise 1-D cross-correlation, stride 1, with zero padding.
+    /// `x`/`dst` are `[rows, channels]`, `weight` is `[channels, kernel]`:
+    /// `dst[t,c] = sum_j x[t+j-pad_left,c] * weight[c,j]`, with out-of-range x zero.
+    /// All dimensions are positive and `pad_left + pad_right == kernel - 1`, preserving rows.
+    /// Left-only padding is causal; other splits may read future rows. No activation/history.
+    /// Float inputs/weights (F32/F16/BF16), F32 output. Reads finish before any write, so
+    /// `dst` may alias either operand when its descriptor also satisfies the output contract.
+    /// CPU in-place writes reuse a TensorId; distinct external handles sharing storage are rejected.
+    /// Initially implemented by CPU only; callers select the backend above this IR.
+    DepthwiseConv1d {
+        x: TensorId,
+        weight: TensorId,
+        dst: TensorId,
+        rows: u32,
+        channels: u32,
+        kernel: u32,
+        pad_left: u32,
+        pad_right: u32,
+    },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and
     /// leaving it updated after the last row. `x`/`dst` are `[rows, channels]`; `weight` is the
@@ -1528,6 +1553,7 @@ impl Op {
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::Silu { .. } => "Silu",
+            Op::Relu { .. } => "Relu",
             Op::Gelu { .. } => "Gelu",
             Op::QwenHcMix { .. } => "QwenHcMix",
             Op::QwenHcNorm { .. } => "QwenHcNorm",
@@ -1548,6 +1574,7 @@ impl Op {
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
+            Op::DepthwiseConv1d { .. } => "DepthwiseConv1d",
             Op::DeltaNet { .. } => "DeltaNet",
             Op::Kda { .. } => "Kda",
             Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
@@ -1575,6 +1602,93 @@ impl Op {
         smallvec::SmallVec<[TensorId; 3]>,
     ) {
         self.io_lists()
+    }
+
+    /// Validate the dense, stateless CPU primitives against their declared operands.
+    /// Older composite ops retain their backend-specific validation. This must run before
+    /// provisioning tensors: `TensorDesc::numel` itself does not check overflow.
+    pub fn validate(&self, graph: &Graph) -> crate::error::Result<()> {
+        use crate::error::Error;
+        use crate::tensor::DType;
+
+        let invalid = |msg: &str| Error::backend(format!("{}: invalid shape: {msg}", self.kind()));
+        let tensor = |id: TensorId| {
+            graph
+                .tensors
+                .get(id.0 as usize)
+                .ok_or_else(|| invalid("undeclared tensor handle"))
+        };
+        let numel = |desc: &TensorDesc| -> crate::error::Result<usize> {
+            let n = desc
+                .shape
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| invalid("element count overflow"))?;
+            if n == 0 || n.checked_mul(4).is_none_or(|b| b > isize::MAX as usize) {
+                return Err(invalid("empty tensor or F32 workspace byte count overflow"));
+            }
+            Ok(n)
+        };
+        let read = |id: TensorId| -> crate::error::Result<&TensorDesc> {
+            let desc = &tensor(id)?.desc;
+            if !matches!(desc.dtype, DType::F32 | DType::F16 | DType::Bf16) {
+                return Err(Error::Unsupported(format!(
+                    "{}: operands must be F32/F16/BF16",
+                    self.kind()
+                )));
+            }
+            numel(desc)?;
+            Ok(desc)
+        };
+        let write = |id: TensorId| -> crate::error::Result<&TensorDesc> {
+            let decl = tensor(id)?;
+            if decl.kind == TensorKind::Weight {
+                return Err(invalid("destination is a read-only Weight"));
+            }
+            if decl.desc.dtype != DType::F32 {
+                return Err(Error::Unsupported(format!(
+                    "{}: destination must be F32",
+                    self.kind()
+                )));
+            }
+            numel(&decl.desc)?;
+            Ok(&decl.desc)
+        };
+        match *self {
+            Op::Relu { x, dst, n } => {
+                if numel(read(x)?)? != n as usize || numel(write(dst)?)? != n as usize {
+                    return Err(invalid("x and dst must each contain exactly n elements"));
+                }
+            }
+            Op::DepthwiseConv1d {
+                x,
+                weight,
+                dst,
+                rows,
+                channels,
+                kernel,
+                pad_left,
+                pad_right,
+            } => {
+                if rows == 0 || channels == 0 || kernel == 0 {
+                    return Err(invalid("rows, channels and kernel must be positive"));
+                }
+                if pad_left.checked_add(pad_right) != Some(kernel - 1) {
+                    return Err(invalid(
+                        "pad_left + pad_right must equal kernel - 1 (without overflow)",
+                    ));
+                }
+                let shape = [rows as usize, channels as usize];
+                if read(x)?.shape.as_slice() != shape || write(dst)?.shape.as_slice() != shape {
+                    return Err(invalid("x and dst must be [rows, channels]"));
+                }
+                if read(weight)?.shape.as_slice() != [channels as usize, kernel as usize] {
+                    return Err(invalid("weight must be [channels, kernel]"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn io_lists<R, W>(&self) -> (R, W)
@@ -1825,6 +1939,7 @@ impl Op {
             Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
             Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
             Op::Silu { x, dst, .. } => (vec![x], vec![dst]),
+            Op::Relu { x, dst, .. } => (vec![x], vec![dst]),
             Op::Gelu { x, dst, .. } => (vec![x], vec![dst]),
             Op::QwenHcMix { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::QwenHcNorm { x, norm, dst, .. } => (vec![x, norm], vec![dst]),
@@ -1893,6 +2008,7 @@ impl Op {
                 r.extend(expert_ids);
                 (r, vec![dst])
             }
+            Op::DepthwiseConv1d { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
             Op::Conv1dSilu {
                 x,
                 weight,

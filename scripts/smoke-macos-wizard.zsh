@@ -40,12 +40,25 @@ mkdir -p -- "$root" "$home"
 make_engine "$root/infr" 1.0.2
 touch "$root/model.gguf" "$root/draft.gguf"
 
-output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
-    --root "$root" --dry-run --mode run --model model.gguf --profile aggressive --dev metal --ram 48GiB)
+output=$(
+    unset CONFIG_DIR STATE
+    HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
+        --root "$root" --dry-run --mode run --model model.gguf --profile aggressive --dev metal --ram 48GiB
+)
 assert_contains "$output" '--dev metal'
 assert_contains "$output" 'device.auto_profile=aggressive'
 assert_contains "$output" 'device.ram_budget=48GiB'
 assert_contains "$output" "$root/model.gguf"
+[[ ! -e "$root/gui-data" && ! -e "$home/Library/Application Support/MoE4All" ]] || fail 'Clean dry-run entry wrote configuration'
+legacy_entry_dir="$home/Library/Application Support/MoE4All"
+mkdir -p -- "$legacy_entry_dir"
+printf '{"setup_mode":"conservative"}\n' > "$legacy_entry_dir/wizard-state.json"
+entry_legacy_before=$(< "$legacy_entry_dir/wizard-state.json")
+output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
+    --root "$root" --yes --skip-update-check --mode run --model model.gguf --dev metal)
+assert_contains "$output" 'device.auto_profile=conservative'
+[[ -f "$root/gui-data/wizard-state.json" && $(< "$legacy_entry_dir/wizard-state.json") == "$entry_legacy_before" ]] || fail 'Real entry did not save package-local state while preserving legacy settings'
+rm -f -- "$root/gui-data/wizard-state.json"
 [[ $output != *kv.type_k=* && $output != *kv.type_v=* ]] || fail 'Automatic profile forced a KV format'
 for side in k v; do
     output=$(HOME="$home" /bin/zsh "$repo/Start-INFR-Wizard-macOS.sh" \
@@ -110,6 +123,26 @@ if version_valid 1.1.0-beta.1 || installed_version_valid '1.1.0-beta/1' || versi
 fi
 BINARY="$root/infr"
 ROOT="$root"
+CONFIG_DIR="$ROOT/gui-data"; STATE="$CONFIG_DIR/wizard-state.json"
+LEGACY_CONFIG_DIR="$home/Library/Application Support/MoE4All"; LEGACY_STATE="$LEGACY_CONFIG_DIR/wizard-state.json"
+
+# Library fixtures initialize the same locations as main. Legacy state stays read-only.
+mkdir -p -- "$LEGACY_CONFIG_DIR"
+printf '{"model":"legacy-model.gguf","setup_mode":"aggressive"}\n' > "$LEGACY_STATE"
+defaults; load_state
+[[ ${S[model]} == legacy-model.gguf && ${S[setup_mode]} == aggressive && ! -e $STATE ]] || fail 'Legacy JSON fallback did not remain read-only'
+legacy_before=$(< "$LEGACY_STATE")
+save_state
+[[ -f $STATE && $(< "$LEGACY_STATE") == "$legacy_before" ]] || fail 'Package-local migration changed the legacy file'
+printf '{"model":"package-model.gguf","setup_mode":"conservative"}\n' > "$STATE"
+defaults; load_state
+[[ ${S[model]} == package-model.gguf && ${S[setup_mode]} == conservative ]] || fail 'Package-local state did not take precedence'
+rm -f -- "$STATE"
+mv -- "$LEGACY_STATE" "$work/legacy-state-fixture.json"
+printf 'MODE=server\nMODEL=legacy-conf.gguf\n' > "$LEGACY_CONFIG_DIR/wizard.conf"
+defaults; load_state
+[[ ${S[launch_mode]} == serve && ${S[model]} == legacy-conf.gguf ]] || fail 'Legacy wizard.conf fallback failed'
+rm -f -- "$LEGACY_CONFIG_DIR/wizard.conf"
 
 for profile in conservative aggressive; do
     for mode in run serve bench; do
@@ -236,7 +269,7 @@ extract_package "$old_out/MoE4All-macOS-arm64-v1.0.1.tar.gz" "$install" 1.0.1
 stage="$work/stage"
 extract_package "$new_out/MoE4All-macOS-arm64-v1.0.2.tar.gz" "$stage" 1.0.2
 ROOT=$install
-CONFIG_DIR="$home/Library/Application Support/MoE4All"
+CONFIG_DIR="$install/gui-data"
 STATE="$CONFIG_DIR/wizard-state.json"
 apply_update "$install" "$stage" 1.0.2
 [[ $("$install/infr" --version) == 'infr 1.0.2' ]] || fail 'Updater did not install the new engine'

@@ -15,10 +15,11 @@
 // representable in f32 (24-bit mantissa holds d up to 2^-14..2^15 times 7-bit ints exactly); bf16
 // and f16 widen exactly as the f32 kernels' own loads would. The f32 GEMV accumulates f32 x f32
 // exactly as it does for a model that ships these tensors in F32 (Qwen3.8-Flash-Next UD does).
+//
+// The base byte address may belong to a resident tensor or a streamed arena slot
+// (native_weight_addr.glsl); `w_off` is the op's within-slot ELEMENT offset (0 for every caller —
+// these tensors are never fused slices).
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-
-// arena_lo/arena_hi carry the weight's base BYTE address (native_weight_addr.glsl); `w_off` is the
-// op's within-slot ELEMENT offset (0 for every caller — these tensors are never fused slices).
 layout(push_constant) uniform PC { uint n; uint w_off; uint arena_lo; uint arena_hi; } pc;
 layout(binding = 1) writeonly buffer DB { float dst[]; };
 
