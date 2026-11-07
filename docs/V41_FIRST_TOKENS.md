@@ -173,3 +173,26 @@ push constant 拷贝、barrier 判定等宿主侧成本）。
 
 这与 poorseek 的结论同族 —— 那边是「每次 launch 都等上一次」的闸门占 40%，
 这边是 dispatch 数量本身。**两条线都是调度级问题，不是算力。**
+
+## 第四个排除项：显式扩大专家缓存也没用（2026-11-08 00:05）
+
+```
+--set paging.cache=22GiB  ->  expert_cache_target=10.23 GiB, arena 21.66 GiB
+                           ->  decode 6.6 t/s   （与默认相同）
+```
+
+VRAM 总共只有 **27.65 GiB**（`total_room`），其中 fixed 6.06 + state 0.07 +
+runtime_elastic 11.05 已经占掉，专家最多拿 ~21.7 GiB。
+**123 GiB 专家里最多 18% 能同时驻留** —— 这是硬件上限，不是配置能调的。
+
+## 结论：6.5 t/s 的成因
+
+每 token 约 240 次专家访问（6 专家 × 40 层），其中约 82% 必须从 host RAM 经 PCIe 搬到 VRAM。
+175.7 ms/token 里绝大部分是这次搬运的等待，不是计算，也不是 dispatch。
+
+| 已排除 | 证据 |
+|---|---|
+| 专家缓存太小 | 多给 10 GiB → 无改善；显式 22GiB → 无改善 |
+| 提交批次太碎 | 512 vs 64 → 噪声内 |
+| dispatch 数量太多 | 每 forward 仅 ~69 次，设备时间 0.2–4.8 ms |
+| 图构建开销 | setup 仅 0.073 ms/token |
