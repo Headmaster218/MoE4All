@@ -136,3 +136,17 @@ expert_cache_target=10.16 GiB  elastic_pool=21.21 GiB (k=Q8_0, v=Q8_0)
 2. **批量预填充**：`batched_prefill_ok` 的 `!is_dsv4_family(c)` 让 V4.1 一次只预填充一个 token，
    这是 prefill 7 t/s 的直接原因，也是与 poorseek 1063 t/s 差距最大之处。
 3. `moe_batched_ok` 的全有或全无判定（40 层只有 1 层满足 MMQ）。
+
+## 排除的两个假设（2026-11-07 23:30）
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| 专家缓存太小 | `--ctx 8192` 多腾 10 GiB 给专家缓存 | 6.6 → **6.4 t/s**（无改善，略降） |
+| 提交拆分太碎 | `--set device.submit_dispatches=512`（默认 64） | 6.4 → **6.6 t/s**（噪声内） |
+
+**两个都排除。** 所以不是缓存命中率，也不是 submit 批次大小，
+而是**每 token 约 1.8 万次 dispatch 的固有开销**（每次约 8.7 us，含 desciptor 绑定、
+push constant 拷贝、barrier 判定等宿主侧成本）。
+
+这与 poorseek 的结论同族 —— 那边是「每次 launch 都等上一次」的闸门占 40%，
+这边是 dispatch 数量本身。**两条线都是调度级问题，不是算力。**
