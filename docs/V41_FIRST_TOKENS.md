@@ -406,22 +406,35 @@ layer=2 calls=6 wall=27.630ms paging_sync=25.616ms record=3.896ms
 ```
 **每层 wall 的 92% 是 paging_sync，record 只占 12%。**
 
-### 根因
+### 根因（已修正到准确的那一处）
 
-`Pager::ensure_resident` 的 miss 分支（`crates/infr-vulkan/src/pager.rs:1229-1246`）：
+我最初怀疑的是 `Pager::ensure_resident` 的 `copy_into_slot(...)` —— 那确实是 `vk.one_shot`，
+**但它只是 parity 测试用的接口**（pager.rs:27 的模块注释写明）。
+
+生产路径上真正记这笔账的是 **`crates/infr-vulkan/src/adapter.rs:17890`**，
+在 `PagedStream` 的段收尾函数里，`record_paging_sync_wait(elapsed)` 包住的是**整段同步**：
 
 ```rust
-Resolution::Miss { slot, evicted } => {
-    vk.upload(staging, bytes)?;                 // 上传
-    copy_into_slot(vk, staging, arena, ...)?;   // <-- 同步 one-shot
-}
+pending.wait()?;                 // 等 GPU 完成
+...
+ps.drain()?;                     // 释放已 signal 的 fence 对象
+ps.wait_cpu_promotion(be_)?;     // 等 CPU promotion
+clear_frozen_moe_lut_slots(...)?;
+ps.acquire_cpu_promotion(&fresh);
 ```
 
-`copy_into_slot` 内部是 `vk.one_shot(...)` —— **一次独立提交并阻塞等待完成**。
-240 次串行 one-shot × 3.1 ms = 743 ms/token。
+**每个 segment 都把整条队列排干**，然后才开下一个 recorder。40 层，每层多次。
 
-`dma_busy=0.000ms` 说明这些拷贝走的是普通队列而非专用 DMA 队列，
-**每一个都单独提交、单独等待**，完全没有批量或被后续计算重叠。
+### 已验证：`fence_wait` 不是那个开关
+
+`decode_gpu_resident_fence_wait=false` 只跳过第一段 `pending.wait()`，
+后面 `drain()` + `wait_cpu_promotion()` 仍然无条件执行。
+实测：**6.4 t/s，与默认完全相同**，`paging_sync` 仍是每层 ~69 ms（wall 76.5 ms 的 91%）。
+
+所以真正的解不是关开关，而是**让这些 segment 不必排干**：
+- `drain()` 是为了尽快释放 transient 对象，可以延后
+- `wait_cpu_promotion()` 理论上能与后续层的计算重叠
+这是架构级改动，需要小心处理 fence 生命周期与 LUT 冻结窗口。
 
 ### 这解释了此前所有的"排除"
 
