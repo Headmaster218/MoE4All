@@ -4172,16 +4172,34 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // intentionally deferred until fixed Vulkan allocations have landed and Windows can
         // report the real remaining WDDM/system commit headroom.
         const HOST_CHUNK_MAX: usize = 2 * 1024 * 1024 * 1024;
+        // Chunks split only at complete layer boundaries, so the cap must admit a whole layer —
+        // otherwise a layer larger than the cap can never be chunked at all and the pager refuses
+        // it outright ("layer N crosses permanent host-store chunks"). DeepSeek V4.1's 384
+        // experts x 2304 x 5120 at IQ1_M is ~2.77 GiB per layer, past the 2 GiB default; the cap
+        // is a "avoid one enormous host allocation" heuristic, not a hardware limit, so raising it
+        // to one whole layer preserves the intent (no split inside a Prefill layer push) while
+        // letting the architecture run. Scoped to V4.1 so every other arch keeps the 2 GiB cap
+        // byte-for-byte.
+        let host_chunk_max = if cfg.deepseek41 {
+            let largest_layer = host_layers
+                .iter()
+                .map(|&(start, end)| end - start)
+                .max()
+                .unwrap_or(0);
+            HOST_CHUNK_MAX.max(largest_layer)
+        } else {
+            HOST_CHUNK_MAX
+        };
         let oversized_host_layer = host_layers
             .iter()
             .map(|&(start, end)| end - start)
-            .find(|&bytes| bytes > HOST_CHUNK_MAX);
+            .find(|&bytes| bytes > host_chunk_max);
         let host_chunks: Vec<infr_vulkan::pager::MoeHostChunkSpec> =
             if oversized_host_layer.is_none() {
                 let mut chunk_ranges = Vec::<(usize, usize)>::new();
                 for &(start, end) in &host_layers {
                     match chunk_ranges.last_mut() {
-                        Some((chunk_start, chunk_end)) if end - *chunk_start <= HOST_CHUNK_MAX => {
+                        Some((chunk_start, chunk_end)) if end - *chunk_start <= host_chunk_max => {
                             *chunk_end = end;
                         }
                         _ => chunk_ranges.push((start, end)),
