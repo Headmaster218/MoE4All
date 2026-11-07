@@ -974,6 +974,27 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
                 g::native_gemm_mmq_iq4_xs_xpg32_spv(),
             ),
         },
+        // IQ1_M: nbn = 256/32 = 8 activation blocks per 256-value superblock.
+        D::Iq1M => MoeMmqDesc {
+            resident_nb: 8,
+            xp: (
+                "native_gemm_mmq_iq1_m_xp",
+                g::native_gemm_mmq_iq1_m_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq1_m_xp32",
+                g::native_gemm_mmq_iq1_m_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq1_m_xpg",
+                g::native_gemm_mmq_iq1_m_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq1_m_xpg32",
+                g::native_gemm_mmq_iq1_m_xpg32_spv(),
+            ),
+        },
         D::Iq2S => MoeMmqDesc {
             resident_nb: 6,
             xp: (

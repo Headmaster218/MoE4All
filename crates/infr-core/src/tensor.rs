@@ -184,6 +184,10 @@ pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Iq4Xs,
     DType::Iq2S,
     DType::Iq2Xs,
+    // IQ1_M: added once native_gemm_mmq_iq1_m landed the per-8-element sign-keyed delta
+    // correction (two dp4a accumulators per 32-block, four self-computed per-l activation sums).
+    // DeepSeek-V4.1 ships 28 of its 40 ffn_down_exps blocks in this format.
+    DType::Iq1M,
     DType::Iq3S,
     DType::Iq3Xxs,
     DType::Mxfp4,

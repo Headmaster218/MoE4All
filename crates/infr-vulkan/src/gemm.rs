@@ -1278,6 +1278,25 @@ macro_rules! iq_xs_mmq_spv {
     };
 }
 
+// IQ1_M (DeepSeek-V4.1's dominant ffn_down_exps format). Four variants mirroring IQ2_S's pair;
+// see the shader header for the per-8-element sign-keyed delta correction that makes dp4a legal.
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq1_m_xp_spv,
+    "native_gemm_mmq_iq1_m_xp"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq1_m_xp32_spv,
+    "native_gemm_mmq_iq1_m_xp32"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq1_m_xpg_spv,
+    "native_gemm_mmq_iq1_m_xpg"
+);
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq1_m_xpg32_spv,
+    "native_gemm_mmq_iq1_m_xpg32"
+);
+
 iq_xs_mmq_spv!(native_gemm_mmq_iq2_xs_xp_spv, "native_gemm_mmq_iq2_xs_xp");
 iq_xs_mmq_spv!(
     native_gemm_mmq_iq2_xs_xp32_spv,

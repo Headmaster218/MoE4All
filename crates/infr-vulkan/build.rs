@@ -3600,6 +3600,29 @@ fn main() {
             "native_gemm_mmq_q2_0_xp",
             &["-DEXPERT_GRID"],
         ),
+        // IQ1_M — DeepSeek-V4.1's dominant ffn_down_exps format (28 of 40 blocks). Needs the
+        // per-8-element sign-keyed delta correction (see the shader's header); four variants
+        // mirror IQ2_S's pair so the resident/paged expert caches can both use it.
+        (
+            "native_gemm_mmq_iq1_m",
+            "native_gemm_mmq_iq1_m_xp",
+            &["-DEXPERT_GRID", "-DFMT_IQ1M", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq1_m",
+            "native_gemm_mmq_iq1_m_xp32",
+            &["-DEXPERT_GRID", "-DFMT_IQ1M", "-DUSE_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq1_m",
+            "native_gemm_mmq_iq1_m_xpg",
+            &["-DEXPERT_GRID", "-DPAGED", "-DFMT_IQ1M", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq1_m",
+            "native_gemm_mmq_iq1_m_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DFMT_IQ1M", "-DUSE_GRID", "-DBM_TILE=32u"],
+        ),
         // IQ2_S (gate/up) / IQ3_S (down) — the Qwen3.6-35B-A3B-UD-IQ3_S expert pair.
         (
             "native_gemm_mmq_iq2_s",

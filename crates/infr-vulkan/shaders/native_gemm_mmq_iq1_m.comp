@@ -1,0 +1,262 @@
+#version 460
+// Batched expert-grid dp4a GEMM for IQ1_M expert banks.
+//
+// WHY THIS KERNEL EXISTS. DeepSeek-V4.1 ships ffn_down_exps as IQ1_M in 28 of its 40 blocks, and
+// IQ1_M was deliberately held out of MOE_MMQ_DTYPES because it is "min-carrying" in the worst
+// form: EVERY 8-element sub-block carries its own SIGNED +/-0.125 delta, so
+//   sum (grid + delta) * x
+// cannot collapse into `scale * sact` the way Q4_K/Q5_K's one-per-32 min term does.
+//
+// native_gemm_mmq_q2_k hit the same class of problem for its per-16 min and solved it by
+// SELF-COMPUTING the activation sum from the already-staged int8 codes instead of reading the
+// shared `sact` buffer. This kernel follows that precedent one step finer: IQ1_M needs FOUR
+// per-8-element partial sums per 32-element activation block (one per `l`), because each `l` has
+// its own delta sign.
+//
+// BLOCK LAYOUT (56 bytes / 256 values), ground-truthed against infr-gguf dequant.rs's Iq1M arm
+// (itself a port of llama.cpp's dequantize_row_iq1_m):
+//   [u8 qs[32]][u8 qh[16]][u16 scales[4]]
+//   d = f16 assembled from the HIGH nibbles of the four scale u16s:
+//       bits = (sc0>>12) | ((sc1>>8)&0x00f0) | ((sc2>>4)&0x0f00) | (sc3&0xf000)
+//   For sub-block ib in 0..8 (one 32-value activation block each):
+//     dl1 = d * (2*((sc[ib/2] >> (6*(ib%2)))     & 7) + 1)
+//     dl2 = d * (2*((sc[ib/2] >> (6*(ib%2) + 3)) & 7) + 1)
+//   and within that sub-block, for l in 0..4 (each 8 values, qs byte = 4*ib + l):
+//     idx[l]   = qs[4*ib+l] | (((qh0|qh1) << n) & 0x700)
+//     delta[l] = +/-0.125, the sign taken from bit 0x08 (l = 0,2) or 0x80 (l = 1,3) of qh
+//     dl[l]    = l < 2 ? dl1 : dl2
+//
+// THE DOT. For one 32-element activation block with per-l sums S_l = sum_j x_j over that l's own
+// eight elements:
+//   sum_j y_j x_j = dl1 * ( D_01 + d0*S_0 + d1*S_1 ) + dl2 * ( D_23 + d2*S_2 + d3*S_3 )
+// where D_lm is the dp4a dot of that l's grid int8 values with the staged activation codes and
+// d_l is the signed delta. The grid words are already signed int8, exactly like IQ4_NL's codebook
+// operand, so they feed dp4a unchanged; the four S_l come from the SAME staged `As` words with
+// four sign-extending adds each. No `sact` binding, no extra global read.
+//
+// Requires n%64, k%32.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef BM_TILE
+#define BM_TILE 64u
+#endif
+const uint BM = BM_TILE;
+const uint BN = 64u;
+const uint BLK = 32u;      // IQ1_M sub-block == one 32-value activation block
+const uint WPB = BLK / 4u; // 8 packed-int8 u32 words per 32-block
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN);
+const uint SP = WPB + 1u;
+const uint IQ1M_BLOCK_BYTES = 56u;
+const float IQ1M_DELTA = 0.125;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+#include "native_grids.glsl"
+
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#elif defined(STREAMED)
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
+
+layout(binding = 0) readonly buffer QA { uint qa[]; };
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };
+#if !defined(PAGED) && !defined(STREAMED)
+layout(binding = 2) readonly buffer WB { uint nw[]; };
+#endif
+#ifdef PAGED
+layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };
+#elif defined(EXPERT_GRID)
+layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };
+#else
+layout(binding = 3) writeonly buffer CB { float c[]; };
+#endif
+
+shared uint As[BM * SP];
+shared uint Bs[BN * SP];
+shared float Bdl1[BN];
+shared float Bdl2[BN];
+// One packed nibble per column: bit 2*l set means that l's delta is NEGATIVE.
+shared uint Bneg[BN];
+
+#if defined(PAGED) || defined(STREAMED)
+#include "native_weight_addr.glsl"
+uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+#else
+uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#endif
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+int sgn8(uint b) { return int(b << 24u) >> 24; }
+
+void main() {
+    grid_init(); // stages G_IQ1S into shared; has a barrier, so it must precede any return
+#ifdef STREAMED
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+#endif
+    uint nsub = pc.k / BLK;   // 32-element sub-blocks along k
+    uint nblk32 = pc.k / 32u; // activation 32-blocks along k (dact index)
+    uint kw = pc.k / 4u;
+    uint tilesN = pc.n / BN;
+#ifdef EXPERT_GRID
+    uint ex = gl_WorkGroupID.y;
+    uint cnt = counts[ex];
+    if ((gl_WorkGroupID.x / tilesN) * BM >= cnt) { return; }
+    uint wgRow = offsets[ex] + (gl_WorkGroupID.x / tilesN) * BM;
+    uint rowEnd = offsets[ex] + cnt;
+#ifdef PAGED
+    w_addr = arena_base(lut[pc.w_base + ex].x, lut[pc.w_base + ex].y);
+    uint wbase = 0u;
+#elif defined(STREAMED)
+    w_addr += uint64_t(ex) * uint64_t(pc.m);
+    uint wbase = pc.w_base;
+#else
+    uint wbase = pc.w_base + ex * pc.m;
+#endif
+#else
+    uint wgRow = gl_WorkGroupID.x / tilesN * BM;
+    uint wbase = pc.w_base;
+#endif
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN);
+    uint tc = li % (BN / TN);
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint sub = 0u; sub < nsub; sub++) {
+        // stage activations: BM rows x WPB packed words
+        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
+            uint r = idx / WPB;
+            uint p = idx % WPB;
+            As[r * SP + p] = qa[(wgRow + r) * kw + sub * WPB + p];
+        }
+        // per-column: the two scales for this 32-block and the 4-bit delta sign nibble.
+        for (uint cc = li; cc < BN; cc += THREADS) {
+            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
+            uint bd = (gstart / 256u) * IQ1M_BLOCK_BYTES;
+            uint sc0 = ru16(bd + 48u), sc1 = ru16(bd + 50u);
+            uint sc2 = ru16(bd + 52u), sc3 = ru16(bd + 54u);
+            uint d_bits = (sc0 >> 12u) | ((sc1 >> 8u) & 0x00f0u)
+                        | ((sc2 >> 4u) & 0x0f00u) | (sc3 & 0xf000u);
+            float d = f16tof32(d_bits);
+            // ib is the sub-block index within the 256-value superblock (8 of them).
+            uint ib = (gstart >> 5u) & 7u;
+            uint pair = ib >> 1u;
+            uint sh = 6u * (ib & 1u);
+            uint scl = (pair == 0u) ? sc0 : ((pair == 1u) ? sc1 : ((pair == 2u) ? sc2 : sc3));
+            Bdl1[cc] = d * (2.0 * float((scl >> sh) & 7u) + 1.0);
+            Bdl2[cc] = d * (2.0 * float((scl >> (sh + 3u)) & 7u) + 1.0);
+            // qh0/qh1 for this sub-block carry the four delta signs of its four l's.
+            uint qh0 = rb(bd + 32u + 2u * ib);
+            uint qh1 = rb(bd + 33u + 2u * ib);
+            uint neg = 0u;
+            if ((qh0 & 0x08u) != 0u) { neg |= 1u; }  // l = 0
+            if ((qh0 & 0x80u) != 0u) { neg |= 2u; }  // l = 1
+            if ((qh1 & 0x08u) != 0u) { neg |= 4u; }  // l = 2
+            if ((qh1 & 0x80u) != 0u) { neg |= 8u; }  // l = 3
+            Bneg[cc] = neg;
+        }
+        // stage weights as four signed-int8 lanes per word, gathered from the IQ1S grid.
+        // Word p covers l = 2p/... : each l is 8 values = 2 words, so word p belongs to l = p/2
+        // and covers values 4*(p%2) .. 4*(p%2)+3 of that l.
+        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
+            uint cc = idx / WPB;
+            uint p = idx % WPB;
+            uint l = p >> 1u;
+            uint wh = p & 1u;
+            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
+            uint bd = (gstart / 256u) * IQ1M_BLOCK_BYTES;
+            uint ib = (gstart >> 5u) & 7u;
+            uint qh0 = rb(bd + 32u + 2u * ib);
+            uint qh1 = rb(bd + 33u + 2u * ib);
+            uint qbyte = rb(bd + 4u * ib + l);
+            uint idxg;
+            if (l == 0u)      { idxg = qbyte | ((qh0 << 8u) & 0x700u); }
+            else if (l == 1u) { idxg = qbyte | ((qh0 << 4u) & 0x700u); }
+            else if (l == 2u) { idxg = qbyte | ((qh1 << 8u) & 0x700u); }
+            else              { idxg = qbyte | ((qh1 << 4u) & 0x700u); }
+            uint gw = (wh == 0u) ? G_IQ1S[2u * idxg] : G_IQ1S[2u * idxg + 1u];
+            Bs[cc * SP + p] = gw;
+        }
+        barrier();
+
+        // TWO accumulator sets, not one: l = 0,1 are scaled by dl1 and l = 2,3 by dl2, so their
+        // grid dots must not be summed into a single scalar before the scale is applied.
+        int q_lo[TM][TN]; // l = 0,1  (dl1)
+        int q_hi[TM][TN]; // l = 2,3  (dl2)
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+            [[unroll]] for (uint j = 0u; j < TN; j++) { q_lo[i][j] = 0; q_hi[i][j] = 0; }
+        // Per-l activation sums S_l over the SAME staged As words the dp4a above reads: word p
+        // belongs to l = p/2, so words 0,1 -> S_0; 2,3 -> S_1; 4,5 -> S_2; 6,7 -> S_3.
+        int xl[TM][4];
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+            [[unroll]] for (uint k2 = 0u; k2 < 4u; k2++) xl[i][k2] = 0;
+        [[unroll]] for (uint p = 0u; p < WPB; p++) {
+            int av[TM];
+            int bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++) {
+                    if ((p >> 1u) < 2u) {
+                        q_lo[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], q_lo[i][j]);
+                    } else {
+                        q_hi[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], q_hi[i][j]);
+                    }
+                };
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                uint w = uint(av[i]);
+                xl[i][p >> 1u] += sgn8(w & 0xFFu) + sgn8((w >> 8u) & 0xFFu)
+                                + sgn8((w >> 16u) & 0xFFu) + sgn8((w >> 24u) & 0xFFu);
+            }
+        }
+
+        float dval[TM];
+        [[unroll]] for (uint i = 0u; i < TM; i++) dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + sub]);
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            uint neg = Bneg[tc * TN + j];
+            float dl1 = Bdl1[tc * TN + j];
+            float dl2 = Bdl2[tc * TN + j];
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                float s0 = float(xl[i][0]) * ((neg & 1u) != 0u ? -IQ1M_DELTA : IQ1M_DELTA);
+                float s1 = float(xl[i][1]) * ((neg & 2u) != 0u ? -IQ1M_DELTA : IQ1M_DELTA);
+                float s2 = float(xl[i][2]) * ((neg & 4u) != 0u ? -IQ1M_DELTA : IQ1M_DELTA);
+                float s3 = float(xl[i][3]) * ((neg & 8u) != 0u ? -IQ1M_DELTA : IQ1M_DELTA);
+                acc[i][j] += dval[i] * (dl1 * (float(q_lo[i][j]) + s0 + s1)
+                                      + dl2 * (float(q_hi[i][j]) + s2 + s3));
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        uint rr = wgRow + tr * TM + i;
+#ifdef EXPERT_GRID
+        if (rr >= rowEnd) { continue; }
+#endif
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
+        }
+    }
+}
