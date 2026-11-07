@@ -577,20 +577,61 @@ argmax_part            3436.5 us   <- 扫 129280 个 f32
 因此**修 argmax shader 不会有收益**（它本来就不慢），这条线索到此为止。
 真正的账仍然是：40 层 wall 814 ms，其中 paging_sync 约占 80%。
 
-### 补：`argmax_part` 的 3 ms 也不是计算（Round 5 收尾）
+---
 
-同一次 forward 内的对比（`INFR_PROF_OPS`）：
+## Round 6：decode 的天花板与地板都量出来了，方向需要重新评估（2026-11-08 04:33）
+
+### 本源代码结构（此前没看全的部分）
+
+`adapter.rs:19064`：
+
+```rust
+let touch_all   = rows * n_used >= 3 * n_expert;      // 整层常驻
+let layer_stream = touch_all && cfg.paging.moe_layer_stream;  // 整层一次性 staging
+```
+
+`paging.moe_layer_stream` **默认 true**（config/mod.rs:242），所以瓶颈不在这个开关，
+而在 `touch_all`：decode 时 `rows=1`、`n_used≈8`、`n_expert=384`，
+`8 >= 1152` 永远不成立 → **decode 天然用不上整层 streaming，只能逐专家 LRU + 每层 sync**。
+
+这解释了为什么 Round 4 的 `submit_layers` 四档（0/8/16/40）完全无差别。
+
+### 专家 GEMM 的真实速度（关键新数据）
+
+单次 `native_idm_*` 的**真速度是 6–27 μs**（看 forward 尾部那些已经被喂饱的层）：
 
 ```
-native_idm_iq1m_paged   285.2 us   <- 真正的专家 GEMM（256 专家的矩阵乘）
-argmax_part            3436.5 us   <- 扫 129280 个 f32
+native_idm_iq2xs_paged   27.8 us   6.4 us   131.4 us
+native_idm_iq1m_paged     6.7 us   6.5 us     6.4 us
 ```
 
-**词表扫描比矩阵乘慢 12 倍**，不可能是计算量的问题——256 个 workgroup × 256 线程
-扫 505 KiB 在 Arc B70 上应该是微秒级。
+汇总里 133 μs 的平均值**是被排队等待拉高的**，不是 kernel 慢。
 
-结论：这 3 ms 是**排队等待**，argmax 排在一整层专家 GEMM 之后，
-设备时间戳把等待前面的活也算了进去。和 `paging_sync` 是同一现象的另一面。
+按真速度折算：40 层 × 3 次 × 6–50 μs = **0.7–6.0 ms/token**，
+而一个 decode token 实测 **155.3 ms**。**GEMM 连 5% 都不到。**
 
-**因此修 argmax shader 不会有收益**（它本身不慢），这条线索到此为止。
-真正的账仍然是：40 层 wall 814 ms，其中 paging_sync 约占 80%。
+### 诚实的结论
+
+到此为止，六轮测量把 decode 的时间**从头到尾翻了一遍**：
+
+| 项 | 量级 | 是否瓶颈 |
+|---|---|---|
+| 专家 GEMM 本身 | 0.7–6 ms/token | ❌ |
+| argmax / 采样 | ~20 ms/token | ❌ |
+| 图构建 | 0.07 ms/token | ❌ |
+| dispatch 数量 | 69 次/forward | ❌ |
+| 专家命中率 | 0.65→0.74 无变化 | ❌ |
+| 回放磁带 | 无变化 | ❌ |
+| submit 批次 | 四档无变化 | ❌ |
+| **paging_sync（每层一次）** | **124 ms/token** | ✅ **唯一剩下的** |
+
+而这些 sync 的结构性成因（`touch_all` 不可达 + 每层必须有 miss）是**设计使然，不是 bug**。
+在 27.6 GiB 显存跑 123 GiB 专家这个前提下，它可能是**固有的**。
+
+### 下一轮该问的问题（而不是继续试参数）
+
+1. **poorseek 是不是也在做同样的事？** 它跑的是 "V4.1-XXS"——**XXS 是更小的模型**，
+   参数量可能小一个数量级，专家能**全部常驻**，于是完全不触发这条 paged 路径。
+   如果是这样，**这个对比从一开始就不是同类比较**，需要先确认 poorseek 的模型规格与显存占用。
+2. 若模型确实同级：需要在 `adapter.rs` 里做出**跨层 pipeline**
+   （层 n 的 sync 与层 n+1 的计算重叠），这是真正的架构改动，不是开关。
