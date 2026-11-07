@@ -1594,6 +1594,55 @@ mod tests {
         assert!(engram_map_for_layer(&cfg, 0).is_none());
     }
 
+    #[test]
+    #[ignore = "needs both the real model header and the 202 GB table"]
+    fn the_real_chain_from_token_ids_to_embedding_rows() {
+        // The whole host half, end to end: real Config hash arrays -> row_indices -> real table
+        // gather. This is the exact sequence the seam will run per token, so a stride, dim-order
+        // or off-by-one anywhere in it shows up here as NaN, an out-of-range row, or a
+        // non-order-1 magnitude.
+        let (Some(shard1), Some(table)) = (
+            std::env::var("INFR_DSV41_SHARD1").ok().map(PathBuf::from),
+            std::env::var("INFR_ENGRAM_TABLE").ok().map(PathBuf::from),
+        ) else {
+            eprintln!("set INFR_DSV41_SHARD1 and INFR_ENGRAM_TABLE");
+            return;
+        };
+        if !shard1.exists() || !table.exists() {
+            eprintln!("inputs missing — skipping");
+            return;
+        }
+        let g = infr_gguf::Gguf::open(&shard1).expect("shard 1");
+        let cfg = crate::Config::from_gguf(&g).expect("config");
+        let t = EngramTable::open(&table).expect("table");
+
+        for &layer in &[1u32, 14] {
+            let m = engram_map_for_layer(&cfg, layer).unwrap().unwrap();
+            // Two windows: a normal one, and one at the start of a sequence (all pad).
+            for (current, prev) in [(1234u32, [11i32, 22, 33]), (7, [-1, -1, -1])] {
+                let rows = m.row_indices(current, &prev);
+                assert_eq!(rows.len(), 24);
+                let emb = t
+                    .gather_rows(layer, &rows)
+                    .unwrap_or_else(|e| panic!("layer {layer} gather: {e}"));
+                assert_eq!(emb.len(), 24 * cfg.engram_key_length);
+                let finite = emb.iter().all(|v| v.is_finite());
+                let max_abs = emb.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let rms = (emb.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                    / emb.len() as f64)
+                    .sqrt();
+                eprintln!(
+                    "layer {layer} window {current}: {}x{} finite={finite} max|x|={max_abs} rms={rms}",
+                    24,
+                    cfg.engram_key_length
+                );
+                assert!(finite, "layer {layer}: non-finite value in a real embedding");
+                assert!(max_abs > 1e-6 && max_abs < 1e6, "layer {layer}: max|x| {max_abs}");
+                assert!(rms > 0.01 && rms < 100.0, "layer {layer}: rms {rms} is not order-1");
+            }
+        }
+    }
+
     // ── real file (opt-in) ──────────────────────────────────────────────────
     //
     //   INFR_ENGRAM_TABLE=/home/dyy/engram-mxfp8/engram-mxfp8.gguf \
