@@ -259,23 +259,65 @@ pub(super) struct Dsv4W {
 
 /// One DeepSeek V4 softmax-pooling compressor. Ratio-4 layers own two of these (attention CSA and
 /// LID); ratio-128 layers own only the attention HCA compressor.
+///
+/// `wgate` and `ape` are `Option` because DeepSeek V4.1 carries neither on every source:
+/// - V4.1 ships **no `attn_compressor_ape` tensor at all** (zero occurrences in the real file's
+///   1008-tensor inventory), so `ape` is `None` on every V4.1 compressor and `Some` on every V4 one.
+/// - V4.1 layer 20 is its only *source* whose ratio is 1, so it pools exactly one token per row and
+///   has nothing to gate — the file carries no `attn_compressor_gate` there. That is **correct, not
+///   corruption**: with the score ring receiving the values themselves, softmax over one element is
+///   exactly 1.0 and the unweighted projection is exact. The local `{0,1,2}` reference encodes the
+///   same invariant as a config-time check ("a compressor with no gate only makes sense where there
+///   is nothing to pool").
 pub(super) struct Dsv4CompressorW {
     pub(super) wkv: TensorId,
-    pub(super) wgate: TensorId,
-    pub(super) ape: TensorId,
+    pub(super) wgate: Option<TensorId>,
+    pub(super) ape: Option<TensorId>,
     pub(super) norm: TensorId,
 }
 
-/// Ratio-4-only lightning indexer weights and its independent compressor.
+/// DeepSeek V4's lightning indexer weights (ratio-4 layers and their independent LID compressor),
+/// and DeepSeek V4.1's split into two roles that need not be the same layer.
+///
+/// In V4 every indexer tensor lives on the same ratio-4 layer, so `proj`/`q_b` and the LID
+/// compressor are all `Some`. V4.1 separates the roles across a **source/reuse** topology (see
+/// `Config::dsv41_kv_source`):
+/// - the eight **top-k sources** {2,8,14,20,24,28,32,36} carry `indexer.proj` + `indexer.attn_q_b`
+///   and score queries against the shared index-key stream;
+/// - the four **index-key owners** {2,8,14,20} additionally carry `indexer.attn_k` +
+///   `indexer.k_norm`, which produce that stream from the compressor's pre-rope latent;
+/// - **no** V4.1 layer carries `indexer_compressor_*`, so `compressor` is `None` throughout.
 pub(super) struct Dsv4IndexerW {
-    pub(super) proj: TensorId,
-    pub(super) q_b: TensorId,
-    pub(super) compressor: Dsv4CompressorW,
+    pub(super) proj: Option<TensorId>,
+    pub(super) q_b: Option<TensorId>,
+    /// V4.1 only: `indexer.attn_k.weight`, mapping the compressor's pooled+normed PRE-ROPE latent
+    /// onto the shared index-key row. V4 derives its indexer keys from `compressor` instead, which
+    /// is why the two are mutually exclusive.
+    pub(super) attn_k: Option<TensorId>,
+    /// V4.1 only: `indexer.k_norm.weight` over that row.
+    pub(super) k_norm: Option<TensorId>,
+    /// V4 only — its own softmax-pooling compressor feeding the LID cache. V4.1 has none.
+    pub(super) compressor: Option<Dsv4CompressorW>,
 }
 
 pub(super) struct Dsv4CompressedW {
     pub(super) attention: Dsv4CompressorW,
     pub(super) indexer: Option<Dsv4IndexerW>,
+}
+
+/// DeepSeek V4.1's engram projectors, on the two layers that own an associative-memory slot
+/// (`blk.{1,14}.engram_*`). The hash itself runs on the host (`crate::engram`) because ggml has no
+/// 64-bit xor; these three are the only *uploaded* engram weights.
+///
+/// `wkv` is ONE projection split into two offset GEMVs: rows `[0, hc_mult*n_embd)` are the per-copy
+/// keys and `[hc_mult*n_embd, hc_mult*n_embd + n_embd)` the shared value block — see `Op::Linear`'s
+/// `w_off`, the same trick V4's grouped output projection uses.
+pub(super) struct EngramW {
+    pub(super) wkv: TensorId,
+    /// `engram_k.weight` `[hc_mult*n_embd]` — the per-copy key-side norm scale.
+    pub(super) k: TensorId,
+    /// `engram_q.weight` `[hc_mult*n_embd]` — the per-copy query-side norm scale.
+    pub(super) q: TensorId,
 }
 
 /// One hyper-connection block's `(fn, base, scale)` triple. `w_fn` is the mixing matmul's weight
@@ -341,8 +383,12 @@ pub(super) struct LayerW {
     pub(super) qwen_hc: Option<QwenLayerHcW>,
     pub(super) ple: Option<QwenPleW>,
     /// V4 ratio-4/128 compressor handles, declared after the layer's HC weights to mirror GGUF
-    /// upload order. `None` for ratio-0 and every non-V4 layer.
+    /// upload order. `None` for ratio-0 and every non-V4 layer. On V4.1 only the four KV *source*
+    /// layers carry one; reuse layers read the source's stream and stay `None` here.
     pub(super) dsv4_compressed: Option<Dsv4CompressedW>,
+    /// DeepSeek V4.1 engram projectors, declared LAST to mirror the `wload` tail (wkv, k, q).
+    /// `Some` only on `Config::engram_layer_ids` members of a V4.1 model.
+    pub(super) engram: Option<EngramW>,
     /// bitnet (BitNet b1.58) SubLN: RMSNorm on the concatenated-heads attention output BEFORE the
     /// o-projection (`AttnW::wo`). `Some` only when `Config::sub_norm` (bitnet); `None` elsewhere.
     pub(super) attn_sub_norm: Option<TensorId>,

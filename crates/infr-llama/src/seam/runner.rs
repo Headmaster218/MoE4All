@@ -9,7 +9,8 @@ use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::token_delivery::ParallelTokenCallback;
 use super::weights::{
     alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
-    FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
+    EngramW, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
+    MoeSharedW,
     MtpDeltaCkpt, QsaW, QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights,
     SegmentedKvState, SessionStable, TurnRecurrentCkpt,
 };
@@ -29,6 +30,20 @@ use infr_core::graph::{
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
+
+/// DeepSeek V4.1: whether layer `il` owns the index-KEY stream (`indexer.attn_k` +
+/// `indexer.k_norm`), i.e. its `dsv41_index_key_source` entry points at itself.
+///
+/// The three CSA2 roles are distinct and deliberately split by the file: 4 KV sources
+/// `{2,8,14,20}`, 4 index-KEY owners, and 8 top-k owners `{2,8,14,20,24,28,32,36}` — the top-k set
+/// is a strict SUPERSET of the key owners, which is why every reuse layer can score against a
+/// stream several layers above it publishes. `Config` exposes the KV and top-k predicates but not
+/// this one, so it lives here beside its only consumers (`wload`/`wpush`) instead of widening the
+/// config API: the map is already the whole truth, and "`[il] == il` means 'layer il publishes'" is
+/// the same test the other two helpers spell out. `false` for every other arch.
+fn is_dsv41_index_key_source(c: &Config, il: usize) -> bool {
+    c.dsv41_index_key_source.get(il).copied() == Some(il as i32)
+}
 
 fn paged_decode_stages_enabled(be: &dyn Backend, mtp: bool) -> bool {
     !mtp && be.moe_paged() && !be.dense_paged()
@@ -2385,12 +2400,46 @@ pub(super) fn cold_weight_plan(
             ] {
                 wload(&[&p(name)])?;
             }
-            // The per-layer compression ratio decides which tensors this layer HAS: 0 carries
-            // no compressor at all, 4 and 128 carry the attention compressor, and 4 alone adds
-            // the lightning indexer with its own compressor. `Config::from_gguf` has already
-            // refused any other value, so these two comparisons cover every layer.
-            let ratio = c.layer_compress_ratio(l);
-            if ratio != 0 {
+            // The per-layer compression ratio decides which tensors this layer HAS. In V4 the
+            // ratio is a per-layer SELF-CONTAINED choice: 0 carries no compressor at all, 4 and
+            // 128 carry the attention compressor (plus the indexer and its own compressor at 4),
+            // and `Config::from_gguf` has already refused any other value, so two comparisons
+            // cover every layer.
+            //
+            // V4.1 is structurally different and gets its own arm below: `compress_ratios` there
+            // is a ROLE map over a source/reuse topology (`Config::dsv41_kv_source`), so tensor
+            // presence follows the tensor's own role, never the layer's ratio.
+            if c.deepseek41 {
+                // ── DeepSeek V4.1: one publisher, N consumers ────────────────────────────
+                // Only the KV SOURCE layer runs the compressor and owns the state ring; the reuse
+                // layers between sources carry NO `attn_compressor_*` at all and read the source's
+                // compressed rows. Upstream's "ratio != 0 ⇒ this layer owns its compressor" rule
+                // would demand compressor tensors on all 38 non-zero-ratio layers, and the real
+                // file does not have them.
+                if c.dsv41_is_kv_source(l) {
+                    // `attn_compressor_ape` does not exist anywhere in a V4.1 file — `Dsv4CompressorW::ape`
+                    // is `Option` for exactly that reason, and stays `None` here.
+                    wload(&[&p("attn_compressor_kv.weight")])?;
+                    // A gate is only meaningful where there is something to pool: the ratio-1
+                    // source (layer 20) pools one token per row, so softmax over one element is
+                    // 1.0 and the file correctly omits the tensor.
+                    if c.layer_compress_ratio(l) > 1 {
+                        wload(&[&p("attn_compressor_gate.weight")])?;
+                    }
+                    wload(&[&p("attn_compressor_norm.weight")])?;
+                }
+                // The shared index-KEY stream, derived from the compressor's pre-rope latent by
+                // `indexer.attn_k` + `indexer.k_norm` — tensors V4 explicitly does NOT have, and
+                // the ones V4.1 ships instead of `indexer_compressor_*`.
+                if is_dsv41_index_key_source(c, l) {
+                    wload(&[&p("indexer.attn_k.weight"), &p("indexer.k_norm.weight")])?;
+                }
+                // The top-k selector, on the eight layers that score queries (a superset of the
+                // key owners).
+                if c.dsv41_is_index_source(l) {
+                    wload(&[&p("indexer.proj.weight"), &p("indexer.attn_q_b.weight")])?;
+                }
+            } else if c.layer_compress_ratio(l) != 0 {
                 for name in [
                     "attn_compressor_kv.weight",
                     "attn_compressor_gate.weight",
@@ -2400,7 +2449,7 @@ pub(super) fn cold_weight_plan(
                     wload(&[&p(name)])?;
                 }
             }
-            if ratio == 4 {
+            if !c.deepseek41 && c.layer_compress_ratio(l) == 4 {
                 // V4's indexer has no `attn_k` and no `k_norm`, unlike V3.2's: its keys come out
                 // of the compressor below, so `indexer_top_k` counts compressed BLOCKS.
                 for name in [
@@ -2617,6 +2666,15 @@ pub(super) fn cold_weight_plan(
             wload(&[&p("proj.weight")])?;
             wload(&[&p("post_norm.weight")])?;
         }
+        // DeepSeek V4.1 engram projectors — the two engram layers only, LAST in the layer, in the
+        // order wkv, k, q (`deepseek41.cpp::load_arch_tensors`'s `engram_index(i) >= 0` arm). The
+        // 32 GiB `engram_embd` table is NOT an uploaded weight: its rows are gathered on the host
+        // from the mmap (crate::engram) and arrive as a graph Input, so it never appears here.
+        if c.deepseek41 && c.has_engram(l) {
+            wload(&[&p("engram_wkv.weight")])?;
+            wload(&[&p("engram_k.weight")])?;
+            wload(&[&p("engram_q.weight")])?;
+        }
     }
     // Qwen3.8's final grouped HC mixer replaces output_norm and is stored before the LM head.
     // Every other architecture keeps the original output_norm-first order exactly.
@@ -2643,7 +2701,12 @@ pub(super) fn cold_weight_plan(
     // parallel residual streams back to one vector before `output_norm`. Model-level, not
     // per-layer (`output_hc_*`, no `blk.` prefix) — same standing as `output_norm`/`output`
     // above, which is why they load here rather than in the layer loop.
-    if c.deepseek4 {
+    //
+    // **V4.1 has no such triple** and must not be asked for one. Its head collapses the streams
+    // with the LAST LAYER'S FFN mix instead — the one mix nothing consumed under the lagging
+    // schedule — so the read exists but the weights do not (`deepseek41.cpp` 919-923). Loading
+    // them here would fail the model load outright on a file that correctly omits them.
+    if c.deepseek4 && !c.deepseek41 {
         wload(&["output_hc_fn.weight"])?;
         wload(&["output_hc_base.weight"])?;
         wload(&["output_hc_scale.weight"])?;
@@ -4939,24 +5002,60 @@ fn generate_dense_backend_inner(
                     scale: wpush(&mut g, &mut weights),
                 },
             });
-            let dsv4_compressed = if c.deepseek4 && c.layer_compress_ratio(l) != 0 {
-                let attention = Dsv4CompressorW {
-                    wkv: wpush(&mut g, &mut weights),
-                    wgate: wpush(&mut g, &mut weights),
-                    ape: wpush(&mut g, &mut weights),
-                    norm: wpush(&mut g, &mut weights),
-                };
-                let indexer = (c.layer_compress_ratio(l) == 4).then(|| Dsv4IndexerW {
-                    proj: wpush(&mut g, &mut weights),
-                    q_b: wpush(&mut g, &mut weights),
-                    compressor: Dsv4CompressorW {
+            let dsv4_compressed = if c.deepseek4 {
+                if c.deepseek41 {
+                    // EXACT order of the `wload` deepseek41 arm: per-role, not per-ratio.
+                    let (kv_src, key_src, topk_src) = (
+                        c.dsv41_is_kv_source(l),
+                        is_dsv41_index_key_source(c, l),
+                        c.dsv41_is_index_source(l),
+                    );
+                    let attention = kv_src.then(|| Dsv4CompressorW {
                         wkv: wpush(&mut g, &mut weights),
-                        wgate: wpush(&mut g, &mut weights),
-                        ape: wpush(&mut g, &mut weights),
+                        // `wload` asks for the gate only above ratio 1 — the ratio-1 source pools
+                        // one token per row, so softmax over one element is already 1.0.
+                        wgate: (c.layer_compress_ratio(l) > 1).then(|| wpush(&mut g, &mut weights)),
+                        // No V4.1 file ships `attn_compressor_ape` at all.
+                        ape: None,
                         norm: wpush(&mut g, &mut weights),
-                    },
-                });
-                Some(Dsv4CompressedW { attention, indexer })
+                    });
+                    let indexer = (key_src || topk_src).then(|| Dsv4IndexerW {
+                        // `wload` pushes attn_k + k_norm BEFORE proj + q_b, and pushes neither
+                        // pair on a layer that lacks the role, so the branches below are the only
+                        // ones that may consume a slot.
+                        attn_k: key_src.then(|| wpush(&mut g, &mut weights)),
+                        k_norm: key_src.then(|| wpush(&mut g, &mut weights)),
+                        proj: topk_src.then(|| wpush(&mut g, &mut weights)),
+                        q_b: topk_src.then(|| wpush(&mut g, &mut weights)),
+                        // V4.1 has no `indexer_compressor_*` anywhere.
+                        compressor: None,
+                    });
+                    attention.map(|attention| Dsv4CompressedW { attention, indexer })
+                } else if c.layer_compress_ratio(l) != 0 {
+                    let attention = Dsv4CompressorW {
+                        wkv: wpush(&mut g, &mut weights),
+                        wgate: Some(wpush(&mut g, &mut weights)),
+                        ape: Some(wpush(&mut g, &mut weights)),
+                        norm: wpush(&mut g, &mut weights),
+                    };
+                    let indexer = (c.layer_compress_ratio(l) == 4).then(|| Dsv4IndexerW {
+                        proj: Some(wpush(&mut g, &mut weights)),
+                        q_b: Some(wpush(&mut g, &mut weights)),
+                        // V4's indexer keys come out of its own compressor, never out of an
+                        // `attn_k`/`k_norm` pair — those tensors do not exist in a V4 file.
+                        attn_k: None,
+                        k_norm: None,
+                        compressor: Some(Dsv4CompressorW {
+                            wkv: wpush(&mut g, &mut weights),
+                            wgate: Some(wpush(&mut g, &mut weights)),
+                            ape: Some(wpush(&mut g, &mut weights)),
+                            norm: wpush(&mut g, &mut weights),
+                        }),
+                    });
+                    Some(Dsv4CompressedW { attention, indexer })
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -5089,6 +5188,13 @@ fn generate_dense_backend_inner(
             } else {
                 (None, None, None)
             };
+            // DeepSeek V4.1 engram projectors — mirrors the `wload` tail (wkv, k, q), the last
+            // uploads of an engram layer. Exactly the two `engram_layer_ids` layers declare them.
+            let engram = (c.deepseek41 && c.has_engram(l)).then(|| EngramW {
+                wkv: wpush(&mut g, &mut weights),
+                k: wpush(&mut g, &mut weights),
+                q: wpush(&mut g, &mut weights),
+            });
             lw.push(LayerW {
                 attn_norm,
                 mixer,
@@ -5096,6 +5202,7 @@ fn generate_dense_backend_inner(
                 qwen_hc,
                 ple,
                 dsv4_compressed,
+                engram,
                 attn_sub_norm,
                 post_attn,
                 ffn_norm,
@@ -5105,8 +5212,7 @@ fn generate_dense_backend_inner(
                 pl_inp_gate,
                 pl_proj,
                 pl_post_norm,
-            });
-        }
+            });        }
         // Qwen3.8 executes layer 0 and layers 1..end as separate graphs around the CPU PLE
         // hand-off. Keep an explicit directory so layer 0 can still name layer 1's router and
         // expert banks; it stays empty for prefill and every architecture without the validated
@@ -6444,6 +6550,45 @@ fn generate_dense_backend_inner(
                 };
                 let ff4 = (ratio4 != 0).then_some(yarn_ff).flatten();
 
+                // ── TRIPWIRE (V4.1, temporary) ────────────────────────────────────────────
+                // The ternary above keys off the RAW `compress_ratios` value. On V4.1 that value
+                // is a ROLE (`{0,1,2}`), not V4's ratio (`{0,4,128}`), so a future reader will
+                // reasonably assume it needs "translating" and break it. It does not: role 0 is
+                // exactly "pure sliding window, rope plain at `rope_theta`, no YaRN", and roles 1
+                // and 2 are exactly "compressed tier, rope at `compress_rope_theta` WITH YaRN" —
+                // which is what `ratio4 == 0` already tests. The comparison never needs the V4
+                // scale. (Local reference: ratio-0 layers rope at 10000.0, compressed tiers at
+                // 160000.0; the real V4.1 file carries `attention.compress_rope_freq_base =
+                // 160000.0`, distinct from `rope.freq_base = 10000.0`.)
+                //
+                // What CAN go wrong, and is silent when it does: `compress_rope_theta` is only
+                // correct if `Config` actually parsed `attention.compress_rope_freq_base`. A
+                // regression that makes the key look absent would hand every compressed layer
+                // theta 0.0 — `exp(-2*0/rope_dim) == 1`, so every position gets the same angle:
+                // plausible-looking, silently wrong logits that no shape check or cheap test
+                // catches. Refusing the build with the layer number beats emitting garbage.
+                //
+                // Guard both halves of the branch, so neither the rotated compressed tiers nor a
+                // role-0 layer can proceed on an unusable base. V4.1's `Config::from_gguf` already
+                // requires the key, so this is a belt-and-braces check on the seam side, not the
+                // primary defence — it exists because the seam is where the damage would be done.
+                if c.deepseek41 {
+                    let ropes = rd > 0;
+                    let (uses, what) = if ratio4 == 0 {
+                        (theta4, "plain-rope (role 0)")
+                    } else {
+                        (theta4, "compressed-tier")
+                    };
+                    assert!(
+                        !(ropes && !(uses > 0.0) && uses.is_finite()),
+                        "deepseek41 layer {l} ({what}, role {ratio4}) would rope at theta {uses} \
+                         — a non-positive or non-finite base gives every position the same angle. \
+                         `Config::compress_rope_theta` must be parsed from \
+                         `deepseek41.attention.compress_rope_freq_base` (160000.0); got {uses}. \
+                         Refusing rather than emitting silently wrong logits"
+                    );
+                }
+
                 // Q: wq_a → q_a_norm → wq_b, then a WEIGHTLESS per-head RMS norm (bare
                 // `ggml_rms_norm` after the reshape to [head_dim, n_head, n_tokens] — there is no
                 // `attn_q_norm` tensor in a V4 file, which is why `Op::QkNorm` takes `None`).
@@ -6595,7 +6740,10 @@ fn generate_dense_backend_inner(
                     });
                     g.push(Op::Linear {
                         x: hn,
-                        weight: cw.attention.wgate,
+                        weight: cw
+                            .attention
+                            .wgate
+                            .expect("a V4 compressor always carries a pooling gate"),
                         dst: d4_comp_scores,
                         m: 1,
                         in_f: ne as u32,
@@ -6605,7 +6753,10 @@ fn generate_dense_backend_inner(
                     g.push(Op::Dsv4Compress {
                         values: d4_comp_values,
                         scores: d4_comp_scores,
-                        ape: cw.attention.ape,
+                        ape: cw
+                            .attention
+                            .ape
+                            .expect("a V4 compressor always carries an APE table"),
                         norm: cw.attention.norm,
                         freq_factors: yarn_ff,
                         state: v_cache[l],
@@ -6639,9 +6790,16 @@ fn generate_dense_backend_inner(
                             .expect("ratio-4 V4 layer without indexer weights");
                         let ix_hd = c.indexer_head_size as u32;
                         let ix_width = 2 * ix_hd;
+                        // V4's LID compressor is its own tier; V4.1 has no `indexer_compressor_*`
+                        // at all (its indexer keys come from `attn_k`/`k_norm` instead), so the
+                        // field is `Option` and this arm — unreachable for V4.1 — demands it.
+                        let lid = iw
+                            .compressor
+                            .as_ref()
+                            .expect("a ratio-4 V4 layer always carries its LID compressor");
                         g.push(Op::Linear {
                             x: hn,
-                            weight: iw.compressor.wkv,
+                            weight: lid.wkv,
                             dst: d4_lid_values,
                             m: 1,
                             in_f: ne as u32,
@@ -6650,7 +6808,7 @@ fn generate_dense_backend_inner(
                         });
                         g.push(Op::Linear {
                             x: hn,
-                            weight: iw.compressor.wgate,
+                            weight: lid.wgate.expect("a V4 LID compressor always carries a gate"),
                             dst: d4_lid_scores,
                             m: 1,
                             in_f: ne as u32,
@@ -6660,8 +6818,8 @@ fn generate_dense_backend_inner(
                         g.push(Op::Dsv4Compress {
                             values: d4_lid_values,
                             scores: d4_lid_scores,
-                            ape: iw.compressor.ape,
-                            norm: iw.compressor.norm,
+                            ape: lid.ape.expect("a V4 LID compressor always carries an APE table"),
+                            norm: lid.norm,
                             freq_factors: yarn_ff,
                             state: v_cache[l],
                             dst: d4_lid,
@@ -6689,7 +6847,9 @@ fn generate_dense_backend_inner(
                         if visible > c.indexer_top_k {
                             g.push(Op::Linear {
                                 x: d4_qa,
-                                weight: iw.q_b,
+                                weight: iw
+                                .q_b
+                                .expect("a ratio-4 V4 indexer always carries attn_q_b"),
                                 dst: d4_ix_q,
                                 m: 1,
                                 in_f: qlr,
@@ -6719,7 +6879,9 @@ fn generate_dense_backend_inner(
                             });
                             g.push(Op::Linear {
                                 x: hn,
-                                weight: iw.proj,
+                                weight: iw
+                                .proj
+                                .expect("a ratio-4 V4 indexer always carries proj"),
                                 dst: d4_ix_w,
                                 m: 1,
                                 in_f: ne as u32,
