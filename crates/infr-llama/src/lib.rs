@@ -14,6 +14,9 @@ mod config;
 pub mod seam;
 pub use seam::model::{BenchPlacement, SeamModel};
 pub mod diffusion;
+/// DeepSeek V4.1 engram: the host half of the n-gram associative lookup, plus the MXFP8 table
+/// reader. See the module docs for why it is host-side and why it needs no new graph operator.
+pub mod engram;
 mod util;
 pub(crate) use util::*;
 mod kv;

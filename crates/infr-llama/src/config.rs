@@ -642,6 +642,7 @@ impl Config {
             | crate::arch::DEEPSEEK2
             | crate::arch::DEEPSEEK32
             | crate::arch::DEEPSEEK4
+            | crate::arch::DEEPSEEK41
             | crate::arch::BAILINGMOE3
             | crate::arch::BITNET
             | crate::arch::BITNET_B158 => false,
@@ -696,6 +697,12 @@ impl Config {
         // router — is wrong for it. Sharing is limited to the MoE block, the shared expert, the
         // Q-LoRA projection and generic plumbing, each of which is picked up by name below.
         let deepseek4 = arch == crate::arch::DEEPSEEK4;
+        // DeepSeek V4.1 is a distinct flag on purpose (see [`arch::DEEPSEEK41`]): folding it into
+        // `deepseek4` would route a V4.1 file through V4's `{0,4,128}` compress-ratio check and
+        // V4's per-layer-ownership and hyper-connection assumptions, none of which hold. The two
+        // share the skeleton, so several parses below read `deepseek4 || deepseek41` explicitly —
+        // each of those says WHY, and none of them is "it's close enough".
+        let deepseek41 = arch == crate::arch::DEEPSEEK41;
         // llama4 (Scout etc.): shares the llama attention skeleton (NORM/interleaved rope, no bias,
         // converter-permuted q/k) but adds a 16-expert sigmoid top-1 MoE + iRoPE (per-layer NoPE) +
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
@@ -776,12 +783,12 @@ impl Config {
             (0, 0, 0, 0, 0)
         };
         let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) =
-            if deepseek2 || deepseek4 || bailingmoe3 {
+            if deepseek2 || deepseek4 || deepseek41 || bailingmoe3 {
                 // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
                 // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
                 // with no such fallback, and neither arch's real value is softmax — defaulting it would
                 // silently re-route.
-                let gf = if deepseek32 || deepseek4 {
+                let gf = if deepseek32 || deepseek4 || deepseek41 {
                     let key = mk("expert_gating_func");
                     meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8
                 } else {
@@ -824,7 +831,7 @@ impl Config {
             rope_attn_factor,
             rope_yarn_beta_fast,
             rope_yarn_beta_slow,
-        ) = if deepseek2 || deepseek4 {
+        ) = if deepseek2 || deepseek4 || deepseek41 {
             let yarn = g
                 .metadata()
                 .get(&mk("rope.scaling.type"))
@@ -880,7 +887,7 @@ impl Config {
         // `indexer.k_norm` — its keys come from the compressor) but is described by the same three
         // numbers.
         let (indexer_n_head, indexer_head_size, indexer_top_k) =
-            if deepseek32 || deepseek4 || qwen4exp {
+            if deepseek32 || deepseek4 || deepseek41 || qwen4exp {
                 let ix = |k: &str| -> Result<usize> {
                     let key = mk(k);
                     let v = meta_u64(g, &key).with_context(|| format!("{key} missing"))?;
@@ -975,7 +982,13 @@ impl Config {
         // silently collapse a dimension. The remaining three are counts and an epsilon, where zero
         // is a legal — if degenerate — value, so they are only required to be PRESENT.
         let (o_group_count, o_lora_rank, hc_mult, hc_low_rank, hc_sinkhorn_iters, hash_layer_count) =
-            if deepseek4 {
+            if deepseek4 || deepseek41 {
+                // V4.1 carries every one of these keys with V4's meaning and shape (verified against
+                // the real file: `output_group_count=8`, `output_lora_rank=1024`,
+                // `hyper_connection.count=4` / `sinkhorn_iterations=20` / `epsilon=9.999999974752427e-07`,
+                // `hash_layer_count=0`). This is the narrow, per-key sharing the arch doc calls for —
+                // what must NOT be shared is how these fields are later *consumed* (V4.1 lags the HC
+                // coefficient by one sublayer and has no learned head triple), which lives in the graph.
                 (
                     req_dim("attention.output_group_count")?,
                     req_dim("attention.output_lora_rank")?,
@@ -996,9 +1009,18 @@ impl Config {
             } else {
                 (0, 0, 0, 0, 0, 0)
             };
-        let (compress_rope_theta, hc_eps) = if deepseek4 {
+        let (compress_rope_theta, hc_eps) = if deepseek4 || deepseek41 {
             (
-                req_f32("attention.compress_rope_freq_base")?,
+                // V4.1 has NO compressed-attention rope base: it publishes no
+                // `attention.compress_rope_freq_base` and no ratio-4/128 tier that would use one (all
+                // its compressed layers rope at `rope.freq_base`). Reading the key as V4 does would
+                // turn a working file into a "missing" error, so the V4.1 value is 0.0 — the same
+                // "this arch has none" sentinel every other arch uses.
+                if deepseek4 {
+                    req_f32("attention.compress_rope_freq_base")?
+                } else {
+                    0.0
+                },
                 req_f32("hyper_connection.epsilon")?,
             )
         } else {
@@ -1009,7 +1031,7 @@ impl Config {
         // because `load_arch_tensors` then indexes `[il]` for every layer; the extra entries a
         // longer array carries are simply unused, which is why this takes a prefix rather than
         // demanding an exact length.
-        let compress_ratios: Vec<usize> = if deepseek4 || qwen4exp {
+        let compress_ratios: Vec<usize> = if deepseek4 || deepseek41 || qwen4exp {
             let key = mk("attention.compress_ratios");
             let arr = g
                 .metadata()
@@ -1031,12 +1053,32 @@ impl Config {
                     // compression ratios 0, 4, and 128". An unknown ratio is not a wider variant of
                     // a known one — it decides which tensors the layer HAS — so refuse rather than
                     // round it to the nearest tier.
-                    let valid = if deepseek4 {
+                    //
+                    // V4.1 does NOT reuse that scale, and the temptation to read `1` and `2` as
+                    // "small ratios of the same kind" is the trap this arm exists to document. On
+                    // V4.1 the array is a **layer ROLE MAP in a source/reuse topology**, not a ratio
+                    // at all: the real file carries 43 entries whose first 40 are `{0:2, 1:20, 2:18}`,
+                    // and the tensors corroborate roles rather than ratios — only layers 2, 8, 14, 20
+                    // own an `attn_compressor_kv` (4 of 40) and only 2, 8, 14, 20, 24, 28, 32, 36 own
+                    // an `indexer.attn_q_b`. Under V4's "ratio != 0 ⇒ this layer owns its compressor"
+                    // reading, 38 layers would have to own one and 36 of them do not, so a V4.1 file
+                    // would fail tensor loading on shapes V4's scale makes impossible.
+                    //   0 = pure sliding-window layer; reads no compressed stream at all.
+                    //   1 = a compressed SOURCE that pools one token per row (unpooled).
+                    //   2 = a compressed layer pooling two tokens per row, OR a reuse layer reading an
+                    //       earlier source's stream — the source map below decides which.
+                    // The roles are resolved into publishers/readers by the source map further down.
+                    let valid = if deepseek41 {
+                        matches!(r, 0 | 1 | 2)
+                    } else if deepseek4 {
                         matches!(r, 0 | 4 | 128)
                     } else {
                         matches!(r, 0 | 4)
                     };
                     if !valid {
+                        if deepseek41 {
+                            bail!("{key}[{il}] = {v:?} is not one of 0, 1, 2 (deepseek41 layer roles)");
+                        }
                         if deepseek4 {
                             bail!("{key}[{il}] = {v:?} is not one of 0, 4, 128");
                         }
@@ -1063,7 +1105,7 @@ impl Config {
                 other => other.as_f64().map(|f| vec![f as f32; n_layer]),
             }
         };
-        let (swiglu_clamp_exp, swiglu_clamp_shexp) = if deepseek4 {
+        let (swiglu_clamp_exp, swiglu_clamp_shexp) = if deepseek4 || deepseek41 {
             let key = mk("swiglu_clamp_exp");
             let exp = clamp_arr("swiglu_clamp_exp").with_context(|| format!("{key} missing"))?;
             if exp.len() < n_layer {
@@ -1102,8 +1144,10 @@ impl Config {
         } else {
             (Vec::new(), Vec::new())
         };
-        if deepseek4 {
-            // `deepseek4.cpp::load_arch_hparams` throws on anything but sqrt-softplus. That is not
+        if deepseek4 || deepseek41 {
+            // `deepseek4.cpp::load_arch_hparams` throws on anything but sqrt-softplus. V4.1 shares the
+            // router (its file declares `expert_gating_func = 4` and also restates it as the string
+            // `expert_scoring_func = "sqrtsoftplus"`), so it inherits the same refusal verbatim. That is not
             // a placeholder for "the others are untested": the router this arch was trained with is
             // the one that must run, and every other value here names a DIFFERENT function.
             const SQRT_SOFTPLUS: u8 = 4;
@@ -1136,7 +1180,7 @@ impl Config {
         // it reads `q_lora_rank` here rather than through the MLA tuple above — which is gated on
         // `deepseek2` and also parses `kv_lora_rank` and the two MLA head lengths, none of which
         // exist in a V4 file. Mandatory, like `deepseek32`'s: there is no lite variant.
-        let q_lora_rank = if deepseek4 {
+        let q_lora_rank = if deepseek4 || deepseek41 {
             req_dim("attention.q_lora_rank")?
         } else {
             q_lora_rank
@@ -1188,8 +1232,8 @@ impl Config {
             // needed) if the model has no shared expert either.
             let shexp = meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize;
             vec![shexp; n_layer]
-        } else if deepseek4 {
-            // V4 has no dense FFN on any layer — no dense lead, every layer routed — so its GGUF
+        } else if deepseek4 || deepseek41 {
+            // V4/V4.1 have no dense FFN on any layer — no dense lead, every layer routed — so its GGUF
             // need not carry `feed_forward_length` at all, and `load_arch_hparams` never reads one.
             // As for qwen35moe above, `n_ff`/`n_ff_layers` only size the dense-FFN-SHAPED scratch
             // the shared-expert branch reuses at ITS width, which for DeepSeek is
@@ -1218,6 +1262,7 @@ impl Config {
             || deepseek
             || deepseek2
             || deepseek4
+            || deepseek41
             || bailingmoe3
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
@@ -1241,7 +1286,7 @@ impl Config {
                     true,
                     meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
                 )
-            } else if deepseek2 || deepseek4 || bailingmoe3 {
+            } else if deepseek2 || deepseek4 || deepseek41 || bailingmoe3 {
                 let gating = match expert_gating_func {
                     // 0 = the key is absent, which llama.cpp documents as softmax for the old
                     // V2/V2.5 GGUFs written before `expert_gating_func` existed
@@ -1315,20 +1360,20 @@ impl Config {
             })
             // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
             .unwrap_or(if qwen35 || qwen4exp { 1e-6 } else { 1e-5 });
-        // deepseek4 reads `attention.sliding_window` with a plain `get_key` — its raw attention is
+        // deepseek4/deepseek41 read `attention.sliding_window` with a plain `get_key` — its raw attention is
         // sliding-window on EVERY layer, so the window is not optional decoration there.
-        let swa_window = if deepseek4 {
+        let swa_window = if deepseek4 || deepseek41 {
             req_dim("attention.sliding_window")?
         } else if gemma {
             meta_u64(g, &mk("attention.sliding_window")).unwrap_or(0) as usize
         } else {
             0
         };
-        // deepseek4 keeps `swa_pattern` at 0: the field means "every p-th layer is FULL", and V4
+        // deepseek4/deepseek41 keep `swa_pattern` at 0: the field means "every p-th layer is FULL", and V4
         // has no full layers (`set_swa_pattern(0)`). `Config::is_swa_layer` special-cases the arch
         // instead — reading `attention.sliding_window_pattern` here would invent a period the file
         // does not declare and make five layers in six look full.
-        let swa_pattern = if swa_window == 0 || deepseek4 {
+        let swa_pattern = if swa_window == 0 || deepseek4 || deepseek41 {
             0
         } else if let Some(arr) = g
             .metadata()
@@ -1343,10 +1388,10 @@ impl Config {
             meta_u64(g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
         };
         // gemma3's SWA layers rope at a SMALLER base than its full layers, which is what this
-        // field is for. deepseek4's sliding-window layers do not: a ratio-0 layer ropes at the
+        // field is for. deepseek4/deepseek41's sliding-window layers do not: a role-0 layer ropes at the
         // plain `rope_theta`, and the compressed tiers use `compress_rope_theta` (a separate field)
         // — so V4 keeps them equal rather than picking up gemma's 10000 fallback.
-        let swa_rope_theta = if swa_window > 0 && !deepseek4 {
+        let swa_rope_theta = if swa_window > 0 && !(deepseek4 || deepseek41) {
             g.metadata()
                 .get(&mk("rope.freq_base_swa"))
                 .and_then(|v| match v {
@@ -1508,7 +1553,7 @@ impl Config {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
-        } else if deepseek || deepseek2 || deepseek4 || bailingmoe3 {
+        } else if deepseek || deepseek2 || deepseek4 || deepseek41 || bailingmoe3 {
             let n_shared = meta_u64(g, &mk("expert_shared_count")).unwrap_or(0) as usize;
             moe.map(|m| m.n_ff_exp * n_shared).unwrap_or(0)
         } else {

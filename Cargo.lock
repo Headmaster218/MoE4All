@@ -1416,6 +1416,7 @@ dependencies = [
  "infr-prof-rt",
  "infr-vulkan",
  "llguidance",
+ "memmap2",
  "rayon",
  "serde_json",
  "sha2",

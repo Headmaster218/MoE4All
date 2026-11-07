@@ -325,6 +325,16 @@ impl<'a> Reader<'a> {
 
 // ─── ggml_type → DType + block sizing ────────────────────────────────────────
 
+/// `GGML_TYPE_I32` (ggml type 26) — a plain 4-byte integer tensor, not a weight. Mapped to
+/// [`DType::I32`] below; named here so the V4.1 engram-table filter can gate on the RAW type.
+const GGML_TYPE_I32: u32 = 26;
+/// `GGML_TYPE_I64` (ggml type 27) — a plain 8-byte integer tensor. Deliberately has NO arm in
+/// [`ggml_type_to_dtype`]: nothing in the engine executes integer weights, and adding a `DType`
+/// variant for one would ripple through `dense_bytes` and every backend dtype table. The only
+/// producers seen so far are DeepSeek V4.1's redundant engram lookup tables, which are dropped
+/// before this point (see `map_and_parse`).
+const GGML_TYPE_I64: u32 = 27;
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn ggml_type_to_dtype(t: u32) -> Result<DType> {
     match t {
@@ -351,8 +361,9 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
         23 => Ok(DType::Iq4Xs),  // GGML_TYPE_IQ4_XS: 256 elems, 136 bytes/block
         // GGML_TYPE_I32: a plain 4-byte integer tensor, not a weight. Shipped models carry these as
         // lookup TABLES that a kernel indexes with — DeepSeek V4's `blk.N.ffn_gate_tid2eid.weight`
-        // hash-routing table (token id → expert ids) is the first one infr meets.
-        26 => Ok(DType::I32),
+        // hash-routing table (token id → expert ids) is the first one infr meets. The constant,
+        // not a literal, so the V4.1 engram filter and this arm cannot drift apart.
+        GGML_TYPE_I32 => Ok(DType::I32),
         29 => Ok(DType::Iq1M),  // GGML_TYPE_IQ1_M: 256 elems, 56 bytes/block
         30 => Ok(DType::Bf16),  // GGML_TYPE_BF16
         34 => Ok(DType::Tq1_0), // GGML_TYPE_TQ1_0: 256 elems, 54 bytes/block
@@ -638,6 +649,7 @@ impl Gguf {
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut metadata: Option<Metadata> = None;
         let mut file_base: u64 = 0;
+        let mut skipped: u64 = 0;
 
         for part in parts {
             let ShardParts {
@@ -645,8 +657,10 @@ impl Gguf {
                 metadata: md,
                 tensors: mut ts,
                 data_region_start,
+                skipped_engram_tables,
                 path,
             } = part;
+            skipped += skipped_engram_tables as u64;
             // Rewrite each tensor's shard-local data-region offset into the SET's concatenated
             // address space ONCE, here. That single number then locates the tensor completely —
             // `resolve` finds the owning shard from it — so there is no second per-tensor table
@@ -695,15 +709,31 @@ impl Gguf {
             }
         }
 
-        if let Some(expect) = expect_tensors {
-            if tensors.len() as u64 != expect {
+        if let Some(declared) = expect_tensors {
+            // `split.tensors.count` counts TENSOR DIRECTORY ENTRIES, and we deliberately drop a
+            // few of those at parse time (the redundant V4.1 engram lookup tables). So the set is
+            // complete iff declared == retained + dropped; comparing against `tensors.len()` alone
+            // would reject every shard set that carries a skipped entry.
+            let retained = tensors.len() as u64;
+            let stated = declared.saturating_add(skipped);
+            if retained != stated {
                 return Err(Error::Loader(format!(
-                    "GGUF: the {} shards hold {} tensors between them but the model declares \
-                     {KEY_SPLIT_TENSORS_COUNT} = {expect} — the set is incomplete or mismatched",
+                    "GGUF: the {} shards hold {} tensors between them (plus {skipped} skipped) \
+                     but the model declares {KEY_SPLIT_TENSORS_COUNT} = {declared} — the set is \
+                     incomplete or mismatched",
                     shards.len(),
                     tensors.len()
                 )));
             }
+        }
+        if skipped > 0 {
+            // Loud on purpose: a silent skip is the one failure mode of this filter that no
+            // downstream consumer could ever notice.
+            eprintln!(
+                "GGUF: skipped {skipped} redundant engram lookup table(s) \
+                 (DeepSeek V4.1 `engram_{{token_map,primes,offsets,multipliers}}.weight`, integer \
+                 dtypes, duplicated verbatim by the `deepseek41.engram.*` metadata arrays)"
+            );
         }
 
         Ok(Gguf {
@@ -742,7 +772,7 @@ impl Gguf {
 
         // All parsing happens in this block so the borrow of `mmap` ends
         // before we move `mmap` into the returned struct.
-        let (metadata, tensors, data_region_start) = {
+        let (metadata, tensors, data_region_start, skipped_engram_tables) = {
             let buf: &[u8] = &mmap;
             let mut r = Reader::new(buf);
 
@@ -829,7 +859,35 @@ impl Gguf {
 
             // ── convert raw tensor entries to TensorInfo ─────────────────────
             let mut tensors: Vec<TensorInfo> = Vec::with_capacity(raw.len());
+            let mut skipped_engram_tables = 0usize;
             for (name, shape, ggml_type, offset) in raw {
+                // DeepSeek V4.1 (arch `deepseek41`) ships four standalone engram LOOKUP tables —
+                // `engram_token_map.weight` (I32) and `engram_{primes,offsets,multipliers}.weight`
+                // (I64) — that are byte-for-byte duplicates of the `deepseek41.engram.*` metadata
+                // ARRAYS of the same name. The host engram code reads those arrays out of
+                // `Config`, never these tensors, so nothing in the engine would ever index them.
+                //
+                // They are skipped here, rather than given a `DType::I64` (and the I64 entry
+                // `dense_bytes` + every exhaustive `DType` match across the backends would then
+                // need), because the type is the ONLY thing about them that is unsupported: a
+                // 4-keyword filter buys the whole model for free. Gated on the raw type as well as
+                // the name so the skip can never silently swallow a real weight that happens to
+                // share a prefix, and so an I64/I64-shaped table ANY producer emits elsewhere still
+                // fails loudly instead of loading as garbage. Skipping is offset-safe: `offset` is
+                // shard-local and `assemble` rewrites it against the shard's data-region start, so
+                // dropping entries never shifts another tensor's bytes.
+                if matches!(ggml_type, GGML_TYPE_I32 | GGML_TYPE_I64)
+                    && matches!(
+                        name.as_str(),
+                        "engram_token_map.weight"
+                            | "engram_primes.weight"
+                            | "engram_offsets.weight"
+                            | "engram_multipliers.weight"
+                    )
+                {
+                    skipped_engram_tables += 1;
+                    continue;
+                }
                 let dtype = ggml_type_to_dtype(ggml_type)?;
                 // `checked_mul`: a crafted shape must error, not overflow the product.
                 let numel: usize = shape
@@ -883,7 +941,7 @@ impl Gguf {
                 });
             }
 
-            (metadata, tensors, data_region_start)
+            (metadata, tensors, data_region_start, skipped_engram_tables)
         }; // ← borrow of `mmap` ends here
 
         Ok(ShardParts {
@@ -891,6 +949,7 @@ impl Gguf {
             metadata,
             tensors,
             data_region_start,
+            skipped_engram_tables,
             path: path.to_path_buf(),
         })
     }
@@ -986,6 +1045,12 @@ struct ShardParts {
     tensors: Vec<TensorInfo>,
     /// Absolute byte offset into `mmap` where this shard's tensor data begins.
     data_region_start: usize,
+    /// How many tensor-directory entries this shard DECLARED that parsing deliberately dropped
+    /// (today: only the redundant DeepSeek V4.1 engram lookup tables — see `map_and_parse`).
+    /// `assemble` subtracts it from `split.tensors.count`, which counts header entries, not
+    /// retained tensors: without that the shard-set completeness check would reject a set it had
+    /// just parsed entirely.
+    skipped_engram_tables: usize,
     path: PathBuf,
 }
 

@@ -104,6 +104,27 @@ pub const DEEPSEEK32: &str = "deepseek32";
 /// The LOAD path is complete — config, every tensor — and nothing emits it yet, so a graph build
 /// refuses this arch. See docs/deepseek.md § Stage 4.
 pub const DEEPSEEK4: &str = "deepseek4";
+/// DeepSeek V4.1 (`general.architecture = "deepseek41"`).
+///
+/// Shares V4's skeleton — single-head MQA KV, the Q-LoRA `wq_a → q_a_norm → wq_b` projection, the
+/// grouped low-rank output projection, attention sinks, hyper-connections, the same MoE block with
+/// `sqrt(softplus)` gating and swiglu clamps, every layer sliding-window — but it is a **variant, not
+/// a reskin**, and the differences are exactly the ones that would go silently wrong if the two arch
+/// strings were ever folded together (`deepseek4 = DEEPSEEK4 || DEEPSEEK41` is the anti-pattern):
+///
+/// * `attention.compress_ratios` is a **layer ROLE map** (`{0, 1, 2}`), not a compression ratio
+///   (`{0, 4, 128}`). See [`Config::deepseek41`] and [`Config::layer_compress_ratio`].
+/// * Compressed attention is a **source/reuse topology**: only 4 layers own a compressor and publish
+///   a stream, the rest read the nearest earlier publisher. V4's "ratio != 0 ⇒ this layer owns its
+///   compressor" loader assumption is structurally wrong here.
+/// * An **engram** associative-memory path (layers 1 and 14) that V4 has no code for.
+/// * Hyper-connection coefficients are consumed one sublayer LATE, and the model head has no learned
+///   `output_hc_*` triple (it reuses the last layer's FFN mix).
+///
+/// NONE of V4's own gates may inherit this string: an explicit [`Config::deepseek41`] flag plus
+/// narrow, per-field sharing is the only shape that keeps V4's `{0,4,128}` checks and its HC layout
+/// off a V4.1 file.
+pub const DEEPSEEK41: &str = "deepseek41";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
 /// (`bitnet-b1.58.block_count`, …). Behaviorally identical to [`BITNET`] (same llama+SubLN
@@ -165,6 +186,7 @@ pub const ALL: &[&str] = &[
     DEEPSEEK2,
     DEEPSEEK32,
     DEEPSEEK4,
+    DEEPSEEK41,
     QWEN35,
     QWEN35_MOE,
     QWEN4EXP,
