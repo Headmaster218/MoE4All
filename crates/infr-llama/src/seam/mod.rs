@@ -1983,8 +1983,11 @@ pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.is_recurrent_layer(l) {
         return (0, 0);
     }
-    if cfg.deepseek4 {
-        // Read straight off `head_dim` rather than through `layer_head_dim`/`layer_n_kv`: those
+    // The V4 single-head MQA KV row is shared skeleton with V4.1 (`head_count_kv = 1`,
+    // `attn_kv` is [n_embd, head_dim]); V4.1 differs in the attention *semantics* above it, not
+    // in the row width. Without V4.1 here the row falls through to the plain
+    // `n_kv * head_dim` product, which is the same number only by coincidence.
+    if cfg.deepseek4 || cfg.deepseek41 {
         // route via `is_swa_layer`, which is TRUE for every V4 layer, and so would answer with
         // gemma4's `head_dim_swa`/`n_kv_swa` fields. They happen to equal `head_dim`/`n_kv` for
         // every non-gemma4 model, which is an accident this arch should not depend on.
@@ -2175,7 +2178,12 @@ pub(crate) struct Dsv4LayerLayout {
 }
 
 pub(crate) fn dsv4_layer_layout(cfg: &Config, l: usize, want_ctx: usize) -> Dsv4LayerLayout {
-    debug_assert!(cfg.deepseek4);
+    // The V4 cache skeleton (raw SWA plane + optional compressed plane) is shared by V4 and
+    // V4.1 — `deepseek41` is a distinct flag only because the *semantics* on top of it differ
+    // (role map vs per-layer ratio, CSA2 source/reuse, HC lag). Gating the layout on
+    // `cfg.deepseek4` alone sent V4.1 down the ordinary KV path and allocated the wrong cache
+    // geometry: a debug panic here, silently wrong-sized planes in release.
+    debug_assert!(cfg.deepseek4 || cfg.deepseek41);
     let raw_rows = want_ctx.min(cfg.swa_window.max(1)).max(1);
     let raw_bytes = dsv4_fp8_cache_bytes(raw_rows);
     let ratio = cfg.layer_compress_ratio(l);
@@ -2252,7 +2260,9 @@ pub(crate) fn layer_state_bytes(
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
-    if cfg.deepseek4 {
+    // Same skeleton gate as `dsv4_layer_layout` — V4.1 must take the V4 cache branch too, or it
+    // is allocated context-scaled K/V rows instead of the raw SWA plane + compressed state plane.
+    if cfg.deepseek4 || cfg.deepseek41 {
         let d = dsv4_layer_layout(cfg, l, want_ctx);
         return (d.raw_bytes, d.state_bytes);
     }
