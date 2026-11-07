@@ -3789,10 +3789,18 @@ fn dsv41_dims() -> Dsv4Dims {
 ///   layer 5's attention reads a mix from layer 5 itself — so the same bump must still move things,
 ///   but **differently**.
 ///
-/// So the assertion is two-sided: the bump must move the logits (it is load-bearing), AND a V4.1
-/// build must not produce the same numbers as the immediate schedule (the two are not the same
-/// model). A port that forgot the lag fails the second half while passing the first, which is
-/// precisely the failure mode this change exists to prevent.
+/// **WHAT THIS TEST DOES AND DOES NOT PROVE — read before citing it.**
+///
+/// It proves ONE direction: the hyper-connection collapse is load-bearing, i.e. perturbing a mix
+/// that the lagging schedule pipes into a later sublayer does reach the logits. That catches an
+/// emit that collapses nothing, or collapses from a buffer nothing writes.
+///
+/// It does NOT yet discriminate lag from no-lag. That needs the same perturbation run through BOTH
+/// schedules and compared, and the V4.1 graph cannot reach logits today: the CSA2 source-stream
+/// rewire is not implemented, so a V4.1 build stops at the compressor emit ("a V4 compressor always
+/// carries an APE table") before any forward runs. The discrimination test is therefore **designed
+/// and not written**, and it must be added together with that rewire — see the PR's "not in this
+/// change" section. Do not read this test's name as a claim it has not earned.
 #[test]
 fn synthetic_deepseek41_hc_lag_moves_the_logits() {
     let d = dsv41_dims();
