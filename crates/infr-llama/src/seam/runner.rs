@@ -1381,6 +1381,10 @@ fn session_stable(
     // made every DeepSeek prefill run one token per submit (see the CHANGELOG entry for the
     // before/after prefill throughput that fixing it bought).
     let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
+    // V4.1's expert banks are a 3-way dtype mix (IQ1_M / IQ2_XXS / IQ2_XS) and this gate is
+    // all-or-nothing, so on the real file only 1 of 40 layers qualifies it. Making it per-tensor
+    // would let IQ2_XXS/IQ2_XS layers take their already-shipped MMQ kernels; see
+    // docs/V41_FIRST_TOKENS.md.
     let moe_batched_ok = c.moe.is_some() && {
         let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
         let moe_layers = || (0..c.n_layer).filter(|&l| c.is_moe_layer(l));
@@ -1391,17 +1395,17 @@ fn session_stable(
         // pre-filter `(0..n_layer)` scan could not be vacuous; this one can.
         moe_layers().next().is_some()
             && if c.dual_moe() {
-                moe_layers().all(|l| {
-                    moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
-                        && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
-                })
-            } else {
-                moe_layers().all(|l| {
-                    moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
-                        && moe_mmq_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
-                        && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
-                })
-            }
+                    moe_layers().all(|l| {
+                        moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
+                            && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                    })
+                } else {
+                    moe_layers().all(|l| {
+                        moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
+                            && moe_mmq_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
+                            && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+                    })
+                }
     };
     Ok(SessionStable {
         has_wv,
@@ -12347,6 +12351,24 @@ fn generate_dense_backend_inner(
             && matches!(v_fmt, DType::F16 | DType::Q8_0)
             && (be.moe_paged() || moe_batched_ok)
     } else {
+        // DeepSeek V4 is excluded from the batched path outright; see the comment above for the
+        // two reasons (an `hc_mult`-wide residual cannot cross a partial layer span, and no
+        // batch > 1 V4 graph has ever executed). V4.1 is behind `INFR_DSV41_BATCHED_PREFILL`
+        // while that path is being brought up: the eligibility gate below is CONSERVATIVE for the
+        // whole family, and the residual argument only binds a LAYER-SPAN build — batched prefill
+        // builds one whole-model graph per chunk (`span = None`), never a partial span. The env
+        // var is a bring-up switch, not a default: it exists so the batched path can be exercised
+        // and measured against the per-token one before anything about it changes for users.
+        //
+        // MEASURED, 2026-11-08: enabling it for V4.1 is NOT viable today. With both gates
+        // forced open the short-prompt case runs (41 tok @ 8 t/s vs 7 per-token) but a 2032-token
+        // prompt loses the DEVICE: "wait segment fence: The logical device has been lost", after
+        // ~5 minutes of a 3072-row chunk. The driver recovered (Vulkan1 remained enumerable, no
+        // `xe ... wedged` in the kernel log) and the per-token path still runs at 6.4 t/s, so this
+        // is a reproducible hang in the batched V4.1 graph, not a card problem. That is exactly
+        // what the comment above warned about - no batch > 1 V4 graph had ever been executed.
+        // Until the hc_mult-width residual is carried across a chunked span properly, the family
+        // stays on the per-token path, which is correct and merely slower.
         (c.moe.is_none() || moe_batched_ok) && !is_dsv4_family(c)
     };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {

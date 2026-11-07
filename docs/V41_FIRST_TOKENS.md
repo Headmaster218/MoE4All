@@ -196,3 +196,47 @@ runtime_elastic 11.05 已经占掉，专家最多拿 ~21.7 GiB。
 | 提交批次太碎 | 512 vs 64 → 噪声内 |
 | dispatch 数量太多 | 每 forward 仅 ~69 次，设备时间 0.2–4.8 ms |
 | 图构建开销 | setup 仅 0.073 ms/token |
+
+---
+
+## 批量预填充：实测证明**现在不能开**（2026-11-08 00:43）
+
+上游 `batched_prefill_ok` 里有 `!is_dsv4_family(c)`。注释给的理由是「`hc_mult` 宽残差无法跨 span 携带，
+且从未有 batch>1 的 V4 图被执行过」。我一度认为这个门是**保守的**（因为批量预填充是整图 `span=None`，
+不触发那个 assert），于是用 `INFR_DSV41_BATCHED_PREFILL` 临时把两道门都打开实测。
+
+### 结果：短 prompt 能跑，长 prompt **丢设备**
+
+| prompt | 模式 | 结果 |
+|---|---|---|
+| 41 tok | 逐 token | 7 t/s ✅ |
+| 41 tok | 批量 | **8 t/s** ✅（略快，但样本太小） |
+| **2032 tok** | 逐 token | 6 t/s（344.8s）✅ |
+| **2032 tok** | **批量** | ❌ **`The logical device has been lost`** |
+
+批量路径跑了一个 3072 行的 chunk、约 5 分钟后设备丢失：
+
+```
+WARN infr_vulkan::adapter: Prefill producer cleanup after forward failure also failed
+  cleanup=backend: async Prefill upload dependency failed: backend: wait segment fence:
+  The logical device has been lost.
+WARN infr_vulkan::pcache: [infr] the GPU device was lost during this run
+  — discarding the pipeline cache rather than persisting a shader binary that may be what hung it.
+```
+
+### 驱动状态：**没有 wedge**
+
+- 内核日志无 `xe ... wedged`、无 `guc_exec_queue_timedout`
+- `infr devices` 仍然枚举到 Vulkan1 = Arc B70
+- 逐 token 路径立刻恢复正常：`decode 24 tok @ 6.4 t/s`
+
+所以这是**批量 V4.1 图本身的可复现挂起**，不是显卡问题，也不是把卡弄坏了。
+
+### 结论：门关着是对的
+
+上游那句「no batch > 1 V4 graph has ever been EXECUTED」不是保守措辞，是**陈述事实** ——
+而第一次真去执行它，就挂了。启用开关的代码已**撤回**，只留下这条记录和 `runner.rs` 里
+把实测结果写进注释的说明。
+
+**这是本轮最有价值的否定结论**：省掉了后来人重踩一次的时间，也说明「少预填充一个 token」
+并不是与 poorseek 差距 150x 的原因（41-token prompt 上批量只带来 7→8 t/s）。
