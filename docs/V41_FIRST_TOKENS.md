@@ -576,3 +576,21 @@ argmax_part            3436.5 us   <- 扫 129280 个 f32
 
 因此**修 argmax shader 不会有收益**（它本来就不慢），这条线索到此为止。
 真正的账仍然是：40 层 wall 814 ms，其中 paging_sync 约占 80%。
+
+### 补：`argmax_part` 的 3 ms 也不是计算（Round 5 收尾）
+
+同一次 forward 内的对比（`INFR_PROF_OPS`）：
+
+```
+native_idm_iq1m_paged   285.2 us   <- 真正的专家 GEMM（256 专家的矩阵乘）
+argmax_part            3436.5 us   <- 扫 129280 个 f32
+```
+
+**词表扫描比矩阵乘慢 12 倍**，不可能是计算量的问题——256 个 workgroup × 256 线程
+扫 505 KiB 在 Arc B70 上应该是微秒级。
+
+结论：这 3 ms 是**排队等待**，argmax 排在一整层专家 GEMM 之后，
+设备时间戳把等待前面的活也算了进去。和 `paging_sync` 是同一现象的另一面。
+
+**因此修 argmax shader 不会有收益**（它本身不慢），这条线索到此为止。
+真正的账仍然是：40 层 wall 814 ms，其中 paging_sync 约占 80%。
