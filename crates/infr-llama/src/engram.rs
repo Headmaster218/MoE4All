@@ -137,6 +137,33 @@ impl<'a> EngramMap<'a> {
         self.n_gram.saturating_sub(1) * self.n_head
     }
 
+    /// Borrow layer `slot`'s arrays out of a parsed [`crate::Config`] (see
+    /// [`engram_map_for_layer`], which resolves the slot from a block index).
+    pub fn from_config_slot(cfg: &'a crate::Config, slot: usize) -> Result<Self> {
+        let map = Self {
+            slot,
+            n_gram: cfg.engram_max_ngram,
+            n_head: cfg.engram_n_head,
+            pad_id: cfg.engram_pad_id,
+            multipliers: &cfg.engram_multipliers,
+            primes: &cfg.engram_primes,
+            offsets: &cfg.engram_offsets,
+            token_map: &cfg.engram_token_map,
+        };
+        if !map.is_consistent() {
+            return Err(Error::Loader(format!(
+                "engram config: slot {slot} is not covered by the hash arrays (multipliers {},                  primes {}, offsets {} for n_gram {} x n_head {}); the config parser is supposed \
+                 to reject this",
+                map.multipliers.len(),
+                map.primes.len(),
+                map.offsets.len(),
+                map.n_gram,
+                map.n_head
+            )));
+        }
+        Ok(map)
+    }
+
     /// Whether the borrowed arrays are long enough for this layer's slot. The config parser rejects
     /// a short array, so this is a guard for callers that build an [`EngramMap`] by hand.
     pub fn is_consistent(&self) -> bool {
@@ -214,6 +241,24 @@ impl<'a> EngramMap<'a> {
         }
         rows
     }
+}
+
+/// Build the [`EngramMap`] for block `layer_id` from a parsed [`crate::Config`].
+///
+/// The one piece of glue between the load path (which owns the metadata arrays) and this module
+/// (which owns the arithmetic). `slice` — not a `Config` reference — is still what [`EngramMap`]
+/// holds, so the row maths stays testable without a whole model config; this constructor just
+/// resolves the layer's slot and borrows the four arrays.
+///
+/// Returns `None` when `layer_id` carries no engram, and an error when it does but its slot is not
+/// covered by the arrays (a config that got past `from_gguf` cannot reach that, so it is a bug
+/// rather than a bad file).
+pub fn engram_map_for_layer(cfg: &crate::Config, layer_id: u32) -> Option<Result<EngramMap<'_>>> {
+    let slot = cfg
+        .engram_layer_ids
+        .iter()
+        .position(|&l| l == layer_id)?;
+    Some(EngramMap::from_config_slot(cfg, slot))
 }
 
 // ─── MXFP8 dequant ───────────────────────────────────────────────────────────
@@ -1509,6 +1554,44 @@ mod tests {
         assert_eq!(ggml_type_size(GGML_TYPE_ENGRAM_E4M3, 3).unwrap(), 3);
         // Unknown types are refused by name rather than silently sized.
         assert!(ggml_type_size(10, 256).is_err());
+    }
+
+    #[test]
+    #[ignore = "opens the real 39 GB shard 1 header; set INFR_DSV41_SHARD1"]
+    fn config_glue_resolves_the_real_layer_slots() {
+        // The end-to-end glue: Config::from_gguf -> engram_map_for_layer -> row_indices, against
+        // the real model, using the real multipliers/primes/offsets/token_map.
+        let Some(path) = std::env::var("INFR_DSV41_SHARD1").ok().map(PathBuf::from) else {
+            eprintln!("INFR_DSV41_SHARD1 unset — skipping");
+            return;
+        };
+        if !path.exists() {
+            eprintln!("{} missing — skipping", path.display());
+            return;
+        }
+        let g = infr_gguf::Gguf::open(&path).expect("shard 1 must open");
+        let cfg = crate::Config::from_gguf(&g).expect("deepseek41 config must parse");
+        assert!(cfg.has_engram(1) && cfg.has_engram(14));
+        assert!(!cfg.has_engram(0) && !cfg.has_engram(2));
+        assert_eq!(cfg.engram_n_head, 8);
+        assert_eq!(cfg.engram_max_ngram, 4);
+        assert_eq!(cfg.engram_key_length, 256);
+
+        for &layer in &[1u32, 14] {
+            let m = engram_map_for_layer(&cfg, layer)
+                .expect("has_engram(layer) implies a map")
+                .expect("arrays must cover the slot");
+            assert_eq!(m.n_bucket(), 24, "(4-1) * 8 heads");
+            let rows = m.row_indices(1234, &[11, 22, 33]);
+            assert_eq!(rows.len(), 24);
+            for r in &rows {
+                // Every row is a u32 hash already; what matters is that it fits the TABLE, which
+                // is the real bound (384,006,168 and 384,016,682 rows).
+                assert!(u64::from(*r) < 384_016_682, "row {r} must index a real table row");
+            }
+            eprintln!("layer {layer}: slot {} rows {rows:?}", m.slot);
+        }
+        assert!(engram_map_for_layer(&cfg, 0).is_none());
     }
 
     // ── real file (opt-in) ──────────────────────────────────────────────────
