@@ -517,3 +517,62 @@ paging_sync 123.9 ms/token
    除非提高专家压缩率或改变驻留粒度 —— 属路线级决策。
 
 这三条都不是调参能解决的，需要改 `adapter.rs` 的层内流水线。
+
+---
+
+## Round 5：账目终于平了，并且推翻了我上轮两个假设（2026-11-08 04:06）
+
+### 修正 1：`main_busy` 不能当作"GPU 计算 floor"
+
+上一轮我写「GPU 每 token 真算 103.7 ms，理论 floor 9.6 t/s」，**这个推论是错的**。
+`main_busy` 是主队列设备区间的**并集**，它与 `paging_sync` 大幅重叠（622 vs 737 ms），
+不是可以相加的独立项。
+
+### 修正 2：`argmax_part` 的 85.9% 是**单次 forward 内**的占比，不是全程
+
+全局累计才 124.2 ms / 40 次调用。拿它去比 `main_busy` 的 622 ms 得出"占 20%"，同样是跨口径比较。
+
+### 账目现在平了（同一次运行、同一区间）
+
+```
+40 层 wall 合计        814.2 ms
+整个 decode wall        931.9 ms
+差额（非层开销）        117.7 ms   <- argmax / 采样 / 收尾
+```
+
+每 token：层内 **135.7 ms**，非层 **19.6 ms**。**argmax 只占约 13%，不是大头。**
+
+### 本轮确认的两件事
+
+1. **`argmax_part` 单次 3081 μs 扫 505 KiB = 0.17 GB/s**，比应有带宽慢约 3 个数量级，确实是烂 kernel；
+   但修好它每 token 只省约 20 ms → 6.4 → 7.4 t/s。**值得修，但不解决问题。**
+2. **大头仍在层内的 paging_sync**（123.9 ms/token），与 Round 3/4 的结论一致。
+
+### 教训（写给下一轮的我）
+
+这几轮我反复在**跨口径比较数字**上栽跟头：
+- 把 `INFR_PROF_OPS` 的累计计数当单次 forward
+- 把 `copy_into_slot`（测试接口）当生产路径
+- 把 `main_busy` 当独立 floor
+- 把单次 forward 的占比当全程占比
+
+**规则：任何两个数字要相减/相比，必须先确认它们在同一个时间区间、同一个采样开关下产生。**
+层内用 `single-decode-layer` 求和，全程用 `single-decode-summary`，不要混。
+
+### 补：`argmax_part` 的 3 ms 也不是计算
+
+同一次 forward 内的对比（`INFR_PROF_OPS`）：
+
+```
+native_idm_iq1m_paged   285.2 us   <- 真正的专家 GEMM（一次 256 专家的矩阵乘）
+argmax_part            3436.5 us   <- 扫 129280 个 f32
+```
+
+**词表扫描比矩阵乘慢 12 倍**，不可能是计算量的问题。256 个 workgroup × 256 线程
+扫 505 KiB 在 Arc B70 上应该是微秒级。
+
+结论：这 3 ms 是**排队等待**——argmax 被排在一整层专家 GEMM 之后，
+它的"设备时间戳"把等待前面的活也算了进去。和 `paging_sync` 是同一个现象的另一面。
+
+因此**修 argmax shader 不会有收益**（它本来就不慢），这条线索到此为止。
+真正的账仍然是：40 层 wall 814 ms，其中 paging_sync 约占 80%。
