@@ -3852,18 +3852,36 @@ fn synthetic_deepseek41_refuses_a_zero_rope_base() {
     d.compress_rope_theta = 0.0;
     let m = dsv41_model(&d);
     let tmp = TempGguf::write("ds41-theta0", &m);
-    let err = match infr_llama::SeamModel::load_with(
-        tmp.path(),
-        None,
-        std::sync::Arc::new(infr_llama::EngineConfig::default()),
-    ) {
-        Ok(model) => match model.prefill_logits_cpu(PROMPT) {
-            Ok(logits) => panic!("a zero rope base must be refused, got logits {logits:?}"),
-            Err(e) => format!("{e:#}"),
-        },
-        Err(e) => format!("{e:#}"),
+    // The guard is an `assert!` inside the graph builder — the same build-time-precondition idiom
+    // every other invariant in `build` uses (the builder returns no `Result`) — so the refusal
+    // surfaces as a PANIC, not an `Err`. Catch it and check what it said.
+    let caught = std::panic::catch_unwind(|| {
+        match infr_llama::SeamModel::load_with(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(infr_llama::EngineConfig::default()),
+        ) {
+            Ok(model) => match model.prefill_logits_cpu(PROMPT) {
+                Ok(logits) => Ok(format!("a zero rope base must be refused, got logits {logits:?}")),
+                Err(e) => Err(format!("{e:#}")),
+            },
+            Err(e) => Err(format!("{e:#}")),
+        }
+    });
+    let err = match caught {
+        Ok(Ok(bad)) => panic!("{bad}"),
+        Ok(Err(e)) => e,
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "non-string panic payload".to_string()),
     };
-    // The message must be actionable: a layer number and the reason, not a bare assert.
+    // The message must be actionable: name the arch, the layer and the reason — not a bare assert.
     assert!(
         err.contains("deepseek41") && err.contains("theta"),
         "the refusal must name the arch and the offending base, got: {err}"

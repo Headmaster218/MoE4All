@@ -464,7 +464,13 @@ pub enum Op {
     Dsv4Compress {
         values: TensorId,
         scores: TensorId,
-        ape: TensorId,
+        /// Absolute positional encoding added into the score ring, `[ratio * width]` f32.
+        ///
+        /// `None` means "no APE": the term is zero, so the score ring takes the projected `scores`
+        /// unchanged. Every V4 file ships one; **no V4.1 file ships `attn_compressor_ape` at all**
+        /// (0 of 1008 tensors), which is why this is optional rather than mandatory — V4's own
+        /// `deepseek4` path always passes `Some`.
+        ape: Option<TensorId>,
         norm: TensorId,
         freq_factors: Option<TensorId>,
         state: TensorId,
@@ -1781,7 +1787,8 @@ impl Op {
                 dst,
                 ..
             } => {
-                let mut r: R = vec![values, scores, ape, norm, state];
+                let mut r: R = vec![values, scores, norm, state];
+                r.extend(ape);
                 r.extend(freq_factors);
                 (r, vec![state, dst])
             }

@@ -5491,10 +5491,15 @@ fn lower_op(
                 Some(id) => Some(r(*id)?),
                 None => None,
             };
+            // The graph always binds a real APE table: V4 ships one, and the V4.1 emit substitutes
+            // its shared all-zero `@zero_ape` (that arch ships none). So the op no longer has to
+            // carry the "no APE" case into the backend at all — `Op::Dsv4Compress` keeps `ape`
+            // optional only so the emit can express the difference at the seam.
+            let ape = ape.ok_or_else(|| be("Dsv4Compress: no APE table bound"))?;
             rec.dsv4_compress(
                 r(*values)?,
                 r(*scores)?,
-                r(*ape)?,
+                r(ape)?,
                 r(*norm)?,
                 ff,
                 r(*state)?,

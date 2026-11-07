@@ -60,6 +60,41 @@ fn is_dsv41_index_key_source(c: &Config, il: usize) -> bool {
     c.dsv41_index_key_source.get(il).copied() == Some(il as i32)
 }
 
+/// Elements the shared all-zero APE table needs: the largest `ratio * width` any V4.1 compressor
+/// row can index.
+///
+/// The shader indexes `ape[(pos % ratio) * width + i]`, so a layer needs `ratio * width` entries
+/// (V4.1's `overlap` is `ratio == 4`, giving `width = 2*dim`). One table serves every source layer
+/// because all four use the same compressed head width; sizing it to the maximum keeps a future
+/// file with mixed sources correct rather than silently out of bounds.
+fn dsv41_zero_ape_elems(c: &Config) -> usize {
+    let width = c.head_dim;
+    let mut n = 0usize;
+    for l in 0..c.n_layer {
+        if !c.dsv41_is_kv_source(l) {
+            continue;
+        }
+        let ratio = c.layer_compress_ratio(l) as usize;
+        let w = if ratio == 4 { 2 * width } else { width };
+        n = n.max(ratio.saturating_mul(w));
+    }
+    n
+}
+
+/// The shared all-zero APE handle for V4.1, or `None` for every other arch.
+///
+/// V4.1 ships **no** `attn_compressor_ape` tensor at all (0 of the 1008 in the real file), so the
+/// absolute-positional term must be zero. Binding an explicit zero table says that in the graph
+/// rather than threading `Option` through the recorder, the shader and every backend: the emit is
+/// then identical for both arches and the score ring gets `+ 0.0`, which is the same arithmetic an
+/// all-zero table performs.
+///
+/// `zero_ape` is the per-build handle allocated next to `hc_ones` (same weightless-constant
+/// mechanism, same slot ordering); it is `None` for non-V4.1 builds.
+fn dsv41_zero_ape(c: &Config, zero_ape: Option<TensorId>) -> Option<TensorId> {
+    c.deepseek41.then_some(zero_ape).flatten()
+}
+
 fn paged_decode_stages_enabled(be: &dyn Backend, mtp: bool) -> bool {
     !mtp && be.moe_paged() && !be.dense_paged()
 }
@@ -2813,6 +2848,10 @@ pub(super) fn cold_weight_plan(
         // this allocation would leave `wpush` one slot short — every weight after it binds one
         // buffer off, silently.
         (is_dsv4_family(c), "@hc_ones", c.hc_mult.saturating_mul(ne)),
+        // V4.1 ships no APE table; this all-zero stand-in supplies the term (see
+        // `dsv41_zero_ape`). It is a REAL allocation, so it must appear in this list too or the
+        // upload would leave `wpush` one slot short.
+        (c.deepseek41, "@zero_ape", dsv41_zero_ape_elems(c)),
     ] {
         if enabled {
             allocation_specs.push(super::WeightUploadSpec {
@@ -3554,6 +3593,19 @@ fn generate_dense_backend_inner(
                 .map_err(|e| anyhow!("{e}"))?;
             wbufs.push(b);
             wspecs.push((DType::F32, c.hc_mult * ne));
+        }
+        // V4.1's all-zero APE stand-in. Uploaded AFTER `hc_ones`, matching `@hc_ones`
+        // then `@zero_ape` in `cold_weight_plan`'s weightless list — the two lists are read in
+        // the same order, so a swap here would bind both one slot off.
+        if c.deepseek41 {
+            let zeros = vec![0.0f32; dsv41_zero_ape_elems(c)];
+            let b = be
+                .alloc(zeros.len() * 4, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&zeros))
+                .map_err(|e| anyhow!("{e}"))?;
+            wbufs.push(b);
+            wspecs.push((DType::F32, dsv41_zero_ape_elems(c)));
         }
         if let Some(batch) = allocation_batch.as_mut() {
             batch
@@ -5408,6 +5460,15 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
+        // V4.1's stand-in for the APE table it does not ship (all zeros). Allocated in the same
+        // weightless-constant sequence as `hc_ones` above and uploaded right after it, so the plan
+        // and `wpush` stay in lockstep — a slot that the plan declares but the upload skips leaves
+        // every later weight one handle off.
+        let zero_ape = if c.deepseek41 {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
+        };
         // `logits_rows == 0` (task #27): a HEADLESS graph — the chunked batched-prefill path,
         // whose per-chunk logits nothing ever consumes (the sampler reads the decode loop's own
         // fresh logits for the LAST prompt token; earlier rows' logits were always discarded).
@@ -6863,11 +6924,26 @@ fn generate_dense_backend_inner(
 
                 let mut compressed_indices = None;
                 let mut compressed_selected = 0usize;
-                if ratio4 != 0 {
+                // Ownership, not the raw ratio, decides who runs a compressor.
+                //
+                // V4 keys this off `ratio4 != 0` because in a V4 file every non-zero-ratio layer
+                // owns its own compressor. V4.1's `compress_ratios` is a ROLE map over a
+                // source/reuse topology: only the four source layers (`kv_source_layer_ids`
+                // [2,8,14,20]) carry `attn_compressor_*`, and the other 34 role!=0 layers are
+                // REUSE layers that read a stream a source published earlier. Gating on the raw
+                // ratio therefore sent all 38 into this arm and panicked on the first reuse layer
+                // with "compressed V4 layer without compressor weights" — and, even had the
+                // tensors been there, it would have run 34 compressors the model does not have.
+                //
+                // `dsv4_compressed.is_some()` is exactly the ownership test: `wpush`/`wload` build
+                // it only where `dsv41_is_kv_source(l)`. So the reuse layers now emit no compressor
+                // at all and fall through to reading the source's rows (the source-plane gather).
+                let owns_compressor = lw.dsv4_compressed.is_some();
+                if owns_compressor {
                     let cw = lw
                         .dsv4_compressed
                         .as_ref()
-                        .expect("compressed V4 layer without compressor weights");
+                        .expect("owns_compressor implies dsv4_compressed");
                     let overlap = ratio4 == 4;
                     let comp_width = if overlap { 2 * hd4 } else { hd4 };
                     g.push(Op::Linear {
@@ -6879,25 +6955,44 @@ fn generate_dense_backend_inner(
                         out_f: comp_width,
                         w_off: 0,
                     });
-                    g.push(Op::Linear {
-                        x: hn,
-                        weight: cw
-                            .attention
-                            .wgate
-                            .expect("a V4 compressor always carries a pooling gate"),
-                        dst: d4_comp_scores,
-                        m: 1,
-                        in_f: ne as u32,
-                        out_f: comp_width,
-                        w_off: 0,
-                    });
+                    // A ratio-1 source pools exactly one token per row, so the pooling softmax is
+                    // over a single element and is 1.0 — no gate is needed and V4.1 files ship none
+                    // there (the lead source, layer 20). `wload` already reads the gate
+                    // conditionally on `ratio > 1`; the emit must agree or it demands a tensor that
+                    // was deliberately not loaded. V4 always has one.
+                    if let Some(wgate) = cw.attention.wgate {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: wgate,
+                            dst: d4_comp_scores,
+                            m: 1,
+                            in_f: ne as u32,
+                            out_f: comp_width,
+                            w_off: 0,
+                        });
+                    } else {
+                        assert!(
+                            c.deepseek41 && ratio4 == 1,
+                            "a compressor without a pooling gate must be a ratio-1 V4.1 source"
+                        );
+                        // No gate: the compressor's `scores` input is absent, so feed it the
+                        // (unused at ratio 1) values projection. The `Dsv4Compress` shader still
+                        // reads `scores`, and at ratio 1 every row contributes with weight 1.0.
+                        g.push(Op::Copy {
+                            src: d4_comp_values,
+                            src_off: 0,
+                            dst: d4_comp_scores,
+                            dst_off: 0,
+                            n: comp_width,
+                        });
+                    }
                     g.push(Op::Dsv4Compress {
                         values: d4_comp_values,
                         scores: d4_comp_scores,
-                        ape: cw
-                            .attention
-                            .ape
-                            .expect("a V4 compressor always carries an APE table"),
+                        // V4.1 ships no APE anywhere (0 of 1008 tensors), so it binds the shared
+                        // all-zero table: the term is added as +0.0, which is exactly what "no
+                        // absolute positional encoding" means. V4 keeps its real table.
+                        ape: cw.attention.ape.or_else(|| dsv41_zero_ape(c, zero_ape)),
                         norm: cw.attention.norm,
                         freq_factors: yarn_ff,
                         state: v_cache[l],
@@ -6959,7 +7054,9 @@ fn generate_dense_backend_inner(
                         g.push(Op::Dsv4Compress {
                             values: d4_lid_values,
                             scores: d4_lid_scores,
-                            ape: lid.ape.expect("a V4 LID compressor always carries an APE table"),
+                            // Same rule as the CSA2 compressor above: V4.1 ships no APE, so it
+                            // binds the shared all-zero table and adds exactly zero.
+                            ape: lid.ape.or_else(|| dsv41_zero_ape(c, zero_ape)),
                             norm: lid.norm,
                             freq_factors: yarn_ff,
                             state: v_cache[l],
