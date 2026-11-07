@@ -694,3 +694,50 @@ native_idm_iq1m_paged     6.7 us   6.5 us     6.4 us
 3. 本轮的 `Vulkan0`（核显 141 GiB UMA）路线**已实测不可行**：
    加载时 97.24 GiB 已被物理占用，只剩 43.09 GiB，装不下 129 GiB 模型，
    且这次尝试**触发了一次 device lost**。
+
+---
+
+## Round 8：预填充实测 5 tok/s —— 这才是最大的差距（2026-11-08 05:32）
+
+### 首次实测 V4.1 的长上下文预填充
+
+```
+prefill 10160 tok @ 5 tok/s (1980142 ms = 33 分钟) | decode 2 tok @ 4.5 tok/s
+VRAM plan: ctx=16384 expert_cache_target=10.03 GiB elastic_pool=21.08 GiB
+```
+
+对照 poorseek 文档（`DEEPSEEK_V41.md:118`）：
+
+| | 本机（Arc B70 / IQ2_XXS 129 GiB / ctx 16K） | poorseek（RTX 4090 / GSQ 246 GiB） |
+|---|---:|---:|
+| **预填充 8192 tok** | **~5 tok/s** | **244-248 tok/s** |
+| 差距 | — | **~49×** |
+| decode | 6.4-6.5 tok/s | 25.5-26.3（偏置路由）/ ~3.5（精确路由） |
+
+**预填充的差距（49×）比 decode 大一个数量级。**
+
+### 这正好命中一个已知开关
+
+Round 1 就查明：`batched_prefill_ok` 里有一项 `!is_dsv4_family(c)`（runner.rs:12253），
+让 V4 家族**预填充一次只处理一个 token** —— 一整个 10160-token 的 prompt 被拆成
+10160 次 forward。
+
+而预填充本该走 `touch_all` 路径（`rows * n_used >= 3 * n_expert` 在大 rows 下成立），
+一次性把整层专家搬进来，然后**批量**计算。现在这个优势完全没有被利用。
+
+### Round 1 试过打开，但会丢设备
+
+当时实测：短 prompt 能跑（41 tok 8 t/s vs 7），但 2032-token 会
+`The logical device has been lost`（3072 行 chunk 跑约 5 分钟）。
+注释里写的理由是 **`hc_mult` 宽残差无法跨 span 携带**。
+
+### 这是下一轮唯一值得做的事
+
+理由：
+1. **收益最大** —— 49× 的差距，不是 decode 那种 8×
+2. **方向明确** —— 不是猜，是已知的一个布尔条件
+3. **不涉及路由/质量妥协** —— 纯粹的工程修复，不影响精度
+
+需要解决的具体问题：让 **`hc_mult` 宽的残差能跨 chunk 携带**。
+这是 Round 1 撞墙的那堵墙，也是 `batched_prefill_ok` 里那句
+「no batch > 1 V4 graph has ever been executed」的含义。
