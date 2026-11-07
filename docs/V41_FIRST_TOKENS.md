@@ -108,31 +108,54 @@ expert_cache_target=10.16 GiB  elastic_pool=21.21 GiB (k=Q8_0, v=Q8_0)
 
 实测 6.4–6.6 t/s，距带宽上限还有 ~5x，**说明瓶颈不在带宽，在调度开销**。
 
-## 调度开销（profile 证据）
+## 调度开销 —— 我最初的判断是错的，这里是修正后的
 
-解码 32 token 的 per-op 计数（`INFR_PROF_OPS=1`）：
+**先说我错在哪。** 我最初看 per-op 计数（`native_idm_iq2xxs_paged` 3004 次、
+`hyper_mix_gates_decode` 3120 次……）时，把这些**累计**次数当成了每 token 的次数，
+算出「每 token 约 1.8 万次 dispatch、每次 8.7us」，并据此断言瓶颈是 dispatch 数量。
 
-| op | count | us/次 |
-|---|---:|---:|
-| native_idm_iq2xxs_paged | 3004 | 49.7 |
-| hyper_mix_gates_decode | 3120 | 34.8 |
-| rmsnorm | 3120 | 25.4 |
-| hyper_pre | 3120 | 10.8 |
-| linear_f32r_v4 | 3120 | 10.8 |
-| rope + rope_back | 3120+1560 | ~6 |
-| dsv4_gather | 1560 | 45.5 |
-| moe_topk_sg | 1560 | 25.3 |
+`INFR_PROF_OPS` 的**单次 forward 行**才是可比的：
 
-1560 = 39 token × 40 层，即**每 token 每层一次**。合计约 **1.8 万次 dispatch / token**，
-156 ms/token ÷ 1.8 万 ≈ **8.7 us/dispatch** —— 正是 Vulkan submit 的开销量级。
+```
+[prof:vulkan] per-op device time — 1.8 ms over 69 dispatches
+[prof:vulkan] per-op device time — 4.3 ms over 69 dispatches
+[prof:vulkan] per-op device time — 0.3 ms over  4 dispatches
+```
 
-**所以 V4.1 慢的根因是「每 token 约 1.8 万次小 dispatch」，不是任何一个 kernel 慢。**
-这与 poorseek 侧「闸门占 40%」是同一族问题：**调度，不是算力**。
+**每次 forward 只有约 69 次 dispatch，设备时间 0.2–4.8 ms。** 1.8 万那个数不成立。
+
+## 那么 156 ms/token 花在哪
+
+`INFR_PROF_STAGES=1` 的 decode 汇总行给出了答案：
+
+```
+[cpu prof] prompt 32 tok in 5.91s (5.4 tok/s) | decode 32 tok in 5.63s (5.69 tok/s)
+[dec prof] setup(build+compile+bind) 0.073ms/tok | exec(record+submit+gpu) 175.662ms/tok
+```
+
+- **图构建/编译/绑定：0.073 ms/token** —— 解码回放磁带确实在工作，构建不是开销
+- **record+submit+gpu：175.7 ms/token** —— 全部时间在这里
+
+但单个 forward 的 `submit+gpu` 只有 1.4–3.8 ms，40 层加起来也远不到 175 ms。
+**差额是 GPU 在等：等专家数据的 DMA。** 123 GiB 专家里只有约 23 GiB（`arena_bytes=23262105600`）
+能同时驻留，其余每次 forward 都要从 host RAM 经 PCIe 搬。
+
+## 三个被我逐一排除的假设
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| 专家缓存太小 | `--ctx 8192` 多腾 10 GiB | 6.6 → 6.4 t/s，无改善 |
+| 提交拆得太碎 | `submit_dispatches=512`（默认 64） | 6.4 → 6.6 t/s，噪声内 |
+| dispatch 数量太多 | 见上：每 forward 仅 ~69 次 | **前提本身错了** |
+
+所以瓶颈是**专家流式传输的带宽/延迟**，与 poorseek 那边「闸门占 40%」是不同的问题 ——
+**我先前把它类比成同一个问题，那个类比是错的。**
 
 ## 下一步（按收益排序）
 
-1. **减少 dispatch 数**：40 层 × 约 30 个 op 是结构性的。decode 回放磁带（`no_replay=false`，即已启用）
-   已经省掉了录制，但 dispatch 数本身没变。真正的解是融合（fuse）逐层的 rmsnorm/rope/hyper。
+1. **降低专家流式传输的开销**：这是实测定位到的唯一大头（175.7 ms/token 里绝大部分）。
+   方向包括：把 23 GiB 常驻集挑得更准（复用率高的专家优先）、增大 arena、
+   或用 in-place 索引让 host 侧直接参与计算而不过 PCIe。
 2. **批量预填充**：`batched_prefill_ok` 的 `!is_dsv4_family(c)` 让 V4.1 一次只预填充一个 token，
    这是 prefill 7 t/s 的直接原因，也是与 poorseek 1063 t/s 差距最大之处。
 3. `moe_batched_ok` 的全有或全无判定（40 层只有 1 层满足 MMQ）。
