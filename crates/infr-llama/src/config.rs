@@ -261,9 +261,16 @@ pub struct Config {
     /// DeepSeek V4 (`{arch}.attention.output_lora_rank`): the rank of that output projection's
     /// bottleneck, per group. `0` for every non-`deepseek4` model.
     pub o_lora_rank: usize,
-    /// DeepSeek V4 (`{arch}.attention.compress_rope_freq_base`): the rope base the COMPRESSED
-    /// (ratio 4 / 128) layers use, with YaRN. Ratio-0 layers use plain unscaled rope at
-    /// [`Config::rope_theta`]. `0.0` for every non-`deepseek4` model.
+    /// DeepSeek V4 / V4.1 (`{arch}.attention.compress_rope_freq_base`): the rope base the
+    /// COMPRESSED layers use, with YaRN. Layers whose [`Config::layer_compress_ratio`] is 0 use
+    /// plain unscaled rope at [`Config::rope_theta`] instead.
+    ///
+    /// On V4.1 the field keeps its V4 name but spans roles `{0,1,2}`: role 0 (pure sliding window)
+    /// takes `rope_theta`, roles 1 and 2 (the compressed tiers) take this base. Because role 0 maps
+    /// to ratio 0, the existing `ratio == 0` test is the correct branch for V4.1 too — the values
+    /// are NOT remapped onto V4's `{0,4,128}` scale.
+    ///
+    /// `0.0` for every model that is neither `deepseek4` nor `deepseek41`.
     pub compress_rope_theta: f32,
     /// DeepSeek V4 (`{arch}.hyper_connection.count`): how many parallel residual streams the
     /// hyper-connection block carries. Every per-layer `hc_*` tensor and the model-level
@@ -279,6 +286,64 @@ pub struct Config {
     /// DeepSeek V4 (`{arch}.hyper_connection.epsilon`): the epsilon added inside that Sinkhorn
     /// normalisation. `0.0` for every non-`deepseek4` model.
     pub hc_eps: f32,
+    /// DeepSeek V4.1: `true` only for `arch == "deepseek41"`. Deliberately NOT folded into
+    /// [`Config::deepseek4`]: V4.1 differs from V4 in exactly the places that flag gates — the
+    /// meaning of `compress_ratios` (`{0,1,2}` layer ROLES in a source/reuse topology, not
+    /// `{0,4,128}` ratios), the ownership of compressors and indexers, and the hyper-connection
+    /// scheduling — so an alias would route a V4.1 file through V4's checks without a word. What the
+    /// two DO share (MoE block, Q-LoRA projection, sinks, output grouping, sliding-window pattern,
+    /// YaRN, swiglu clamps) is opted into per-parse, with the reason stated at each site.
+    pub deepseek41: bool,
+    /// DeepSeek V4.1 CSA2 source map: for every layer `il`, the layer whose published KV stream it
+    /// attends over, or `-1` for a pure sliding-window layer (role 0) that reads no compressed
+    /// stream at all. A layer whose entry equals its own index is a **source** — it owns
+    /// `attn_compressor_kv` and publishes the stream others reuse. Empty for every other arch.
+    pub dsv41_kv_source: Vec<i32>,
+    /// DeepSeek V4.1 index-key source map: the layer that publishes `indexer.attn_k` (the scores'
+    /// KEYS) for layer `il`, or `-1`. Distinct from [`Config::dsv41_kv_source`] because the file
+    /// splits the two roles — the real model has 4 KV sources but 8 index-key sources.
+    pub dsv41_index_key_source: Vec<i32>,
+    /// DeepSeek V4.1 top-k scorer source map: the layer that publishes `indexer.attn_q_b` (the
+    /// scoring projection the top-k runs on) for layer `il`, or `-1`. `[il] == il` is the "layer
+    /// `il` is an index source / top-k owner" predicate — that set is
+    /// `index_source_layer_ids`, and it is a SUPERSET of the KV sources.
+    pub dsv41_index_topk_source: Vec<i32>,
+    /// DeepSeek V4.1 (`{arch}.candidate_source_layer_id`): the single layer whose indexer supplies
+    /// the candidate BLOCK selection. `0` for every other arch.
+    pub dsv41_candidate_source: usize,
+    /// DeepSeek V4.1 (`{arch}.candidate_block_size`): how many tokens one candidate block spans.
+    /// `0` for every other arch.
+    pub dsv41_candidate_block: usize,
+    /// DeepSeek V4.1 (`{arch}.candidate_topk_blocks`): how many candidate blocks the selector keeps
+    /// before the real attention runs. `0` for every other arch.
+    pub dsv41_candidate_topk_blocks: usize,
+    /// DeepSeek V4.1 engram (`{arch}.engram.layer_ids`): the layers that carry an engram
+    /// associative-memory path (`blk.N.engram_{q,k,wkv}`). Empty for every other arch.
+    pub engram_layer_ids: Vec<u32>,
+    /// DeepSeek V4.1 engram: query/key head count (`engram.head_count`), the width of the
+    /// `ngram × n_head` bucket space the hash addresses.
+    pub engram_n_head: usize,
+    /// DeepSeek V4.1 engram: the key width per head (`engram.key_length`, 256 on the real model) —
+    /// the length of one gathered row of the engram table.
+    pub engram_key_length: usize,
+    /// DeepSeek V4.1 engram: the longest n-gram the rolling hash forms (`engram.max_ngram_size`,
+    /// 4 on the real model). Every bucket count below is `(max_ngram - 1) * n_head` per layer.
+    pub engram_max_ngram: usize,
+    /// DeepSeek V4.1 engram (`engram.pad_id`): the token id whose presence truncates a window.
+    pub engram_pad_id: u64,
+    /// DeepSeek V4.1 engram table — `engram.multipliers`, `layers * max_ngram` rolling-hash
+    /// weights. These are the SAME values the shard set also ships as the redundant I64 tensor
+    /// `engram_multipliers.weight`; the tensor is skipped at parse time and this array is used.
+    pub engram_multipliers: Vec<u64>,
+    /// DeepSeek V4.1 engram table — `engram.primes`, `layers * (max_ngram-1) * n_head` moduli for
+    /// the bucket hash (no entry may be zero). Same redundancy with `engram_primes.weight`.
+    pub engram_primes: Vec<u64>,
+    /// DeepSeek V4.1 engram table — `engram.offsets`, the same-count additive bucket offsets. Same
+    /// redundancy with `engram_offsets.weight`.
+    pub engram_offsets: Vec<u64>,
+    /// DeepSeek V4.1 engram table — `engram.token_map`, the model-vocabulary id → engram-row
+    /// index remap. Same redundancy with the I32 tensor `engram_token_map.weight`.
+    pub engram_token_map: Vec<u64>,
     /// Qwen3.8 PLE metadata. The enormous `per_layer_token_embd` tensor remains mmap-backed;
     /// these fields are enough to hash and fetch its rows without materializing the table.
     pub ple_layers: Vec<bool>,
@@ -422,7 +487,7 @@ impl Config {
     /// is checked directly. Its long-range recall comes from the compressed caches instead
     /// ([`Config::layer_compress_ratio`]), not from a wider window on some layers.
     pub fn is_swa_layer(&self, il: usize) -> bool {
-        if self.deepseek4 {
+        if self.deepseek4 || self.deepseek41 {
             return self.swa_window > 0;
         }
         self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
@@ -433,8 +498,58 @@ impl Config {
     /// where `0` means pure sliding window with no compressor), and for qwen4exp the QSA block
     /// factor (`0` = no block compression, `4` = one scored block key per 4 indexer keys).
     /// `0` for every layer of every other arch.
+    ///
+    /// # deepseek41: these values are ROLES, not ratios
+    ///
+    /// On V4.1 this returns a **layer role** from `{0, 1, 2}` — `0` pure sliding window, `1` an
+    /// unpooled compressed source, `2` a pooled or reuse layer — and NOT a compression ratio. The
+    /// name and the `{0,4,128}` scale above are V4's and must not be projected onto V4.1: `2` does
+    /// not mean "pools two of V4's tokens" in any sense the V4 code would recognise.
+    ///
+    /// In particular, **do not** keep upstream's `ratio != 0 ⇒ this layer owns
+    /// `attn_compressor_*` / `indexer_*`** rule for V4.1. That rule is wrong there in a way that
+    /// fails at tensor load: the real model has 38 layers with a non-zero role but compressors on
+    /// only 4 of them (2, 8, 14, 20) and indexer scorers on only 8. On V4.1 the only correct
+    /// ownership test is tensor presence, resolved at parse time into [`Config::dsv41_kv_source`]
+    /// and [`Config::dsv41_index_topk_source`] — use [`Config::dsv41_is_kv_source`] /
+    /// [`Config::dsv41_is_index_source`] (or [`Config::dsv41_role`] to read the role by name).
+    ///
+    /// The one place the raw value is still consumed as-is is the rope branch
+    /// (`role == 0 ⇒ plain rope at `rope_theta`, else `compress_rope_theta` with YaRN), where role
+    /// 0 happens to line up with V4's ratio 0.
     pub fn layer_compress_ratio(&self, il: usize) -> usize {
         self.compress_ratios.get(il).copied().unwrap_or(0)
+    }
+
+    /// DeepSeek V4.1: layer `il`'s CSA2 **role** — `0` pure sliding window, `1` an unpooled
+    /// compressed source, `2` a pooled/reuse compressed layer. This is the same array
+    /// [`Config::layer_compress_ratio`] reads, but on V4.1 it is a role map, NOT a ratio, so a
+    /// consumer that wants a ratio out of it is reading the wrong number. Which layer actually
+    /// OWNS the compressor and the indexer is decided by tensor presence, not by this value — see
+    /// [`Config::dsv41_kv_source`] and [`Config::dsv41_index_topk_source`], where `[il] == il`
+    /// means "layer `il` publishes". `0` for every layer of every other arch.
+    pub fn dsv41_role(&self, il: usize) -> usize {
+        self.layer_compress_ratio(il)
+    }
+
+    /// DeepSeek V4.1: whether layer `il` PUBLISHES the compressed KV stream that later layers read
+    /// (it owns `attn_compressor_kv`, so its source-map entry points at itself). `false` for every
+    /// layer of every other arch.
+    pub fn dsv41_is_kv_source(&self, il: usize) -> bool {
+        self.dsv41_kv_source.get(il).copied() == Some(il as i32)
+    }
+
+    /// DeepSeek V4.1: whether layer `il` OWNS an indexer — it publishes the top-k scoring
+    /// projection (`indexer.attn_q_b`), and therefore also an `indexer.attn_k` key set. `false` for
+    /// every layer of every other arch.
+    pub fn dsv41_is_index_source(&self, il: usize) -> bool {
+        self.dsv41_index_topk_source.get(il).copied() == Some(il as i32)
+    }
+
+    /// DeepSeek V4.1: whether layer `il` carries an engram associative-memory path. `false` for
+    /// every layer of every other arch.
+    pub fn has_engram(&self, il: usize) -> bool {
+        self.engram_layer_ids.contains(&(il as u32))
     }
 
     /// deepseek4: whether layer `il` is HASH-routed — it carries a `ffn_gate_tid2eid` token-id →
@@ -1011,16 +1126,25 @@ impl Config {
             };
         let (compress_rope_theta, hc_eps) = if deepseek4 || deepseek41 {
             (
-                // V4.1 has NO compressed-attention rope base: it publishes no
-                // `attention.compress_rope_freq_base` and no ratio-4/128 tier that would use one (all
-                // its compressed layers rope at `rope.freq_base`). Reading the key as V4 does would
-                // turn a working file into a "missing" error, so the V4.1 value is 0.0 — the same
-                // "this arch has none" sentinel every other arch uses.
-                if deepseek4 {
-                    req_f32("attention.compress_rope_freq_base")?
-                } else {
-                    0.0
-                },
+                // Present on V4.1 and read exactly as V4 reads it (`deepseek41.attention.
+                // compress_rope_freq_base = 160000.0` in the real file, distinct from
+                // `rope.freq_base = 10000.0`). The local reference implementation aliases
+                // `deepseek4 = DEEPSEEK4 || DEEPSEEK41` and therefore reaches this same
+                // `req_f32` for V4.1 files, using the value on every compressed tier — so this is
+                // the value V4.1's compressed rope was validated against, not an inference.
+                //
+                // The per-layer split stays where the graph already has it:
+                // `theta = if role == 0 { rope_theta } else { compress_rope_theta }`. Role 0
+                // (pure sliding window) ropes PLAIN at `rope_theta` with no YaRN ramp; roles 1 and
+                // 2 (the compressed tiers) rope at this base WITH YaRN. `layer_compress_ratio`
+                // returns the raw role, and V4.1's roles are `{0,1,2}`, so `role == 0` is exactly
+                // the "plain rope" branch — despite the field's V4-era name, the comparison is not
+                // against V4's `{0,4,128}` scale and needs no remapping.
+                //
+                // Never 0.0: a zero here would silently become the rope base of the 38 of 40
+                // layers that are not role 0 (`exp(-2*0/rope_dim) == 1`, so every position would
+                // get the same angle — wrong logits, no error).
+                req_f32("attention.compress_rope_freq_base")?,
                 req_f32("hyper_connection.epsilon")?,
             )
         } else {
@@ -1090,6 +1214,201 @@ impl Config {
         } else {
             Vec::new()
         };
+        // ── DeepSeek V4.1 CSA2 source/reuse topology (`deepseek41.cpp::load_arch_tensors`) ─────
+        //
+        // A V4.1 compressed layer does not necessarily OWN the stream it attends over. Only a
+        // handful of layers publish: the file gives each publishing layer an `attn_compressor_kv`
+        // (the KV source), an `indexer.attn_k` (index KEYS) and an `indexer.attn_q_b` (the top-k
+        // SCORER). Every other compressed layer reads the nearest earlier publisher's stream. That
+        // is why the tensor presence, not the role number, is the ground truth here: the real file
+        // has compressors on 4 of 40 layers and a scorer on 8, while 38 layers carry a non-zero role.
+        //
+        // A source points at ITSELF (so `[il] == il` is the "I publish" predicate), a reuse layer at
+        // the nearest earlier publisher, and a pure sliding-window layer (role 0) reads no stream at
+        // all and stays -1. Two invariants are checked rather than assumed, because both fail
+        // silently as wrong logits instead of as an error:
+        //   * a reuse layer may not read a stream compressed at a different row ratio — the rows
+        //     would stand for other positions;
+        //   * a source that pools more than one token per row must carry a pooling gate (a role-1
+        //     source legitimately has none: softmax over a single element is exactly 1.0).
+        let (dsv41_kv_source, dsv41_index_key_source, dsv41_index_topk_source) = if deepseek41 {
+            let names: std::collections::HashSet<&str> =
+                g.tensors().iter().map(|t| t.name.as_str()).collect();
+            let has = |n: String| names.contains(n.as_str());
+            let mut kv = vec![-1i32; n_layer];
+            let mut key = vec![-1i32; n_layer];
+            let mut topk = vec![-1i32; n_layer];
+            let (mut last_kv, mut last_key, mut last_topk) = (-1i32, -1i32, -1i32);
+            for il in 0..n_layer {
+                if has(format!("blk.{il}.attn_compressor_kv.weight")) {
+                    last_kv = il as i32;
+                }
+                if has(format!("blk.{il}.indexer.attn_k.weight")) {
+                    last_key = il as i32;
+                }
+                if has(format!("blk.{il}.indexer.attn_q_b.weight")) {
+                    last_topk = il as i32;
+                }
+                if compress_ratios[il] == 0 {
+                    continue;
+                }
+                if last_kv < 0 || last_key < 0 || last_topk < 0 {
+                    bail!(
+                        "deepseek41 layer {il} reads a compressed stream before any layer \
+                         publishes one"
+                    );
+                }
+                if compress_ratios[il] != compress_ratios[last_kv as usize] {
+                    bail!(
+                        "deepseek41 layer {il} compresses at role {} but reads layer {last_kv}, \
+                         which publishes role {}",
+                        compress_ratios[il],
+                        compress_ratios[last_kv as usize]
+                    );
+                }
+                kv[il] = last_kv;
+                key[il] = last_key;
+                topk[il] = last_topk;
+            }
+            for il in 0..n_layer {
+                if kv[il] == il as i32
+                    && compress_ratios[il] != 1
+                    && !has(format!("blk.{il}.attn_compressor_gate.weight"))
+                {
+                    bail!(
+                        "deepseek41 layer {il} pools {} tokens per row but has no pooling gate",
+                        compress_ratios[il]
+                    );
+                }
+            }
+            (kv, key, topk)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        // ── DeepSeek V4.1 engram associative memory (`deepseek41.cpp::load_arch_hparams`) ───────
+        //
+        // The engram hash indexes these metadata arrays DIRECTLY, so a short array is an
+        // out-of-bounds read at inference rather than a missing feature — every count below is
+        // checked against the same `layers * buckets` arithmetic the gather uses. `primes` being
+        // zero is likewise fatal: it is the hash's modulus.
+        //
+        // NOTE the four standalone `engram_{token_map,primes,offsets,multipliers}.weight` TENSORS
+        // in the shard set are deliberately NOT loaded: they duplicate these arrays verbatim (see
+        // `infr_gguf`'s parse-time skip), so `Config` is the single source of truth for the tables.
+        let (
+            engram_layer_ids,
+            engram_n_head,
+            engram_key_length,
+            engram_max_ngram,
+            engram_pad_id,
+            engram_multipliers,
+            engram_primes,
+            engram_offsets,
+            engram_token_map,
+        ) = if deepseek41 {
+            let arr_u64 = |suffix: &str| -> Result<Vec<u64>> {
+                let key = mk(&format!("engram.{suffix}"));
+                let arr = g
+                    .metadata()
+                    .get(&key)
+                    .and_then(MetaValue::as_arr)
+                    .with_context(|| format!("{key} missing (or not an array)"))?;
+                Ok(arr.iter().map(|v| v.as_u64().unwrap_or(u64::MAX)).collect())
+            };
+            let layer_ids: Vec<u32> = arr_u64("layer_ids")?.into_iter().map(|v| v as u32).collect();
+            if layer_ids.is_empty() {
+                bail!("{arch}.engram.layer_ids is empty");
+            }
+            for &l in &layer_ids {
+                if l as usize >= n_layer {
+                    bail!("{arch}.engram.layer_ids holds {l}, past block_count {n_layer}");
+                }
+            }
+            let n_head = meta_u64(g, &mk("engram.head_count")).unwrap_or(0) as usize;
+            let key_length = meta_u64(g, &mk("engram.key_length")).unwrap_or(0) as usize;
+            let max_ngram = meta_u64(g, &mk("engram.max_ngram_size")).unwrap_or(0) as usize;
+            let pad_id = meta_u64(g, &mk("engram.pad_id")).unwrap_or(0);
+            if n_head == 0 || max_ngram < 2 || key_length == 0 {
+                bail!(
+                    "{arch}.engram needs a head count, a 2-gram and a key length, got heads={n_head} \
+                     ngram={max_ngram} key_length={key_length}"
+                );
+            }
+            let multipliers = arr_u64("multipliers")?;
+            let primes = arr_u64("primes")?;
+            let offsets = arr_u64("offsets")?;
+            let token_map = arr_u64("token_map")?;
+            let n_bucket = (max_ngram - 1) * n_head;
+            if multipliers.len() != layer_ids.len() * max_ngram {
+                bail!(
+                    "{arch}.engram.multipliers has {} entries, expected {} (layers * ngram)",
+                    multipliers.len(),
+                    layer_ids.len() * max_ngram
+                );
+            }
+            if primes.len() != layer_ids.len() * n_bucket
+                || offsets.len() != layer_ids.len() * n_bucket
+            {
+                bail!(
+                    "{arch}.engram prime/offset mismatch: {} and {} entries for {} layers * \
+                     {n_bucket} buckets",
+                    primes.len(),
+                    offsets.len(),
+                    layer_ids.len()
+                );
+            }
+            if primes.iter().any(|&p| p == 0) {
+                bail!("{arch}.engram holds a zero prime, which would divide by zero in the hash");
+            }
+            (
+                layer_ids,
+                n_head,
+                key_length,
+                max_ngram,
+                pad_id,
+                multipliers,
+                primes,
+                offsets,
+                token_map,
+            )
+        } else {
+            (
+                Vec::new(),
+                0,
+                0,
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        // V4.1's candidate-block selector keys off ONE layer's indexer (the candidate source), not
+        // the per-layer top-k map: `candidate_block_size` tokens form a block and
+        // `candidate_topk_blocks` of them survive. Cross-checked against the index sources below,
+        // because a candidate source that publishes no indexer would score blocks it cannot build.
+        let (dsv41_candidate_source, dsv41_candidate_block, dsv41_candidate_topk_blocks) =
+            if deepseek41 {
+                let cand = req_u64("attention.candidate_source_layer_id")? as usize;
+                if cand >= n_layer {
+                    bail!(
+                        "{}attention.candidate_source_layer_id = {cand} is past block_count {n_layer}",
+                        mk("")
+                    );
+                }
+                let block = positive_model_dimension(
+                    &mk("candidate_block_size"),
+                    req_u64("attention.candidate_block_size")?,
+                )?;
+                let topk = positive_model_dimension(
+                    &mk("candidate_topk_blocks"),
+                    req_u64("attention.candidate_topk_blocks")?,
+                )?;
+                (cand, block, topk)
+            } else {
+                (0, 0, 0)
+            };
         // `get_key_or_arr(.., n_layer)` in the reference: ONE scalar broadcast to every layer, or a
         // per-layer array. `swiglu_clamp_shexp` is the same key with `required = 0` and falls back
         // to the routed clamp when absent, which is what a GGUF declaring only `_exp` means.
@@ -1958,6 +2277,22 @@ impl Config {
             hc_low_rank,
             hc_sinkhorn_iters,
             hc_eps,
+            deepseek41,
+            dsv41_kv_source,
+            dsv41_index_key_source,
+            dsv41_index_topk_source,
+            dsv41_candidate_source,
+            dsv41_candidate_block,
+            dsv41_candidate_topk_blocks,
+            engram_layer_ids,
+            engram_n_head,
+            engram_key_length,
+            engram_max_ngram,
+            engram_pad_id,
+            engram_multipliers,
+            engram_primes,
+            engram_offsets,
+            engram_token_map,
             ple_layers,
             ple_ngram_size,
             ple_heads_per_ngram,
