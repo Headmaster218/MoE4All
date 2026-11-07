@@ -12383,7 +12383,16 @@ fn generate_dense_backend_inner(
         // what the comment above warned about - no batch > 1 V4 graph had ever been executed.
         // Until the hc_mult-width residual is carried across a chunked span properly, the family
         // stays on the per-token path, which is correct and merely slower.
-        (c.moe.is_none() || moe_batched_ok) && !is_dsv4_family(c)
+        //
+        // The `INFR_DSV41_BATCHED_PREFILL` escape hatch the comment above describes was never
+        // actually wired: the string appeared ONLY in prose, so the gate below was unconditional
+        // and every attempt to exercise the batched path via that variable silently ran the
+        // per-token one instead (measured: `ubatch` 32/64/128/256 all report the same 6-7 tok/s,
+        // which is the tell - a real batched path must move with ubatch). Wiring it now so the
+        // comment is true and the path can be measured rather than guessed at. It stays opt-in.
+        let dsv41_batched_prefill = is_dsv4_family(c)
+            && std::env::var_os("INFR_DSV41_BATCHED_PREFILL").is_some_and(|v| v != "0");
+        ((c.moe.is_none() || moe_batched_ok) && !is_dsv4_family(c)) || dsv41_batched_prefill
     };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
