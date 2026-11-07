@@ -796,3 +796,58 @@ poorseek 8192 token 是 244-248 t/s，我们 12 t/s，**仍差约 20×**。
 1. 把 `ubatch` 的自动策略在 V4.1 上设到 ≥256（现在默认走到 32）——**一行改动，可能再拿 2×**
 2. Round 2 写的 `native_gemm_mmq_iq1_m` kernel 现在**有意义了**：批量预填充一旦走通，
    `moe_batched_ok` 相关的 MMQ 路径才是真正的算力出口
+
+---
+
+## Round 10：批量预填充已经在跑 MMQ，zero_fill 是合理取舍（2026-11-08 07:27）
+
+### 好消息：分组专家路径已经通了
+
+`INFR_DSV41_BATCHED_PREFILL=1` 下的 kernel 名单里已经有：
+
+```
+native_gemm_mmq_q5k / mmq_q8_0 / mmq_q6k_streamed     <- MMQ 系列
+moe_bucket_scatter / moe_bucket_scan / moe_bucket_count  <- 分组散布
+expert_gateup / expert_down / moe_scatter_reduce
+```
+
+也就是说 Round 9 打通的批量路径**走的是按专家分组的 MMQ 管线**，
+不是回落到 per-token 的 id-GEMV。这是 Round 2 写的 `native_gemm_mmq_iq1_m` 终于被用上的前提。
+
+### `zero_fill` 占 51%，但它是合理的
+
+聚合 profile 里最大的一项是：
+
+```
+   31.3s   51.43%   169 次   185.5 ms/次   zero_fill
+```
+
+单次 185 ms 看着惊人，但算一下量：
+
+```
+physical_slots = rows × (n_used + shared) = 512 × 9 = 4608 槽
+gbuf = slots × gu_width × 4 ≈ 0.05–0.14 GiB
+ubuf = slots × nff × 4      ≈ 0.03–0.07 GiB
+单次合计 ≈ 0.08–0.21 GiB
+```
+
+**0.1–0.2 GiB 的清零在 B70 上不该花 185 ms**，所以这个数同样是**排队等待**
+（和 Round 3–5 里 `argmax_part`、`main_busy` 的坑一模一样）。
+
+### 这个清零能不能省？查过了，不能
+
+`rec2.zero(gbuf, physical_slots * gu_width)` 存在的理由是：
+`silu_mul` 会把 `gate` 和 `up` **每个槽**都算一遍，未路由的槽必须读成 0。
+唯一的豁免是 `narrow_hit_activation`，它改用 `silu_mul_masked(..., mask: u32, ...)`
+——**但那个 mask 是 `u32`，最多 32 个槽**，而 512 行的 `physical_slots` 是 4608。
+
+可以逐行套 mask（每行 9 槽），但那要 **512 次小 dispatch**，
+大概率比一次大 `zero_fill` 更慢，且要重写热点 kernel。
+
+**结论：这是当前 kernel 结构下的合理取舍，不值得改。** 记录在此以免下次又翻到。
+
+### 本轮的净产出
+
+- 确认批量预填充走的是 MMQ 分组管线（不是回落）
+- 关掉 `zero_fill` 这条线索，并留下"为什么不能关"的理由
+- 没有改动任何代码——**没有找到比现状更好的方案时不动代码，也是一种结果**
