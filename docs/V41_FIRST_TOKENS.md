@@ -452,3 +452,68 @@ ps.acquire_cpu_promotion(&fresh);
 
 这正是 poorseek 那边 `DS4_PROMPT_SYNC` 教训的反面——**它每次都等，你也要每次都等**；
 把"240 次等待"变成"1 次等待"应该能拿到数量级收益。
+
+---
+
+## Round 4：sync 的结构性成因查清了，以及为什么调参都没用（2026-11-08 03:50）
+
+### 复现（两份独立运行，数字稳定）
+
+```
+run A: paging_sync=743.5ms record=138.97ms submit_cpu=13.14ms  main_busy=623.7ms
+run B: paging_sync=737.3ms record=141.07ms submit_cpu=12.79ms  main_busy=622.0ms
+```
+
+`main_busy` 621–623 ms 说明 **sync 期间 GPU 并不空闲**——它在处理前面那些层的计算。
+所以这**不是"CPU 空等一个死 GPU"**，而是 **CPU 与 GPU 被同步点强制交替，无法流水**。
+
+### 结构性成因（`adapter.rs` ~19676）
+
+每个 MoE 层有两条路：
+
+| 路径 | 条件 | 代价 |
+|---|---|---|
+| `inline_ok` | **该层 384 个专家全部常驻** | `touch_all_hits`，**零 sync** |
+| 否则 | 任意一个专家缺失 | `sync_stream()` + 读回 ids + 逐个 stage |
+
+而单层专家 **3.08 GiB**，VRAM 专家缓存只有 21.66 GiB ——
+即使排满也只够 **7 层**，剩下 **33 层必然走 sync 分支**。
+
+**这解释了为什么提高命中率没用**：命中率从 0.65 到 0.74 只是让"每层有 miss"变成"每层少几个 miss"，
+而判据是 `all_resident` —— **只要不是全量常驻，就一次不少地 sync**。
+
+### `submit_layers` 也不是杠杆（实测）
+
+| submit_layers | decode |
+|---|---|
+| 0 (auto=16) | 6.4 t/s |
+| 8 | 6.5 t/s |
+| 16 | 6.4 t/s |
+| **40**（整个模型一次提交） | **6.5 t/s** |
+
+即使把整个 40 层合成一次提交，速度不变 —— 因为 sync 发生在**层内**，与提交批次无关。
+
+### 收益上限（值得记住）
+
+```
+当前 155.3 ms/token = 6.4 t/s
+paging_sync 123.9 ms/token
+若完全消除 -> 31.4 ms/token = 31.8 t/s
+```
+
+**31.8 t/s 略高于 poorseek 的 27.7。** 靶子是对的：
+把 paging_sync 真正消掉，就能追上甚至超过参照值。
+
+### 还没做的（下一轮）
+
+真正的解是让 **sync 不再是每层必需**。三条可能的路径，都未尝试：
+
+1. **让 routed 专家集合在层内可预知**：若能在 GPU 上完成 routing 并直接 stage，
+   就不需要"读回 ids → CPU 决定 → 再上传"这个往返，sync 可省。
+   代码里已有 `hit_first` / GPU routing 的基础设施（日志 `hit_first=true`）。
+2. **把 sync 的成本与下一层的计算重叠**：`main_busy` 已 622ms，GPU 是忙的；
+   让 CPU 的 stage 工作排到 GPU 队列里，而不是阻塞等。
+3. **降低单层专家占用使 `inline_ok` 可达**：需要 3.08 GiB/层全驻留，当前不可行，
+   除非提高专家压缩率或改变驻留粒度 —— 属路线级决策。
+
+这三条都不是调参能解决的，需要改 `adapter.rs` 的层内流水线。
