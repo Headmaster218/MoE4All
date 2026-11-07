@@ -2456,12 +2456,23 @@ pub(super) fn cold_weight_plan(
                 // `indexer.attn_k` + `indexer.k_norm` — tensors V4 explicitly does NOT have, and
                 // the ones V4.1 ships instead of `indexer_compressor_*`.
                 if is_dsv41_index_key_source(c, l) {
-                    wload(&[&p("indexer.attn_k.weight"), &p("indexer.k_norm.weight")])?;
+                    // Loaded as TWO groups, not one concat: `indexer.attn_k` is BF16 and
+                    // `indexer.k_norm` is F32 in the real file, and `wload`'s concat path
+                    // requires one dtype across the group (weight_upload.rs `describe`). They are
+                    // separate `Dsv4IndexerW` fields (`attn_k`, `k_norm`), so nothing downstream
+                    // wants them contiguous.
+                    wload(&[&p("indexer.attn_k.weight")])?;
+                    wload(&[&p("indexer.k_norm.weight")])?;
                 }
                 // The top-k selector, on the eight layers that score queries (a superset of the
                 // key owners).
                 if c.dsv41_is_index_source(l) {
-                    wload(&[&p("indexer.proj.weight"), &p("indexer.attn_q_b.weight")])?;
+                    // TWO groups, not one concat and not one `wload(&[a, b])` — `wpush` consumes
+                    // one spec per HANDLE, so pairing them here (as V4's arm does for its own
+                    // indexer tensors, where a matching pair is pushed as one `IndexerW` slot)
+                    // leaves `wpush` one spec short per top-k layer from here to end of model.
+                    wload(&[&p("indexer.proj.weight")])?;
+                    wload(&[&p("indexer.attn_q_b.weight")])?;
                 }
             } else if c.layer_compress_ratio(l) != 0 {
                 for name in [
@@ -2648,12 +2659,19 @@ pub(super) fn cold_weight_plan(
                     layer_has_epb[l] = true;
                 }
             }
-            if c.deepseek4 {
+            if is_dsv4_family(c) {
                 // Hash-routed MoE: the first `hash_layer_count` layers pick their experts from
                 // a token-id → expert-id table INSTEAD of scoring the router bias, so the two
                 // tensors are mutually exclusive per layer — `deepseek4.cpp` creates exactly
                 // one of them. A V4 file is not optional about either (unlike deepseek2's
                 // `exp_probs_b`, which the pre-V3 GGUFs simply do not have).
+                //
+                // V4.1 is in this arm for the `exp_probs_b` half ONLY: its `hash_layer_count` is
+                // 0, so `is_hash_moe_layer` is false and every layer takes the router-bias branch.
+                // Leaving V4.1 out entirely would push NEITHER tensor on ANY layer while `wpush`
+                // still pushes `exp_probs_b` (`layer_has_epb` is what gates that, and only this
+                // arm ever sets it), so every weight after the first MoE router would bind one
+                // buffer off — silently, and only visible as wrong numbers.
                 if c.is_hash_moe_layer(l) {
                     wload(&[&p("ffn_gate_tid2eid.weight")])?;
                 } else {
@@ -2790,7 +2808,11 @@ pub(super) fn cold_weight_plan(
         (gemma4, "@v_ones", max_hd),
         (c.dual_moe(), "@router_ones", ne),
         (c.kq_l2norm, "@qk_ones", c.head_dim),
-        (c.deepseek4, "@hc_ones", c.hc_mult.saturating_mul(ne)),
+        // `is_dsv4_family`, not `c.deepseek4`: the handle itself is declared for V4.1 too (see
+        // `hc_ones` in `build`, gated on the same family predicate), so a V4.1 model that skipped
+        // this allocation would leave `wpush` one slot short — every weight after it binds one
+        // buffer off, silently.
+        (is_dsv4_family(c), "@hc_ones", c.hc_mult.saturating_mul(ne)),
     ] {
         if enabled {
             allocation_specs.push(super::WeightUploadSpec {
@@ -3517,7 +3539,13 @@ fn generate_dense_backend_inner(
         // `ggml_rms_norm` there). `Op::RmsNorm` requires a weight, so — exactly like the three
         // ones-vectors above — one `hc_mult*n_embd`-wide vector of 1.0 serves all of them
         // (`x * s * 1.0 == x * s` in IEEE). See the matching `hc_ones` handle in `build`.
-        if c.deepseek4 {
+        //
+        // `is_dsv4_family`, NOT `c.deepseek4`: the plan reserves this slot for V4.1 too
+        // (`cold_weight_plan`'s weightless list) and `build` declares the handle for it, so a
+        // V4.1 model that skipped this upload would leave `wpush` ONE slot short — every weight
+        // after it binds one buffer off, silently, and only the very END of a 1004-tensor model
+        // would notice.
+        if is_dsv4_family(c) {
             let ones = vec![1.0f32; c.hc_mult * ne];
             let b = be
                 .alloc(ones.len() * 4, BufferUsage::Weights)
@@ -4815,6 +4843,13 @@ fn generate_dense_backend_inner(
         let mut weights: Vec<TensorId> = Vec::new();
         let mut wi = 0usize;
         let mut wpush = |g: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
+            assert!(
+                wi < wspecs.len(),
+                "wpush ran out of specs at index {wi} (len {}): wload pushed fewer weight groups \
+                 than wpush consumes — one handle out of place here binds every later weight one \
+                 buffer off",
+                wspecs.len()
+            );
             let (dt, n) = wspecs[wi];
             wi += 1;
             let id = g.weight(TensorDesc::new(vec![n], dt));
