@@ -38,6 +38,9 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Iq2Xs => (256, 74),
         DType::Iq3S => (256, 110),
         DType::Iq3Xxs => (256, 98),
+        // IQ1_M: QK_K=256, block = [qs[32]][qh[16]][scales[8]] = 56 bytes (see infr-gguf
+        // dequant.rs). This is the format DeepSeek-V4.1 uses for 16 of its 40 gate/up layers.
+        DType::Iq1M => (256, 56),
         other => panic!("no geometry for {other:?}"),
     }
 }
@@ -51,7 +54,37 @@ fn synth_bank(dt: DType, n_elems: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(n_elems / epb * bpb);
     for _ in 0..n_elems / epb {
         let mut b: Vec<u8> = (0..bpb).map(|_| rng.byte()).collect();
-        b[0..2].copy_from_slice(&d16);
+        match dt {
+            // IQ1_M has NO leading `d` field: the block is [qs[32]][qh[16]][scales[8]] and `d`
+            // lives in the TOP NIBBLE of each of the four `scales` u16s (see infr-gguf
+            // dequant.rs: d_bits = (sc0>>12) | ((sc1>>8)&0xf0) | ((sc2>>4)&0xf00) | (sc3&0xf000)).
+            // Writing d into bytes 0..2 the way the other formats do would corrupt qs[0..2] and
+            // leave d = 0, which is exactly the trap this test would otherwise fall into.
+            DType::Iq1M => {
+                // `d` is split across the HIGH nibble of the four scale u16s, and where each
+                // nibble lands is not the obvious order (the shader and the host dequant agree,
+                // so this packing is just its inverse):
+                //   d[3:0]   <- sc0[15:12]   (d_bits has (sc0 >> 12) as its LOW nibble)
+                //   d[7:4]   <- sc1[11:8]    ((sc1 >> 8) & 0x00f0)
+                //   d[11:8]  <- sc2[15:12]   ((sc2 >> 4) & 0x0f00 takes sc2[15:12] to [11:8])
+                //   d[15:12] <- sc3[15:12]   (sc3 & 0xf000)
+                // Using 0x2400 (f16 ~0.0625) keeps magnitudes comparable to the other banks.
+                let dbits: u16 = 0x2400;
+                let parts = [
+                    (dbits & 0x000f) << 12,
+                    (dbits & 0x00f0) << 4,
+                    (dbits & 0x0f00) << 4,
+                    dbits & 0xf000,
+                ];
+                for (i, part) in parts.iter().enumerate() {
+                    let off = 48 + i * 2;
+                    let mut u = u16::from_le_bytes([b[off], b[off + 1]]);
+                    u = (u & 0x0fff) | part;
+                    b[off..off + 2].copy_from_slice(&u.to_le_bytes());
+                }
+            }
+            _ => b[0..2].copy_from_slice(&d16),
+        }
         out.extend_from_slice(&b);
     }
     out
@@ -637,4 +670,136 @@ fn qwen38_xs_grid_mmq_all_variants_match_host() {
             println!("{dt:?} {label}: resident+paged parity OK ({rows} rows)");
         }
     }
+}
+
+/// IQ1_M paged/GEMM parity — the format round 33 made reachable in paged prefill.
+///
+/// `MOE_MMQ_PAGED_DTYPES` was missing `Iq1M`, so V4.1's 16-of-40 IQ1_M gate/up layers fell back
+/// to the id-GEMV path (38.8 s of a 60 s prefill). Adding the entry measured 2.16x faster, but
+/// speed is not correctness: IQ1_M carries a per-8-element sign-keyed +/-0.125 delta whose
+/// correction needs four self-computed per-l activation sums, and the paged build feeds them
+/// through 64-bit BDA addressing rather than the resident path. This test is the missing control
+/// — it compares the GPU GEMM against `infr_gguf::dequant::dequant_block` block by block, so a
+/// wrong delta or a mis-scaled sub-block shows up as a numeric mismatch instead of as plausible
+/// text.
+///
+/// Run: `cargo test -p infr-vulkan --test grid_mmq_parity iq1m -- --ignored --nocapture`
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn iq1m_expert_gemm_matches_host() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (k, n, n_expert) = (256usize, 64usize, 5usize);
+    let stride = k * n;
+
+    let banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| synth_bank(DType::Iq1M, stride, 0x1a1b ^ ((e as u64) << 32)))
+        .collect();
+    let host: Vec<Vec<f32>> = banks
+        .iter()
+        .map(|b| infr_gguf::dequant::dequant_block(DType::Iq1M, b).unwrap())
+        .collect();
+
+    let flat: Vec<u8> = banks.concat();
+    let padded = pad_to_u32_align(&flat);
+    let w = be.alloc(padded.len(), BufferUsage::Weights).unwrap();
+    be.upload(w.as_ref(), &padded).unwrap();
+
+    // 200 rows -> avg 40/expert -> BM=64 path.
+    let counts_host = vec![50u32, 40, 45, 35, 30];
+    let offsets_host: Vec<u32> = {
+        let mut acc = 0u32;
+        counts_host
+            .iter()
+            .map(|&c| {
+                let o = acc;
+                acc += c;
+                o
+            })
+            .collect()
+    };
+    let rows = counts_host.iter().sum::<u32>() as usize;
+    let npad = rows.div_ceil(64) * 64 + 64;
+
+    let x: Vec<f32> = (0..rows * k)
+        .map(|i| (((i * 37 + 11) % 61) as f32 - 30.0) * 0.01)
+        .collect();
+    let xq = quant_act(&x);
+
+    let mk_u32 = |v: &[u32]| {
+        let b = be.alloc(v.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+        b
+    };
+    let counts = mk_u32(&counts_host);
+    let offsets = mk_u32(&offsets_host);
+    let xbuf = be.alloc(rows * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let qa = be.alloc(npad * k, BufferUsage::Activations).unwrap();
+    let qda = be
+        .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
+        .unwrap();
+    let qsa = be
+        .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
+        .unwrap();
+    let gbufs: Vec<_> = (0..3)
+        .map(|_| be.alloc(npad * n * 4, BufferUsage::Activations).unwrap())
+        .collect();
+
+    let rec = be.recorder().unwrap();
+    rec.quant_q8(
+        xbuf.as_ref(),
+        qa.as_ref(),
+        qda.as_ref(),
+        qsa.as_ref(),
+        rows,
+        k,
+    );
+    for g in &gbufs {
+        rec.matmul_mmq_experts(
+            DType::Iq1M,
+            "expert_gateup",
+            qa.as_ref(),
+            qda.as_ref(),
+            None,
+            w.as_ref(),
+            0,
+            stride,
+            counts.as_ref(),
+            offsets.as_ref(),
+            g.as_ref(),
+            rows,
+            k,
+            n,
+            n_expert,
+            1,
+        );
+    }
+    rec.finish().unwrap();
+
+    let dl = |b: &dyn infr_core::backend::Buffer, len: usize| {
+        let mut out = vec![0u8; len * 4];
+        be.download(b, &mut out).unwrap();
+        bytemuck::cast_slice::<u8, f32>(&out).to_vec()
+    };
+    let g0 = dl(gbufs[0].as_ref(), npad * n);
+    let g1 = dl(gbufs[1].as_ref(), npad * n);
+    let g2 = dl(gbufs[2].as_ref(), npad * n);
+    assert!(
+        g0[..rows * n]
+            .iter()
+            .zip(&g1[..rows * n])
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+            && g0[..rows * n]
+                .iter()
+                .zip(&g2[..rows * n])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "IQ1_M GEMM nondeterministic across identical dispatches"
+    );
+
+    let want = host_expert_gemm(&host, &xq, &counts_host, &offsets_host, k, n);
+    assert_close("IQ1_M xp", &g0[..rows * n], &want);
+    println!("resident IQ1_M: parity + 3x determinism OK ({rows} rows)");
 }
