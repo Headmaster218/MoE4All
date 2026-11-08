@@ -1000,6 +1000,7 @@ fn bind_layer_io<'a>(
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
     ple_state_buf: &'a Option<Box<dyn Buffer>>,
+    engram_emb_buf: &'a Option<Box<dyn Buffer>>,
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
@@ -1030,6 +1031,12 @@ fn bind_layer_io<'a>(
         b.bind(id, buf.as_ref());
     }
     if let (Some(id), Some(buf)) = (h.ple_state, ple_state_buf) {
+        b.bind(id, buf.as_ref());
+    }
+    // DeepSeek V4.1 engram rows. This is precisely the class of bind the doc comment above warns
+    // about: every execution path goes through here, so an engram input left to the callers is
+    // unbound for whichever path forgot it - which is what `unbound tensor 3` was.
+    if let (Some(id), Some(buf)) = (h.engram_emb, engram_emb_buf.as_ref()) {
         b.bind(id, buf.as_ref());
     }
 }
@@ -1075,6 +1082,7 @@ fn bind_parallel_layer_io<'a>(
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
     primary_ple_state: &'a Option<Box<dyn Buffer>>,
+    engram_emb_buf: &'a Option<Box<dyn Buffer>>,
     wide: Option<&'a dyn Buffer>,
     ple_embd: Option<&'a dyn Buffer>,
     peers: &'a [SeamKv],
@@ -1096,6 +1104,7 @@ fn bind_parallel_layer_io<'a>(
         primary_wide,
         primary_ple_embd,
         primary_ple_state,
+    engram_emb_buf,
     );
     if let (Some(id), Some(buf)) = (h.qwen_wide, wide) {
         b.bind(id, buf);
@@ -9490,6 +9499,7 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                engram_emb_buf,
                 Some(wide_batch.as_ref()),
                 None,
                 &*parallel.peers,
@@ -9568,6 +9578,7 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                engram_emb_buf,
                 Some(wide_batch.as_ref()),
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
@@ -9937,6 +9948,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+        engram_emb_buf,
         );
         if plan_sc {
             if dyn_sc {
@@ -10246,6 +10258,7 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                engram_emb_buf,
                 Some(fixed.wide.as_ref()),
                 None,
                 &*parallel.peers,
@@ -10315,6 +10328,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            engram_emb_buf,
             Some(fixed.wide.as_ref()),
             has_ple.then_some(fixed.ple.as_ref()),
             &*parallel.peers,
@@ -10656,6 +10670,7 @@ fn generate_dense_backend_inner(
                     qwen_wide_buf,
                     ple_embd_buf,
                     ple_state_buf,
+                engram_emb_buf,
                 );
                 vb0.bind(
                     vh0.qwen_wide.expect("Qwen VERIFY head has a wide residual"),
@@ -10717,6 +10732,7 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+            engram_emb_buf,
             );
             vb.bind(
                 vh.qwen_wide.expect("Qwen VERIFY has a wide residual"),
@@ -10891,6 +10907,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+        engram_emb_buf,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -11492,6 +11509,7 @@ fn generate_dense_backend_inner(
                             qwen_wide_buf,
                             ple_embd_buf,
                             ple_state_buf,
+                            engram_emb_buf,
                             wide_batch.as_deref(),
                             None,
                             &*parallel.peers,
@@ -11534,6 +11552,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        engram_emb_buf,
                         wide_batch.as_deref(),
                         ple_batch.as_deref(),
                         &*parallel.peers,
@@ -11718,6 +11737,7 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
+                                    engram_emb_buf,
                                     wide_batch.as_deref(),
                                     if is_main { ple_batch.as_deref() } else { None },
                                     &*parallel.peers,
@@ -13018,6 +13038,7 @@ fn generate_dense_backend_inner(
                                 ple_embd_buf
                             },
                             ple_state_buf,
+                        engram_emb_buf,
                         );
                         debug_assert!(
                             pf_h.logits.is_none(),
@@ -13323,6 +13344,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+        engram_emb_buf,
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -13858,6 +13880,7 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
+                                engram_emb_buf,
                                 );
                                 // DeepSeek V4.1 engram rows for this step. Bound here, in the
                                 // decode loop, because the plan is precompiled from immutable
@@ -13963,6 +13986,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                    engram_emb_buf,
                     );
                     let ple_buf = ple_embd_buf
                         .as_ref()
@@ -13994,6 +14018,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                    engram_emb_buf,
                     );
                     b1.bind(
                         h1.logits.expect("qwen4exp tail build has logits"),
@@ -14099,6 +14124,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                    engram_emb_buf,
                     );
                     b.bind(
                         h.logits.expect("decode build has logits"),
