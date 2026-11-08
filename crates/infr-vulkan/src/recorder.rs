@@ -15288,6 +15288,16 @@ impl<'a> Recorder<'a> {
             }
         } else if small_tile {
             desc.xp32
+        } else if dtype == infr_core::DType::Iq1M
+            && std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0")
+        {
+            // Test-only: run the IQ1M_DEBUG build of the same kernel, which additionally dumps
+            // the per-32-block intermediates past the end of the output. Default OFF, so the
+            // production path is untouched.
+            (
+                "native_gemm_mmq_iq1_m_xp_dbg",
+                crate::gemm::native_gemm_mmq_iq1_m_xp_dbg_spv(),
+            )
         } else {
             desc.xp
         };

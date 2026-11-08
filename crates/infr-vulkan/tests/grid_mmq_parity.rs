@@ -857,6 +857,27 @@ fn run_expert_gemm_parity(dt: DType, n_expert: usize) {
         dt
     );
 
+    // When the diag build ran, the kernel also wrote its per-32-block intermediates for row 0 /
+    // column 0 of tile (0,0) at [n*BM ..). Print them next to the host values for the same
+    // quantities so the first divergence is visible instead of guessed at.
+    if dt == DType::Iq1M && std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0") {
+        let base = n * 64; // BM = 64 at the large-tile path this test drives
+        let d = &g0[base..base + 11];
+        println!("--- IQ1M_MMQ_DEBUG dump (row 0, col 0, sub 0) ---");
+        println!("  dl1={} dl2={} neg={}", d[0], d[1], d[2]);
+        println!("  xl = [{}, {}, {}, {}]", d[3], d[4], d[5], d[6]);
+        println!("  q_lo={} q_hi={} dact={} acc={}", d[7], d[8], d[9], d[10]);
+        // Host-side reference for the same block.
+        let blk = &host[0][0..256];
+        let xrow = &xq[0..k];
+        let mut want_dot = 0.0f32;
+        for i in 0..k {
+            want_dot += blk[i] * xrow[i];
+        }
+        println!("  host full dot (row0,col0) = {want_dot}");
+        println!("  host blk[0..4] = {:?}", &blk[0..4]);
+    }
+
     let want = host_expert_gemm(&host, &xq, &counts_host, &offsets_host, k, n);
     assert_close(&format!("{dt:?} xp"), &g0[..rows * n], &want);
     println!("resident {dt:?}: parity + 3x determinism OK ({rows} rows)");

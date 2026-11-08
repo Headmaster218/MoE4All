@@ -3623,6 +3623,15 @@ fn main() {
             "native_gemm_mmq_iq1_m_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DFMT_IQ1M", "-DUSE_GRID", "-DBM_TILE=32u"],
         ),
+        // Diagnostic build: the resident _xp kernel plus IQ1M_DEBUG, which dumps the per-32-block
+        // intermediates (dl1, dl2, neg, the four S_l, q_lo, q_hi, acc) past the end of the output
+        // so a test can compare each against the host and see which one diverges first. Built
+        // only for the test harness; nothing selects it in production.
+        (
+            "native_gemm_mmq_iq1_m",
+            "native_gemm_mmq_iq1_m_xp_dbg",
+            &["-DEXPERT_GRID", "-DFMT_IQ1M", "-DUSE_GRID", "-DIQ1M_DEBUG"],
+        ),
         // IQ2_S (gate/up) / IQ3_S (down) — the Qwen3.6-35B-A3B-UD-IQ3_S expert pair.
         (
             "native_gemm_mmq_iq2_s",
