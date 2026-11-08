@@ -15007,8 +15007,17 @@ impl<'a> Recorder<'a> {
             );
             return;
         }
+        // Where the stamp goes decides what the 'zero_fill' figure MEANS, and round 26 proved
+        // the current placement mis-attributes by ~160x: a 32 MiB fill takes 0.9 ms measured
+        // directly, yet this label reports 147 ms per call. The barrier below forces the fill to
+        // wait for all prior compute, and a device timestamp opened BEFORE that barrier charges
+        // the wait to zero_fill. INFR_STAMP_AFTER_BARRIER opens the interval after the barrier
+        // instead, so the label covers only the fill itself. A/B, default unchanged.
+        let stamp_after = std::env::var_os("INFR_STAMP_AFTER_BARRIER").is_some_and(|v| v != "0");
         // Transfer chokepoint (see `copy`): previously an un-stamped blind spot.
-        self.stamp("zero_fill");
+        if !stamp_after {
+            self.stamp("zero_fill");
+        }
         // `cmd_fill_buffer` takes a raw handle + explicit byte offset, not a descriptor — go
         // through `vk_handle`, not `vkb`. The fill starts at the buffer's `sub_offset` (0 for every
         // ordinary buffer): a resident-BDA sub-tensor shares its arena block's handle, and a fill
@@ -15017,6 +15026,9 @@ impl<'a> Recorder<'a> {
         let buf_h = Self::vk_handle(buf);
         let sub = Self::vk_of(buf).sub_offset;
         self.sync(&[], &[buf_h], true);
+        if stamp_after {
+            self.stamp("zero_fill");
+        }
         unsafe {
             self.be
                 .shared
