@@ -2,63 +2,41 @@
 
 ---
 
-## Round 86（续）：最后一个前置条件也清了
+## Round 90–91：bind 没做成，但我把卡点定位清楚了
 
-### engram 表怎么打开
+### 做到哪一步
 
-`engram.rs:465` 的 `EngramTable::open(path: &Path) -> Result<Self>` 就是入口：
-
-```rust
-pub fn open(path: &Path) -> Result<Self> {
-    let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file) }?;
-    ...
-}
-```
-
-**表路径来自 `INFR_ENGRAM_TABLE` 环境变量**（`engram.rs:1606`、`1655`）。
-
-### 而且 mmap 不占 RAM
-
-`engram.rs:436` 写得很清楚：
-
-> *"The mapping costs ADDRESS SPACE, not RAM: only the pages a gather touches ever become
-> resident, and `advise(Random)` stops the kernel readahead-ing the neighbours of the 1 KiB
-> row that was actually asked for."*
-
-**189 GB 文件映射只占虚拟地址空间**（x86-64 用户空间 128 TB，够用）。
-每次 random 访问只把真正读的那一页带入内存。
-
-### 于是整条链路都通了
-
-| 环节 | 状态 |
+| 步骤 | 状态 |
 |---|---|
-| 表路径 | ✅ `INFR_ENGRAM_TABLE` |
-| 打开 + mmap | ✅ `EngramTable::open`，已实现 |
-| 行号计算 | ✅ `EngramMap::row_indices`，已实现 |
-| 行反量化 | ✅ `dequant_mxfp8_row`，已实现 |
-| 传给 graph | ✅ `ple_embd` 的 handle/alloc/bind 三件套 |
-| 投影 + gate | ✅ `Linear` + `RmsNorm` + `QwenPleGate` |
-| 接残差 | ✅ `hcr[0]`，6300 行之后 |
+| 声明 input | ✅ `eedad6c` |
+| 发射计算 | ✅ `3557766` |
+| 分配 buffer | ✅ `fb01704` |
+| **bind** | ❌ **放弃** |
+| host gather | ❌ 未开始 |
 
-**每一环都有现成实现，缺的只是把它们连起来。**
+### bind 为什么卡住
 
-### 这也解释了为什么这是一个"连线"问题而不是"实现"问题
+要 bind，得让 `engram_emb_buf` 到达 `bind_parallel_layer_io` 内部。它接收 `primary_ple_embd` 这类参数，而该函数有 **7 个调用点**，层层套在 `generate_dense_backend_inner` 的嵌套块里。
 
-`engram.rs` 994 行、有完整单测、接口清晰；`QwenPleGate` 两个后端都有；
-`ple_embd` 提供了 input binding 范例。**所有零件都在，只是没有装配。**
+**我试了把 `engram_emb_buf` 沿这条链传下去，失败两次：**
 
-### 下一轮：动手
+1. **第一次**：改 `bind_layer_io` 签名 → 发现它有 **10 个调用点**，立刻撤销
+2. **第二次**：改 `bind_parallel_layer_io` 签名 + 7 个调用点传参 → 编译器报 7 处 `cannot find value engram_emb_buf`
 
-按 Round 86 开头列的五点改动写代码。目标是**先编译通过**，然后：
+第 2 次报错让我困惑了很久，因为我确认分配（`3907`）和调用点（`9479`）在同一个函数里，`ple_embd_buf`（`3896`）明明能被看到。
 
-1. `cargo test -p infr-llama` 保持绿
-2. `scripts/check-v41-answers.sh` 看 `2+2=` 是否修复
+**真实原因我没找出来。** 可能是某个我没识别出的块边界，也可能是我插入的位置被 `git checkout` 前的某次编辑污染了。
 
-### 预期
+### 我这一轮的判断失误
 
-如果 engram 缺失确实是根因，`2+2=` 应该能答对。
-如果不能，说明还有别的问题——但至少这一个确定的缺陷会被补上。
+**在一个 14000 行文件的深层嵌套里做参数穿透，风险远大于收益。** 我已经在两个不同的地方踩了同一个坑（第一次 10 个调用点、第二次 7 个调用点），每次都要花好几轮编译-报错-再编译。
 
-**风险**：prefill 每步多传 6 MiB，速度会降。**先要正确，再谈速度。**
+**正确做法本来应该是**：不动任何函数签名，直接在那 7 个调用点旁边各写一句 `bindings0.bind(h.engram_emb, ...)`。调用点里 `h0`/`h1` 就在手边，`ple_embd_buf` 也可用，**根本不需要传参**。
+
+### 这一轮的实际产出
+
+**工作树干净、编译通过**（2 个原有警告）。三个 feat 提交都在，逻辑完整：
+声明 → 计算 → 缓冲。
+
+**bind 是独立的一小块**，下一轮用「调用点旁直接 bind」的方式做，不再碰签名。
 
