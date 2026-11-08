@@ -971,3 +971,44 @@ ubuf = 3584 × 2304 × 4 = 0.031 GiB
 静默的错误结果而非崩溃。**建议下一轮先做一件事**：
 确认这些操作是否各自触发了 submit（用 `INFR_PROF_STAGES` 或 submit 计数），
 如果 169+262 次里有大量独立 submit，那就是明确的、可验证的优化点。
+
+### 更正：prefill 不是 paging_sync 的锅
+
+我上一条写「两者是同一个病（paging_sync）」——**算了一下，是错的，撤回。**
+
+```
+prefill 每层: wall 6.0 ms, paging_sync 5.755 ms (96%), record 0.579 ms, submits 2
+40 层 × 2 chunk(731 tok @ 512) = 80 层次
+  => paging_sync 总量 ≈ 0.46 s
+实测 731-token 预填充 = 62 s
+```
+
+**0.46 / 62 = 1%。** 而 `zero_fill` + `silu_mul` 是 44 s / 72%。
+两者**对不上**，所以"同一个根因"不成立。
+
+单个 chunk 内的比例（96%）之所以误导人，是因为**一个 chunk 只有 40 层次**，
+而 62 秒里绝大部分不在被 `single-decode-layer` 采样的那一段。
+
+### 那么 prefill 的时间到底在哪
+
+`zero_fill`(31.3s) + `silu_mul`(12.8s) = 44 s 是**真实的聚合值**，
+来自整次运行的 `INFR_PROF_OPS` 汇总，不是采样区间。
+
+但按真实参数量算，这些操作总共只有 **40 GiB**，理论 0.09 秒。
+**44 秒里有 43.9 秒是空的。**
+
+这 43.9 秒既不是 paging_sync（1%），也不在 record 里，那它只能是：
+`INFR_PROF_OPS` 的设备时间戳**把提交之间的等待也计入了**，
+而等待发生在**这些操作之外**。
+
+### 结论：我不知道 prefill 的 62 秒花在哪，且现有工具分辨不出来
+
+诚实地记下来总比编一个解释好。已知：
+- 不是 GEMM（<0.2 s）
+- 不是 paging_sync（~0.5 s）
+- 不是 zero_fill/silu_mul 的真实搬运量（0.09 s）
+- 不是 ubatch（128 vs 512 只差 9%）
+
+**下一步需要的是 wall-clock 级的逐阶段计时**（像 decode 的
+`setup/build` vs `exec/record+submit+gpu` 那样），而不是设备时间戳。
+现在 prefill 路径没有这个拆分。
