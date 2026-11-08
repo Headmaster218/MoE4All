@@ -5604,6 +5604,19 @@ fn generate_dense_backend_inner(
         let hc_mixes = g.internal(f32d(batch * ((2 + c.hc_mult) * c.hc_mult).max(1)));
         let hc_hmixes = g.internal(f32d(batch * c.hc_mult.max(1)));
         let hc_pre = g.internal(f32d(batch * c.hc_mult.max(1)));
+        // DeepSeek V4.1 engram scratch (`deepseek41.cpp` 382 `build_engram`). `engram_kv` is the
+        // one projection's output — hc keys then one shared value — and the two norm buffers hold
+        // the grouped-normalised key side and the query side the gate scores.
+        let (engram_kv, engram_k_normed, engram_q_normed, engram_gated) = if c.deepseek41 {
+            (
+                g.internal(f32d(batch * (hcw + ne))),
+                g.internal(f32d(batch * hcw)),
+                g.internal(f32d(batch * hcw)),
+                g.internal(f32d(batch * ne)),
+            )
+        } else {
+            (hc_pre, hc_pre, hc_pre, hc_pre)
+        };
         // DeepSeek V4.1 holds the collapse weights one sublayer BEHIND (`deepseek41.cpp` 843-886).
         // The pair ping-pongs in step with `hcr`, so the parity is fixed rather than a running
         // index: every ATTENTION sublayer writes [1] and reads [0], every FFN writes [0] and reads
@@ -5870,6 +5883,75 @@ fn generate_dense_backend_inner(
         let hc_wrap_pre = |g: &mut Graph, t: &HcTriple, res: TensorId, dst: TensorId| {
             hc_mix(g, t, res, hc_pre);
             hc_pre_collapse(g, res, hc_pre, dst);
+        };
+        // DeepSeek V4.1 engram associative memory (`deepseek41.cpp` 382 `build_engram`), injected at
+        // the TOP of the layer, before any hyper-connection mix reads the stream — the reference
+        // does `inpL = build_engram(...)` at 840, ahead of its first `build_hc_mixes`.
+        //
+        // One projection produces hc keys then a single shared value. The file's `wkv` is
+        // `[n_cols*key_length, hc*n_embd + n_embd]` in ggml order, so the two halves are two
+        // offset GEMVs over the SAME activation, exactly the split `weights.rs` documents.
+        let engram_apply = |g: &mut Graph, ew: &crate::seam::weights::EngramW, res: TensorId| {
+            let emb = engram_emb.expect("an engram layer needs the gathered engram input");
+            let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
+            // key half: rows [0, hc*n_embd)
+            g.push(Op::Linear {
+                x: emb,
+                weight: ew.wkv,
+                dst: engram_kv,
+                m: batch as u32,
+                in_f: (n_cols * c.engram_key_length) as u32,
+                out_f: hcw as u32,
+                w_off: 0,
+            });
+            // value half: rows [hc*n_embd, hc*n_embd + n_embd)
+            g.push(Op::Linear {
+                x: emb,
+                weight: ew.wkv,
+                dst: engram_gated,
+                m: batch as u32,
+                in_f: (n_cols * c.engram_key_length) as u32,
+                out_f: ne as u32,
+                w_off: hcw as u32,
+            });
+            // Grouped RMSNorm per (token, hc copy) over n_embd, scaled by engram_k / engram_q.
+            // `QwenHcNorm` is exactly that reduction; its `norm` operand is `hc` scales of
+            // `n_embd`, which is the shape `engram_k`/`engram_q` already have.
+            g.push(Op::QwenHcNorm {
+                x: engram_kv,
+                norm: ew.k,
+                dst: engram_k_normed,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                n_embd: ne as u32,
+                eps,
+            });
+            g.push(Op::QwenHcNorm {
+                x: res,
+                norm: ew.q,
+                dst: engram_q_normed,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                n_embd: ne as u32,
+                eps,
+            });
+            // signed-sqrt sigmoid gate over the per-copy dot product, value broadcast to hc rows
+            g.push(Op::QwenPleGate {
+                key: engram_k_normed,
+                query: engram_q_normed,
+                value: engram_gated,
+                dst: hn,
+                rows: batch as u32,
+                hc: c.hc_mult as u32,
+                n_embd: ne as u32,
+            });
+            // x + gated value, written back over the residual stream the mixes are about to read
+            g.push(Op::Add {
+                a: res,
+                b: hn,
+                dst: res,
+                n: (batch * hcw) as u32,
+            });
         };
         let qwen_hc_mix =
             |g: &mut Graph,
@@ -6228,6 +6310,11 @@ fn generate_dense_backend_inner(
         #[allow(unused_mut)]
         let mut dsv41_lag_slot0_written = false;
         for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first) {
+            // engram first, before any hyper-connection mix reads the stream (`deepseek41.cpp`
+            // 840 injects at the top of the layer, ahead of its first `build_hc_mixes`).
+            if let Some(ew) = &lw.engram {
+                engram_apply(&mut g, ew, hcr[0]);
+            }
             if let Some(pw) = &lw.ple {
                 let wide = qwen_wide.expect("a qwen4exp PLE layer needs qwen_wide");
                 let embd = ple_embd.expect("a qwen4exp PLE layer needs ple_embd");
