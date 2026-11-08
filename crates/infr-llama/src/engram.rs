@@ -1750,3 +1750,52 @@ mod tests {
     }
 }
 
+
+// ─── Host-side engram gather ─────────────────────────────────────────────────
+
+/// Gather one step's engram rows for `layer_id`: `tokens.len() * n_cols * key_length` floats,
+/// laid out token-major then bucket, which is the order `deepseek41.cpp:375` reshapes into
+/// `[key_length * n_cols, n_tokens]` before its single `wkv` projection.
+///
+/// The two halves of the work live in different places for a reason: the n-gram hash is
+/// arithmetic over `Config`'s token map and prime tables, and the rows themselves live in a 189
+/// GB mmap that only `EngramTable` can reach. This is the glue that runs them per layer, and it
+/// is what the forward path was missing — `EngramW`'s weights were uploaded and the graph op was
+/// emitted, but nothing ever produced the input they project.
+///
+/// `prev` is the `n_gram - 1` predecessors of each token, oldest first, `-1` where the window runs
+/// off the start of the sequence; the map turns a negative into the pad id, which truncates the
+/// n-gram exactly as the reference does.
+pub fn gather_for_layer(
+    cfg: &crate::Config,
+    table: &EngramTable,
+    layer_id: u32,
+    tokens: &[u32],
+    prev: &[Vec<i32>],
+) -> Result<Vec<f32>> {
+    let map = engram_map_for_layer(cfg, layer_id).ok_or_else(|| {
+        Error::Loader(format!("engram: block {layer_id} carries no engram in this config"))
+    })??;
+    let n_cols = (cfg.engram_max_ngram.saturating_sub(1)) * cfg.engram_n_head;
+    let expected_prev = cfg.engram_max_ngram.saturating_sub(1);
+    if prev.len() != tokens.len() {
+        return Err(Error::Loader(format!(
+            "engram: {} tokens but {} predecessor windows",
+            tokens.len(),
+            prev.len()
+        )));
+    }
+    let mut rows = Vec::with_capacity(tokens.len() * n_cols);
+    for (i, &tok) in tokens.iter().enumerate() {
+        if prev[i].len() != expected_prev {
+            return Err(Error::Loader(format!(
+                "engram: token {i} has {} predecessors, expected {expected_prev}",
+                prev[i].len()
+            )));
+        }
+        let idx = map.row_indices(tok, &prev[i]);
+        debug_assert_eq!(idx.len(), n_cols);
+        rows.extend_from_slice(&idx);
+    }
+    table.gather_rows(layer_id, &rows)
+}
