@@ -12526,8 +12526,19 @@ fn generate_dense_backend_inner(
                     Some(worker.submit_range(prompt, cstart, cend - cstart, c.ple_ngram_size)?);
             }
         }
+        // Wall-clock split for the batched chunk loop. Decode has had `setup` vs
+        // `exec(record+submit+gpu)` since the replay-tape work, and that split is what located its
+        // bottleneck; prefill had nothing equivalent, which is why a 3131-token run could show
+        // 44 s inside zero_fill/silu_mul in INFR_PROF_OPS while those ops move only ~40 GiB
+        // (0.09 s at this card's bandwidth) - the device timestamps were absorbing waits that
+        // happen outside the ops, and no counter could say where. These two clocks put the
+        // per-chunk GROUP wall time on the table so the next measurement has somewhere to land.
+        let pf_prof = ec.prof.stages;
+        let mut pf_group_wall = std::time::Duration::ZERO;
+        let mut pf_groups = 0usize;
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
+            let group_t0 = pf_prof.then(std::time::Instant::now);
             let preallocate_group = layer_major && c.qwen4exp;
             let passes = if preallocate_group { 2 } else { 1 };
             for pass in 0..passes {
@@ -12956,6 +12967,24 @@ fn generate_dense_backend_inner(
                     }
                 }
             }
+            if let Some(t0) = group_t0 {
+                pf_group_wall += t0.elapsed();
+                pf_groups += 1;
+            }
+        }
+        if pf_prof && pf_groups > 0 {
+            let rows = pf_end - start;
+            let secs = pf_group_wall.as_secs_f64();
+            tracing::info!(
+                "[pf prof] {} rows over {} chunks ({} groups) | wall {:.3}s | {:.1} tok/s | \
+                 {:.1} ms/group",
+                rows,
+                chunks.len(),
+                pf_groups,
+                secs,
+                rows as f64 / secs.max(1e-9),
+                secs * 1e3 / pf_groups as f64,
+            );
         }
 
         // KV rows are now filled through position plen-2; the last prompt token is handled by
