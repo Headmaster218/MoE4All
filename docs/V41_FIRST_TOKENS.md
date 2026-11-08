@@ -2,68 +2,55 @@
 
 ---
 
-## Round 66：长上下文 prefill 实测，以及 16K 以上的硬失败
+## Round 67：16K 的坎与 ubatch 无关
 
-### 方法修正
+### 排除 ubatch
 
-先用 `infr run <prompt>` 试 100K，直接失败：**`参数列表过长`**。
-400KB 的 prompt 不能走命令行参数。
+上一轮 16K 失败时用的是自动选的 `ubatch 3072`。
+怀疑是 chunk 太大，于是用 `-u 512` 重跑 16K：
 
-改用 **`infr bench`**（llama-bench 同接口，按 token 数生成 prompt）：
+**同样失败**，卡在同一位置 `drm_syncobj_array_wait_timeout`，20 分钟后设备丢失。
 
-```
-infr bench <model> -p <N> -n 0 --dev Vulkan1
-```
+**所以不是 ubatch 的问题。**
 
-### 实测结果
+### 矩阵
 
-| 规模 | 结果 |
-|---|---|
-| **pp4096** | **27.5 t/s**（3 reps, 27.4–27.5, spread 0.4%） |
-| **pp8192** | **26.3 t/s**（3 reps, 26.2–26.3, spread 0.3%） |
-| **pp16384** | **失败**（跑了 20+ 分钟无输出） |
-| **pp100000** | **失败**（26 分钟后 `device lost`） |
+| 规模 | ubatch | 结果 |
+|---|---|---|
+| pp4096 | 3072 | ✅ 27.5 t/s |
+| pp8192 | 3072 | ✅ 26.3 t/s |
+| **pp16384** | **3072** | ❌ device lost |
+| **pp16384** | **512** | ❌ device lost |
+| pp100000 | 3072 | ❌ device lost |
 
-两次成功都自动选了 **`ubatch 3072`**（不是 `infr run` 默认的 256/512）。
+**坎在 8K–16K 之间，与 batch 大小无关。**
 
-### 重要发现：bench 的 ubatch 更大，prefill 更快
-
-`infr run --ubatch 256` 是 25 tok/s，`infr run --ubatch 512` 是 27 tok/s，
-而 **`infr bench` 自动用 3072，拿到 27.5**。
-
-**所以在 prefill 场景，ubatch 越大越快**（与 Round 63 的观察一致）。
-
-### 100K 失败的诊断
-
-日志：
+### 卡住时的状态
 
 ```
-[moe-prefill] target_lanes=40 actual_lanes=5 resident_layers=0/40
-[moe-prefill] streamed_layer_max=3928227840 ring_bytes=19074908160
+41 个线程，全部 S (sleeping)
+RSS 123.2 GB
+wchan = drm_syncobj_array_wait_timeout
 ```
 
-- **`target_lanes=40` 但 `actual_lanes=5`** —— 只能同时跑 5 层
-- `resident_layers=0/40` —— **一层都没常驻**
-- `ring_bytes=19.07 GiB`，`streamed_layer_max=3.93 GiB`
+**所有线程都在等 GPU fence，没有一个在计算。** 这是 GPU 侧的挂起，
+不是 host 死锁（host 死锁会有线程在 R 状态抢锁）。
 
-进程等待位置是 `drm_syncobj_array_wait_timeout`（等 GPU fence），
-26 分钟后 `devsandqueues-lost-device`。
+### `actual_lanes=5` 不是 bug
 
-**这是真实的规模上限，不是调用方式问题。**
+查 `pager.rs:3260` 的 lane 规划：`actual_lanes` 是**"能装进固定 corridor 的
+完整 Prefill streaming lane 数"**，显存约束下的必然结果，不是配置错误。
 
-### 设备未受损
+真正的问题是 16K 时 GPU 侧挂起，与 lane 数无关。
 
-失败后 `infr resources` 仍报 `vram_live: true`，`/dev/dri` 齐全。
-**这次 device lost 是温和的，没触发驱动 wedge。**
+### 设备每次都安然无恙
 
-### 当前基线
+三次 device lost 之后 `infr resources` 仍报 `vram_live: true`。
+**这是可恢复的失效，不是驱动 wedge。**
 
-| 场景 | 实测 |
-|---|---|
-| prefill 4K | **27.5 t/s** |
-| prefill 8K | **26.3 t/s** |
-| prefill 16K+ | 不可用（device lost） |
-| decode | 6.2 t/s @ 4K ctx |
+### 结论
 
-**poorseek 的 100K@1063 t/s 在本机完全不可达**，连 16K 都跑不完。
+**本机可用的 prefill 上限是 8K（26.3 t/s）。**
+16K 及以上会导致 GPU 挂起，与 ubatch 无关，属于引擎在这个模型+规模下的问题，
+需要看 GPU 侧具体在等什么 fence 才能定位——这超出了一次会话能修的范围。
 
