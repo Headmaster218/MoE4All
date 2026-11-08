@@ -2,45 +2,53 @@
 
 ---
 
-## Round 40：读了累加段，核对无误，但没找到 bug
+## Round 44：两个否定结果 —— 不是 debug 变体的问题，也不是 resident_nb
 
-### 已核对的累加逻辑（第 208-249 行）
+### 做了什么
 
-| 项 | 公式 | 核对结果 |
-|---|---|---|
-| `q_lo` / `q_hi` 分组 | `if ((p>>1) < 2) q_lo else q_hi`，`p∈[0,8)` | `p=0..3 → q_lo`（l=0,1）、`p=4..7 → q_hi`（l=2,3），**与 `dl1/dl2` 的对应正确** |
-| `S_l` 的累加 | `xl[i][p>>1] += sgn8(4 个字节)` | `p>>1 ∈ [0,4)`，**正确覆盖四个 l** |
-| `As` 的 staging | `qa[(wgRow+r)*kw + sub*WPB + p]`，`kw=k/4=64`，`sub∈[0,8)`、`p∈[0,8)` → 最大 63 | **边界正确** |
-| `dact` 索引 | `dact[(wgRow+tr*TM+i)*nblk32 + sub]` | **正确** |
-| 最终组合 | `dl1*(q_lo + s0 + s1) + dl2*(q_hi + s2 + s3)` | **与 shader 头部注释的公式一致** |
-| `dp4a` 内建 | `dotPacked4x8AccSatEXT` | 与 IQ2_S **同一内建、同一用法** |
+上一轮的结论是「新增的 `_xp_dbg` 变体没有到达设备」。这一轮绕开它：
+**把探针无条件加进生产 `_xp` kernel**（同一 shader，去掉 `-DIQ1M_DEBUG`），
+并把 `INFR_IQ1M_MMQ_DEBUG` 的 kernel 覆盖整段删掉。
 
-**没有发现不匹配。**
+### 结果一：magic 仍然不出现
 
-### 本轮没有结论
+```
+MAGIC ABSENT (saw 0) - the probe never executed; nothing else is readable
+```
 
-这是第二次「读代码试图找 bug」失败（Round 38 一次，本轮一次）。
-前一次排除了五项、定位到一处可疑（后被 Round 39 的测量否掉）；这一次**一项都没找到**。
+探针现在位于 IQ2_S 能正常工作的**同一条生产路径**上。所以：
+**"新变体没注册" 这个解释被排除。**
 
-### 为什么读代码在这里失效
+### 结果二：`resident_nb: 8 → 6` 也不是原因
 
-这个 kernel 有 262 行、六处间接寻址（`wbase`/`wstart`/`bd`/`As`/`Bs`/`dact`）、
-一个自算的 per-l 激活和、和一套双累加器组合公式。
-**逐项读「看起来对不对」可以验证每一处局部，但验证不了它们之间的组合**——
-而 bug 很可能正是某两个「各自都对」的部分拼错了。
+IQ1_M 的 `resident_nb` 是 8，而 EXPERT_GRID 构建的 shader 只有 6 个 binding、
+`bufs` 也只给 6 个——看起来像个明显的类型错误（注释写的是 "8 activation blocks"，
+那是 k 循环次数不是 binding 数）。改成 6 之后：
 
-Round 33-39 用测量能收敛，是因为每一个测量**直接约束了输出的某一条性质**；
-读代码只能约束「这一行像不像对的」，对组合错误无能为力。
+```
+MAGIC ABSENT (saw 0) - ...
+Iq1M xp mismatch at 0: got 0 want -0.05855285
+```
 
-### 下一步：放弃读，改为**插桩**
+**完全没变。**
 
-在 shader 里加 `#ifdef IQ1M_DEBUG` 分支，把中间量（`d`、`dl1`、`dl2`、`neg`、
-`xl[0][*]`、`q_lo[0][0]`、`q_hi[0][0]`）写到输出缓冲的保留区，
-然后在测试里和 host 逐项对比 —— **哪一项先偏，bug 就在那一项之前**。
+### 两个改动都已撤回
 
-这比再来一轮读代码确定得多。
+工作树回到 `90b42b0`，干净。没有提交代码。
 
-### 状态
+### 现在的状态
 
-无代码改动，工作树干净。PR #183：72 commits。
+**探针在生产 kernel 里都不执行**，这意味着 `matmul_mmq_experts` 对 IQ1_M 的 dispatch
+要么没有发出、要么被丢弃。IQ2_S 走同一函数却能工作，所以差异只在参数。
+
+还没排除的：（a）`push_size=24` 与 IQ1_M 的 PC 布局不符导致 pipeline 建失败；
+（b）`gx`/网格维度退化为 0；（c）`kernel()` 对该 name 建 pipeline 时静默失败。
+
+### 下一步该换个层级
+
+连续四轮（41–44）都卡在「让插桩跑起来」，而没有向前推进缺陷本身。
+**下一轮不该继续修插桩**，而是：
+在 `matmul_mmq_experts` 里直接打印它实际用的 `name` / `nb` / `gx` / `n_expert` / `push`
+（Rust 侧 `eprintln!`，不需要 GPU 执行就能看到），先确认 dispatch 参数是否正确。
+**Rust 侧的日志比 shader 侧的探针便宜得多。**
 
