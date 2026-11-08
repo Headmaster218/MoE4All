@@ -906,3 +906,68 @@ chunk 变大只减少了**每 chunk 一次**的固定开销（topk、scatter 之
 **本轮不改代码，只把账本记清楚**：下一轮若有人想优化预填充，
 应该直接看 `silu_mul` 能否改成按 mask/按实际路由遍历，
 而不是再调 ubatch（已证明无收益）。
+
+---
+
+## Round 12：把量算准了 —— 40 GiB 的活花了 44 秒，效率 0.1%（2026-11-08 08:07）
+
+### 先拿到真实模型参数（此前一直靠估）
+
+直接读 GGUF 元数据（`deepseek41.*`），不再猜：
+
+```
+expert_count              = 384
+expert_used_count         = 6      <- 我此前一直按 8 算
+expert_shared_count       = 1
+expert_feed_forward_length= 2304   <- 此前按 1536-4096 估
+```
+
+### 于是每笔开销可以精确算
+
+```
+physical_slots = rows × (n_used + shared) = 512 × 7 = 3584
+gbuf = 3584 × 4608 × 4 = 0.062 GiB
+ubuf = 3584 × 2304 × 4 = 0.031 GiB
+单次 zero_fill = 0.092 GiB     -> 理论 0.22 ms @450GB/s   实测 185.5 ms
+单次 silu_mul  = 0.092 GiB×3   -> 理论 0.22 ms            实测  48.8 ms
+```
+
+**实测效率 0.1%。**
+
+全量：
+```
+169 次 zero_fill × 0.092 GiB = 15.6 GiB
+262 次 silu_mul  × 0.276 GiB = 24.2 GiB   (读 g + 读 u + 写 y)
+合计 ≈ 40 GiB
+```
+**在 450 GB/s 的卡上搬 40 GiB 只要 0.09 秒，实际花了 44 秒。**
+
+### 所以这不是带宽问题，也不是量的问题
+
+是**每一次操作都在等前面的工作完成**——GPU 没有流水起来。
+
+这和本会话在 decode 上查到的成因是**同一个病**：
+- decode：每层一次 `paging_sync`，743 ms / 931 ms
+- prefill：169+262 次小操作，44 s / 61 s
+
+两者的共同点不是"某个 kernel 慢"，而是**大量短操作之间没有重叠**。
+
+### 本轮我否掉了自己两个中间假设
+
+1. 先怀疑 `zero_fill` 是 `cmd_fill_buffer`（转移操作）会排干队列 —— **错**，
+   `Recorder::sync` 只是发一个标准 pipeline barrier，不排干。
+2. 再怀疑 `dst_transfer=true` 的 barrier 太重 —— **错**，那是正常的
+   compute→transfer 屏障写法，而且是 spec 要求（注释里写了 ANV 会拒绝错误的 mask）。
+
+两次都靠读代码否掉了，没有写进结论。
+
+### 结论与下一步
+
+**不该再盯着 zero_fill/silu_mul 的"量"做优化**——它们本来就只有 40 GiB。
+该做的是让这些操作**不阻塞**：把 169 次 fill 和 262 次 silu 合并进更大的提交，
+或者让它们与计算重叠。
+
+但这一层已经是引擎的提交/屏障策略，改动面很大，且任何错误都会表现为
+静默的错误结果而非崩溃。**建议下一轮先做一件事**：
+确认这些操作是否各自触发了 submit（用 `INFR_PROF_STAGES` 或 submit 计数），
+如果 169+262 次里有大量独立 submit，那就是明确的、可验证的优化点。
