@@ -2,70 +2,62 @@
 
 ---
 
-## Round 75：三条源码线索逐一排除，以及我自己的一次误判
+## Round 77：找到一个可能的外部 oracle，但被 engram 打包方式挡住
 
-### ① 43 项 vs 40 层：不是偏移问题
-
-`config.rs:1170` 是 `arr[..n_layer]`——**截取前 40 项**。
-多出的 3 项被直接丢弃，索引不存在偏移。
-
-### ② 角色语义：代码是对的
-
-`config.rs:1181-1195` 把语义写得很清楚：
+### 本机有一个 llama.cpp 分支
 
 ```
-0 = pure sliding-window layer; reads no compressed stream at all.
-1 = a compressed SOURCE that pools one token per row (unpooled).
-2 = a compressed layer pooling two tokens per row, OR a reuse layer
-    reading an earlier source's stream — the source map decides which.
+/home/dyy/deepseek-work/llm-for-glm-flash/llama-cpp-dsv41/
+  src/models/deepseek41.cpp        948 行
+  build-cpu/bin/llama-cli          已构建
 ```
 
-**所以 `visible = (pos+1)/ratio4` 对 role=2 除以 2 是正确语义**，不是"拿角色当比例"。
-Round 74 我把它当成缺陷，**这个判断撤回**。
+`config.rs` 的注释一直在引用 `deepseek41.cpp`，**源文件就在本机**。
+这是本会话第一次有可能拿到独立参照。
 
-### ③ 我犯了一个更基础的错误：只读了一个分片
+### 尝试直接用
 
-Round 75 中我解析第一个 gguf 发现"只有 42 个张量、没有 attn_compressor_kv"，
-于是推断"所有权判定全落空"。**这是错的。**
+```
+llama-cli -m ...-IQ2_XXS-00001-of-00004.gguf -p "2+2=" -n 8 --temp 0
+```
 
-模型是**四分片**（`-00001-of-00004` 等），第一片只有专家权重和 engram 表。
-把四片合起来：
+结果：
 
-| 分片 | 张量数 |
+```
+E llama_model_load: error loading model: blk.1.engram_embd.weight is missing
+```
+
+### 为什么
+
+这个 llama.cpp 分支**期待 engram 张量打包在同一个 gguf 里**。
+
+而本项目的布局是：engram 表放**独立文件**（`engram-mxfp8.gguf`，189 GB；
+`engram.rs:38` 有完整文档），通过 `INFR_ENGRAM_TABLE` 指定，运行时 gather 后作为
+graph Input 喂进去，**不当作上传权重**。
+
+两种打包方式不兼容。本机没有把 engram 内联进主 gguf 的版本
+（`dsv41-engram-stub` 只有 2 个张量、架构名 `deepseek41-engram`，不能被当作主模型加载）。
+
+### 为什么不继续
+
+要让 llama.cpp 接受这个模型，得改它的加载器去读外部 engram 表——
+**那是给 llm.cpp 打补丁，超出了"给 V4.1 做验收"的范围**，而且改完的 oracle
+本身就不可信了（是我改过的）。
+
+### 但这仍然是有价值的发现
+
+| 项目 | 状态 |
 |---|---|
-| 00001 | 42 |
-| 00002 | 36 |
-| 00003 | 34 |
-| 00004 | **896** |
-| **合计** | **1008** |
+| llama.cpp 分支源码 | ✅ 在本机，948 行 |
+| llama-cli 可执行 | ✅ 已构建 |
+| 能直接跑本 repo 的 V4.1 | ❌ engram 打包方式不同 |
+| 改造可行性 | 需改 llama.cpp 加载器 |
 
-（`config.rs` 注释里那句 "0 of 1008 tensors" 正是这个总数。）
+**`deepseek41.cpp` 仍然可以当"读代码的参照"用**——它实现了同一套 CSA2 source/reuse、
+engram、dspark，可以逐段对照我们的 `runner.rs`。只是不能当"跑出答案的 oracle"。
 
-用全集重新验证属主：
+### 下一步
 
-```
-owns attn_compressor_kv : [2, 8, 14, 20]            ← 与 config 声明一致
-owns indexer.attn_q_b   : [2,8,14,20,24,28,32,36]   ← 与 config 声明一致
-```
-
-**和代码推断完全吻合。** 所有权判定没有问题，`owns_compressor` 会正确地为 4 个 source 层
-返回 true、为其余 36 层返回 false。
-
-### 本轮净结果：三条线索全部排除
-
-| 线索 | 结论 |
-|---|---|
-| 43 vs 40 偏移 | 不存在，`arr[..n_layer]` |
-| 角色当比例 | 语义正确，撤回该判断 |
-| compressor 属主 | 与文件完全一致 |
-
-### 剩下的
-
-`hc_mult` 残差 与 IQ1_M 专家 dequant 仍是候选，但都需要外部参照才能判定。
-**本轮没有找到新缺陷。**
-
-### 教训
-
-**多分片 gguf 必须先合并元数据再下结论。** 我用第一片 42 个张量推断出了两个错误结论
-（"compressor 不存在"、"所有权全落空"），幸好验证时自己发现了。
+如果要拿答案级 oracle，最省事的是**下载一个把 engram 内联的 V4.1 gguf**
+（如果发布方提供），而不是改 llama.cpp。
 
