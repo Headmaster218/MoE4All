@@ -2,67 +2,46 @@
 
 ---
 
-## Round 97：`unbound tensor 3` 就是 engram，根因是 record-once 路径
+## Round 98：没能解决，但排除了三个候选路径
 
-### 第一步：确认 tensor 3 是什么
+### 做了什么
 
-在 `prepare_decode_plan` 的 `be.compile(&g)` 之前打印前 6 个张量：
+按 Round 97 的结论找 `ro` 的构造点，找到 `13287: let ro = if dyn_replay {`，
+在其中 `b.bind(h.logits, ...)` 前加了 engram bind。**仍是 `unbound tensor 3`。**
 
-```
-ENGRAM_T0 kind=Input    desc=[1],     dtype=I32
-ENGRAM_T1 kind=Internal desc=[5120],  dtype=F32
-ENGRAM_T2 kind=Input    desc=[1],     dtype=I32
-ENGRAM_T3 kind=Input    desc=[6144],  dtype=F32   ← 就是它
-ENGRAM_T4 kind=Input    desc=[18688], dtype=U32
-ENGRAM_T5 kind=Input    desc=[1],     dtype=U32
-```
+### 用探针排除的三条路径
 
-**`[6144] F32` 正是 `n_cols(24) × key_length(256)`。**
+| 探针 | 结果 | 结论 |
+|---|---|---|
+| `ENGRAM_RO_BIND`（在 `ro` 构造里） | **未打印** | `dyn_replay == false`，`ro` 是 `None` |
+| `ENGRAM_BOUND id=3`（在 13833 的 bind_future） | **打印了，id 正是 3** | 绑定执行了，但**不生效** |
+| `ENGRAM_REAL_BIND`（在 11689 的 bind_future） | **未打印** | 这条也不是执行路径 |
 
-**所以 tensor 3 就是 `engram_emb`。** Round 96 里我说"tensor 3 不是 engram 的 wkv"——
-前半段（不是 wkv 的权重）对，后半段（不是 engram）错。**它就是 engram 的输入。**
+### 最有价值的一条观察
 
-### 第二步：为什么 bind 了还是 unbound
+**`ENGRAM_BOUND id=3` 打印了、绑的就是 3，却仍报 unbound。**
 
-链路是：
+这不是"绑错地方"，而是 **`bind_future` 返回的 `bindings` 没有到达 execute**。
+它被 `next_stages` / `next_bundle` / `execute_decode_stages` 的某层转手丢掉了。
 
-```
-bind_future(...)  ->  bindings  ->  ExecutionStage::new(*plan, bindings)
-                                ->  execute_decode_stages(...)
-```
+### 我这一轮的方法问题
 
-**但 execute 有两条路径：**
+**我在同一个 14000 行文件里追了三个不同的 `bind_future`，每个都试了一遍。**
+正确的做法应该是**先确认"哪条路径在执行"，再去改那条路径**——而我是一边猜一边改，
+每次编译 1 分钟、跑 30 秒，代价很高。
 
-```rust
-if let Some((plan, b)) = &ro {
-    // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
-    be.execute(plan.as_ref(), b)?;          // ← 用 ro 里的 b，不是 bind_future 的
-} else if c.qwen4exp {
-    ...
-}
-```
+更有效的做法：在 **`resolve()` 报错的那个点**直接把 `bindings` 里已绑的 id 全部打印出来，
+一次就能看到 engram 在不在里面。这一轮没想到。
 
-**`ro` 是 record-once 路径**，用的是**调用方预先建好的 `(plan, bindings)`**，
-**完全绕过 `bind_future`**。我在 `bind_future` 里加的 engram bind 在这条路径上不生效。
+### 当前状态
 
-### 这解释了所有矛盾
-
-| 观察 | 解释 |
-|---|---|
-| `ENGRAM_DECODE_BIND holder=true buf=true` 打印了 | bind_future 确实执行了 |
-| 但 tensor 3 仍然 unbound | **执行的不是 bind_future 的 bindings** |
-| 报错在 op 67 | engram 的 `Linear` 在 ro 的 plan 里，但它没有 engram 的 binding |
-
-### 我的诊断方法这次是对的
-
-**打印张量 desc 一步定死了 `[6144]` 这个特征**，比查 label、查 kind 都快。
-`label` 全是 `None`——这个项目没有给张量打标签，所以只能靠形状识别。
+- 8 个 bind 点都在代码里，编译通过
+- `unbound tensor 3` 仍在
+- 工作树干净
 
 ### 下一步
 
-`ro` 的 `(plan, bindings)` 是调用方构建的。要么：
-1. 在那里补 engram bind
-2. 或在 record-once 场景下禁用 engram（但那等于 engram 永远不生效）
-
-**先找到 `ro` 的构造点**（它是 `generate_dense_backend_inner` 的入参，在 `mod.rs` 或上层构造）。
+在 `infr-vulkan/src/adapter.rs:462` 的 `resolve()` 失败处，打印该 `Bindings` 的完整 id 集合。
+这一步能直接回答"engram 到底有没有进到执行用的 bindings 里"，
+不用再靠追调用链猜。
 
