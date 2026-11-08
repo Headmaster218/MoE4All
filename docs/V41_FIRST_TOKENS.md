@@ -2,53 +2,48 @@
 
 ---
 
-## Round 63：显存还有余量，但 arena 不由它决定
+## Round 63（续）：ubatch 是 prefill 与 decode 的真实权衡
 
-### 更正设备规格
+### A/B（同一模型、同一 prompt）
 
-```
-device_name: Intel(R) Graphics (BMG G31)
-vram_total_bytes = 34,242,297,856 = 31.9 GiB
-vram_available   = 30,772,559,872 = 28.7 GiB
-```
+| ubatch | prefill | decode | hit_rate |
+|---|---|---|---|
+| **256**（默认） | 25 tok/s | **6.2 tok/s** | 61.0% |
+| **512** | **27 tok/s** | **5.5 tok/s** | **51.8%** |
 
-**不是 24 GiB，是 31.9 GiB。** 我先前写"24 GiB 显存"是错的。
+### 结果解读
 
-### 于是余量存在
+- **prefill 快了 8%**（25 → 27）
+- **decode 慢了 11%**（6.2 → 5.5）
+- **命中率反而下降**（61.0% → 51.8%）
 
-| 项 | 值 |
-|---|---|
-| 设备 arena | 21.27 GiB |
-| 显存总量 | 31.9 GiB |
-| **占比** | **67%** |
+### 为什么命中率会下降
 
-**约 10 GiB 空闲。** 这意味着提高命中率在**容量上**是可能的。
+我原本预期「arena 变大 → 更多专家常驻 → 命中率上升」。
 
-### 但 `INFR_NO_VRAM_GUARD=1` 无效
+**实际相反。** 可能的原因：arena 变大后，缓存策略的驱逐粒度也变了，
+或者大 arena 下的划分让**单位时间内的复用机会变少**。
 
-| | 默认 | `NO_VRAM_GUARD=1` |
-|---|---|---|
-| decode | 6.2 tok/s | **6.2 tok/s** |
-| hit_rate | 61.0% | 61.0% |
-| arena | 21.27 GiB | 21.27 GiB |
+**具体机制还没查清，但方向明确：ubatch 增大并不改善 decode 的命中率。**
 
-**arena 大小没变。**
+### 结论
 
-### 为什么
+**ubatch 256 是 decode 的最优点，512 是 prefill 的最优点。**
 
-preflight 那行写的是 **"provisional device arena at ubatch 256"** ——
-**arena 是按 `ubatch` 算出来的，不是按显存余量算的。**
+这不是 bug，是两者对 batch 大小的相反需求：
+- prefill 要大批次（提高并行度）
+- decode 要小批次（减少每 token 的换入压力）
 
-`INFR_NO_VRAM_GUARD` 解除的是显存保护，不改变 arena 的尺寸公式。
+### 可行动的建议
 
-### 所以要提高命中率，得改 ubatch
+**按用途分别配置**：prefill 密集场景用 `--ubatch 512`（+8%），
+交互式 decode 场景用默认 256。
 
-但 `ubatch` 是 prefill 的批大小：调大能扩大 arena（更多专家常驻），
-但会改变 prefill 的并行度——**可能拿 decode 换 prefill**。
+**这也说明 25 vs 27 tok/s 的 prefill 差距是可以拿到的**，只要场景匹配。
 
-这是个真实的权衡，值得测，但要注意两边都要量。
+### 到此为止的判断
 
-### 下一步
-
-A/B `--ubatch 512`，同时记录 prefill 和 decode 两个数字。
+在**单一配置**下，已经没有进一步的调优空间：
+- decode 6.2（带宽 70%）
+- prefill 25（ubatch 256）/ 27（ubatch 512）
 
