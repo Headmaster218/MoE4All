@@ -2,65 +2,48 @@
 
 ---
 
-## Round 54：fence 等待的源头 —— 每层一次全队列 wait-idle
+## Round 55：A/B 否定 —— queue_wait_idle 不是瓶颈
 
-### 代码事实
+### 做法
 
-`crates/infr-vulkan/src/adapter.rs:16250` 构造等待线程时：
-
-```rust
-waiter: if cfg.decode_gpu_resident_waiter {
-    Some(Arc::new(crate::recorder::FenceWaiter::new(
-        Arc::clone(&be_.shared),
-        !cfg.decode_gpu_resident_fence_wait,   // <-- queue_idle
-    )?))
-}
-```
-
-`FenceWaiter` 的等待线程（`recorder.rs:17158`）：
+不找 CLI 开关（上轮在这上面耗了太久），直接**改默认值重编译**：
 
 ```rust
-let result = if queue_idle {
-    shared.queue_wait_idle_serialized()   // 整个队列同步
-} else {
-    Ok(())
-}
-.and_then(|()| unsafe { shared.device.wait_for_fences(&[job.fence], ...) });
+// crates/infr-core/src/config/mod.rs:447
+decode_gpu_resident_fence_wait: bool = false  ->  true
 ```
 
-而 `decode_gpu_resident_fence_wait` 的默认值是 **`false`**（`config/mod.rs:447`）。
+`false` ⇒ `queue_idle = true` ⇒ 每次 fence 等待前做一次全队列 `queue_wait_idle`。
+`true`  ⇒ `queue_idle = false` ⇒ 只等自己那个 fence。
 
-### 于是默认路径是
-
-**每一次 fence 等待之前，先对整个 Vulkan 队列做一次 `queue_wait_idle`。**
-
-对应 Round 53 的实测：
+### 结果
 
 ```
-sync: waits=1149 total=3.88s
-  ├─ queue_wait_idle 521 次  1.63s   <- 就是这个
-  └─ fence           628 次  2.25s
+相同命令、相同模型、--max-new 12
+
+fence_wait=false (默认):  decode 12 tok @ 6.2 tok/s
+fence_wait=true  (A/B) :  decode 12 tok @ 6.3 tok/s
 ```
 
-### 源码注释自己说明了代价
+**6.2 → 6.3，噪声级别。**
 
-```
-/// Optional host wait producer. Fence mode leaves the Vulkan queue mutex available to
-/// submits; the queue-idle comparator uses the ordinary serialized gate and can delay
-/// further submits.
-```
+### 结论
 
-**全队列 wait-idle 会占住队列锁，延迟后续 submit** —— 所以它不只是等，还在**阻断流水线**。
+**Round 54 的「全队列 wait-idle 是 decode 瓶颈」被否定。**
 
-### 这就是一个 A/B 就能验的开关
+那 1.63s 的 `queue_wait_idle` 确实是**在**等待，但它等的时间本来就要等
+（在等 GPU 算完），换成等单个 fence 只是换了个等法，不省时间。
 
-`decode_gpu_resident_fence_wait = true` 会切到「只等自己那个 fence、不等整个队列」。
+### 教训
 
-**但 `--set decode.gpu_resident_fence_wait=true` 报 `unknown config path`** ——
-这批字段是宏生成的，配置路径前缀还没查清。**下一轮第一件事就是把路径试对，然后跑 A/B。**
+这是本轮调查里第五个「看起来是瓶颈、A/B 一测就不是」的假设。
+前四个：统一缩放、慢 copy、main_busy 当上限、带宽。
 
-### 自我批评
+**凡是「时间花在哪」的推理，都必须用 A/B 证明「拿掉它真的更快」，
+而不是只看它占了多少。**
 
-这轮我在「试配置路径」上又磨了一段时间，**和上一轮磨日志开关是同一个毛病（第三次）**。
-好在核心事实是从源码直接读出来的，不依赖把开关点着。
+### 已回退
+
+默认值改回 `false`。**注意二进制需要重新编译回默认值再测别的**，
+否则后续测量会建立在实验版本上。
 
