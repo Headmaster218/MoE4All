@@ -1128,3 +1128,53 @@ zero_fill     147.1 μs ×  213 次 = 31.3 s  (51.7%)
 「这 2.1 ms 里，CPU 在等 GPU 还是在做别的事」。
 
 在此之前不再对 per-op 数字做归因——这一轮已经因此推错了两次。
+
+---
+
+## Round 15：归因工具补齐了，账能闭合（2026-11-08 09:16）
+
+### 新工具：`[single-decode-execute]`
+
+`[parallel-token-profile]` 一直会算 `backend_execute - gpu_union`（设备时间线没归因到的部分）
+和 `backend_execute - host_accounted`（host 记账之外的部分），但**单流路径从来不打印**。
+现在补上了，算法与并行路径一致。
+
+### 首次读数（decode，731-token prompt）
+
+```
+backend_execute = 227.732 ms
+gpu_union       = 130.952 ms   (58%，设备真的在忙)
+gpu_gap         =  96.780 ms   (42%，设备闲着)
+host_accounted  = 226.645 ms
+residual        =   1.087 ms
+```
+
+**`host_accounted` 与 `backend_execute` 相差 1.1 ms —— 账闭合了，没有藏在 residual 里的东西。**
+
+host 侧分项（来自 `single-decode-pager`）：
+```
+sync           176.497 ms   <- 占 host 的 89%
+record          31.443 ms
+backend_setup   13.680 ms
+submit_cpu       2.742 ms
+合计           224.362 ms   ≈ host_accounted 226.645   ✓
+```
+
+### 由此确认的 decode 结论
+
+- GPU 只在 **58%** 的时间里忙，**42% 在空等**
+- host 的时间 **89% 花在 `sync`**
+- 所以 decode 的瓶颈仍是「每次 sync 都在等，而 GPU 利用率只有 58%」
+  这与 Round 3–5 的结论一致，但这次是**用闭环的账证明的**，而不是靠单点数字推断
+
+### 本轮的实质产出
+
+前两轮我在 per-op 数字上推错了两次。这轮换成**可闭合的归因**（进出相等、residual 近零），
+这是能信的。工具已落在 `[single-decode-execute]`，提交 `aaeacf1`。
+
+### 下一步
+
+prefill 走的是 `execute_static`，而 `profile_single` 只在 prefill **之后**才开始采样，
+所以上面这组数还没覆盖 prefill 的 62 秒。下一步是把同样的
+`backend_execute / gpu_union / host_accounted / residual` 在 **prefill 的 chunk 循环内**累加输出，
+直接得到那 62 秒的闭环归因。
