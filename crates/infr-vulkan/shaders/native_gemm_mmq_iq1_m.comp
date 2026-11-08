@@ -82,10 +82,14 @@ layout(binding = 4) readonly buffer CNT { uint counts[]; };
 layout(binding = 5) readonly buffer OFF { uint offsets[]; };
 layout(binding = 6) writeonly buffer CB { float c[]; };
 #elif defined(EXPERT_GRID)
-layout(binding = 3) readonly buffer LUT { uvec2 lut[]; };
-layout(binding = 4) readonly buffer CNT { uint counts[]; };
-layout(binding = 5) readonly buffer OFF { uint offsets[]; };
-layout(binding = 6) writeonly buffer CB { float c[]; };
+// No LUT here: slot-index indirection exists only in the PAGED build (see main()'s `#ifdef PAGED`
+// arm, the sole reader of `lut[]`). Declaring it anyway pushed counts/offsets/c up by one slot,
+// so `c` landed on binding 6 while matmul_mmq_experts supplies six descriptors (0..5) and the
+// kernel's stores went nowhere - every result read back as exactly zero. IQ2_S's expert kernel
+// has always had this block without the LUT; this matches it.
+layout(binding = 3) readonly buffer CNT { uint counts[]; };
+layout(binding = 4) readonly buffer OFF { uint offsets[]; };
+layout(binding = 5) writeonly buffer CB { float c[]; };
 #else
 layout(binding = 3) writeonly buffer CB { float c[]; };
 #endif
