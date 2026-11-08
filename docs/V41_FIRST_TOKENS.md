@@ -2,58 +2,49 @@
 
 ---
 
-## Round 72：问题比"batched 路径算错"更深 —— 两条路径都答不出来
+## Round 73：对照实验证明引擎没问题，问题只在 V4.1
 
-### 用一个更简单的问题重测
+### 用同一个引擎跑一个已知正常的模型
 
-`2+2=`，`--max-new 6 --temp 0`：
+`qwen2.5-1.5b-q4_k_m`（1.1 GB），同一 prompt `2+2=`，同样 greedy：
 
-| 路径 | 输出 |
+**输出：`2+2=4`** ✅
+
+### 这个对照排除了什么
+
+| 环节 | 结论 |
 |---|---|
-| per-token（默认） | `We need answer. The question` |
-| batched | `We need answer. Need answer. We` |
+| Vulkan 后端 | ✅ 正常 |
+| 采样 / greedy 路径 | ✅ 正常 |
+| chat template | ✅ 正常 |
+| `infr run` CLI | ✅ 正常 |
+| **V4.1 模型的推理** | ❌ **错误** |
 
-**两条路径都没有回答 2+2。**
+**所以问题被完全限制在 V4.1 这条实现路径上**，不是引擎或工具链。
 
-### 这改变了 Round 71 的结论
-
-Round 71 我看到两条路径输出不同，判断"batched 算错、per-token 是对的"。
-
-**这个判断不成立。** 两条路径都在输出同类的模板套话，**没有任何一条在真正回答问题**。
-
-所以问题不在"哪条路径算错"，而在**更底层：模型本身没有正确工作**。
-
-### 三个候选根因
-
-1. **IQ1_M 专家的 dequant 仍然错** —— 从"全零"变成了"非零但错误"，
-   而 `grid_mmq_parity` 只对照 host 侧的**同一套误解码**，所以测不出来
-2. **34 个复用层的 source-stream 复用路径没接对**
-3. V4.1 特有组件（engram / dspark）未正确接线
-
-### 一个检验路径被排除了
-
-尝试用 `dsv41-engram-iq4nl`（IQ4_NL，非 IQ1_M）做对照模型，**加载失败**：
+### 补充：V4.1 的专用开关只有三个
 
 ```
-infr-llama supports architecture=...|deepseek|..., got "deepseek41-engram"
+INFR_DSV41_BATCHED_PREFILL
+INFR_DSV41_SHARD1
+INFR_ENGRAM_TABLE
 ```
 
-**本机有两个不同的 V4.1 架构变体**：`deepseek41`（当前测的）和
-`deepseek41-engram`（未支持）。所以没有现成的同架构对照模型。
+**没有关闭 engram / dspark 的总开关**，所以不能靠"关掉某个组件"来二分定位。
 
-### 这意味着什么
+### 现在的诊断状态
 
-`grid_mmq_parity` 的 `iq1m_expert_gemm_matches_host` 通过，**只证明 GPU 与 host
-实现一致**——如果 host 侧的 IQ1_M 解码本身是错的，两边一起错，测试照样通过。
+问题精确定位到 V4.1 的 forward 实现，候选仍是 Round 72 那三个：
 
-**这是一个结构性盲点**：本项目没有任何一个测试对照了"真实模型的外部正确答案"。
+1. **IQ1_M 专家 dequant 错误**（`grid_mmq_parity` 只做 GPU-vs-host，发现不了）
+2. **34 个复用层的 source-stream 路径**
+3. **engram / dspark 接线**
 
-### 下一步该做的
+### 最有价值的下一步
 
-需要一个**独立的、外部可信**的正确性参照。可行选项：
-- 用 llama.cpp（若支持 V4.1）跑同一模型，对比输出
-- 或用同一模型的已知正确输出作为 golden
-- 若都没有，只能逐层 dump 中间激活与参考实现比对
+`qwen2.5-1.5b` 的正确性说明**引擎的通用算子是对的**。
+V4.1 独有的东西是：IQ1_M experts、复用层、engram、dspark、hc_mult 残差。
 
-**在此之前，任何速度数字都没有意义。**
+**逐个关闭/替换这些独有组件，就能二分定位。** 需要代码改动来加开关，
+但至少现在每次 A/B 都有 `2+2=4` 这个客观判据，不再是盲测。
 
