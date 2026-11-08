@@ -50,11 +50,21 @@ Measured, not guessed — each of these came out of an A/B that failed to move t
   overhead is under 1% unattributed. The remaining candidates are structural — one output
   per workgroup, grid-decode cost at m=1, per-node dispatch overhead — and need kernel
   work rather than tuning.
-- **Prefill above 8K is not usable here.** pp16384 hangs and loses the device after ~20
-  minutes with all 41 threads sleeping in `drm_syncobj_array_wait_timeout`; pp100000 does
-  the same after 26 minutes. This is independent of ubatch (3072 and 512 both fail). The
-  device survives each loss. The pager reports `target_lanes=40 actual_lanes=5
-  resident_layers=0/40`, which is a VRAM consequence rather than the cause.
+- **Prefill above 8K needs the batched path, and the batched V4.1 path is not viable
+  yet.** Every prefill figure above was taken with `INFR_DSV41_BATCHED_PREFILL=1`, the
+  opt-in bring-up switch. With it set, pp16384 loses the device after ~20 minutes (all 41
+  threads sleeping in `drm_syncobj_array_wait_timeout`), and pp100000 does the same after
+  26; ubatch makes no difference (3072 and 512 both fail). With it unset, 16K does not hang
+  but does not finish in 50 minutes on the per-token path.
+
+  `runner.rs:12370` already documents the cause: the batched path builds one whole-model
+  graph per chunk with `span = None`, so V4.1's `hc_mult`-width residual cannot cross a
+  chunk boundary, and no batch>1 V4 graph has ever executed correctly. The per-token path
+  is the product behaviour — correct, merely slow. The 4K/8K numbers measure the batched
+  configuration, where it does run, and should not be read as default-path figures.
+
+  The pager's `target_lanes=40 actual_lanes=5 resident_layers=0/40` is a VRAM consequence,
+  not the cause.
 - **MTP cannot be exercised with this checkpoint.** The code path is complete, but the
   GGUF carries no mtp/draft/nextn head (42 tensors, none of them).
 
