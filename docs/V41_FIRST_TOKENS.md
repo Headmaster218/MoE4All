@@ -2,40 +2,48 @@
 
 ---
 
-## Round 56（续）：A/B 否定 —— staging ring 槽数无关
+## Round 58：区间是什么 —— 每次带时间戳的 submit
 
-`INFR_PAGER_RING_SLOTS` 2（默认）vs 8：
+### 代码事实
 
-```
-              slots=2 (默认)      slots=8
-decode        6.2 tok/s           6.2 tok/s
-main_intervals 1149               1149
-main_busy     2.86s               2.86s
-outside       1.54s               1.55s
-dma_hidden    0.0%                0.0%
-staging ring  acquisitions=0      acquisitions=0
+`main_intervals` 的唯一记录点是 `lib.rs:1864`：
+
+```rust
+infr_core::pager_profile::record_device_interval(
+    DeviceIntervalKind::MainQueue, ticks[0], ticks[1], ...)
 ```
 
-**三项完全一致。**
+它读的是 **`SubmitTimingToken` 的一对时间戳查询**（`get_query_pool_results` 的
+`ticks[0]` / `ticks[1]`，`WAIT` 模式）。
 
-### 决定性的一点
+### 于是
 
-**`staging ring: acquisitions=0` —— 这个 ring 从头到尾一次都没被用过。**
+**1149 个区间 = 1149 次带时间戳的 submit。**
 
-所以 1.54s 的空档**不是** staging ring 造成的，增加槽位自然也没有意义。
+而 `main_gaps = 0` 说明这 1149 个 submit 的 GPU 区间彼此相接、互不重叠——
+**每个 submit 内部是连续执行的**（`avg_dispatches_per_submit = 23.3` 个 dispatch 一口气跑完）。
 
-### 这条线索关闭
+### 所以空档在哪
 
-第 6 个被 A/B 否掉的假设。
+**空档在 submit 与 submit 之间，不在 dispatch 与 dispatch 之间。**
 
-### 现在剩下的候选
+`submits = 1684` 而 `main_intervals = 1149`，说明有 535 次 submit 不带时间戳查询，
+所以只有 1149 次可观测——但两者都是"submit 之间的间隙"。
 
-空档 = GPU 两次 `main_intervals` 之间的时间。已知：
-- 不是 CPU 记录（只占 9%）
-- 不是 staging ring（从未使用）
-- 不是全队列同步（Round 55 已否）
-- DMA 计时为 0，无法直接观测
+### 这个结论把优化目标锁定了
 
-**下一个该查的是 `main_intervals` 为什么被切成 1149 段、每层 2.39 段。**
-如果能把每层的段数降到 1，即使空档不变，也能省掉一半的切换。
+不要去合并 kernel、不要去减少 dispatch（那 23 个 dispatch 本来就是连续的）。
+**要去减少 submit 的次数。**
+
+`submit splitter` 行显示每次 forward 里 `cap_end = split/16`，即被切成 16 段。
+如果能减少这个切分，submit 数下降，空档数也随之下降。
+
+### 数据校验
+
+1149 次 submit、span 4.41s → **平均每次 submit 间隔 3.84ms**
+其中 GPU 忙 2.49ms、空 1.35ms —— 与实际测到的两个数吻合。
+
+### 下一步
+
+找 `cap_end = split/16` 那个 cap 是从哪来的、能否 A/B 调大。
 
