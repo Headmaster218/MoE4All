@@ -313,7 +313,7 @@ fn grid_mmq_expert_gemm_matches_host_and_is_deterministic() {
                     .iter()
                     .zip(&g2[..rows * n])
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "IQ2_S {label} GEMM nondeterministic across identical dispatches"
+        "IQ2_S {label} GEMM nondeterministic across identical dispatches"
         );
         let y0 = dl(ybufs[0].as_ref(), npad * k);
         let y1 = dl(ybufs[1].as_ref(), npad * k);
@@ -327,7 +327,7 @@ fn grid_mmq_expert_gemm_matches_host_and_is_deterministic() {
                     .iter()
                     .zip(&y2[..rows * k])
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "IQ3_S {label} GEMM nondeterministic across identical dispatches"
+        "IQ3_S {label} GEMM nondeterministic across identical dispatches"
         );
 
         let want_g = host_expert_gemm(&gate_host, &xq, &counts_host, &offsets_host, k, n);
@@ -687,6 +687,15 @@ fn qwen38_xs_grid_mmq_all_variants_match_host() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn iq1m_expert_gemm_matches_host() {
+    // IQ2_S is the CONTROL: it goes through the exact same dispatch path and is already a
+    // trusted member of MOE_MMQ_DTYPES. If IQ2_S passes here and IQ1_M returns zeros, the
+    // harness is sound and the defect is in the IQ1_M kernel/bank layout - not the test.
+    for dt in [DType::Iq2S, DType::Iq1M] {
+        run_expert_gemm_parity(dt);
+    }
+}
+
+fn run_expert_gemm_parity(dt: DType) {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -695,11 +704,11 @@ fn iq1m_expert_gemm_matches_host() {
     let stride = k * n;
 
     let banks: Vec<Vec<u8>> = (0..n_expert)
-        .map(|e| synth_bank(DType::Iq1M, stride, 0x1a1b ^ ((e as u64) << 32)))
+        .map(|e| synth_bank(dt, stride, 0x1a1b ^ ((e as u64) << 32)))
         .collect();
     let host: Vec<Vec<f32>> = banks
         .iter()
-        .map(|b| infr_gguf::dequant::dequant_block(DType::Iq1M, b).unwrap())
+        .map(|b| infr_gguf::dequant::dequant_block(dt, b).unwrap())
         .collect();
 
     let flat: Vec<u8> = banks.concat();
@@ -759,7 +768,7 @@ fn iq1m_expert_gemm_matches_host() {
     );
     for g in &gbufs {
         rec.matmul_mmq_experts(
-            DType::Iq1M,
+            dt,
             "expert_gateup",
             qa.as_ref(),
             qda.as_ref(),
@@ -796,10 +805,11 @@ fn iq1m_expert_gemm_matches_host() {
                 .iter()
                 .zip(&g2[..rows * n])
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
-        "IQ1_M GEMM nondeterministic across identical dispatches"
+        "{:?} GEMM nondeterministic across identical dispatches",
+        dt
     );
 
     let want = host_expert_gemm(&host, &xq, &counts_host, &offsets_host, k, n);
-    assert_close("IQ1_M xp", &g0[..rows * n], &want);
-    println!("resident IQ1_M: parity + 3x determinism OK ({rows} rows)");
+    assert_close(&format!("{dt:?} xp"), &g0[..rows * n], &want);
+    println!("resident {dt:?}: parity + 3x determinism OK ({rows} rows)");
 }
