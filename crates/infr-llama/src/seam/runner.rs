@@ -12973,6 +12973,50 @@ fn generate_dense_backend_inner(
             }
         }
         if pf_prof && pf_groups > 0 {
+            // Prefill's own per-layer accounting. `execute_static_walk` records these for every
+            // path (layer_profile_t0 is unconditional), but nothing ever PRINTED them for prefill:
+            // the single-decode dump subtracts a snapshot taken AFTER prefill, so it reports
+            // calls=1 (one decode forward) and the parallel dump only runs with multiple lanes.
+            // Without this the 62 s of a 731-token prefill had no layer-level breakdown at all,
+            // which is why several rounds of it were attributed to the wrong thing.
+            let mut pf_layer_wall = std::time::Duration::ZERO;
+            let mut pf_layer_sync = std::time::Duration::ZERO;
+            let mut pf_layer_record = std::time::Duration::ZERO;
+            let mut pf_layer_submit = std::time::Duration::ZERO;
+            let mut pf_layer_calls = 0u64;
+            let mut pf_worst = (0usize, 0u64, 0u64);
+            for (layer, st) in infr_core::pager_profile::paged_moe_layer_snapshot()
+                .into_iter()
+                .enumerate()
+            {
+                if st.calls == 0 {
+                    continue;
+                }
+                pf_layer_calls += st.calls;
+                pf_layer_wall += std::time::Duration::from_nanos(st.wall_ns);
+                pf_layer_sync += std::time::Duration::from_nanos(st.paging_sync_wait_ns);
+                pf_layer_record += std::time::Duration::from_nanos(st.command_record_ns);
+                pf_layer_submit += std::time::Duration::from_nanos(st.queue_submit_ns);
+                if st.wall_ns > pf_worst.1 {
+                    pf_worst = (layer, st.wall_ns, st.paging_sync_wait_ns);
+                }
+            }
+            if pf_layer_calls > 0 {
+                let w = pf_layer_wall.as_secs_f64();
+                tracing::info!(
+                    "[pf layers] calls={} layers_wall={:.3}s sync={:.3}s ({:.1}%) record={:.3}s \
+                     submit={:.3}s | worst=layer{} wall={:.1}ms sync={:.1}ms",
+                    pf_layer_calls,
+                    w,
+                    pf_layer_sync.as_secs_f64(),
+                    pf_layer_sync.as_secs_f64() / w.max(1e-9) * 100.0,
+                    pf_layer_record.as_secs_f64(),
+                    pf_layer_submit.as_secs_f64(),
+                    pf_worst.0,
+                    pf_worst.1 as f64 / 1e6,
+                    pf_worst.2 as f64 / 1e6,
+                );
+            }
             let rows = pf_end - start;
             let secs = pf_group_wall.as_secs_f64();
             tracing::info!(
