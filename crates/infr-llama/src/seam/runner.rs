@@ -1483,6 +1483,11 @@ pub(super) struct DecodeHandles {
     qwen_wide: Option<TensorId>,
     ple_embd: Option<TensorId>,
     ple_state: Option<TensorId>,
+    /// DeepSeek V4.1 engram: the host-gathered `n_cols * key_length` rows for this step, one
+    /// block per token. `crate::engram` computes the row indices and dequantizes them out of the
+    /// mmapped table on the host (ggml has no 64-bit xor for the hash), so this arrives as an
+    /// input exactly as `ple_embd` does. Present only on a span containing an engram layer.
+    engram_emb: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     mtp_k_trace: Vec<Option<TensorId>>,
@@ -4794,6 +4799,15 @@ fn generate_dense_backend_inner(
         let ple_state = span_has_ple.then(|| {
             let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
             g.input(f32d(hist * c.hc_mult * ne))
+        });
+        // DeepSeek V4.1 engram input (`deepseek41.cpp` 382 `build_engram`): per token, `n_cols`
+        // gathered rows of `key_length` each, already dequantized on the host. `n_cols` is
+        // `(max_ngram - 1) * n_head` — 24 on the real model — and `wkv`'s input width is exactly
+        // `n_cols * key_length` (6144 there), so no reshaping is needed on this side.
+        let span_has_engram = c.deepseek41 && (l_first..l_end).any(|l| c.has_engram(l));
+        let engram_emb = span_has_engram.then(|| {
+            let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
+            g.input(f32d(batch * n_cols.max(1) * c.engram_key_length.max(1)))
         });
         let trace_recurrent = mtp_verify
             && mtp_trace.is_some_and(|(rows, _)| rows == batch || parallel_mtp_rows == Some(rows));
@@ -9077,6 +9091,7 @@ fn generate_dense_backend_inner(
                 qwen_wide,
                 ple_embd,
                 ple_state,
+                engram_emb,
                 k_cache,
                 v_cache,
                 mtp_k_trace,
