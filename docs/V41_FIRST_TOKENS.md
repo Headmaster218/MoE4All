@@ -1632,3 +1632,61 @@ GPU 满载下的 kernel 效率。已知（Round 10）：`zero_fill` + `silu_mul`
    那 337 MB/s 就完全正常，问题在于**缓冲区选错了位置**
 2. 每次 fill 前的 pipeline barrier 是否造成了整条队列的排空（需直接测屏障耗时）
 3. fill 与其他工作争抢同一条队列
+
+---
+
+## Round 25：查了缓冲区归属，没查到底；一个交叉推算被自己撤回
+
+### 追查"这个 buffer 在哪块内存上"
+
+路径是 `pooled()` → `BufferUsage::Activations` → `unified_class_for_usage`：
+
+```rust
+(None, BufferUsage::Activations) if self.unified_vram().is_some() =>
+    Some(UnifiedVramClass::LlmRuntime)
+```
+
+所以 MoE 的 `gbuf`/`ubuf` 走**统一显存池**的 `LlmRuntime` 分类。
+但 `LlmRuntime` 只是**逻辑分类**，真正的物理堆在 `pool.plan_owner_claim` / `make_alloc` 里决定。
+**我翻到这一层就没再往下** —— 再翻下去成本比做一个运行时测量更高。
+
+### 一个顺带查到的、可能推翻"位置假说"的注释
+
+`lib.rs:2410` 附近有一段说明：在这类设备上存在一个"合成的 device-local 堆"，
+**其带宽与真 device-local 相同**（权重从 GTT 读出，两种路径都要走 `mem_info_gtt_used`），
+并明确写着 "spilling there costs no bandwidth"。
+
+如果 `LlmRuntime` 落在这个合成堆上，那么**"缓冲区位置选错"这个假说也不成立** ——
+位置对，带宽就不该是 337 MB/s。
+
+### 撤回一个我自己做的交叉推算
+
+我试图用 Round 13 的 m=26/64/218/256 那组 execute 数据反推 `zero_fill` 的带宽：
+
+```
+m=26   → 1.5 μs/MiB
+m=256  → 1.1 μs/MiB
+```
+
+看起来"每 MiB 恒定"，但**这个推算无效**：我是拿 m=256 那次的 51.7% 占比
+去乘其他 m 的 execute 时间，而**不同 m 的 zero_fill 占比本来就不同**。
+用同一个比例外推，等于预设了结论。**撤回。**
+
+### 本轮状态：没有结论，也没有代码改动
+
+- 查到 `LlmRuntime` 分类，没查到物理堆
+- 找到一段注释，暗示"位置"可能不是问题
+- 做了个交叉验证，发现方法本身有循环论证，撤回
+
+**没有改动就没有提交**，工作树干净。
+
+### 下一轮：别再翻源码了
+
+源码层级已经翻到收益递减。应该做的是**一次运行时测量**：
+
+在同一进程里，对同一块 buffer 分别测
+「清 1 MiB / 清 16 MiB / 清 47 MiB」的耗时，
+看是**线性（带宽受限）**还是**近似恒定（固定开销）**。
+
+- 线性 → 带宽 337 MB/s 是真的，去找这块 buffer 为什么慢（换堆 / 换分配方式）
+- 恒定 → 那 147 ms 根本不是"搬运时间"，而是别的东西（屏障、队列排空），回到 Round 23 的候选 2
