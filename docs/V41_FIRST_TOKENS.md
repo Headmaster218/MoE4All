@@ -2,57 +2,63 @@
 
 ---
 
-## Round 86：engram 注入的五点改动清单
+## Round 86（续）：最后一个前置条件也清了
 
-### 现成的范例：`ple_embd`
+### engram 表怎么打开
 
-宿主侧数据进入 graph 的机制已经存在，`ple_embd` 就是范例，三步：
+`engram.rs:465` 的 `EngramTable::open(path: &Path) -> Result<Self>` 就是入口：
 
 ```rust
-// 1. handle（builder 的结构体里声明）
-ple_embd: Option<TensorId>,
-// 2. alloc
-let ple_embd_buf = Some(be.alloc(..., BufferUsage::Activations)?);
-// 3. bind
-if let (Some(id), Some(buf)) = (h.ple_embd, ple_embd_buf) { b.bind(id, buf.as_ref()); }
+pub fn open(path: &Path) -> Result<Self> {
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file) }?;
+    ...
+}
 ```
 
-### engram 要动的五处
+**表路径来自 `INFR_ENGRAM_TABLE` 环境变量**（`engram.rs:1606`、`1655`）。
 
-| # | 位置 | 内容 |
-|---|---|---|
-| 1 | builder handle 结构体 | 加 `engram_emb: Option<TensorId>` |
-| 2 | `runner.rs:1732` 旁 | `alloc(n_cols(24) * key_length(256) * nt * 4)` |
-| 3 | `runner.rs:1030` 旁 | `bind(h.engram_emb, buf)` |
-| 4 | 每步 forward 前 | 调 `crate::engram` 算 rows、gather、`dequant_mxfp8_row` |
-| 5 | `runner.rs:6300` 后 | `Linear(wkv)` → 切 key/value → `RmsNorm` + `engram_k/q` → `QwenPleGate` → 累加进 `hcr[0]` |
+### 而且 mmap 不占 RAM
 
-### 数据量
+`engram.rs:436` 写得很清楚：
 
-| 场景 | 每步传输 |
+> *"The mapping costs ADDRESS SPACE, not RAM: only the pages a gather touches ever become
+> resident, and `advise(Random)` stops the kernel readahead-ing the neighbours of the 1 KiB
+> row that was actually asked for."*
+
+**189 GB 文件映射只占虚拟地址空间**（x86-64 用户空间 128 TB，够用）。
+每次 random 访问只把真正读的那一页带入内存。
+
+### 于是整条链路都通了
+
+| 环节 | 状态 |
 |---|---|
-| decode `nt=1` | **24 KiB** |
-| prefill `nt=256` | **6.0 MiB** |
+| 表路径 | ✅ `INFR_ENGRAM_TABLE` |
+| 打开 + mmap | ✅ `EngramTable::open`，已实现 |
+| 行号计算 | ✅ `EngramMap::row_indices`，已实现 |
+| 行反量化 | ✅ `dequant_mxfp8_row`，已实现 |
+| 传给 graph | ✅ `ple_embd` 的 handle/alloc/bind 三件套 |
+| 投影 + gate | ✅ `Linear` + `RmsNorm` + `QwenPleGate` |
+| 接残差 | ✅ `hcr[0]`，6300 行之后 |
 
-**decode 的 24 KiB 可忽略；prefill 的 6 MiB 会明显拖慢**（当前 prefill 27 tok/s，
-按流式带宽算每步多传 6 MiB 需要额外时间）。
+**每一环都有现成实现，缺的只是把它们连起来。**
 
-### 但有一个前提必须先确认
+### 这也解释了为什么这是一个"连线"问题而不是"实现"问题
 
-**engram 表是独立文件（189 GB），运行时需要 mmap 或 open+seek。**
+`engram.rs` 994 行、有完整单测、接口清晰；`QwenPleGate` 两个后端都有；
+`ple_embd` 提供了 input binding 范例。**所有零件都在，只是没有装配。**
 
-问题：`run` 命令目前只接收主 gguf 路径，**没有 engram 表路径的参数**。
-`engram.file = DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` 是元数据里的**相对文件名**，
-与 189 GB 的 `engram-mxfp8.gguf` 不一致。
+### 下一轮：动手
 
-**所以第一件事是确认 engram 表如何定位**：
-- 是否已有 CLI 参数 / 环境变量（`INFR_ENGRAM_TABLE` 在 `engram.rs` 的测试里出现过）
-- 还是需要在主 gguf 同目录按约定查找
+按 Round 86 开头列的五点改动写代码。目标是**先编译通过**，然后：
 
-**这个不确定的话，改动 1-5 写完了也跑不起来。**
+1. `cargo test -p infr-llama` 保持绿
+2. `scripts/check-v41-answers.sh` 看 `2+2=` 是否修复
 
-### 下一步
+### 预期
 
-先查 `INFR_ENGRAM_TABLE` 的实际含义和加载路径，确认表如何打开。
-这是编译前必须打通的最后一环。
+如果 engram 缺失确实是根因，`2+2=` 应该能答对。
+如果不能，说明还有别的问题——但至少这一个确定的缺陷会被补上。
+
+**风险**：prefill 每步多传 6 MiB，速度会降。**先要正确，再谈速度。**
 
