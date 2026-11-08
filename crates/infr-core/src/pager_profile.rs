@@ -44,6 +44,10 @@ struct DeviceInterval {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceTimelineStats {
     pub main_intervals: usize,
+    /// Intervals left after merging overlaps. `main_intervals` counts raw timestamped spans
+    /// (one per recorded segment); this is how many DISJOINT runs of GPU work they form, so
+    /// `main_intervals - main_merged` is the number of gaps.
+    pub main_merged: usize,
     pub dma_intervals: usize,
     pub span_ns: u64,
     pub main_busy_ns: u64,
@@ -1605,9 +1609,11 @@ pub fn print_summary_if_enabled() {
     let timeline = device_timeline_snapshot();
     let _ = writeln!(
         out,
-        "device queue timeline: span={} main_intervals={} main_busy={} dma_intervals={} dma_busy={} concurrent_overlap={} dma_hidden={:.1}% visible_dma_tail={} outside_timestamped_intervals={}",
+        "device queue timeline: span={} main_intervals={} main_merged={} main_gaps={} main_busy={} dma_intervals={} dma_busy={} concurrent_overlap={} dma_hidden={:.1}% visible_dma_tail={} outside_timestamped_intervals={}",
         fmt_ns(timeline.span_ns),
         timeline.main_intervals,
+        timeline.main_merged,
+        timeline.main_intervals.saturating_sub(timeline.main_merged),
         fmt_ns(timeline.main_busy_ns),
         timeline.dma_intervals,
         fmt_ns(timeline.dma_busy_ns),
@@ -1831,6 +1837,7 @@ pub fn device_timeline_snapshot() -> DeviceTimelineStats {
     let main_intervals = main_raw.len();
     let dma_intervals = dma_raw.len();
     let main = merge_intervals(main_raw);
+    let main_merged = main.len();
     let dma = merge_intervals(dma_raw);
     let main_busy = interval_duration(&main);
     let dma_busy = interval_duration(&dma);
@@ -1851,6 +1858,7 @@ pub fn device_timeline_snapshot() -> DeviceTimelineStats {
     let union_busy = main_busy.saturating_add(dma_busy).saturating_sub(overlap);
     DeviceTimelineStats {
         main_intervals,
+        main_merged,
         dma_intervals,
         span_ns: span.min(u64::MAX as u128) as u64,
         main_busy_ns: main_busy.min(u64::MAX as u128) as u64,
