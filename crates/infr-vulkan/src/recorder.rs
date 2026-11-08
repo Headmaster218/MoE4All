@@ -976,7 +976,7 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
         },
         // IQ1_M: nbn = 256/32 = 8 activation blocks per 256-value superblock.
         D::Iq1M => MoeMmqDesc {
-            resident_nb: 8,
+            resident_nb: 6,
             xp: (
                 "native_gemm_mmq_iq1_m_xp",
                 g::native_gemm_mmq_iq1_m_xp_spv(),
@@ -15340,6 +15340,26 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let gx = (rows.div_ceil(bm) * (n / bn)) as u32;
+        // Temporary dispatch-parameter trace for the IQ1_M investigation. Prints from the Rust
+        // side, where every quantity is known without the GPU running anything - rounds 41-44
+        // were all spent trying to make a shader-side probe observable.
+        if std::env::var_os("INFR_MMQ_TRACE").is_some_and(|v| v != "0") {
+            eprintln!(
+                "[mmq-trace] dtype={dtype:?} stage={stage} name={name} nb={nb} push_size=24 \
+                 gx={gx} gy={} rows={rows} k={k} n={n} n_expert={n_expert} bm={bm} bn={bn} \
+                 small_tile={small_tile} wide_bn={wide_bn} n_buf={}",
+                n_expert,
+                if sact.is_some() { 7 } else { 6 },
+            );
+            eprintln!(
+                "[mmq-trace]   push: m(stride_bytes)={} n={} k={} w_base={} arena_lo={:#x}",
+                stride_bytes,
+                n,
+                k,
+                w_base,
+                arena_addr as u32,
+            );
+        }
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));

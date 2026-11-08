@@ -693,10 +693,10 @@ fn iq1m_expert_gemm_matches_host() {
     // SINGLE EXPERT FIRST: `wbase = pc.w_base + ex * pc.m` is round 38's remaining suspect, and
     // with one expert that term is `0 * pc.m = 0` whatever pc.m means. Run it before the
     // 5-expert case so its verdict is not masked by a panic in the later one.
+    // CONTROL FIRST: IQ1_M panics, which masked the IQ2_S control for four rounds.
+    run_expert_gemm_parity(DType::Iq2S, 5);
     run_expert_gemm_parity(DType::Iq1M, 1);
-    for dt in [DType::Iq2S, DType::Iq1M] {
-        run_expert_gemm_parity(dt, 5);
-    }
+    run_expert_gemm_parity(DType::Iq1M, 5);
 }
 
 /// FIVE REAL IQ1_M blocks, one per expert, lifted byte-for-byte from
