@@ -2,48 +2,68 @@
 
 ---
 
-## Round 65：带宽和算力都不是瓶颈，瓶颈在 kernel 自身的效率
+## Round 66：长上下文 prefill 实测，以及 16K 以上的硬失败
 
-### 两个上限都远没到
+### 方法修正
 
-| 资源 | 本机能力 | decode 实际 | 利用率 |
-|---|---|---|---|
-| 带宽（CpuToGpu 实测） | **112.74 GB/s** | 6.6 GB/s | **5.9%** |
-| 算力（保守估算峰值） | ~10 TFLOPS | **0.105 TFLOPS** | **1.05%** |
+先用 `infr run <prompt>` 试 100K，直接失败：**`参数列表过长`**。
+400KB 的 prompt 不能走命令行参数。
 
-计算量核验：40 层 × top-6 × `3×5120×2304` MAC = **8.49 G MAC/token**，
-6.2 tok/s 即 0.105 TFLOPS。
+改用 **`infr bench`**（llama-bench 同接口，按 token 数生成 prompt）：
 
-### 但 GPU 确实在忙
+```
+infr bench <model> -p <N> -n 0 --dev Vulkan1
+```
 
-`main_busy` 折算到 decode 阶段约 107 ms/token（161 ms 的 66%）。
+### 实测结果
 
-**所以不是"在等"，是 GPU 里在跑效率很低的东西。**
+| 规模 | 结果 |
+|---|---|
+| **pp4096** | **27.5 t/s**（3 reps, 27.4–27.5, spread 0.4%） |
+| **pp8192** | **26.3 t/s**（3 reps, 26.2–26.3, spread 0.3%） |
+| **pp16384** | **失败**（跑了 20+ 分钟无输出） |
+| **pp100000** | **失败**（26 分钟后 `device lost`） |
 
-### 一个被排除的可能优化
+两次成功都自动选了 **`ubatch 3072`**（不是 `infr run` 默认的 256/512）。
 
-`recorder.rs:463` 的注释提到：消掉 `grid_init()` 的 codebook 暂存后，
-`native_idm_iq2s` 从 49.8ms → 23.3ms（约 50ms/505ms decode 的收益）。
+### 重要发现：bench 的 ubatch 更大，prefill 更快
 
-**但这条对 IQ1_M 不适用**：`native_gemv_id_multi.comp` 里
-`grid_init` 出现次数为 **0**，IQ1_M 的 GEMV 本来就不做 LDS 暂存。
+`infr run --ubatch 256` 是 25 tok/s，`infr run --ubatch 512` 是 27 tok/s，
+而 **`infr bench` 自动用 3072，拿到 27.5**。
 
-另外 `Iq1M` 也不在 SG 名单里（名单是 `Q6K | Q5K | Iq3S`），走的是 NR=1。
+**所以在 prefill 场景，ubatch 越大越快**（与 Round 63 的观察一致）。
 
-### 剩下的瓶颈是什么
+### 100K 失败的诊断
 
-三个候选，都需要读 kernel 或重写：
+日志：
 
-1. **每 workgroup 只算 1 个输出**（`native_idm_*_paged` 的固有结构）
-2. **网格解码本身的开销**（记忆里 2026-10-17 的结论：decode m=1 时网格解码占 78%）
-3. 每节点的 dispatch / barrier 开销
+```
+[moe-prefill] target_lanes=40 actual_lanes=5 resident_layers=0/40
+[moe-prefill] streamed_layer_max=3928227840 ring_bytes=19074908160
+```
 
-**这不是调参能解决的，是 kernel 结构问题。**
+- **`target_lanes=40` 但 `actual_lanes=5`** —— 只能同时跑 5 层
+- `resident_layers=0/40` —— **一层都没常驻**
+- `ring_bytes=19.07 GiB`，`streamed_layer_max=3.93 GiB`
 
-### 诚实判断
+进程等待位置是 `drm_syncobj_array_wait_timeout`（等 GPU fence），
+26 分钟后 `devsandqueues-lost-device`。
 
-- prefill：25 tok/s（512 时 27），**2.1 倍已拿到**
-- decode：6.2 tok/s，**九个调参假设全否，且带宽/算力都不是瓶颈**
-- 再往上需要**改 kernel 结构**（重写 GEMV 或换 MMQ 路径处理 m=1），
-  风险和体量都超出"调优"的范围
+**这是真实的规模上限，不是调用方式问题。**
+
+### 设备未受损
+
+失败后 `infr resources` 仍报 `vram_live: true`，`/dev/dri` 齐全。
+**这次 device lost 是温和的，没触发驱动 wedge。**
+
+### 当前基线
+
+| 场景 | 实测 |
+|---|---|
+| prefill 4K | **27.5 t/s** |
+| prefill 8K | **26.3 t/s** |
+| prefill 16K+ | 不可用（device lost） |
+| decode | 6.2 t/s @ 4K ctx |
+
+**poorseek 的 100K@1063 t/s 在本机完全不可达**，连 16K 都跑不完。
 
