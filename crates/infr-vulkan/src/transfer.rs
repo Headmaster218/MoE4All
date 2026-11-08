@@ -1788,6 +1788,61 @@ mod tests {
         }
     }
 
+    /// Is a 47 MiB zero-fill slow because it is BANDWIDTH-bound, or because every fill pays a
+    /// fixed cost?
+    ///
+    /// Round 23 measured zero_fill at 147 ms per call for a 47 MiB range (337 MB/s against a
+    /// ~450 GB/s card) and ruled out the command type with an A/B. Rounds 24-25 traced the buffer
+    /// to the unified pool's LlmRuntime class but could not reach the physical heap by reading
+    /// code. This decides it from the outside instead: clear 1, 8, 16, 32 and 47 MiB of the SAME
+    /// buffer and print time and implied bandwidth for each.
+    ///
+    ///   time flat      -> fixed per-fill cost (barrier / queue drain), bandwidth is irrelevant
+    ///   time linear    -> genuinely bandwidth-bound, and 337 MB/s is this buffer's real limit
+    #[test]
+    #[ignore = "opt-in device zero-fill bandwidth probe; run with --ignored --nocapture"]
+    fn probe_zero_fill_bandwidth_by_size() {
+        use gpu_allocator::MemoryLocation;
+        let be = crate::VulkanBackend::new().expect("probe Vulkan device");
+        // The MoE scratch peak: physical_slots x gu_width at rows=256, n_used=6 + shared.
+        let full = 256usize * 7 * 4608;
+        // Probe BOTH placements: the MoE scratch goes through the unified pool, and the open
+        // question is whether that lands it somewhere slower than plain device-local.
+        for (label, location) in [
+            ("GpuOnly", MemoryLocation::GpuOnly),
+            ("CpuToGpu", MemoryLocation::CpuToGpu),
+        ] {
+        let buf = be
+            .make_buf(full * 4, location, "zero-fill-probe")
+            .expect("probe buffer");
+        println!(
+            "zero-fill probe [{label}]: buffer {:.1} MiB",
+            full as f64 * 4.0 / (1024.0 * 1024.0)
+        );
+        for mib in [1usize, 8, 16, 32, 47] {
+            let words = (mib * 1024 * 1024 / 4).min(full);
+            // Warm the path once so the first sample does not pay one-time setup.
+            let rec = be.recorder().expect("recorder");
+            rec.zero(&buf, words);
+            rec.finish().expect("warm fill");
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let rec = be.recorder().expect("recorder");
+                rec.zero(&buf, words);
+                rec.finish().expect("fill");
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            let bytes = words as f64 * 4.0;
+            println!(
+                "zero-fill [{label}] mib={mib:3} words={words:9} ms={:8.3} GBps={:6.2}",
+                best * 1e3,
+                bytes / best / 1e9,
+            );
+        }
+        }
+    }
+
     #[test]
     fn mapped_host_batch_copies_disjoint_ranges_exactly() {
         let sources = [vec![0x17u8; 257], vec![0x5cu8; 513], vec![0xe1u8; 129]];
