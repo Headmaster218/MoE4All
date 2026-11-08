@@ -14200,6 +14200,32 @@ fn generate_dense_backend_inner(
             delta(after.host_reads, before.host_reads),
             delta(after.mmap_fallbacks, before.mmap_fallbacks),
         );
+        // `backend_execute` is the wall time INSIDE execute_static_next; `gpu_gap` is the part of
+        // it that the device timeline does NOT attribute to main/DMA queue busy, and `residual` is
+        // what host-side accounting (setup/acquire/record/submit/sync) leaves unexplained. Those
+        // three numbers answer the question the per-op table could not: prefill's execute is
+        // 18.4 s for a 218-row chunk while INFR_PROF_OPS attributes only ~40 GiB of traffic, so
+        // either the device is busy in a way the timeline misses, or the host is spending it.
+        let backend_execute_ns = delta(after.backend_execute_ns, before.backend_execute_ns);
+        let gpu_union_ns = delta(timeline.main_busy_ns, timeline_before.main_busy_ns)
+            .saturating_add(delta(timeline.dma_busy_ns, timeline_before.dma_busy_ns))
+            .saturating_sub(delta(timeline.overlap_ns, timeline_before.overlap_ns));
+        let host_accounted_ns = delta(after.backend_setup_ns, before.backend_setup_ns)
+            .saturating_add(delta(
+                after.command_recorder_acquire_ns,
+                before.command_recorder_acquire_ns,
+            ))
+            .saturating_add(delta(after.command_record_ns, before.command_record_ns))
+            .saturating_add(delta(after.queue_submit_ns, before.queue_submit_ns))
+            .saturating_add(delta(after.sync_wait_ns, before.sync_wait_ns));
+        tracing::info!(
+            "[single-decode-execute] backend_execute={:.3}ms gpu_union={:.3}ms gpu_gap={:.3}ms host_accounted={:.3}ms residual={:.3}ms",
+            backend_execute_ns as f64 / 1e6,
+            gpu_union_ns as f64 / 1e6,
+            backend_execute_ns.saturating_sub(gpu_union_ns) as f64 / 1e6,
+            host_accounted_ns as f64 / 1e6,
+            backend_execute_ns.saturating_sub(host_accounted_ns) as f64 / 1e6,
+        );
         tracing::info!(
             "[single-decode-device] main_busy={:.3}ms dma_busy={:.3}ms dma_timed={} ple_work={:.3}ms ple_wait={:.3}ms hit_windows={} overlap_lower_bound={:.3}ms",
             ms(timeline.main_busy_ns, timeline_before.main_busy_ns),
