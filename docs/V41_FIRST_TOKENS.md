@@ -2,60 +2,58 @@
 
 ---
 
-## Round 71：决定性发现 —— batched 路径的输出是错的
+## Round 72：问题比"batched 路径算错"更深 —— 两条路径都答不出来
 
-### 对照实验
+### 用一个更简单的问题重测
 
-同一个 prompt（`The capital of France is`）、同样 `--max-new 8 --temp 0`：
+`2+2=`，`--max-new 6 --temp 0`：
 
-| 路径 | 输出 | 复现 |
-|---|---|---|
-| `INFR_DSV41_BATCHED_PREFILL=1` | `We need answer. Need answer. We` | **两次一致** |
-| 默认 per-token | `. Wait, the answer is 100` | **两次一致** |
+| 路径 | 输出 |
+|---|---|
+| per-token（默认） | `We need answer. The question` |
+| batched | `We need answer. Need answer. We` |
 
-**两条路径生成完全不同的文本。**
+**两条路径都没有回答 2+2。**
+
+### 这改变了 Round 71 的结论
+
+Round 71 我看到两条路径输出不同，判断"batched 算错、per-token 是对的"。
+
+**这个判断不成立。** 两条路径都在输出同类的模板套话，**没有任何一条在真正回答问题**。
+
+所以问题不在"哪条路径算错"，而在**更底层：模型本身没有正确工作**。
+
+### 三个候选根因
+
+1. **IQ1_M 专家的 dequant 仍然错** —— 从"全零"变成了"非零但错误"，
+   而 `grid_mmq_parity` 只对照 host 侧的**同一套误解码**，所以测不出来
+2. **34 个复用层的 source-stream 复用路径没接对**
+3. V4.1 特有组件（engram / dspark）未正确接线
+
+### 一个检验路径被排除了
+
+尝试用 `dsv41-engram-iq4nl`（IQ4_NL，非 IQ1_M）做对照模型，**加载失败**：
+
+```
+infr-llama supports architecture=...|deepseek|..., got "deepseek41-engram"
+```
+
+**本机有两个不同的 V4.1 架构变体**：`deepseek41`（当前测的）和
+`deepseek41-engram`（未支持）。所以没有现成的同架构对照模型。
 
 ### 这意味着什么
 
-**batched 路径不只是"跨 chunk 会挂"——它在单 chunk 内的数值本身就不对。**
+`grid_mmq_parity` 的 `iq1m_expert_gemm_matches_host` 通过，**只证明 GPU 与 host
+实现一致**——如果 host 侧的 IQ1_M 解码本身是错的，两边一起错，测试照样通过。
 
-`hc_mult` 残差问题比注释描述的更严重：
-不是"chunk 边界传不过去"，而是**这条路径从来就没有算对过**。
+**这是一个结构性盲点**：本项目没有任何一个测试对照了"真实模型的外部正确答案"。
 
-### 这直接推翻了之前对 prefill 成果的解读
+### 下一步该做的
 
-| 之前的说法 | 现在的事实 |
-|---|---|
-| 「prefill 27.5 t/s，2.3 倍」 | **数值错误，这个速度没有意义** |
-| 「4K/8K 在 batched 路径下有效」 | **不可作为正确性依据** |
-| 「16K 只是跨 chunk 传不过」 | **单 chunk 就已经错了** |
+需要一个**独立的、外部可信**的正确性参照。可行选项：
+- 用 llama.cpp（若支持 V4.1）跑同一模型，对比输出
+- 或用同一模型的已知正确输出作为 golden
+- 若都没有，只能逐层 dump 中间激活与参考实现比对
 
-**27.5 t/s 是一个算错东西的速度。**
-
-### 那么 IQ1_M 那个修复还有效吗
-
-**有效，但需要重新界定范围。**
-
-那个 LUT 绑定缺陷是**真实的**（全零 → 非零），它让模型从"完全跑不出 token"变成"能跑出 token"。
-但：
-- 在 batched 路径上，正确性被 `hc_mult` 问题掩盖
-- 在 per-token 路径上，那个修复的作用是真实的
-
-**需要重新测：per-token 路径上的 prefill 速率，才是产品口径的、可信的数字。**
-（Round 70 测到 per-token 4K 是 <1.37 tok/s，那个数字现在反而更重要了。）
-
-### 也解释了模型输出质量差
-
-`We need answer. Need answer. We` 和 `. Wait, the answer is 100`
-**都不是对"The capital of France is"的合理回答**。per-token 至少语法通顺。
-
-两者都不是好答案，但 batched 明显更差——这与"batched 路径算错"一致。
-
-### 结论
-
-**本分支真正站得住的成果只有：**
-1. `stray LUT binding` 缺陷修复（真实、可验证、有单测）
-2. `ape: Option` + 复用层处理（让模型能加载并出 token）
-
-**prefill 提速 2.3 倍这个结论必须撤回**——它是在一条算错数值的路径上测的。
+**在此之前，任何速度数字都没有意义。**
 
