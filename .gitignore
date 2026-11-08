@@ -32,3 +32,4 @@ target-prof/
 /tests/context-resource/matrix.local.json
 bili_report_work/*
 followtasks.txt
+benchmark-results/
