@@ -2,61 +2,72 @@
 
 ---
 
-## Round 78：拿参考实现对照 `hc_*` 接线
+## Round 78（续）：`hc_mult` 也被排除了 —— 移植是完整的
 
-### 参考实现里的关键结构
+### 参考实现的实际算法（`deepseek4.cpp:352` `build_hc_mixes`）
 
-`deepseek41.cpp`（948 行，本机 llama.cpp fork）：
+V4.1 复用 V4 的这套：
 
 ```cpp
-const int64_t hc_mult    = hparams.dsv4_hc_mult;      // 4
-const int64_t hc_dim     = hc_mult * n_embd;
-const int64_t hc_mix_dim = (2 + hc_mult) * hc_mult;   // 24
-...
-layer.hc_attn_fn    = {hc_dim, hc_mix_dim}   // [4*n_embd, 24]
-layer.hc_attn_base  = {hc_mix_dim}           // [24]
-layer.hc_attn_scale = {3}
-layer.hc_ffn_fn     = {hc_dim, hc_mix_dim}
-layer.hc_ffn_base   = {hc_mix_dim}
-layer.hc_ffn_scale  = {3}
+flat      = reshape(x, [hc_dim, nt])              // hc_dim = 4*n_embd
+flat_norm = rms_norm(flat)
+mixes     = hc_fn @ flat_norm                     // 24 个系数 = (2+4)*4
+
+pre  = sigmoid(affine(mixes[0..4],   scale[0], base[0..4])  + eps)
+post = 2 * sigmoid(affine(mixes[4..8], scale[1], base[4..8]))
+comb = sinkhorn(mixes[8..24], scale[2], base[8..24])        // 4x4 混合矩阵
 ```
 
-以及 `dsv41_hc_mean`：**对 `hc_mult` 个副本求平均**（求和后 `scale 1/hc`），
-只用在 `t_layer_inp`（层输入嵌入）上，不用于主干。
-
-### 本项目的接线是对的
-
-`runner.rs:2463-2472`：
+### 本项目的对应实现（`runner.rs:5809`）
 
 ```rust
-for name in [
-    "hc_attn_fn.weight",  "hc_attn_base.weight",  "hc_attn_scale.weight",
-    "hc_ffn_fn.weight",   "hc_ffn_base.weight",   "hc_ffn_scale.weight",
-] { wload(&[&p(name)])?; }
+Op::RmsNorm { x: res, weight: ones, dim: hcw, ... }     // ones = hc_ones，全 1 向量
+Op::Linear  { weight: t.w_fn, out_f: (2 + hc_mult) * hc_mult, ... }
+Op::HyperConnectMix { mixes, scale: t.scale, base: t.base,
+                      pre: mix_pre, gates: Some(HyperGates { post, comb }),
+                      hc, eps, n_iter: hc_sinkhorn_iters }
 ```
 
-**六个全都在，顺序也对。** 模型里 `hc_*` 共 240 个 = 40 层 × 6，一个不少。
+**逐项对上**：
+- flatten + RMSNorm 用的是 `hc_ones`（weight 为全 1，等价于纯归一化）—— 这是**故意的权重力学技巧**，
+  `runner.rs:3587-3591` 的注释解释过 `x * s * 1.0 == x * s`
+- `out_f = (2+hc)*hc = 24` —— 与参考实现一致
+- `sigmoid` / `2*sigmoid` / `Sinkhorn` 全部在 `Op::HyperConnectMix` 内
+- `n_iter = hc_sinkhorn_iters` —— 与 `dsv4_hc_sinkhorn_iters` 一致
 
-（我一开始只 grep 到 `hc_attn_scale`/`hc_ffn_scale` 两处，差点又误判成"少加载 4 个"，
-是 `for name in [...]` 的数组把另外四个藏住了。）
+### 而且注释还处理了 V4.1 独有的时序差异
 
-### 但参考实现多了一个本项目没有的概念
+`runner.rs:5805-5808`：
 
-`hc_mix_dim = (2 + hc_mult) * hc_mult = 24`：
+> *"DeepSeek V4.1 consumes a mix one sublayer BELOW the one that computes it:
+> a sublayer runs the matmul but collapses `res` with its PREDECESSOR's weights
+> (`deepseek41.cpp` 843-886). V4 does both in the same sublayer."*
 
-- `2` 应是 attn 与 ffn 两个子层的混合系数
-- `hc_mult = 4` 是四路并行残差流
+**这个滞后语义也移植了。** V4.1 的 HEAD 复用最后一层 FFN mix（`deepseek41.cpp` 919-923）也在注释里。
 
-**即每层的 hc 混合矩阵产出 24 个系数**，而本项目用 `hc_ones`（全 1 向量）+ RMSNorm
-来做归一化。
+### 结论：`hc_mult` 候选排除
 
-**这两种做法不等价**：参考实现是学习出的混合（`hc_*_fn` 投影 + `base` 偏置 + `scale` 缩放），
-本项目是固定的 1/hc 平均。
+| 候选 | 状态 |
+|---|---|
+| 34 复用层 / compressor 属主 | ❌ 排除（Round 75） |
+| 角色语义 | ❌ 排除（Round 75） |
+| **hc_mult 残差** | ❌ **排除（本轮）** |
+| **IQ1_M 专家 dequant** | ⬅ **唯一剩下的** |
 
-**这正是 `hc_mult` 残差处理的核心差异**，也是接下来要逐行对照的地方。
+### 剩下这一个为什么重要
+
+`grid_mmq_parity` 声称 IQ1_M 与 host 一致，但**两边是实现同一套解码**。
+如果那套解码本身错了（比如 IQ1_M 的 `d0` 位序、grid 索引移位），两边会一起错，测试照样通过。
+
+**而 IQ1_M 占专家权重的 79%（30/40 层的 exps 张量）。** 它错了，整个模型就废了——
+这与观测到的"全局性套话输出"完全吻合。
 
 ### 下一步
 
-读参考实现的 `build_arch` 主循环里 `hc_attn_fn`/`hc_attn_base`/`hc_attn_scale`
-的实际用法（不是只加载，而是**怎么算**），与 `runner.rs` 的对应片段比较。
+逐字段比对 IQ1_M 解码：
+- `dequant.rs` 里的 IQ1_M 实现
+- 参考实现（llama.cpp 的 `ggml-quants.c` 或这个 fork）的 IQ1_M
+- 重点看 `d` 的位打包、四个 grid 索引的移位、delta 符号
+
+**这是唯一还没被排除的候选，而且它影响面最大。**
 
