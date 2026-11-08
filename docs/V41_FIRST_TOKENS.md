@@ -2,92 +2,88 @@
 
 ---
 
-## Round 81：engram 算法已完整读出，但修复是大工程
+## Round 81（续）：修复量比预估小得多 —— `QwenPleGate` 就是 engram 的算子
 
-### 参考实现的 `build_engram`（`deepseek41.cpp:382`）
+### 上一节我算错了工作量
 
-注入点在**每层主循环最开头**，`build_hc_mixes` 之前：
+我数出"缺 6 个算子"（`sum_rows`/`sqrt`/`abs`/`clamp`/`sgn`/`repeat`），
+据此判断"一天量级"。
+
+**这 6 个全都已经在同一个现成 Op 里：`Op::QwenPleGate`。**
+
+### 逐项对照
+
+参考实现 `build_engram` 的 gate：
 
 ```cpp
-if (pmodel.engram_index(il) >= 0) {
-    inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
-}
-```
-
-算法：
-
-```cpp
-// 1. 一次投影产出 hc 个 key + 一个共享 value
-kv    = engram_wkv @ emb                      // [hc_dim + n_embd, nt]
-key   = kv[0        .. hc_dim]                // 每 hc 副本一个 key
-value = kv[hc_dim   .. hc_dim + n_embd]       // 所有副本共享
-
-// 2. 分组 RMSNorm：按 (token, hc 副本) 在 n_embd 上归一，不是跨副本联合
-k = grouped_norm(key, engram_k)               // reshape [n_embd, hc, nt] → rms_norm → 乘 w
-q = grouped_norm(x,   engram_q)
-
-// 3. 打分
-s = sum_rows(k * q) * (1/sqrt(n_embd))
-
-// 4. 符号平方根后 sigmoid（对应训练 kernel）
+s    = sum_rows(k * q) / sqrt(n_embd)
 mag  = sqrt(clamp(abs(s), 1e-6, inf))
 gate = sigmoid(sgn(s) * mag)
-
-// 5. value 广播到 hc 份，乘 gate，加回残差
-v = repeat_4d(value, n_embd, hc, nt, 1)
-return x + v * gate
+out  = x + repeat(value, hc) * gate
 ```
 
-### 本项目缺的算子
+`Op::QwenPleGate` 的 CPU 实现（`infr-cpu/src/lib.rs:3268-3292`）：
 
-| 步骤 | 需要的 Op | 本项目 |
-|---|---|---|
-| 投影 | `Linear` | ✅（`w_off` 支持拆分） |
-| 分组 RMSNorm | `RmsNorm` | ✅ |
-| 元素乘 | — | 有 `MulVec`，但**广播语义不同** |
-| `sum_rows` | 按行归约 | ❌ **无** |
-| `sqrt` | — | ❌ **无** |
-| `abs` | — | ❌ **无** |
-| `clamp` | — | ❌ **无** |
-| `sigmoid` | — | ✅（`Sigmoid` 存在） |
-| `sgn` | — | ❌ **无**（`QwenPleGate` 里可能内联） |
-| `repeat_4d` | 广播 | ❌ **无** |
+```rust
+let score  = dot / (ne as f32).sqrt();                       // s
+let signed = if score > 0.0      {  score.abs().max(1e-6).sqrt() }
+             else if score < 0.0 { -score.abs().max(1e-6).sqrt() }
+             else                { 0.0 };                     // sqrt(clamp(abs))，带号
+let scale  = 1.0 / (1.0 + (-signed).exp());                  // sigmoid
+row[d]     = vs[r * ne + d] * scale;                         // repeat(value) * gate
+```
 
-**缺 6 个基础算子。**
+**数学上完全一致。**
 
-### 这意味着什么
+Vulkan 后端 `shaders/qwen_ple_gate.comp` 同样逐行对上：
 
-**修复不是"接上三个投影"，而是新增 6 个 Op，每个都要：**
-1. `infr-core/src/graph.rs` 加 enum 变体 + 依赖/输出声明
-2. CPU 后端实现
-3. **Vulkan 后端实现（要写 shader）**
-4. `synthetic_deepseek2` fixture 覆盖
+```glsl
+float score = sums[0] / sqrt(float(pc.n_embd));
+float signed_root = score > 0.0 ? sqrt(max(abs(score), 1e-6))
+                  : score < 0.0 ? -sqrt(max(abs(score), 1e-6)) : 0.0;
+sums[0] = 1.0 / (1.0 + exp(-signed_root));
+```
 
-**这是一天量级的工程，不是一轮能完成的。**
+### 而且签名也吻合
 
-而且每加一个 shader 就要编译、要在 GPU 上验证正确性——
-**在模型本身还答不对题的现在，新 kernel 的正确性无法用 `2+2=4` 来判**（它本来就错）。
+```rust
+Op::QwenPleGate { key, query, value, dst, rows, hc, n_embd }
+```
 
-### 但这仍然是本会话最大的进展
+- `key` / `query` —— engram 的 `grouped_norm(key, engram_k)` / `grouped_norm(x, engram_q)`
+- `value` —— `kv` 的共享 value 段
+- `rows` = `hc * nt`（每个 (token, hc 副本) 一行）
+- `hc` / `n_embd` —— 广播与归约维度
+
+**engram 需要的输入，这个 Op 一个不缺。**
+
+### 所以修复是
+
+1. 在 `engram_wkv` 上做一次 `Op::Linear`，得到 `[hc*n_embd + n_embd, nt]`
+2. `key` 取 `[0, hc*n_embd)`，`value` 取 `[hc*n_embd, +n_embd)`（`w_off` 已支持）
+3. 对 `key` 和 `x` 各做一次分组 RMSNorm 并乘上 `engram_k`/`engram_q`
+4. 推一个 `Op::QwenPleGate`
+5. 结果加回残差
+
+**全部用现有 Op，不需要新 shader，不需要新 enum 变体。**
+
+### 修正后的判断
 
 | 之前 | 现在 |
 |---|---|
-| 不知道哪里错 | **知道 engram 没被调用** |
-| 四个候选全排除 | **根因定位到具体组件** |
-| 只能猜 | **有完整算法和参考实现** |
+| 缺 6 个算子，一天量级 | **全部现成，一轮可能做完** |
+| 新 shader 正确性无法验证 | **复用已验证的 shader**（它有 fixture） |
 
-### 我这一轮不做的事
+### 唯一还需要确认的
 
-**不在这一轮动手写那 6 个算子。** 理由：
-- 需要 GPU shader，每步都要编译验证，一轮做不完
-- 做完之前模型仍然错，无法验证新算子是否写对
-- 半成品提交会污染这个已经 45 个提交的分支
+`QwenPleGate` 的 `value` 广播语义：CPU 里是 `vs[r * ne + d]`（`r = rh / hc`），
+即**每 hc 行共用同一个 value**。这正是 engram 要的（"the value is shared across the
+copies, only the gate differs"）。
 
-**更合理的做法**：先只加 CPU 后端实现（不需要 shader、不需要 GPU），
-用现有 `synthetic_deepseek2` fixture 验证算子正确性；Vulkan 版本单独一轮做。
+**语义吻合。**
 
 ### 下一步
 
-先看 `QwenPleGate` —— 它的结构与 engram gate 极像（同样的 sigmoid(sgn*sqrt(clamp(abs)))），
-**如果它已经有现成实现，engram 可以复用它的后端**。
+下一轮直接动手：在 `runner.rs` 的层循环顶部、`hc_mix` 之前，插入 engram 的
+5 步发射。改完编译、跑 `synthetic_deepseek2`、再用 `check-v41-answers.sh` 验。
 
