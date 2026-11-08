@@ -13859,6 +13859,14 @@ fn generate_dense_backend_inner(
                                     ple_embd_buf,
                                     ple_state_buf,
                                 );
+                                // DeepSeek V4.1 engram rows for this step. Bound here, in the
+                                // decode loop, because the plan is precompiled from immutable
+                                // metadata alone - `prepare_decode_plan` never sees buffers.
+                                if let (Some(id), Some(buf)) =
+                                    (handles.engram_emb, engram_emb_buf.as_ref())
+                                {
+                                    bindings.bind(id, buf.as_ref());
+                                }
                                 if let Some(id) = handles.logits {
                                     bindings.bind(id, logits_buf.as_ref());
                                 }
