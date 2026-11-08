@@ -1865,6 +1865,7 @@ fn finish_pending_seam_slot(
         },
         ple_embd_buf: pending.ple_embd_buf,
         ple_state_buf: pending.ple_state_buf,
+        engram_emb_buf: pending.engram_emb_buf,
         mtp_verify_bufs: pending.mtp_verify_bufs,
         max_ctx: want_ctx,
         kv_ring,
@@ -3996,6 +3997,20 @@ fn generate_dense_backend_inner(
         // shape exists; backends without such a lower tier keep the default no-op.
         be.finish_session_allocations()
             .map_err(|e| anyhow!("{e}"))?;
+        // DeepSeek V4.1 engram staging: one gathered row block per token, `n_cols * key_length`
+        // wide (= wkv's input width). Sized per token, not per batch, like `qwen_wide_buf`.
+        let engram_emb_buf = if c.deepseek41 && !c.engram_layer_ids.is_empty() {
+            let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
+            Some(
+                be.alloc(
+                    n_cols.max(1) * c.engram_key_length.max(1) * 4,
+                    BufferUsage::Staging,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
         *state = Some(SeamKv {
             weights,
             stable: std::sync::Arc::clone(&stable),
@@ -4017,6 +4032,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            engram_emb_buf,
             mtp_verify_bufs,
             max_ctx: want_ctx,
             kv_ring,
@@ -4150,6 +4166,7 @@ fn generate_dense_backend_inner(
         qwen_wide_buf,
         ple_embd_buf,
         ple_state_buf,
+        engram_emb_buf,
         mtp_verify_bufs,
         max_ctx,
         cached,
@@ -9480,6 +9497,9 @@ fn generate_dense_backend_inner(
                 independent_rows,
             );
             drop(timeline_l0_bind);
+            if let (Some(id), Some(buf)) = (h0.engram_emb, engram_emb_buf.as_ref()) {
+                bindings0.bind(id, buf.as_ref());
+            }
             let timeline_l0_execute = infr_core::timeline::span("prefill_l0_execute");
             be.execute(plan0.as_ref(), &bindings0)
                 .map_err(|error| anyhow!("{error}"))?;

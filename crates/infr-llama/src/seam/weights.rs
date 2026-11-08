@@ -464,6 +464,9 @@ pub(crate) struct SeamKv {
     pub(super) qwen_wide_buf: Option<Box<dyn Buffer>>,
     /// Host-gathered PLE rows uploaded after layer 0 finishes.
     pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
+    /// DeepSeek V4.1 engram rows, gathered on the host from the mmap'd table (`crate::engram`)
+    /// and uploaded before the layer that consumes them. `None` for every other arch.
+    pub(super) engram_emb_buf: Option<Box<dyn Buffer>>,
     /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
     pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
     /// Fixed Qwen3.8 MTP VERIFY IO. A single slot needs four rows; parallel serving reserves the
@@ -1981,6 +1984,7 @@ impl SeamKv {
                 None
             },
             ple_state_buf,
+            engram_emb_buf: None,
             mtp_verify_bufs,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
