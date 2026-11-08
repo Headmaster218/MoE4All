@@ -1288,6 +1288,12 @@ iq_xs_mmq_spv!(
     native_gemm_mmq_iq1_m_xp32_spv,
     "native_gemm_mmq_iq1_m_xp32"
 );
+// Diagnostic twin of the _xp build with IQ1M_DEBUG: dumps the per-32-block intermediates past
+// the end of the output. Test-only; nothing in production selects it.
+iq_xs_mmq_spv!(
+    native_gemm_mmq_iq1_m_xp_dbg_spv,
+    "native_gemm_mmq_iq1_m_xp_dbg"
+);
 iq_xs_mmq_spv!(
     native_gemm_mmq_iq1_m_xpg_spv,
     "native_gemm_mmq_iq1_m_xpg"

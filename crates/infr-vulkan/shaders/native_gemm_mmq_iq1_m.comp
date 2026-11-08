@@ -247,6 +247,28 @@ void main() {
                                       + dl2 * (float(q_hi[i][j]) + s2 + s3));
             }
         }
+
+#ifdef IQ1M_DEBUG
+        // Diagnostic dump (see the build variant's comment in build.rs). Written INSIDE the k-loop
+        // because xl/q_lo/q_hi are per-32-block locals. Tile (0,0), thread 0, sub 0 only: the
+        // intermediates for row 0 / column 0 of the very first block, which is enough to see which
+        // quantity diverges from the host first. Laid out past the real output at
+        // [pc.n * <BM rows actually used>, ...) - the caller reserves 16 floats.
+        if (sub == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && li == 0u) {
+            uint base = pc.n * BM; // straight past this tile's own output block
+            c[base + 0u] = Bdl1[0];
+            c[base + 1u] = Bdl2[0];
+            c[base + 2u] = float(Bneg[0]);
+            c[base + 3u] = float(xl[0][0]);
+            c[base + 4u] = float(xl[0][1]);
+            c[base + 5u] = float(xl[0][2]);
+            c[base + 6u] = float(xl[0][3]);
+            c[base + 7u] = float(q_lo[0][0]);
+            c[base + 8u] = float(q_hi[0][0]);
+            c[base + 9u] = dval[0];
+            c[base + 10u] = float(acc[0][0]);
+        }
+#endif
         barrier();
     }
 
@@ -259,4 +281,5 @@ void main() {
             c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
         }
     }
+
 }
