@@ -2,47 +2,68 @@
 
 ---
 
-## Round 73（续）：纠正 —— `engram-iq4nl.gguf` 不是模型
+## Round 74：读源码定位到一处具体的"拿角色当比例"的用法
 
-上一节提到"用 `dsv41-engram-iq4nl` 做 IQ4_NL 对照"。**这个说法是错的。**
+### 先纠正我自己
 
-核实文件头：**只有 2 个张量、1 个元数据项**。
+`runner.rs:6942-6962` 的注释和代码**已经实现了目标里的第 (2) 步**：
 
-`engram.rs:38` 的文档写明：`deepseek41-engram` 是 **engram 表**的架构名，
-布局是每层两个张量（`engram_embd.weight` + `engram_embd.scale`），
-是主模型旁边的**辅助表**，不是可推理的模型。
-
-**所以 `dsv41-engram-iq4nl/engram-iq4nl.gguf` 是一个 14 GB 的 engram 表，
-不是模型。** 拿它当对照是我读错了目录名。
-
-### 本机没有非 IQ1_M 的 V4.1 模型
-
-盘点 `/data/models/dsv41-*`：
-
-| 目录 | 内容 |
-|---|---|
-| `dsv41-uncensored-iq2xxs` | **真正的模型**（4 分片，含 IQ1_M 专家） |
-| `dsv41-engram-iq4nl` | engram 表（2 张量），非模型 |
-| `dsv41-engram-stub` | engram 桩（4 KB） |
-| `dsv41-fp8-*` / `dsv41-i8test` | 只有 5 MB 的 lora，无模型 |
-
-**要绕过 IQ1_M 做对照，需要另外下载一个非 IQ1_M 的 V4.1 量化版本。**
-
-### 但对照实验的价值不受影响
-
-`qwen2.5-1.5b` → `2+2=4` 这个结论仍然成立且重要：
-**引擎正确，只有 V4.1 错。** 只是"V4.1 内部哪个组件错"还定位不了。
-
-### 当前的准确定位
-
-```
-引擎（Vulkan/采样/template/CLI）   ✅ 由 qwen2.5-1.5b 证明
-V4.1 forward                        ❌ 输出错误
-  ├─ IQ1_M 专家 dequant             ?  
-  ├─ 34 复用层 source-stream        ?
-  ├─ engram / dspark                ?
-  └─ hc_mult 残差                   ?
+```rust
+let owns_compressor = lw.dsv4_compressed.is_some();   // 按张量存在与否判所有权
 ```
 
-**四个候选，无法在本机用现有模型二分。**
+`ape: cw.attention.ape.or_else(|| dsv41_zero_ape(c, zero_ape))` 也在（`runner.rs:7009`）。
+
+**所以"给 Dsv4Compress 加 ape: Option"和"复用层不发射 compressor"都已完成。**
+我前面几轮把它们当成待办是错的。
+
+### 但发现一处真实的类型误用
+
+`config.rs:524-530` 自己写着：
+
+> *"on V4.1 it is a **role map, NOT a ratio**, so a consumer that wants a ratio out of it
+> is reading the wrong number."*
+
+而 `runner.rs:7158` 正是这种消费者：
+
+```rust
+visible: ((start_pos + 1) / (ratio4 as usize).max(1)) as u32
+```
+
+`ratio4` 来自 `c.layer_compress_ratio(l)`（`runner.rs:6751`）——**就是那个角色表**。
+
+同样的用法还有三处：`7021`（`is_multiple_of(ratio4)`）、`7026`（`start_pos / ratio4`）、
+以及 `ratio: ratio4` 传给 `Dsv4Compress`。
+
+### 模型里的实际数据
+
+```
+compress_ratios = [0,0, 2 x18, 1 x20, 0,0,0]    共 43 项
+block_count     = 40
+```
+
+角色分布（前 40 层）：**role=1 有 20 层，role=2 有 18 层，role=0 有 2 层**。
+
+四个 kv source `[2,8,14,20]` 的角色分别是 **2, 2, 2, 1**。
+
+### 这意味着什么
+
+如果 role 2 真的被当成"2 倍压缩比"：
+- `visible = (pos+1)/2` —— 每两个 token 合成一个
+- `row = pos/2` —— 写第 pos/2 行
+
+**但如果 V4.1 的实际压缩比不是 2**（V4 是 4 和 128），那么复用层读到的位置全是错的。
+18 个 role=2 层 + 20 个 role=1 层，**几乎整个模型都受影响**——足以解释全局性的输出错误。
+
+### 但我不能确定
+
+`role=1` 时除以 1 等价于不压缩，看起来是"对的"。
+`role=2` 时除以 2 **可能恰好就是对的**（角色 2 = 池化 2 倍），也可能不是。
+
+**这需要外部资料确认 V4.1 的 CSA2 语义**，而不是靠猜。
+
+### 顺带：`compress_ratios` 43 项 vs `block_count` 40
+
+多出 3 项（`0,0,0`）。可能是 MTP 层的槽位，但也不排除是索引偏移。
+**这个必须先确认**——如果 `layer_compress_ratio(l)` 取错了偏移，后面全部作废。
 
