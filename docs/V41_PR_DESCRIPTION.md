@@ -1,4 +1,4 @@
-# DeepSeek-V4.1 support: run it, and a 2.3x prefill fix
+# DeepSeek-V4.1 support: run it, and fix the IQ1_M expert GEMM
 
 Adds DeepSeek-V4.1 to the Vulkan backend and fixes a descriptor-binding defect that made
 its dominant expert format produce exact zeros.
@@ -16,18 +16,25 @@ trap — it wrote into a descriptor nobody bound, and the experts came back as e
 
 Removing the declaration puts `CNT` / `OFF` / `CB` back at 3 / 4 / 5, matching IQ2_S.
 
-## The result
+## What is verified, and what is not
 
-Measured on the real model (`dsv41-uncensored-iq2xxs`, 40 layers, 30 IQ1_M + 8 IQ2_XXS
-expert tensors) on an Intel Arc (BMG G31):
+**Verified:** the defect was real and the fix is pinned by tests. Before it, IQ1_M expert
+output came back as exact zeros; after it, `grid_mmq_parity` matches the host. `ape: Option`
+and the reuse-layer handling let the checkpoint load and emit tokens at all.
 
-| | before | after |
-|---|---|---|
-| prefill | 12 tok/s | **25 tok/s** (`infr run`), **27.5 tok/s** (`infr bench`) |
-| decode | 6.2 tok/s | 6.2 tok/s |
+**Not verified, and previously claimed here:** a 2.3x prefill speedup. That figure was
+measured with `INFR_DSV41_BATCHED_PREFILL=1`, and that path answers wrong. Same prompt,
+greedy, both reproduced twice:
 
-`pp4096` repeated at 27.5 t/s across 3 reps (spread 0.4%); `pp8192` at 26.3 t/s
-(spread 0.3%). The 12 tok/s figure reproduced consistently before the fix.
+```
+INFR_DSV41_BATCHED_PREFILL=1   "We need answer. Need answer. We"
+default per-token              ". Wait, the answer is 100"
+```
+
+The batched path is numerically wrong even for a prompt short enough to fit one chunk, so
+27.5 tok/s on it measures a different, incorrect computation rather than a faster model.
+No speedup is claimed. Per-token throughput (the product path) is below 1.37 tok/s at
+2K on this hardware, and that is the honest number.
 
 ## What else is in here
 
@@ -50,12 +57,15 @@ Measured, not guessed — each of these came out of an A/B that failed to move t
   overhead is under 1% unattributed. The remaining candidates are structural — one output
   per workgroup, grid-decode cost at m=1, per-node dispatch overhead — and need kernel
   work rather than tuning.
-- **Prefill above 8K needs the batched path, and the batched V4.1 path is not viable
-  yet.** Every prefill figure above was taken with `INFR_DSV41_BATCHED_PREFILL=1`, the
-  opt-in bring-up switch. With it set, pp16384 loses the device after ~20 minutes (all 41
-  threads sleeping in `drm_syncobj_array_wait_timeout`), and pp100000 does the same after
-  26; ubatch makes no difference (3072 and 512 both fail). With it unset, 16K does not hang
-  but does not finish in 50 minutes on the per-token path.
+- **The batched prefill path is not viable for V4.1 and is wrong, not merely slow or
+  fragile.** With `INFR_DSV41_BATCHED_PREFILL=1`, pp16384 loses the device after ~20
+  minutes (all 41 threads sleeping in `drm_syncobj_array_wait_timeout`) and pp100000 does
+  the same; ubatch makes no difference. More importantly it computes wrong answers at
+  every size tested, including sizes that fit a single chunk. `runner.rs:12370` says no
+  batch>1 V4 graph has ever executed correctly because the `hc_mult`-width residual cannot
+  cross a chunk boundary; the evidence here is that the failure is broader than the
+  boundary. Without the switch, 16K does not hang but does not finish in 50 minutes on the
+  per-token path.
 
   `runner.rs:12370` already documents the cause: the batched path builds one whole-model
   graph per chunk with `span = None`, so V4.1's `hc_mult`-width residual cannot cross a
