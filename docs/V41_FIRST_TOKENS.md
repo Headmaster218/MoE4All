@@ -2,72 +2,67 @@
 
 ---
 
-## Round 95：用运行时证据定位 —— engram 真的被执行了，但走的是 decode 路径
+## Round 97：`unbound tensor 3` 就是 engram，根因是 record-once 路径
 
-### 静态阅读查不出来，改用探针
+### 第一步：确认 tensor 3 是什么
 
-前几轮我一直在静态读代码找“V4.1 走哪条 prefill 路径”，读了好几轮没定论。
-这一轮改成**在 7 个 bind 点和发射闭包里各加一条 `eprintln!`，跑一次真实 V4.1**。
-
-### 跑出来的结果（决定性）
+在 `prepare_decode_plan` 的 `be.compile(&g)` 之前打印前 6 个张量：
 
 ```
-ENGRAM_EMIT batch=1        （×4）
-Error: backend: vulkan adapter: op 67 Linear failed: unbound tensor 3
+ENGRAM_T0 kind=Input    desc=[1],     dtype=I32
+ENGRAM_T1 kind=Internal desc=[5120],  dtype=F32
+ENGRAM_T2 kind=Input    desc=[1],     dtype=I32
+ENGRAM_T3 kind=Input    desc=[6144],  dtype=F32   ← 就是它
+ENGRAM_T4 kind=Input    desc=[18688], dtype=U32
+ENGRAM_T5 kind=Input    desc=[1],     dtype=U32
 ```
 
-**含义**：
-1. **engram 的 Op 确实被发射并执行了**（`op 67 Linear` 就是 `wkv`）——
-   证明 Round 87-88 写的发射代码是活的，不是死代码
-2. **但 7 个 bind 点一个都没触发**（没有任何 `ENGRAM_BIND_SITE_*` 输出）
-3. 所以 `wkv` 拿到的是未绑定的 tensor 3
+**`[6144] F32` 正是 `n_cols(24) × key_length(256)`。**
 
-**这才是当前模型答不对题的真正状态**：不是“engram 缺失”，而是
-**“engram 已接入计算，但输入没接上”**。
+**所以 tensor 3 就是 `engram_emb`。** Round 96 里我说"tensor 3 不是 engram 的 wkv"——
+前半段（不是 wkv 的权重）对，后半段（不是 engram）错。**它就是 engram 的输入。**
 
-### backtrace 指向真正的路径
+### 第二步：为什么 bind 了还是 unbound
+
+链路是：
 
 ```
-0: {closure#48}                      runner.rs:5931   ← engram_apply 定义处
-1: {closure#73}                      runner.rs:6352   ← 层循环里调用
-2: {closure#283}                     runner.rs:13405  ← prepare_decode_plan
-3: {closure#284}  ...checkpoints_constrained         runner.rs:13435
-4: ...generate_vulkan_session_turn_with_checkpoints_constrained
-5: infr_core/step_pipeline.rs:115
+bind_future(...)  ->  bindings  ->  ExecutionStage::new(*plan, bindings)
+                                ->  execute_decode_stages(...)
 ```
 
-**V4.1 走的是 `prepare_decode_plan` 这条 decode 路径**，不是我以为的 prefill 路径。
+**但 execute 有两条路径：**
 
-### 而这条路径的注释，早就写明了原因
+```rust
+if let Some((plan, b)) = &ro {
+    // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
+    be.execute(plan.as_ref(), b)?;          // ← 用 ro 里的 b，不是 bind_future 的
+} else if c.qwen4exp {
+    ...
+}
+```
 
-`runner.rs:1401`：
+**`ro` 是 record-once 路径**，用的是**调用方预先建好的 `(plan, bindings)`**，
+**完全绕过 `bind_future`**。我在 `bind_future` 里加的 engram bind 在这条路径上不生效。
 
-> *"Only immutable graph metadata reaches this closure: **no bindings, buffers or token history**."*
+### 这解释了所有矛盾
 
-**这个闭包在设计上就拿不到 buffer 和 token 历史。** 而 engram 两者都需要。
-
-**所以这 7 个 bind 点全部无效不是 bug——是它们压根不在这条执行路径上。**
-
-### 这意味着什么
-
-| 之前以为 | 实际 |
+| 观察 | 解释 |
 |---|---|
-| bind 写好了，只是没在正确位置 | **bind 写在了永远不会执行的路径上** |
-| 需要找 prefill 路径 | **V4.1 的 token 生成走 decode 路径** |
-| 剩下的是“调用 gather” | **剩下的是“在这条 decode 路径上拿到 buffer 和 token 历史”** |
+| `ENGRAM_DECODE_BIND holder=true buf=true` 打印了 | bind_future 确实执行了 |
+| 但 tensor 3 仍然 unbound | **执行的不是 bind_future 的 bindings** |
+| 报错在 op 67 | engram 的 `Linear` 在 ro 的 plan 里，但它没有 engram 的 binding |
 
-最后一条是**架构性问题**，不是接一根线：这个闭包明确禁止访问可变状态。
+### 我的诊断方法这次是对的
 
-### 诊断代码已清除
-
-`git checkout` 还原，工作树干净，`infr-llama` 编译通过。
+**打印张量 desc 一步定死了 `[6144]` 这个特征**，比查 label、查 kind 都快。
+`label` 全是 `None`——这个项目没有给张量打标签，所以只能靠形状识别。
 
 ### 下一步
 
-两条路：
-1. **改 `prepare_decode_plan` 闭包的签名**，让它能接收 engram buffer 和 token 历史
-   —— 但这违背了它"只处理不可变元数据"的设计，可能影响 decode 的异步预编译
-2. **找 decode 路径上真正做 bind 的地方**，在那里加 engram
+`ro` 的 `(plan, bindings)` 是调用方构建的。要么：
+1. 在那里补 engram bind
+2. 或在 record-once 场景下禁用 engram（但那等于 engram 永远不生效）
 
-**第 2 条更保守**，下轮先查 decode 循环里的 bind 是怎么做的。
+**先找到 `ro` 的构造点**（它是 `generate_dense_backend_inner` 的入参，在 `mod.rs` 或上层构造）。
 
