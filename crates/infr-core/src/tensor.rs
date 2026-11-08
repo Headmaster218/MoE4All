@@ -242,6 +242,14 @@ pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
     DType::Iq4Xs,
     DType::Iq2S,
     DType::Iq2Xs,
+    // IQ1_M: the paged builds have existed since native_gemm_mmq_iq1_m_xpg landed (build.rs
+    // registers _xp/_xp32/_xpg/_xpg32, with the comment "DeepSeek-V4.1's dominant
+    // ffn_down_exps format (28 of 40 blocks)"), but this list never gained the entry. The
+    // consequence was not subtle: V4.1's 16-of-40 IQ1_M gate/up layers fail
+    // moe_paged_mmq_ok and fall back to native_idm_iq1m_paged - a 1-output-per-workgroup
+    // GEMV - which measured 38.8 s of a 60 s prefill at 0.26 TFLOPS. The list's own doc says
+    // it "Mirrors MOE_MMQ_DTYPES IN FULL"; this restores that invariant for IQ1_M.
+    DType::Iq1M,
     DType::Iq3S,
     DType::Iq3Xxs,
     DType::Mxfp4,
