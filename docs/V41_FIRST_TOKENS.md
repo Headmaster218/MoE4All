@@ -2,46 +2,59 @@
 
 ---
 
-## Round 98：没能解决，但排除了三个候选路径
+## Round 99：拿到了决定性数据，但代码改乱了
 
-### 做了什么
+### 决定性证据：bound_ids 里独独缺 3
 
-按 Round 97 的结论找 `ro` 的构造点，找到 `13287: let ro = if dyn_replay {`，
-在其中 `b.bind(h.logits, ...)` 前加了 engram bind。**仍是 `unbound tensor 3`。**
+在 `resolve()` 报错处打印该 `Bindings` 的完整 id 集合：
 
-### 用探针排除的三条路径
+```
+ENGRAM_RESOLVE_FAIL id=3
+bound_ids=[0, 2, 4, 5, 6, 7, 8, ... 1163]
+```
 
-| 探针 | 结果 | 结论 |
-|---|---|---|
-| `ENGRAM_RO_BIND`（在 `ro` 构造里） | **未打印** | `dyn_replay == false`，`ro` 是 `None` |
-| `ENGRAM_BOUND id=3`（在 13833 的 bind_future） | **打印了，id 正是 3** | 绑定执行了，但**不生效** |
-| `ENGRAM_REAL_BIND`（在 11689 的 bind_future） | **未打印** | 这条也不是执行路径 |
+**有 0、有 2，独独没有 3。**
 
-### 最有价值的一条观察
+这彻底排除了"绑错对象"和"绑定被覆盖"，**是 engram 的 input 根本没进这份 bindings**。
 
-**`ENGRAM_BOUND id=3` 打印了、绑的就是 3，却仍报 unbound。**
+### 顺着调用链找到 b1，但不是它
 
-这不是"绑错地方"，而是 **`bind_future` 返回的 `bindings` 没有到达 execute**。
-它被 `next_stages` / `next_bundle` / `execute_decode_stages` 的某层转手丢掉了。
+```
+execute_decode_stages(main.bindings)
+  ← execute_decode(main, ...)
+  ← ExecutionStage::new(plan1, &b1)     runner.rs:14058
+  ← let mut b1 = Bindings::new()         runner.rs:13976
+```
 
-### 我这一轮的方法问题
+在 `b1` 上补了 engram bind，**`bound_ids` 仍然缺 3**。
 
-**我在同一个 14000 行文件里追了三个不同的 `bind_future`，每个都试了一遍。**
-正确的做法应该是**先确认"哪条路径在执行"，再去改那条路径**——而我是一边猜一边改，
-每次编译 1 分钟、跑 30 秒，代价很高。
+### 但探针给出了新线索
 
-更有效的做法：在 **`resolve()` 报错的那个点**直接把 `bindings` 里已绑的 id 全部打印出来，
-一次就能看到 engram 在不在里面。这一轮没想到。
+在 `bind_layer_io` 函数体内打印：
 
-### 当前状态
+```
+ENGRAM_BIND_LAYER_IO engram_holder=Some(TensorId(3))   ×2
+```
 
-- 8 个 bind 点都在代码里，编译通过
-- `unbound tensor 3` 仍在
-- 工作树干净
+**`bind_layer_io` 只被调用两次，handle 是对的** —— 但它**本身不负责 engram**。
+这就是漏洞：`bind_layer_io` 是两条实际路径共用的绑定函数，engram 却不在里面。
 
-### 下一步
+### 然后我把代码改乱了
 
-在 `infr-vulkan/src/adapter.rs:462` 的 `resolve()` 失败处，打印该 `Bindings` 的完整 id 集合。
-这一步能直接回答"engram 到底有没有进到执行用的 bindings 里"，
-不用再靠追调用链猜。
+想让 `bind_layer_io` 内部绑 engram，需要给它加参数。它和 `bind_parallel_layer_io`
+加起来有 **18 个调用点**。我用脚本批量插入，但：
+
+- 第一次插到参数列表末尾 → 顺序错
+- 第二次按 `primary_ple_state,` 定位 → 只匹配到 1 处（调用点里参数名各不相同）
+
+**已经 `git checkout` 全部回退**，工作树干净、编译通过。
+
+### 下一轮的正确做法
+
+**不要用脚本批量改 18 个调用点。** 改为：
+1. 在 `bind_layer_io` 里加参数（1 处签名）
+2. 用编译器逐个报出调用点，**手工**补（每处 1 行）
+3. 只有 18 处，手工比脚本出错少
+
+**而且这次有明确的验证标准**：`bound_ids` 里是否出现 3。
 
