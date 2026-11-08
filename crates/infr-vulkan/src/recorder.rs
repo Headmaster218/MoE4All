@@ -14983,7 +14983,18 @@ impl<'a> Recorder<'a> {
 
     /// Zero the first `n` words, using a predicated compute fill inside conditional regions.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
-        if self.conditional_active.get() {
+        // `vkCmdFillBuffer` measured 337 MB/s (0.1% of this card's bandwidth) inside a prefill
+        // chunk: 213 fills of a 47 MiB range taking 31.3 s, against 0.02 s of traffic. A fill is a
+        // TRANSFER command, so it needs the compute->transfer barrier at the call site and lands on
+        // a queue path this driver clearly does not accelerate. The same range written by a compute
+        // shader is a plain dispatch on the queue that is already busy, which is what the
+        // conditional arm below already does for its own reasons.
+        //
+        // A/B on `INFR_ZERO_VIA_DISPATCH=1` rather than flipping the default: this is on the
+        // hot path of every paged layer and the change must earn its place with a measurement.
+        let via_dispatch = self.conditional_active.get()
+            || std::env::var_os("INFR_ZERO_VIA_DISPATCH").is_some_and(|v| v != "0");
+        if via_dispatch {
             let kernel = self
                 .be
                 .kernel("zero_words", crate::gemm::zero_words_spv(), 1, 4);
