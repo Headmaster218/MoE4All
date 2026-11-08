@@ -2,49 +2,53 @@
 
 ---
 
-## Round 62（续）：实测验证 —— decode 带宽 6.6 GB/s，上限 9.5
+## Round 63：显存还有余量，但 arena 不由它决定
 
-### 用实测 DMA 字节反推
-
-24 token decode 的一次运行：
+### 更正设备规格
 
 ```
-decode 24 tok @ 6.3 tok/s
-dedicated DMA: regions=13946  bytes=37.34 GiB   (含 32 token prefill)
-gpu cache: hit_rate=64.8%
+device_name: Intel(R) Graphics (BMG G31)
+vram_total_bytes = 34,242,297,856 = 31.9 GiB
+vram_available   = 30,772,559,872 = 28.7 GiB
 ```
 
-按 GPU 时间比例拆分（prefill 2.29s / decode 3.81s）：
+**不是 24 GiB，是 31.9 GiB。** 我先前写"24 GiB 显存"是错的。
+
+### 于是余量存在
 
 | 项 | 值 |
 |---|---|
-| decode 阶段 DMA | **≈ 23.3 GiB** |
-| 每 token | **≈ 996 MiB** |
-| decode 带宽 | **6.6 GB/s** |
-| 本机上限（PCIe probe 实测） | 9.5 GB/s |
-| **利用率** | **69%** |
+| 设备 arena | 21.27 GiB |
+| 显存总量 | 31.9 GiB |
+| **占比** | **67%** |
 
-### 与理论估算一致
+**约 10 GiB 空闲。** 这意味着提高命中率在**容量上**是可能的。
 
-Round 62 前半段按权重公式估出 7.7 GB/s（81%）。
-实测反推 6.6 GB/s（69%）。**两者同量级，互相印证。**
+### 但 `INFR_NO_VRAM_GUARD=1` 无效
 
-### 所以九个假设为什么全无效
+| | 默认 | `NO_VRAM_GUARD=1` |
+|---|---|---|
+| decode | 6.2 tok/s | **6.2 tok/s** |
+| hit_rate | 61.0% | 61.0% |
+| arena | 21.27 GiB | 21.27 GiB |
 
-**decode 不是在找瓶颈，它已经跑在带宽上限的七成。**
+**arena 大小没变。**
 
-要再快，能拿的只有剩下的三成：
-- 6.3 × 9.5/6.6 ≈ **9 tok/s**（带宽打满的理想值）
-- 而 27.7 tok/s 需要 4.4 倍当前带宽 —— **本机不可能**
+### 为什么
 
-### 唯一还有意义的优化方向
+preflight 那行写的是 **"provisional device arena at ubatch 256"** ——
+**arena 是按 `ubatch` 算出来的，不是按显存余量算的。**
 
-**提高 `hit_rate`（当前 64.8%）**。命中率每提高一个点，就少 1% 的换入量。
+`INFR_NO_VRAM_GUARD` 解除的是显存保护，不改变 arena 的尺寸公式。
 
-这也是唯一还剩的软件杠杆，而它受限于显存容量（166 GiB 权重 vs 24 GiB 显存）。
+### 所以要提高命中率，得改 ubatch
 
-### 结论
+但 `ubatch` 是 prefill 的批大小：调大能扩大 arena（更多专家常驻），
+但会改变 prefill 的并行度——**可能拿 decode 换 prefill**。
 
-**本机的 decode 上限约 9 tok/s，当前 6.3，已用到 70%。**
-对标 poorseek 的 27.7 不成立——那是不同硬件 + 近似路由下的数字。
+这是个真实的权衡，值得测，但要注意两边都要量。
+
+### 下一步
+
+A/B `--ubatch 512`，同时记录 prefill 和 decode 两个数字。
 
