@@ -1588,6 +1588,9 @@ struct PendingSeamSlot {
     logits_buf: Box<dyn Buffer>,
     ple_embd_buf: Option<Box<dyn Buffer>>,
     ple_state_buf: Option<Box<dyn Buffer>>,
+    /// DeepSeek V4.1 engram: the host-gathered rows for one step, `n_cols * key_length` per
+    /// token. Sized for the widest batch this slot will see, as `ple_embd_buf` is.
+    engram_emb_buf: Option<Box<dyn Buffer>>,
     turn_recurrent_ckpts: [Option<TurnRecurrentCkpt>; super::TURN_CHECKPOINT_COUNT],
     mtp_delta_ckpt: Option<MtpDeltaCkpt>,
     mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
@@ -1743,6 +1746,20 @@ fn allocate_pending_seam_slot(
     } else {
         None
     };
+    // DeepSeek V4.1 engram: one gathered row block per token, `n_cols * key_length` wide — which is
+    // exactly `wkv`'s input width. Sized per token like `qwen_wide_buf`, not per batch.
+    let engram_emb_buf = if cfg.deepseek41 && !cfg.engram_layer_ids.is_empty() {
+        let n_cols = (cfg.engram_max_ngram.saturating_sub(1)) * cfg.engram_n_head;
+        Some(
+            be.alloc(
+                n_cols.max(1) * cfg.engram_key_length.max(1) * 4,
+                BufferUsage::Staging,
+            )
+            .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
 
     Ok(PendingSeamSlot {
         kbufs,
@@ -1755,6 +1772,7 @@ fn allocate_pending_seam_slot(
         logits_buf,
         ple_embd_buf,
         ple_state_buf,
+        engram_emb_buf,
         turn_recurrent_ckpts,
         mtp_delta_ckpt,
         mtp_verify_bufs,
