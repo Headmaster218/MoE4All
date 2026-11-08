@@ -116,6 +116,36 @@ void main() {
     uint nblk32 = pc.k / 32u; // activation 32-blocks along k (dact index)
     uint kw = pc.k / 4u;
     uint tilesN = pc.n / BN;
+#ifdef IQ1M_DEBUG
+    // LIVENESS PROBE. Round 42 showed the previous in-loop dump never ran (its offset came from
+    // a push constant that read as 0, and it sat inside a k-loop whose bound was also 0). This
+    // sits in straight-line code that every workgroup reaches, at a FIXED far offset that cannot
+    // collide with any output, and writes a magic value first: if the magic is absent the probe
+    // itself did not run and nothing else in the dump may be trusted.
+    {
+        const uint PROBE = 1000000u; // far past any n*k output this test allocates
+        const float MAGIC = 12345.0;
+        // No WorkGroupID.x/y filter: with a 2-D grid the y index is the expert, and requiring
+        // y == 0 was not enough to make the probe observable. Every workgroup writes the same
+        // values, so the last one to run wins and the result is still deterministic.
+        if (gl_LocalInvocationIndex == 0u) {
+            c[PROBE + 0u] = MAGIC;
+            c[PROBE + 1u] = float(pc.n);
+            c[PROBE + 2u] = float(pc.k);
+            c[PROBE + 3u] = float(pc.m);
+            c[PROBE + 4u] = float(nsub);
+            c[PROBE + 5u] = float(kw);
+            c[PROBE + 6u] = float(tilesN);
+            c[PROBE + 7u] = float(qa[0]);
+            c[PROBE + 8u] = float(dact[0]);
+            c[PROBE + 9u] = float(counts[0]);
+            c[PROBE + 10u] = float(gl_WorkGroupID.x);
+            c[PROBE + 11u] = float(gl_WorkGroupID.y);
+            c[PROBE + 12u] = float(gl_NumWorkGroups.x);
+            c[PROBE + 13u] = float(gl_NumWorkGroups.y);
+        }
+    }
+#endif
 #ifdef EXPERT_GRID
     uint ex = gl_WorkGroupID.y;
     uint cnt = counts[ex];
@@ -248,41 +278,6 @@ void main() {
             }
         }
 
-#ifdef IQ1M_DEBUG
-        // Diagnostic dump (see the build variant's comment in build.rs). Written INSIDE the k-loop
-        // because xl/q_lo/q_hi are per-32-block locals. Tile (0,0), thread 0, sub 0 only: the
-        // intermediates for row 0 / column 0 of the very first block, which is enough to see which
-        // quantity diverges from the host first. Laid out past the real output at
-        // [pc.n * <BM rows actually used>, ...) - the caller reserves 16 floats.
-        if (sub == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && li == 0u) {
-            uint base = pc.n * BM; // straight past this tile's own output block
-            c[base + 0u] = Bdl1[0];
-            c[base + 1u] = Bdl2[0];
-            c[base + 2u] = float(Bneg[0]);
-            c[base + 3u] = float(xl[0][0]);
-            c[base + 4u] = float(xl[0][1]);
-            c[base + 5u] = float(xl[0][2]);
-            c[base + 6u] = float(xl[0][3]);
-            c[base + 7u] = float(q_lo[0][0]);
-            c[base + 8u] = float(q_hi[0][0]);
-            c[base + 9u] = dval[0];
-            c[base + 10u] = float(acc[0][0]);
-            // Raw inputs, to separate "the kernel's arithmetic is wrong" from "the buffers
-            // themselves read as zero". qa is binding 0, dact binding 1, counts binding 4.
-            c[base + 11u] = float(qa[0]);
-            c[base + 12u] = float(dact[0]);
-            c[base + 13u] = float(counts[0]);
-            c[base + 14u] = float(offsets[0]);
-            c[base + 15u] = float(pc.n);
-            c[base + 16u] = float(pc.k);
-            c[base + 17u] = float(pc.m);
-            c[base + 18u] = float(nsub);
-            c[base + 19u] = float(wgRow);
-            c[base + 20u] = float(wgCol);
-            c[base + 21u] = float(ex);
-            c[base + 22u] = float(cnt);
-        }
-#endif
         barrier();
     }
 

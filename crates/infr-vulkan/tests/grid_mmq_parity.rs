@@ -801,8 +801,10 @@ fn run_expert_gemm_parity(dt: DType, n_expert: usize) {
     let qsa = be
         .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
         .unwrap();
+    // Sized past the debug build's liveness probe (float offset 1_000_000) so the probe lands
+    // inside the allocation; ordinary runs simply ignore the extra room.
     let gbufs: Vec<_> = (0..3)
-        .map(|_| be.alloc(npad * n * 4, BufferUsage::Activations).unwrap())
+        .map(|_| be.alloc((npad * n).max(1_000_010) * 4, BufferUsage::Activations).unwrap())
         .collect();
 
     let rec = be.recorder().unwrap();
@@ -841,9 +843,16 @@ fn run_expert_gemm_parity(dt: DType, n_expert: usize) {
         be.download(b, &mut out).unwrap();
         bytemuck::cast_slice::<u8, f32>(&out).to_vec()
     };
-    let g0 = dl(gbufs[0].as_ref(), npad * n);
-    let g1 = dl(gbufs[1].as_ref(), npad * n);
-    let g2 = dl(gbufs[2].as_ref(), npad * n);
+    // Download the whole allocation when the debug build is active so the liveness probe at
+    // float offset 1_000_000 comes through; ordinary runs only need npad*n.
+    let dl_len = if std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0") {
+        1_000_010
+    } else {
+        npad * n
+    };
+    let g0 = dl(gbufs[0].as_ref(), dl_len);
+    let g1 = dl(gbufs[1].as_ref(), dl_len);
+    let g2 = dl(gbufs[2].as_ref(), dl_len);
     assert!(
         g0[..rows * n]
             .iter()
@@ -861,15 +870,16 @@ fn run_expert_gemm_parity(dt: DType, n_expert: usize) {
     // column 0 of tile (0,0) at [n*BM ..). Print them next to the host values for the same
     // quantities so the first divergence is visible instead of guessed at.
     if dt == DType::Iq1M && std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0") {
-        let base = n * 64; // BM = 64 at the large-tile path this test drives
-        let d = &g0[base..base + 23];
-        println!("--- IQ1M_MMQ_DEBUG dump (row 0, col 0, sub 0) ---");
-        println!("  dl1={} dl2={} neg={}", d[0], d[1], d[2]);
-        println!("  xl = [{}, {}, {}, {}]", d[3], d[4], d[5], d[6]);
-        println!("  q_lo={} q_hi={} dact={} acc={}", d[7], d[8], d[9], d[10]);
-        println!("  RAW qa[0]={} dact[0]={} counts[0]={} offsets[0]={}", d[11], d[12], d[13], d[14]);
-        println!("  PC n={} k={} m={} nsub={}", d[15], d[16], d[17], d[18]);
-        println!("  IDX wgRow={} wgCol={} ex={} cnt={}", d[19], d[20], d[21], d[22]);
+        const PROBE: usize = 1_000_000;
+        let p = &g0[PROBE..PROBE + 10];
+        println!("--- IQ1M liveness probe ---");
+        if p[0] != 12345.0 {
+            println!("  MAGIC ABSENT (saw {}) - the probe never executed; nothing else is readable", p[0]);
+        } else {
+            println!("  MAGIC ok - probe ran");
+            println!("  PC n={} k={} m={} nsub={} kw={} tilesN={}", p[1], p[2], p[3], p[4], p[5], p[6]);
+            println!("  RAW qa[0]={} dact[0]={} counts[0]={}", p[7], p[8], p[9]);
+        }
         // Host-side reference for the same block.
         let blk = &host[0][0..256];
         let xrow = &xq[0..k];

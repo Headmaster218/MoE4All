@@ -15288,16 +15288,6 @@ impl<'a> Recorder<'a> {
             }
         } else if small_tile {
             desc.xp32
-        } else if dtype == infr_core::DType::Iq1M
-            && std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0")
-        {
-            // Test-only: run the IQ1M_DEBUG build of the same kernel, which additionally dumps
-            // the per-32-block intermediates past the end of the output. Default OFF, so the
-            // production path is untouched.
-            (
-                "native_gemm_mmq_iq1_m_xp_dbg",
-                crate::gemm::native_gemm_mmq_iq1_m_xp_dbg_spv(),
-            )
         } else {
             desc.xp
         };
@@ -15324,6 +15314,19 @@ impl<'a> Recorder<'a> {
             n,
         ) {
             crate::gemm::iq4_pair_lut_kernel(small_tile, false)
+        } else {
+            (name, spv)
+        };
+        // Test-only override, applied LAST so the kquant/iq4 shortcuts above cannot replace it
+        // (that is exactly what happened on the first attempt: the debug kernel was selected here
+        // and then overwritten further down, so the probe never ran).
+        let (name, spv) = if dtype == infr_core::DType::Iq1M
+            && std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0")
+        {
+            (
+                "native_gemm_mmq_iq1_m_xp_dbg",
+                crate::gemm::native_gemm_mmq_iq1_m_xp_dbg_spv(),
+            )
         } else {
             (name, spv)
         };
