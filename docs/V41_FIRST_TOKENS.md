@@ -2,68 +2,92 @@
 
 ---
 
-## Round 80：找到了 —— engram 权重上传了，但从未参与计算
+## Round 81：engram 算法已完整读出，但修复是大工程
 
-### 编译器给出的证据
+### 参考实现的 `build_engram`（`deepseek41.cpp:382`）
 
+注入点在**每层主循环最开头**，`build_hc_mixes` 之前：
+
+```cpp
+if (pmodel.engram_index(il) >= 0) {
+    inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
+}
 ```
-$ cargo check -p infr-llama
-warning: fields `wkv`, `k`, and `q` are never read
-  --> crates/infr-llama/src/seam/weights.rs:315
-   |
-315| pub(super) struct EngramW {
+
+算法：
+
+```cpp
+// 1. 一次投影产出 hc 个 key + 一个共享 value
+kv    = engram_wkv @ emb                      // [hc_dim + n_embd, nt]
+key   = kv[0        .. hc_dim]                // 每 hc 副本一个 key
+value = kv[hc_dim   .. hc_dim + n_embd]       // 所有副本共享
+
+// 2. 分组 RMSNorm：按 (token, hc 副本) 在 n_embd 上归一，不是跨副本联合
+k = grouped_norm(key, engram_k)               // reshape [n_embd, hc, nt] → rms_norm → 乘 w
+q = grouped_norm(x,   engram_q)
+
+// 3. 打分
+s = sum_rows(k * q) * (1/sqrt(n_embd))
+
+// 4. 符号平方根后 sigmoid（对应训练 kernel）
+mag  = sqrt(clamp(abs(s), 1e-6, inf))
+gate = sigmoid(sgn(s) * mag)
+
+// 5. value 广播到 hc 份，乘 gate，加回残差
+v = repeat_4d(value, n_embd, hc, nt, 1)
+return x + v * gate
 ```
 
-**`EngramW` 的三个字段 `wkv` / `k` / `q` 从未被读取。**
+### 本项目缺的算子
 
-### 这不是我读代码的推测，是 rustc 的静态结论
+| 步骤 | 需要的 Op | 本项目 |
+|---|---|---|
+| 投影 | `Linear` | ✅（`w_off` 支持拆分） |
+| 分组 RMSNorm | `RmsNorm` | ✅ |
+| 元素乘 | — | 有 `MulVec`，但**广播语义不同** |
+| `sum_rows` | 按行归约 | ❌ **无** |
+| `sqrt` | — | ❌ **无** |
+| `abs` | — | ❌ **无** |
+| `clamp` | — | ❌ **无** |
+| `sigmoid` | — | ✅（`Sigmoid` 存在） |
+| `sgn` | — | ❌ **无**（`QwenPleGate` 里可能内联） |
+| `repeat_4d` | 广播 | ❌ **无** |
 
-| 检查 | 结果 |
+**缺 6 个基础算子。**
+
+### 这意味着什么
+
+**修复不是"接上三个投影"，而是新增 6 个 Op，每个都要：**
+1. `infr-core/src/graph.rs` 加 enum 变体 + 依赖/输出声明
+2. CPU 后端实现
+3. **Vulkan 后端实现（要写 shader）**
+4. `synthetic_deepseek2` fixture 覆盖
+
+**这是一天量级的工程，不是一轮能完成的。**
+
+而且每加一个 shader 就要编译、要在 GPU 上验证正确性——
+**在模型本身还答不对题的现在，新 kernel 的正确性无法用 `2+2=4` 来判**（它本来就错）。
+
+### 但这仍然是本会话最大的进展
+
+| 之前 | 现在 |
 |---|---|
-| `grep -rn "EngramW" crates/` | 只有定义、构造、字段声明三处 |
-| `grep -rn "\.engram"` 全部消费点 | **零** |
-| `infr-core/src/graph.rs` 有 Engram Op 吗 | **没有** |
-| `cargo check` | **`never read`** |
+| 不知道哪里错 | **知道 engram 没被调用** |
+| 四个候选全排除 | **根因定位到具体组件** |
+| 只能猜 | **有完整算法和参考实现** |
 
-### 而代码在别处是"支持 engram"的样子
+### 我这一轮不做的事
 
-| 位置 | 行为 |
-|---|---|
-| `config.rs:551` `has_engram()` | 判定层 1、14 有 engram |
-| `config.rs:1320-1361` | **一整套配置校验**（head count、2-gram、key length、prime 非零、multipliers 长度） |
-| `runner.rs:2766` | 加载 `engram_wkv/k/q.weight` |
-| `runner.rs:5323` | 构造 `EngramW` 放进 `LayerW` |
-| `weights.rs:309-313` | 注释说"这三个是唯一上传的 engram 权重" |
-| **计算** | **不存在** |
+**不在这一轮动手写那 6 个算子。** 理由：
+- 需要 GPU shader，每步都要编译验证，一轮做不完
+- 做完之前模型仍然错，无法验证新算子是否写对
+- 半成品提交会污染这个已经 45 个提交的分支
 
-**配置校验、权重加载、结构体、注释全都写好了——唯独没写用它算。**
-
-这正是 Round 79 收敛出的那类故障：**组件是对的，但它没有被调用。**
-
-### 为什么这足以解释全部现象
-
-`engram_layer_ids = [1, 14]`，层 1 是**第二层**。
-
-残差流逐层累积——**第 1 层注入缺失，后面 39 层全部偏离**。
-
-模型不是"某个模块算错"，而是**从第 1 层起就走在一条与训练时不同的残差轨迹上**，
-最终输出只能是语法通顺但没有内容的套话（`We need answer. The question`）。
-
-这与我 Round 73 的排除理由（"只有 2 层"）正好相反——**恰恰因为它在第 1 层**。
-
-### 未确认的部分
-
-1. **engram 是否"必须"**——有没有可能缺了它只是精度下降，不至于答错 `2+2=`？
-   参考实现 `deepseek41.cpp` 是把它当必经路径算的（`engram_index(il) >= 0` 就注入）。
-2. **补上它有多大工作量**——需要：host 侧 hash（`crate::engram` 已有）、
-   gather（已有）、三个投影的 Op 序列（`wkv` 拆两次 GEMV + `k`/`q` 的 norm 缩放）。
-   **`Op::Linear` 的 `w_off` 已经支持拆分**（注释提到与 V4 分组输出投影同一技巧）。
+**更合理的做法**：先只加 CPU 后端实现（不需要 shader、不需要 GPU），
+用现有 `synthetic_deepseek2` fixture 验证算子正确性；Vulkan 版本单独一轮做。
 
 ### 下一步
 
-按 `deepseek41.cpp` 的 engram 注入段，把三个投影接进 graph。
-预计是几十行 Op 序列，不是重写。
-
-**但第一步先确认参考实现里 engram 注入的确切位置和顺序**
-（`deepseek41.cpp` 的 `engram_index(i) >= 0` 分支）。
+先看 `QwenPleGate` —— 它的结构与 engram gate 极像（同样的 sigmoid(sgn*sqrt(clamp(abs)))），
+**如果它已经有现成实现，engram 可以复用它的后端**。
 
