@@ -1532,3 +1532,57 @@ Round 11 我自己的笔记里就写着：
 - 逐 token 路径：**6 t/s**（114 s）
 - 之前关于 prefill 的所有分析（Round 13–18）**都是基于 12 t/s 那条路**，仍然有效
 - Round 19–21 关于"波动"的全部内容**作废**
+
+---
+
+## Round 22：那 57.6 秒一直都在 GPU 上 —— 六轮的框架是错的
+
+### 决定性读数
+
+```
+[pf device] main_busy=60.434s layers_wall=59.220s | busy/wall=102.0% | outside_gpu=0.000s
+[pf layers] calls=120 layers_wall=59.220s sync=0.000s record=1.668s submit=0.004s
+[pf prof]   730 rows over 3 chunks | wall 63.606s | 11.5 tok/s
+```
+
+### 修正
+
+Round 16 我写：「层 wall 59.2 s，`sync`=0、`record`=1.8 s，**其余 57.6 s 未归因**」。
+此后 Round 17–21 六轮都在找那 57.6 秒去哪了。
+
+**它没去哪。它就是 GPU 的执行时间。**
+
+GPU 在那段时间里 **忙了 60.4 秒**（比层 wall 还略多，因为队列跑在 host 前面）。
+`outside_gpu = 0.000s` —— **没有任何时间在 GPU 之外**。
+
+「未归因」是我读错了：`PagedMoeLayerStats` 的 `sync`/`record` 字段**不是** wall 的分解，
+wall 本来就是「队列在忙」的时间。把两个子字段当成全量分解，才凭空造出一个 57.6 秒的黑洞。
+
+### 真正的问题换了一个
+
+不是「时间去哪了」，而是**「GPU 为什么要花这么久」**。
+
+```
+730 行 × 40 层 = 29,200 个「行-层」
+60.43 s ÷ 29,200 = 2.07 ms / 行-层
+```
+
+**GPU 满载，每个「行-层」2.07 ms。** 这是 kernel 效率问题，不是调度问题、不是等待问题。
+
+这也把之前所有「等待」方向的排除（缓存、锁、线程数、显存）统一解释了：
+**它们全部正确地被否证了，因为根本没有等待可找。**
+
+### 完整运行方式（按 Round 21 的纪律记录）
+
+```
+INFR_DSV41_BATCHED_PREFILL=1 INFR_PROF_STAGES=1 \
+  ./target/release/infr run <模型> "$(cat /tmp/p512.txt)" \
+  --max-new 1 --temp 0 --ctx 4096 --ubatch 256 --dev Vulkan1 \
+  --set prof.pager_profile=true
+```
+
+### 下一步
+
+GPU 满载下的 kernel 效率。已知（Round 10）：`zero_fill` + `silu_mul` 合计占 72% 的**设备时间**，
+那个比例现在看是可信的——因为设备时间就是全部。所以那个方向（融合或按需遍历）仍然成立，
+只是现在它从「可疑」变成了「经过闭环验证的主线索」。
