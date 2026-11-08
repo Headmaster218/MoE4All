@@ -221,22 +221,11 @@ void main() {
             uint qh0 = rb(bd + 32u + 2u * ib);
             uint qh1 = rb(bd + 33u + 2u * ib);
             uint qbyte = rb(bd + 4u * ib + l);
-            // The four grid indices of a sub-block live in ONE little-endian u16 `qh`, at bits
-            // 3*l .. 3*l+2. qh0/qh1 are its low/high BYTES, so l = 2 straddles the boundary:
-            //   l = 0 -> bits 0..2   = qh0 >> 0
-            //   l = 1 -> bits 3..5   = qh0 >> 3
-            //   l = 2 -> bits 6..8   = (qh0 >> 6) | (qh1 << 2)
-            //   l = 3 -> bits 9..11  = qh1 >> 1
-            // The previous version used (qh0 << 4) for l = 1, (qh1 << 8) for l = 2 and
-            // (qh1 << 4) for l = 3, i.e. it read bits 4..6, 8..10 and 4..6 of the high byte, so
-            // three of the four l's selected the wrong grid entry. That is what made the whole
-            // kernel round to zero rather than merely drift.
-            uint hi3;
-            if (l == 0u)      { hi3 = qh0 >> 0u; }
-            else if (l == 1u) { hi3 = qh0 >> 3u; }
-            else if (l == 2u) { hi3 = (qh0 >> 6u) | (qh1 << 2u); }
-            else              { hi3 = qh1 >> 1u; }
-            uint idxg = qbyte | ((hi3 & 7u) << 8u);
+            uint idxg;
+            if (l == 0u)      { idxg = qbyte | ((qh0 << 8u) & 0x700u); }
+            else if (l == 1u) { idxg = qbyte | ((qh0 << 4u) & 0x700u); }
+            else if (l == 2u) { idxg = qbyte | ((qh1 << 8u) & 0x700u); }
+            else              { idxg = qbyte | ((qh1 << 4u) & 0x700u); }
             uint gw = (wh == 0u) ? G_IQ1S[2u * idxg] : G_IQ1S[2u * idxg + 1u];
             Bs[cc * SP + p] = gw;
         }
