@@ -2,57 +2,57 @@
 
 ---
 
-## Round 59（续）：对账失败 —— 空档其实全部已归因
+## Round 60：第 9 个否证 —— inflight 深度
 
-### 我先前的错误
+### 假设
 
-上一节我手算「已知 host 开销 503ms，空档 1550ms，剩 1047ms 无解释」。
+`decode_gpu_resident_inflight: usize = 1`（默认），注释说它被 clamp 在 1..2，
+2 表示「允许额外一个投机段」。**如果只有 1 个在途段，CPU 就无法与下一段重叠。**
 
-**这个算法漏了一项：`sync_wait_ns`。**
+这与 Round 59 的结论吻合（CPU 在 `sync_wait` 里等，`overlap_lower_bound=0`）。
 
-`host_accounted` 的定义（`runner.rs:14264`）是：
+### A/B
 
-```rust
-backend_setup + command_recorder_acquire + command_record + queue_submit + sync_wait
-```
+| | inflight=1（默认） | inflight=2 |
+|---|---|---|
+| **decode** | **6.2 tok/s** | **6.2 tok/s** |
 
-**`sync_wait` 就在里面**，而它正是 3.88s 那个大头。我没把它算进去。
+**没有变化。**
 
-### 加上 `unattributed` 指标后的实测
+### 这是第 9 个
 
-```
-execute_wall  = 4.27s
-attributed    = 4.25s
-unattributed  = 26.4ms     <- 0.6%
-```
+| # | 假设 | 结论 |
+|---|---|---|
+| 1 | 统一缩放 | 否 |
+| 2 | 慢 copy | 否 |
+| 3 | `main_busy` 当上限 | 否 |
+| 4 | 带宽不足 | 否 |
+| 5 | `queue_wait_idle` | 否 |
+| 6 | staging ring slots | 否 |
+| 7 | submit 数 | 否 |
+| 8 | 隐藏 CPU 开销 | **不存在（已 100% 归因）** |
+| 9 | inflight 深度 | 否 |
 
-**未归因时间只有 0.6%，几乎为零。**
+### 我现在的判断
 
-### 结论
+**decode 没有"可以摘掉的浪费"。** Round 59 的对账已经证明 host 侧 <1% 未归因，
+现在方向 2（重叠）也被否掉。
 
-**空档不是"CPU 在干别的事"，而是 CPU 在 `sync_wait` 里等 GPU。**
+剩下的只有 **方向 1：减少 GPU 的实际工作量**。
 
-所以"给这 1047ms 插采样器看它在干嘛"这个计划本身就不成立——
-那 1047ms 并不存在，是我算错的。
+而 decode 的 GPU 工作量主要由**每 token 要过多少专家权重**决定：
+- `gpu cache hit_rate = 59.9%`
+- 40 层 × 每层 top-6 专家 = 每 token 240 个专家实例
 
-### 这意味着什么
+**这不是一个"调参"问题，是算法/调度问题。** 可选项：
+- 更好的专家亲和性（让连续 token 复用同一批专家）
+- 更激进的路由近似（poorseek 用了 `--route-bias`，明确牺牲精度换速度）
+- 减少层数（V4.1 的 34 个复用层是否真的都需要跑满）
 
-八轮下来，所有证据现在指向同一个结论：
+### 诚实的进度判断
 
-- GPU 忙 2.86s 是**真的在算**
-- GPU 闲 1.55s 时，**CPU 在等它**（`sync_wait` 已计入）
-- host 侧没有隐藏的浪费（0.6%）
+**prefill 已从 12 → 25 tok/s（2.1 倍，已确认）。**
+**decode 卡在 6.2，九个方向全部用尽，没有任何一个带来改善。**
 
-**decode 6.2 tok/s 就是这套计算+换入的真实成本，而不是某个环节的浪费。**
-
-要更快，只有两条路：
-1. **减少 GPU 的工作量**（更少的专家、更少的换入）
-2. **让 CPU 不等**（异步流水，让下一个 token 的准备与当前计算重叠）
-
-第 2 条才是 `hit_windows`/`overlap` 那些指标本来要衡量的事——而它们实测是 0。
-
-### 保留的产出
-
-`unattributed` 这个指标本身是有价值的：它把"CPU 时间有没有漏账"变成了一个恒等式，
-以后任何 host 侧改动都能立刻看到有没有凭空多出时间。
+对标 poorseek 的 27.7 tok/s 需要的是**架构级的改变**，不是继续找瓶颈。
 
