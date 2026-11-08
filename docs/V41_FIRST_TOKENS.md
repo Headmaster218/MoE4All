@@ -2,55 +2,54 @@
 
 ---
 
-## Round 31：修正 Round 30 的固定开销结论 —— 它只是最后一个不满的 chunk
+## Round 32：根因找到了 —— paged MMQ 白名单漏掉 IQ1_M
 
-### Round 30 的拟合有问题
+### 完整因果链
 
-Round 30 用两点（ub=128 的 87.6ms / ub=256 的 140.4ms）拟合出 `34.8ms 固定 + 58.9μs/槽`。
-但那个**每槽成本是用平均行数算的**，而最后一批 chunk 通常不满：
+1. `native_idm_iq1m_paged` 标在 **`native_gemv_id_multi`** 上（`build.rs:2545`）——
+   **它是一个 GEMV，不是 GEMM。** 每个 workgroup 只算 **1 个输出**，沿 K=5120 协作归约。
+
+2. GEMV 的算术强度：`5120 MAC / 1000 字节 = 5.1 MAC/B`。
+   对比 MMQ 的 tile 形态（64×64 输出算一次），强度高 64 倍。
+   **GEMV 天生喂不满 dp4a，这是 0.26 TFLOPS 的来源。**
+
+3. 仓库**已经有** `native_gemm_mmq_iq1_m.comp`（MMQ 版），而且
+   `DType::Iq1M` **已经在 `MOE_MMQ_DTYPES` 里**：
+
+   > `IQ1_M: added once native_gemm_mmq_iq1_m landed the per-8-element sign-keyed delta
+   > correction (two dp4a accumulators per 32-block, four self-computed per-l activation sums).`
+
+4. **但 paged 路径用的是另一个白名单 `MOE_MMQ_PAGED_DTYPES`，里面没有 `Iq1M`。**
 
 ```
-731 tok @ ub=128: 5×128 + 91  -> 最后一个 chunk 只有 91 行
-731 tok @ ub=256: 2×256 + 219 -> 最后一个 chunk 只有 219 行
+MOE_MMQ_DTYPES        : ... Iq2Xs, Iq1M, Iq3S, Iq3Xxs, Mxfp4, Nvfp4, Q2_0
+MOE_MMQ_PAGED_DTYPES  : ... Iq2Xs,        Iq3S, Iq3Xxs, Mxfp4, Nvfp4, Q2_0
+                                    ^^^^ 缺 Iq1M
 ```
 
-把不满的 chunk 当成满的算，就会凭空造出一个"固定开销"。
-**这与 Round 28–29 的教训相同：不要在估计值上做拟合。**
+### 这就是那 38.8 秒
 
-### 用第三个点重新验证（不同 prompt 长度）
+V4.1 的 gate/up 有 **16/40 层是 IQ1_M**（Round 11 普查）。
+这些层的专家矩阵乘因为 paged 白名单不含 IQ1_M，**全部退回到 GEMV 路径**——
+单 workgroup 单输出、算术强度 5.1 MAC/B、实测 0.26 TFLOPS。
 
-```
-700 词 (~700 tok):  38.9s  276 次  141.1ms/次
-318 词 (~318 tok):  21.1s  201 次  105.0ms/次
-```
+### 这不是架构限制
 
-按每 chunk 实际行数重算（`chunks` 分别为 `[256, 256, 188]` 和 `[256, 62]`）：
-
-| prompt | 总槽数 | 总 MAC | 耗时 | 有效算力 | μs/槽 |
-|---|---:|---:|---:|---:|---:|
-| 318 tok | 223,713 | 2.64 T | 21.1 s | **0.25 TFLOPS** | 94.3 |
-| 700 tok | 450,800 | 5.32 T | 38.9 s | **0.27 TFLOPS** | 86.3 |
-
-**两组独立测得的有效算力一致（0.25 / 0.27），每槽耗时也一致（94.3 / 86.3 μs）。**
-
-所以那个 `34.8 ms` 固定开销**不成立**——它是把不满的 chunk 当满的算出来的假象。
-**真实成本就是一条：约 90 μs/槽，等效 0.26 TFLOPS。**
-
-### 与 Round 29 的一致性
-
-Round 29 从单次调用的 MAC 数算出 0.30 TFLOPS；这里从两次不同长度 prompt 的总量算出 0.25–0.27。
-
-**三次独立路径都指向同一个数：这个 kernel 跑在 0.25–0.30 TFLOPS。**
+`native_gemm_mmq_iq1_m.comp` 已经实现了 IQ1_M 的 MMQ（含 ±0.125 delta 的 sign-keyed 校正、
+每 32-block 两个 dp4a 累加器）。**它只是没有被 paged 路径接受。**
 
 ### 状态
 
-无代码改动。PR #183：63 commits。
+无代码改动。PR #183：64 commits。
 
-### 下一步
+### 下一步（明确且收益可估）
 
-问题非常清楚了：**为什么 IQ1_M 的 paged kernel 只有 0.26 TFLOPS？**
+把 `DType::Iq1M` 加进 `MOE_MMQ_PAGED_DTYPES`，验证：
+1. `synthetic_deepseek2` 仍绿
+2. 实跑 V4.1，看 `native_idm_iq1m_paged` 是否消失、被 `native_gemm_mmq_iq1_m` 取代
+3. 正确性：输出是否与 GEMV 路径一致（**这是关键，不能只看速度**）
+4. 速度：38.8 秒能降到多少
 
-在这台卡上 int8 dp4a 的合理值应该在 10 TOPS 以上。**低 40 倍**。
-下一步该看 kernel 本身——`native_idm_iq1m_paged` 的实现（`shaders/` 下的 IQ1_M paged 变体），
-特别是它对每个槽是否真的按 1 行处理、以及解量化路径的开销。
+**风险**：paged 白名单当初排除 IQ1_M 可能有原因（比如 paged 布局下 sact 校正在 64-bit
+BDA 寻址上有问题）。**必须先查清楚为什么当初没加**，或者直接在小样本上对比两条路径的数值。
 
