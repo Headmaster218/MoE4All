@@ -693,6 +693,13 @@ fn iq1m_expert_gemm_matches_host() {
     // SINGLE EXPERT FIRST: `wbase = pc.w_base + ex * pc.m` is round 38's remaining suspect, and
     // with one expert that term is `0 * pc.m = 0` whatever pc.m means. Run it before the
     // 5-expert case so its verdict is not masked by a panic in the later one.
+    // Print the device's per-workgroup shared-memory budget and the two kernels' footprints:
+    // IQ1_M stages G_IQ1S[4096] = 16 KiB on its own, plus As/Bs/scales, which lands near 21 KiB
+    // above Vulkan's 16 KiB minimum guarantee, while IQ2_S totals ~13.5 KiB.
+    {
+        let be = infr_vulkan::VulkanBackend::new().unwrap();
+        println!("[lds] device max_shared_memory_bytes = {}", be.max_shared_memory_bytes());
+    }
     // CONTROL FIRST: IQ1_M panics, which masked the IQ2_S control for four rounds.
     run_expert_gemm_parity(DType::Iq2S, 5);
     run_expert_gemm_parity(DType::Iq1M, 1);
