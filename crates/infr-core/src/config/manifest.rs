@@ -379,6 +379,36 @@ knobs! {
 /// "someone added a knob and forgot the manifest".
 pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
+        "INFR_DSV41_BATCHED_PREFILL",
+        "DeepSeek V4.1 batched-prefill experiment switch, read by the runner while choosing the \
+         prefill path; not yet promoted to configuration.",
+    ),
+    (
+        "INFR_DSV41_SHARD1",
+        "DeepSeek V4.1 shard-selection diagnostic; not yet promoted to configuration.",
+    ),
+    (
+        "INFR_ENGRAM_TABLE",
+        "DeepSeek V4.1 engram-table override; not yet promoted to configuration.",
+    ),
+    (
+        "INFR_IQ1M_MMQ_DEBUG",
+        "test-only: selects the IQ1M_DEBUG build of the IQ1_M expert kernel so its intermediates \
+         can be dumped past the output. Nothing in production sets it.",
+    ),
+    (
+        "INFR_MMQ_TRACE",
+        "test-only: prints matmul_mmq_experts' dispatch parameters from the Rust side.",
+    ),
+    (
+        "INFR_STAMP_AFTER_BARRIER",
+        "profiling A/B: moves the zero_fill device stamp after its barrier. Diagnostic only.",
+    ),
+    (
+        "INFR_ZERO_VIA_DISPATCH",
+        "profiling A/B: routes the zero fill through a dispatch. Diagnostic only.",
+    ),
+    (
         "INFR_DIAGNOSTIC_DIR",
         "diagnostic bootstrap output path: resolved through config/env.rs before runtime Config \
          loading, so configuration failures can be recorded; not an inference setting.",
