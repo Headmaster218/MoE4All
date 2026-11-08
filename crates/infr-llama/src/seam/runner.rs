@@ -9574,6 +9574,9 @@ fn generate_dense_backend_inner(
                 Some(&batch_lanes),
                 independent_rows,
             );
+            if let (Some(id), Some(buf)) = (h1.engram_emb, engram_emb_buf.as_ref()) {
+                bindings1.bind(id, buf.as_ref());
+            }
             drop(timeline_main_bind);
             let timeline_main_execute = infr_core::timeline::span("prefill_main_execute");
             be.execute(plan1.as_ref(), &bindings1)
@@ -10249,6 +10252,9 @@ fn generate_dense_backend_inner(
                 None,
                 independent,
             );
+            if let (Some(id), Some(buf)) = (h0.engram_emb, engram_emb_buf.as_ref()) {
+                bindings0.bind(id, buf.as_ref());
+            }
             bind_parallel_mtp_traces(&mut bindings0, &h0, mtp_delta_ckpt, parallel.peers);
             be.execute(plan0.as_ref(), &bindings0)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -10315,6 +10321,9 @@ fn generate_dense_backend_inner(
             None,
             independent,
         );
+        if let (Some(id), Some(buf)) = (h1.engram_emb, engram_emb_buf.as_ref()) {
+            bindings1.bind(id, buf.as_ref());
+        }
         bind_parallel_mtp_traces(&mut bindings1, &h1, mtp_delta_ckpt, parallel.peers);
         bindings1.bind(h1.logits.expect("MTP VERIFY logits"), fixed.logits.as_ref());
         if let Some(id) = h1.h_out {
@@ -11489,6 +11498,9 @@ fn generate_dense_backend_inner(
                             None,
                             independent_rows,
                         );
+                        if let (Some(id), Some(buf)) = (h0.engram_emb, engram_emb_buf.as_ref()) {
+                            b0.bind(id, buf.as_ref());
+                        }
                         Some((plan0, b0))
                     };
                     if let Some(t0) = profile_front_t0 {
@@ -11528,6 +11540,9 @@ fn generate_dense_backend_inner(
                         None,
                         independent_rows,
                     );
+                    if let (Some(id), Some(buf)) = (h1.engram_emb, engram_emb_buf.as_ref()) {
+                        b1.bind(id, buf.as_ref());
+                    }
                     if logits_rows > 0 {
                         b1.bind(
                             h1.logits.expect("parallel token build has logits"),
@@ -11709,6 +11724,9 @@ fn generate_dense_backend_inner(
                                     None,
                                     independent_rows,
                                 );
+                                if let (Some(id), Some(buf)) = (handles.engram_emb, engram_emb_buf.as_ref()) {
+                                    bindings.bind(id, buf.as_ref());
+                                }
                                 if is_main {
                                     if let Some(id) = handles.logits {
                                         bindings.bind(id, logits_batch.as_ref());
