@@ -862,11 +862,14 @@ fn run_expert_gemm_parity(dt: DType, n_expert: usize) {
     // quantities so the first divergence is visible instead of guessed at.
     if dt == DType::Iq1M && std::env::var_os("INFR_IQ1M_MMQ_DEBUG").is_some_and(|v| v != "0") {
         let base = n * 64; // BM = 64 at the large-tile path this test drives
-        let d = &g0[base..base + 11];
+        let d = &g0[base..base + 23];
         println!("--- IQ1M_MMQ_DEBUG dump (row 0, col 0, sub 0) ---");
         println!("  dl1={} dl2={} neg={}", d[0], d[1], d[2]);
         println!("  xl = [{}, {}, {}, {}]", d[3], d[4], d[5], d[6]);
         println!("  q_lo={} q_hi={} dact={} acc={}", d[7], d[8], d[9], d[10]);
+        println!("  RAW qa[0]={} dact[0]={} counts[0]={} offsets[0]={}", d[11], d[12], d[13], d[14]);
+        println!("  PC n={} k={} m={} nsub={}", d[15], d[16], d[17], d[18]);
+        println!("  IDX wgRow={} wgCol={} ex={} cnt={}", d[19], d[20], d[21], d[22]);
         // Host-side reference for the same block.
         let blk = &host[0][0..256];
         let xrow = &xq[0..k];

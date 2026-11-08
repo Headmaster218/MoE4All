@@ -267,6 +267,20 @@ void main() {
             c[base + 8u] = float(q_hi[0][0]);
             c[base + 9u] = dval[0];
             c[base + 10u] = float(acc[0][0]);
+            // Raw inputs, to separate "the kernel's arithmetic is wrong" from "the buffers
+            // themselves read as zero". qa is binding 0, dact binding 1, counts binding 4.
+            c[base + 11u] = float(qa[0]);
+            c[base + 12u] = float(dact[0]);
+            c[base + 13u] = float(counts[0]);
+            c[base + 14u] = float(offsets[0]);
+            c[base + 15u] = float(pc.n);
+            c[base + 16u] = float(pc.k);
+            c[base + 17u] = float(pc.m);
+            c[base + 18u] = float(nsub);
+            c[base + 19u] = float(wgRow);
+            c[base + 20u] = float(wgCol);
+            c[base + 21u] = float(ex);
+            c[base + 22u] = float(cnt);
         }
 #endif
         barrier();
