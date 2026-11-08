@@ -13003,6 +13003,21 @@ fn generate_dense_backend_inner(
             }
             if pf_layer_calls > 0 {
                 let w = pf_layer_wall.as_secs_f64();
+                // The decisive question for this 59 s: is the DEVICE busy during it? Layer wall
+                // being large while sync and record are small says the time is spent somewhere the
+                // per-layer counters do not name, but it cannot distinguish 'GPU computing' from
+                // 'host blocked'. device_timeline_snapshot now accumulates across prefill (the
+                // StepGuard is opened per chunk), so comparing the two answers it directly.
+                let timeline = infr_core::pager_profile::device_timeline_snapshot();
+                let busy = timeline.main_busy_ns as f64 / 1e9;
+                tracing::info!(
+                    "[pf device] main_busy={:.3}s layers_wall={:.3}s | busy/wall={:.1}% | \
+                     outside_gpu={:.3}s",
+                    busy,
+                    w,
+                    busy / w.max(1e-9) * 100.0,
+                    (w - busy).max(0.0),
+                );
                 tracing::info!(
                     "[pf layers] calls={} layers_wall={:.3}s sync={:.3}s ({:.1}%) record={:.3}s \
                      submit={:.3}s | worst=layer{} wall={:.1}ms sync={:.1}ms",
