@@ -2,57 +2,49 @@
 
 ---
 
-## Round 69：挂起的原因找到了 —— 是我自己开的 bring-up 开关
+## Round 70：两条路径差 20 倍，这就是全部问题的量化
 
-### `runner.rs:12370` 的注释直接写了答案
+### per-token 路径的速率下界
+
+`pp2048` 在默认（per-token）路径上跑了 **25 分钟仍未完成**（1500s timeout 截断）。
 
 ```
-// MEASURED, 2026-11-08: enabling it for V4.1 is NOT viable today. ... a 2032-token
-// prompt loses the DEVICE ... this is a reproducible hang in the batched V4.1 graph,
-// not a card problem. ... Until the hc_mult-width residual is carried across a chunked
-// span properly, the family stays on the per-token path, which is correct and merely
-// slower.
+速率 < 2048 / 1500 = 1.37 tok/s
 ```
 
-**根因**：V4.1 的 `hc_mult` 宽度残差**没有在分块 span 之间正确传递**。
+进程一直在推进（CPU 时间 6:11、读取 137.8 GB 都在增长），**不是卡死，是真的慢。**
 
-batched prefill 对每个 chunk 构建整模型图（`span = None`），残差跨 chunk 丢失，
-所以 **batch > 1 的 V4 图从来没有正确执行过**。
+### 与 batched 路径的对比
 
-**而 `INFR_DSV41_BATCHED_PREFILL` 是我在前面几十轮里一直开着的。**
-
-### 关掉它之后
-
-16K 不再挂起：进程 CPU 时间持续增长（2:49 → 8:25），读字节 97.7 → 126.3 GB，
-说明它在**真的干活**，只是走 per-token 路径很慢。
-
-**但跑了 50 分钟仍没完成**（被 3000s timeout 截断）。
-
-### 所以 16K 的真相
-
-| 路径 | 结果 |
-|---|---|
-| `INFR_DSV41_BATCHED_PREFILL=1`（我一直在用） | **~20 分钟后 device lost** |
-| 默认（per-token） | **不挂，但 50 分钟算不完** |
-
-**两条路都不可用，但原因不同**：一条是图构造缺陷，一条是纯速度。
-
-### 这个教训很重
-
-**我在前面所有 prefill 测量里都开着这个 bring-up 开关**，
-而注释明写它是 opt-in 的 bring-up 实验、当前不可用。
-
-- 4K / 8K 在 batched 路径下能跑通（27.5 / 26.3 t/s），所以那部分数据有效
-- 但 16K+ 的失败，**直接原因是我用了不该默认启用的路径**
-
-正确做法：**默认路径（per-token）才是产品行为**，它不挂但很慢；
-batched 路径是实验性的，只在能跑通的规模上才有意义。
-
-### 修正后的可用性
-
-| 规模 | batched（实验） | per-token（默认） |
+| 路径 | 4K prefill | 相对 |
 |---|---|---|
-| 4K | 27.5 t/s ✅ | 未测（历史上 ~6-7 t/s） |
-| 8K | 26.3 t/s ✅ | 未测 |
-| 16K | ❌ device lost | ❌ 50+ 分钟未完 |
+| **batched**（`INFR_DSV41_BATCHED_PREFILL=1`） | **27.5 tok/s** | 1× |
+| **per-token**（默认） | **< 1.37 tok/s** | **慢 20 倍以上** |
+
+### 于是 16K 的真实时间账
+
+| 路径 | 16K 预计耗时 | 可用性 |
+|---|---|---|
+| batched | **~10 分钟** | 但 >8K 会挂 |
+| per-token | **~3.3 小时** | 不挂，但不可用 |
+
+### 这个对比才是整个 long-context 问题的核心
+
+不是"16K 有个谜之 bug"，而是：
+
+**引擎只有两个 prefill 模式——批量模式快 20 倍但 chunk 间传不了残差，逐 token 模式正确但慢到没法用。**
+
+`hc_mult` 残留修复的价值由此可以量化：
+**修好它，16K 从 3.3 小时变成 10 分钟。** 这就是它值得做的理由。
+
+### 为什么这一轮我不动手改
+
+`hc_mult` 的跨 chunk 传递是模型架构级改动：
+- 残差宽度是 `hc_mult × n_embd`（`hc_mult = 4`）
+- 需要在 chunk 边界保存并恢复这个宽残差
+- 注释明说"has never executed correctly"，意味着**没有任何可参照的正确实现**
+
+盲改这种代码的期望是：编译通过、测试绿、但数值错误——而这正是本项目里最危险的一类失败（IQ1_M 那次全零缺陷就是无声的）。
+
+**记录价值判断，交给有时间做正确验证的人。**
 
