@@ -2,66 +2,67 @@
 
 ---
 
-## Round 82：engram 插入点的精确定位
+## Round 83：engram 缺的是两层，不是一层
 
-### 层循环结构（`runner.rs`）
+### 上一轮我以为只需要"接上 Op"
 
-| 行 | 内容 |
+Round 82 的计划是：把 `wkv`/`k`/`q` 三个投影接进 graph。当时假设"输入 embedding 已经在某处备好了"。
+
+**这个假设是错的。**
+
+### `crate::engram` 在推理路径里零调用
+
+```
+$ grep -rn "engram_map_for_layer|dequant_mxfp8_row|engram::" --include=*.rs crates/infr-llama/src/     | grep -v "^crates/infr-llama/src/engram.rs"
+（空）
+```
+
+`engram.rs` 里那几个函数——`row_indices`（完整实现了 n-gram hash：token_map 映射、
+multipliers 加权、prime 取模）、`dequant_mxfp8_row`（E4M3 码 + E8M0 指数反量化）、
+`engram_map_for_layer`——**一个都没被 `runner.rs` 调用过**。
+
+（`ple.rs` 里有 `ple_row_indices_into`，但那是 qwen4exp 的 PLE，与 engram 无关。）
+
+### 所以 engram 缺两层
+
+| 层 | 状态 |
 |---|---|
-| 6179-6190 | **循环前**：`hidden` 复制到 `hcr[0]` 的 `hc_mult` 份（残差流初始化） |
-| **6216** | `for (l, lw) in lw.iter().enumerate().take(l_end).skip(l_first)` |
-| 6217-6300 | 循环体开头：`if let Some(pw) = &lw.ple { ... }`（qwen4exp 专用） |
-| 6301+ | `// Per-layer dims` |
-| 6398 | `hc_wrap_pre(attn, hcr[0], hn)` —— attention 子层起点 |
-| 8297 | `hc_wrap_pre(ffn, hcr[1], hn)` —— FFN 子层起点 |
+| **host 侧 gather**（按 token 算 n-gram 行号，从 189 GB 表里读并反量化） | **写好了，从未被调用** |
+| **graph 侧计算**（三个投影 + QwenPleGate + 残差加回） | **权重上传了，字段未读** |
 
-### 参考实现的对应位置
+Round 80 我用 `rustc` 的 `never read` 定位了第二层。**第一层没有编译器能提醒**——
+`engram.rs` 是个有测试的模块，测试通过、函数是 `pub`，看起来完全正常。
 
-```cpp
-for (il = 0; il < n_layer; ++il) {
-    if (engram_index(il) >= 0) {
-        inpL = build_engram(model, inpL, build_inp_engram(model, il), il);   // ← 作用于 inpL
-    }
-    ...
-    build_hc_mixes(inpL, hc_attn_fn, ...);        // 之后的 hc 混合读 inpL
-```
+### 这解释了为什么它一直没被发现
 
-**`inpL` 就是残差流，对应本项目的 `hcr[0]`。**
-所以 engram 要在**每层循环体开头、`hc_mix`/`hc_wrap_pre` 之前**，作用于 `hcr[0]`。
+- 配置校验通过（`config.rs:1320-1361` 有完整校验，说明作者知道格式）
+- 权重加载成功（`runner.rs:2766`）
+- 模块单测全绿（`engram.rs` 自己的测试）
+- **唯独主流程没调用它**
 
-### 插入方案
+每一处局部检查都通过，缺的是**它们之间的连线**。
 
-在 `6216` 循环体内、PLE 分支之后（`6300` 的 `}` 之后）加一段：
+### 修复的实际范围
 
-```rust
-// DeepSeek V4.1 engram associative memory (deepseek41.cpp:382 build_engram). Injected at the
-// TOP of the layer, before the hyper-connection mixes read the stream.
-if let Some(ew) = &lw.engram {
-    // 1) one projection: hc keys + one shared value  [hc*n_embd + n_embd, batch]
-    g.push(Op::Linear { x: engram_emb, weight: ew.wkv, dst: engram_kv,
-                        m: batch, in_f: ne, out_f: (hcw + ne), w_off: 0 });
-    // 2) grouped RMSNorm per (token, hc copy) over n_embd, then the per-copy scale
-    //    key slice  = engram_kv[0 .. hc*n_embd)      value slice = engram_kv[hc*n_embd ..)
-    // 3) Op::QwenPleGate { key, query, value, dst: engram_out, rows: batch*hc, hc, n_embd }
-    // 4) hcr[0] += engram_out
-}
-```
+现在清楚了，比 Round 81 估计的大，比 Round 81 开头估计的小：
 
-### 三个还需要解决的技术点
+1. **host 侧**：在 forward 之前，对层 1/14 的每个 token 调 `row_indices` +
+   从 mmap 读行 + `dequant_mxfp8_row`，得到 `[n_embd, hc*nt]`（每 token 每副本一行）
+2. **上传**：把这块作为 graph Input 交给 backend（需要一个 input buffer）
+3. **graph 侧**：三个投影 + `QwenPleGate` + 残差累加（Round 81 已确认 Op 齐备）
+4. **接残差**：`hcr[0]` 在 6300 之后、`hc_mix` 之前
 
-1. **`grouped_norm`**：参考是 `reshape[n_embd, hc, nt] → rms_norm → reshape → mul(w)`。
-   本项目 `Op::RmsNorm` 的作用维度和能否表达"按 n_embd 分组"需要确认——
-   `QwenHcNorm` 可能就是干这个的（qwen4exp 的 PLE 路径用了它）。
-2. **`engram_emb`**：engram 的输入是 **host 侧 gather 出来的 embedding**（`crate::engram` 的
-   n-gram hash 查找），不是 token embedding。需要确认它作为 graph Input 如何注入
-   （`engram.rs` 里有 `generate` 侧的 gather，但要接到 forward 里）。
-3. **`hcr[0] += engram_out`**：需要原地累加。现有 `Op` 里有没有 add-into-residual 的形式，
-   还是要一个新 buffer + Copy。
+### 第 1 步是真正的工作量
 
-### 这一轮没动手的原因
+189 GB 的表，每 token 每层要读 `hc_mult` 行（4 行 × n_embd × key_len）。
+**这是随机读，不走 DMA 流水。** 而且 `engram-mxfp8.gguf` 是独立文件，
+需要 mmap 或预读。
 
-前两个技术点（特别是 `engram_emb` 这个 graph Input 的接法）没确认就写代码，
-会写出编译不过或语义错误的东西。
+**这一步的性能会直接吃掉不少 decode 速度**——但正确性优先。
 
-**下一轮先确认这两点，再动手。** 这比写了一堆错代码再回滚划算。
+### 下一轮
+
+先看 `engram.rs` 里 `EngramMap` 的接口能否直接产出 `[n_embd, hc*nt]` 的矩形，
+以及 `dequant_mxfp8_row` 的成本。**如果 gather 本身开销过大，可能需要先确认
+engram 对 `2+2=` 这类短 prompt 是否真的必需**（也许短 prompt 下 gate 值极小）。
 
