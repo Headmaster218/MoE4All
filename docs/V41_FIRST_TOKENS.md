@@ -1690,3 +1690,64 @@ m=256  → 1.1 μs/MiB
 
 - 线性 → 带宽 337 MB/s 是真的，去找这块 buffer 为什么慢（换堆 / 换分配方式）
 - 恒定 → 那 147 ms 根本不是"搬运时间"，而是别的东西（屏障、队列排空），回到 Round 23 的候选 2
+
+---
+
+## Round 28：用正确的时间戳重导设备时间表 —— 瓶颈是 IQ1_M 专家矩阵乘
+
+### 命令
+
+```
+INFR_DSV41_BATCHED_PREFILL=1 INFR_STAMP_AFTER_BARRIER=1 INFR_PROF_OPS=1 \
+  ./target/release/infr run <模型> "$(cat /tmp/p512.txt)" \
+  --max-new 1 --temp 0 --ctx 4096 --ubatch 256 --dev Vulkan1
+```
+
+### 修正前后对照
+
+| kernel | 修正前 % | 修正后 % | 变化 |
+|---|---:|---:|---:|
+| `native_idm_iq1m_paged` | 15.78 | **64.01** | **+48.23** |
+| `silu_mul` | 21.14 | 21.13 | −0.01 |
+| `native_idm_iq2xxs_paged` | 3.47 | 5.71 | +2.24 |
+| `copy_strided` | 3.80 | 3.80 | 0.00 |
+| `native_idm_iq2xs_paged` | 1.72 | 3.00 | +1.28 |
+| `zero_fill` | **51.73** | **≈0.00** | **−51.73** |
+
+修正后总计约 60 秒，与 `main_busy=60.434s` 吻合（`38.8 + 12.8 + 3.47 + 2.30 + 1.82 + 小项`）——**表是自洽的**。
+
+### 那 31.3 秒没有消失，它转移了
+
+`zero_fill` 的 51.73% → ≈0.00%，而 `native_idm_iq1m_paged` 恰好 **+48.23 个百分点（约 29.2 秒）**。
+
+**这证明 Round 27 的解释是对的**：barrier 让 fill 等待的，正是 barrier 之前那批 **IQ1_M 专家矩阵乘**的执行时间。
+计时区间把别人的时间记到了 fill 头上，修正后物归原主。
+
+### 真正的瓶颈
+
+```
+native_idm_iq1m_paged   38.8s   64.0%   276 次   140.7ms/次
+silu_mul                12.8s   21.1%   342 次    37.5ms/次
+native_idm_iq2xxs_paged  3.47s   5.7%
+```
+
+**IQ1_M 的 paged 反量化矩阵乘占了 64%。** 这与 Round 10 之后所有假设都不同——
+不是“清零税”，是一次具体的 kernel 效率问题。
+
+### 顺带确认
+
+`silu_mul` 的 21.13% 在修正前后**几乎不变**（−0.01），说明它的 stamp 位置没有 barrier 误标问题，
+那个数字是可信的。`copy_strided` 同样 0.00 变化，也可信。
+
+### 状态
+
+PR #183：**60 commits**（本轮为文档）。
+
+### 下一步
+
+`native_idm_iq1m_paged`：276 次调用、140.7ms/次。要问的问题变成：
+**一次 IQ1_M 专家 GEMM 处理 m 行 × nff 列，140 ms 合理吗？**
+
+按 Round 11 的数据，专家的 gate/up 是 `IQ1_M×16 + IQ2_XXS×17 + IQ2_XS×7`（40 层里），
+IQ1_M 是最多的。**这是第一次有一个具体、可信、占据 64% 的目标。**
+
