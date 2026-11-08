@@ -1640,7 +1640,7 @@ pub fn print_summary_if_enabled() {
     );
     let _ = writeln!(
         out,
-        "host orchestration: backend_executes={} execute_wall={} avg_execute={} setup_calls={} setup_time={} avg_setup={} recorder_acquires={} acquire_time={} avg_acquire={} recorded_segments={} record_lifetime={} record_dispatches={} avg_record_per_segment={}",
+        "host orchestration: backend_executes={} execute_wall={} avg_execute={} setup_calls={} setup_time={} avg_setup={} recorder_acquires={} acquire_time={} avg_acquire={} recorded_segments={} record_lifetime={} record_dispatches={} avg_record_per_segment={} attributed={} unattributed={}",
         s.backend_executes,
         fmt_ns(s.backend_execute_ns),
         fmt_ns(s.backend_execute_ns.checked_div(s.backend_executes).unwrap_or(0)),
@@ -1661,6 +1661,25 @@ pub fn print_summary_if_enabled() {
             s.command_record_ns
                 .checked_div(s.command_record_segments)
                 .unwrap_or(0)
+        ),
+        // Sum of every host-side interval already counted elsewhere. `execute_wall` minus this
+        // is host time nothing in the profile attributes - the window worth sampling when the GPU
+        // is idle but no counter explains why.
+        fmt_ns(
+            s.backend_setup_ns
+                .saturating_add(s.command_recorder_acquire_ns)
+                .saturating_add(s.command_record_ns)
+                .saturating_add(s.queue_submit_ns)
+                .saturating_add(s.sync_wait_ns),
+        ),
+        fmt_ns(
+            s.backend_execute_ns.saturating_sub(
+                s.backend_setup_ns
+                    .saturating_add(s.command_recorder_acquire_ns)
+                    .saturating_add(s.command_record_ns)
+                    .saturating_add(s.queue_submit_ns)
+                    .saturating_add(s.sync_wait_ns),
+            ),
         ),
     );
     let _ = writeln!(
