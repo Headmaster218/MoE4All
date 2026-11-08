@@ -2,52 +2,56 @@
 
 ---
 
-## Round 52：真机复测 —— prefill 12 → 25 tok/s（2.1 倍），确认
+## Round 53：decode 瓶颈诊断 —— 不是带宽，是同步
 
-### 两个修复都进了二进制
+### 先纠正我自己的一个错误推论
 
-之前那次 2.1 倍是在**坏 shader** 下量的，所以复测前先确认二进制时间戳晚于修复提交。
+看到 `dma=54 MiB/层`，我算出「每 token 2.1 GiB，需要 59 GiB/s」。
+**这个推论是错的**——那 54 MiB 是 prefill 大 batch 的量，不是 decode 的。
 
-### 模型说明（容易搞错）
-
-`dsv41-uncensored-iq2xxs` 这个目录名是误导的。解析 GGUF 头：
-
-```
-exps 张量类型分布: {'IQ1_M': 30, 'IQ2_XXS': 8}
-blk.0.ffn_gate_exps.weight   IQ1_M  [5120, 2304, 384]
-blk.0.ffn_down_exps.weight   IQ1_M  [2304, 5120, 384]
-```
-
-**30/38 的专家张量是 IQ1_M**，不是 IQ2_XXS。修复针对的正是这条路径。
-
-### 测量
+### decode 实测（12 token，ctx 4096）
 
 ```
-INFR_DSV41_BATCHED_PREFILL=1 ./target/release/infr run <model> "$(cat /tmp/p512.txt)" \
-  --max-new 1 --temp 0 --ctx 4096 --ubatch 256 --dev Vulkan1
+decode 12 tok @ 6.2 tok/s
+gpu cache: hits=19420 misses=12980 hit_rate=59.9%
+device queue timeline: span=4.40s  main_busy=2.86s  outside=1.54s
 ```
 
-| | prefill |
+| 项 | 值 |
 |---|---|
-| 修复前（坏 shader） | 731 tok @ **12 tok/s**（62,630 ms） |
-| 修复后（两个修复都进） | 1431 tok @ **25 tok/s**（57,136 ms） |
+| GPU 利用率 | **65%** |
+| GPU 空闲 | **1.54s（35%）** |
 
-**约 2.1 倍**，与旧 shader 下量的 2.16 倍一致。
+### 空闲在哪：sync 拆解
 
-两次 token 数不同（731 vs 1431）是因为提示词文件重新生成过；**可比的是速率**。
+```
+sync: waits=1149  total=3.88s
+  ├─ fence           628 次  2.25s   avg 3.58ms/次
+  ├─ queue_wait_idle 521 次  1.63s
+  └─ paging_explicit 520 次  1.64s
+```
 
-### 一个当初值得怀疑的点
+**12 个 token 等 628 次 fence —— 每 token 52 次同步，每次 3.58ms。**
 
-**坏 shader 下时长明明改善了，输出却是错的。**
-这恰好说明：**加速是真实的，只有结果是坏的**——两者独立。
+### 已验证：专家缓存不是瓶颈
 
-### decode 仍是 4.6 tok/s
+`INFR_MOE_SIZE_CACHE_BIAS=2.0`（日志确认 `+2.00 (explicit)` 生效）：
 
-还没碰。对标 poorseek 的 ~27.7 需要更多工作，而且**不是同口径**：
-poorseek 用 `--route-bias 1.0`（近似路由）+ RTX 4090 + 90 GB DDR4。
+| | decode |
+|---|---|
+| bias off | 6.2 tok/s |
+| bias 2.0 | **6.2 tok/s** |
 
-### 下一步
+**完全没变。** 所以「提高命中率」这条路是死的。
 
-decode 路径。当前 4.6 tok/s，差距在专家换入（`single-decode-layer` 显示
-`paging_sync` 占每层 wall 的 90%+）。
+### 结论
+
+decode 慢在**同步次数**，不在传输量、不在缓存命中率。
+
+下一刀应该数 fence 是谁发的、能不能合并。
+
+### 一个诚实的说明
+
+这轮我先推错了带宽结论，是被 `main_busy` vs `span` 的差值纠正过来的。
+**又一次：「先算了个像样的数」不如「先看一个实测的分解」。**
 
