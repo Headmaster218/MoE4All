@@ -2,56 +2,65 @@
 
 ---
 
-## Round 53：decode 瓶颈诊断 —— 不是带宽，是同步
+## Round 54：fence 等待的源头 —— 每层一次全队列 wait-idle
 
-### 先纠正我自己的一个错误推论
+### 代码事实
 
-看到 `dma=54 MiB/层`，我算出「每 token 2.1 GiB，需要 59 GiB/s」。
-**这个推论是错的**——那 54 MiB 是 prefill 大 batch 的量，不是 decode 的。
+`crates/infr-vulkan/src/adapter.rs:16250` 构造等待线程时：
 
-### decode 实测（12 token，ctx 4096）
-
-```
-decode 12 tok @ 6.2 tok/s
-gpu cache: hits=19420 misses=12980 hit_rate=59.9%
-device queue timeline: span=4.40s  main_busy=2.86s  outside=1.54s
-```
-
-| 项 | 值 |
-|---|---|
-| GPU 利用率 | **65%** |
-| GPU 空闲 | **1.54s（35%）** |
-
-### 空闲在哪：sync 拆解
-
-```
-sync: waits=1149  total=3.88s
-  ├─ fence           628 次  2.25s   avg 3.58ms/次
-  ├─ queue_wait_idle 521 次  1.63s
-  └─ paging_explicit 520 次  1.64s
+```rust
+waiter: if cfg.decode_gpu_resident_waiter {
+    Some(Arc::new(crate::recorder::FenceWaiter::new(
+        Arc::clone(&be_.shared),
+        !cfg.decode_gpu_resident_fence_wait,   // <-- queue_idle
+    )?))
+}
 ```
 
-**12 个 token 等 628 次 fence —— 每 token 52 次同步，每次 3.58ms。**
+`FenceWaiter` 的等待线程（`recorder.rs:17158`）：
 
-### 已验证：专家缓存不是瓶颈
+```rust
+let result = if queue_idle {
+    shared.queue_wait_idle_serialized()   // 整个队列同步
+} else {
+    Ok(())
+}
+.and_then(|()| unsafe { shared.device.wait_for_fences(&[job.fence], ...) });
+```
 
-`INFR_MOE_SIZE_CACHE_BIAS=2.0`（日志确认 `+2.00 (explicit)` 生效）：
+而 `decode_gpu_resident_fence_wait` 的默认值是 **`false`**（`config/mod.rs:447`）。
 
-| | decode |
-|---|---|
-| bias off | 6.2 tok/s |
-| bias 2.0 | **6.2 tok/s** |
+### 于是默认路径是
 
-**完全没变。** 所以「提高命中率」这条路是死的。
+**每一次 fence 等待之前，先对整个 Vulkan 队列做一次 `queue_wait_idle`。**
 
-### 结论
+对应 Round 53 的实测：
 
-decode 慢在**同步次数**，不在传输量、不在缓存命中率。
+```
+sync: waits=1149 total=3.88s
+  ├─ queue_wait_idle 521 次  1.63s   <- 就是这个
+  └─ fence           628 次  2.25s
+```
 
-下一刀应该数 fence 是谁发的、能不能合并。
+### 源码注释自己说明了代价
 
-### 一个诚实的说明
+```
+/// Optional host wait producer. Fence mode leaves the Vulkan queue mutex available to
+/// submits; the queue-idle comparator uses the ordinary serialized gate and can delay
+/// further submits.
+```
 
-这轮我先推错了带宽结论，是被 `main_busy` vs `span` 的差值纠正过来的。
-**又一次：「先算了个像样的数」不如「先看一个实测的分解」。**
+**全队列 wait-idle 会占住队列锁，延迟后续 submit** —— 所以它不只是等，还在**阻断流水线**。
+
+### 这就是一个 A/B 就能验的开关
+
+`decode_gpu_resident_fence_wait = true` 会切到「只等自己那个 fence、不等整个队列」。
+
+**但 `--set decode.gpu_resident_fence_wait=true` 报 `unknown config path`** ——
+这批字段是宏生成的，配置路径前缀还没查清。**下一轮第一件事就是把路径试对，然后跑 A/B。**
+
+### 自我批评
+
+这轮我在「试配置路径」上又磨了一段时间，**和上一轮磨日志开关是同一个毛病（第三次）**。
+好在核心事实是从源码直接读出来的，不依赖把开关点着。
 
