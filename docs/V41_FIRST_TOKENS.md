@@ -2,53 +2,40 @@
 
 ---
 
-## Round 56：GPU 时间轴碎片化 —— 每层 2.39 段、每段间空 1.34ms
+## Round 56（续）：A/B 否定 —— staging ring 槽数无关
 
-### 数据
+`INFR_PAGER_RING_SLOTS` 2（默认）vs 8：
 
 ```
-decode 12 tok @ 6.2 tok/s
-span = 4.41s
-main_intervals = 1149        <- GPU 作业段数
-main_busy      = 2.86s
-outside        = 1.54s       <- 段与段之间的空档
+              slots=2 (默认)      slots=8
+decode        6.2 tok/s           6.2 tok/s
+main_intervals 1149               1149
+main_busy     2.86s               2.86s
+outside       1.54s               1.55s
+dma_hidden    0.0%                0.0%
+staging ring  acquisitions=0      acquisitions=0
 ```
 
-推导：
+**三项完全一致。**
 
-| 量 | 值 |
-|---|---|
-| 每 token 段数 | 1149 / 12 = **96** |
-| 每层段数 | 1149 / (12×40) = **2.39** |
-| 平均每段 busy | **2.49 ms** |
-| 平均每段空档 | **1.34 ms** |
-| 空档 / busy | **0.54** |
+### 决定性的一点
 
-**GPU 每干 2.5ms 就要停 1.3ms。**
+**`staging ring: acquisitions=0` —— 这个 ring 从头到尾一次都没被用过。**
 
-### 已排除的解释
+所以 1.54s 的空档**不是** staging ring 造成的，增加槽位自然也没有意义。
 
-`record_lifetime = 400.6ms`，只占 span 的 9%，**不足以解释 1.54s 空档**。
-所以不是"CPU 记录太慢"这一个简单答案。
+### 这条线索关闭
 
-### 另一个可疑点
+第 6 个被 A/B 否掉的假设。
 
-`dedicated DMA: gpu_timed_submits=0 gpu_timed_bytes=0`、`dma_busy=0ns`。
+### 现在剩下的候选
 
-**DMA 完全不在 GPU 时间轴里统计。** 如果 decode 期间真的有 DMA 在传专家，
-那段传输时间不会出现在 `main_busy`，而会以"空档"的形式算进 `outside`。
+空档 = GPU 两次 `main_intervals` 之间的时间。已知：
+- 不是 CPU 记录（只占 9%）
+- 不是 staging ring（从未使用）
+- 不是全队列同步（Round 55 已否）
+- DMA 计时为 0，无法直接观测
 
-**这正好解释了 1.54s 空档的可能来源：GPU 在等 DMA 传完，但计时器看不到。**
-
-### 下一步（可 A/B）
-
-如果是 DMA 在占空档，做法是把传输和计算**重叠**起来（`dma_hidden` 目前是 0.0%）。
-`INFR_PAGER_RING_SLOTS` 控制 staging ring 槽数——槽多了才可能重叠。
-
-如果槽数已经足够而仍未重叠，那就是同步结构的问题，不是资源问题。
-
-### 说明
-
-这轮我没能让 `INFR_PROF_OPS` 工作（`infr_profile` feature 没编进二进制），
-并且判断它即使能用也只说明"忙在哪"，**答不了"为什么闲"**——所以没有为它专门编译。
+**下一个该查的是 `main_intervals` 为什么被切成 1149 段、每层 2.39 段。**
+如果能把每层的段数降到 1，即使空档不变，也能省掉一半的切换。
 
