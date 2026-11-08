@@ -1178,3 +1178,62 @@ prefill 走的是 `execute_static`，而 `profile_single` 只在 prefill **之�
 所以上面这组数还没覆盖 prefill 的 62 秒。下一步是把同样的
 `backend_execute / gpu_union / host_accounted / residual` 在 **prefill 的 chunk 循环内**累加输出，
 直接得到那 62 秒的闭环归因。
+
+---
+
+## Round 17：syscall 层视角 —— futex 主导，`pread64` 是加载不是推理（2026-11-08 10:04）
+
+### Round 16 留下的靶子
+
+`execute_static_walk` 里，59.19 s 层 wall 中 sync=0、record=1.6 s，**57.5 s 未归因**。
+
+### 换到操作系统视角
+
+`/usr/bin/time -v`（731-token prompt）：
+
+```
+User time   (seconds):  17.53
+System time (seconds): 158.26      <-- 9 倍于 user
+Percent of CPU:         136%
+Elapsed (wall):         129.24 s
+```
+
+**CPU 时间几乎全在内核态。** 这不是 ALU 计算，也不是空等 GPU。
+
+### strace -c 的归因
+
+```
+% time   seconds  usecs/call   calls  errors  syscall
+ 64.65  1085.1     25634      42330    7012   futex
+ 34.12   572.7   1188196        482          pread64
+  0.90    15.1        49     302221          sched_yield
+  0.12     2.1      186       11017       5  ioctl
+```
+
+**`futex` 占 64.65%，`pread64` 占 34.12%。**
+
+### 我两次误判 `pread64`，最后算清了
+
+1. 先猜「推理期在从磁盘读专家」——查到 `pravd64` 持续到进程退出前一刻、最后 10 秒还有 96 次，看起来像。
+2. 再一算总量：**482 × 327,352,320 B = 146.9 GiB**，而模型四个分片合计 **129.1 GiB**。
+   **这就是模型加载**（还有元数据等余量）。它出现在末尾是因为加载与推理异步重叠。
+
+**所以 `pread64` 不属于推理期成本，已排除。** 这一条如果没算总量就写进结论，会是本会话第六次错误归因。
+
+### 站得住的结论
+
+- **`futex` 42330 次、7012 次错误** —— 这是线程同步开销，占 cpu 时间的大头
+- `sched_yield` 302221 次 —— 大量让出/重试，与 futex 竞争一致
+- CPU 时间主要在内核态、由**锁竞争**产生，而不是在算东西
+
+这给了一个新的、具体的方向：**prefill 的 57.5 s 大概率花在线程间同步等待上**，
+这与 Round 16 看到的「层 wall 大、但 sync/record 小」是吻合的——
+时间不在 GPU 命令上，也不在 paging_sync 上，而在 **host 侧的线程协调**。
+
+### 下一步
+
+定位那 42330 次 futex 属于哪个组件。候选：rayon 并行（`sched_yield` 30 万次很像）、
+pager 的锁、PLE worker。查到后才知道能不能降。
+
+**注意**：本轮结论比前几轮弱——它是「指向主机侧同步」的方向性证据，
+还不是「这 57.5 s 精确分解」。不要再往下推成精确结论。
