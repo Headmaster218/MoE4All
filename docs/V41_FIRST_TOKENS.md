@@ -2,72 +2,70 @@
 
 ---
 
-## Round 78（续）：`hc_mult` 也被排除了 —— 移植是完整的
+## Round 79：IQ1_M 解码逐字段核对 —— 五个字段全对
 
-### 参考实现的实际算法（`deepseek4.cpp:352` `build_hc_mixes`）
+### 参考实现（`ggml-quants.c:2732` `dequantize_row_iq1_m`）
 
-V4.1 复用 V4 的这套：
-
-```cpp
-flat      = reshape(x, [hc_dim, nt])              // hc_dim = 4*n_embd
-flat_norm = rms_norm(flat)
-mixes     = hc_fn @ flat_norm                     // 24 个系数 = (2+4)*4
-
-pre  = sigmoid(affine(mixes[0..4],   scale[0], base[0..4])  + eps)
-post = 2 * sigmoid(affine(mixes[4..8], scale[1], base[4..8]))
-comb = sinkhorn(mixes[8..24], scale[2], base[8..24])        // 4x4 混合矩阵
+```c
+scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+for (ib = 0; ib < QK_K/32; ++ib) {
+    dl1 = d * (2*((sc[ib/2] >> (6*(ib%2) + 0)) & 0x7) + 1);
+    dl2 = d * (2*((sc[ib/2] >> (6*(ib%2) + 3)) & 0x7) + 1);
+    idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+    idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+    idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+    idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+    delta[0] = qh[0] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
+    delta[1] = qh[0] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
+    delta[2] = qh[1] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
+    delta[3] = qh[1] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
+}
 ```
 
-### 本项目的对应实现（`runner.rs:5809`）
+### 本项目（`native_gemm_mmq_iq1_m.comp`）
 
-```rust
-Op::RmsNorm { x: res, weight: ones, dim: hcw, ... }     // ones = hc_ones，全 1 向量
-Op::Linear  { weight: t.w_fn, out_f: (2 + hc_mult) * hc_mult, ... }
-Op::HyperConnectMix { mixes, scale: t.scale, base: t.base,
-                      pre: mix_pre, gates: Some(HyperGates { post, comb }),
-                      hc, eps, n_iter: hc_sinkhorn_iters }
-```
+| 字段 | 参考 | 本项目 | 结论 |
+|---|---|---|---|
+| `d` 位打包 | `(sc0>>12)\|((sc1>>8)&0x00f0)\|((sc2>>4)&0x0f00)\|(sc3&0xf000)` | :194-195 **逐字相同** | ✅ |
+| scales 偏移 | `scales[4]` 在块尾 | `bd+48..56` 处的四个 u16 | ✅ |
+| `dl1` | `d*(2*((sc>>6*(ib%2))&7)+1)` | `d*(2*((scl>>sh)&7)+1)`，`sh=6*(ib&1)` | ✅ |
+| `dl2` | `d*(2*((sc>>6*(ib%2)+3)&7)+1)` | `d*(2*((scl>>(sh+3))&7)+1)` | ✅ |
+| idx l=0 | `qs\|((qh0<<8)&0x700)` | :229 相同 | ✅ |
+| idx l=1 | `qs\|((qh0<<4)&0x700)` | :230 相同 | ✅ |
+| idx l=2 | `qs\|((qh1<<8)&0x700)` | :231 相同 | ✅ |
+| idx l=3 | `qs\|((qh1<<4)&0x700)` | :232 相同 | ✅ |
+| delta 符号 | `qh0&0x08 / 0x80`，`qh1&0x08 / 0x80` | :207-210 相同 | ✅ |
 
-**逐项对上**：
-- flatten + RMSNorm 用的是 `hc_ones`（weight 为全 1，等价于纯归一化）—— 这是**故意的权重力学技巧**，
-  `runner.rs:3587-3591` 的注释解释过 `x * s * 1.0 == x * s`
-- `out_f = (2+hc)*hc = 24` —— 与参考实现一致
-- `sigmoid` / `2*sigmoid` / `Sinkhorn` 全部在 `Op::HyperConnectMix` 内
-- `n_iter = hc_sinkhorn_iters` —— 与 `dsv4_hc_sinkhorn_iters` 一致
+**五个字段、九处细节，全部一致。**
 
-### 而且注释还处理了 V4.1 独有的时序差异
-
-`runner.rs:5805-5808`：
-
-> *"DeepSeek V4.1 consumes a mix one sublayer BELOW the one that computes it:
-> a sublayer runs the matmul but collapses `res` with its PREDECESSOR's weights
-> (`deepseek41.cpp` 843-886). V4 does both in the same sublayer."*
-
-**这个滞后语义也移植了。** V4.1 的 HEAD 复用最后一层 FFN mix（`deepseek41.cpp` 919-923）也在注释里。
-
-### 结论：`hc_mult` 候选排除
+### 四个候选，全部排除
 
 | 候选 | 状态 |
 |---|---|
-| 34 复用层 / compressor 属主 | ❌ 排除（Round 75） |
-| 角色语义 | ❌ 排除（Round 75） |
-| **hc_mult 残差** | ❌ **排除（本轮）** |
-| **IQ1_M 专家 dequant** | ⬅ **唯一剩下的** |
+| 34 复用层 / compressor 属主 | ❌ Round 75 |
+| 角色语义 | ❌ Round 75 |
+| hc_mult 残差 | ❌ Round 78 |
+| **IQ1_M 解码** | ❌ **本轮** |
 
-### 剩下这一个为什么重要
+### 这意味着什么
 
-`grid_mmq_parity` 声称 IQ1_M 与 host 一致，但**两边是实现同一套解码**。
-如果那套解码本身错了（比如 IQ1_M 的 `d0` 位序、grid 索引移位），两边会一起错，测试照样通过。
+**我列的四个候选，没有一个是根因。**
 
-**而 IQ1_M 占专家权重的 79%（30/40 层的 exps 张量）。** 它错了，整个模型就废了——
-这与观测到的"全局性套话输出"完全吻合。
+`runner.rs` 里 V4.1 的组件实现、参考实现的移植、量化解码——逐段核对下来都是对的。
 
-### 下一步
+**那问题在哪？**
 
-逐字段比对 IQ1_M 解码：
-- `dequant.rs` 里的 IQ1_M 实现
-- 参考实现（llama.cpp 的 `ggml-quants.c` 或这个 fork）的 IQ1_M
-- 重点看 `d` 的位打包、四个 grid 索引的移位、delta 符号
+可能性重新回到我最初排除的那几类：
+1. **不是"某个组件算错"，而是"某个组件根本没被调用"或"调用顺序错了"**
+2. **张量绑定错位**（例如某个权重上传后 slot 偏移一格，这与 IQ1_M 那个 LUT 缺陷同类）
+3. **engram**（我按影响面排除了，但"影响面小"不等于"不影响"——2 层出错足以污染整条残差流）
 
-**这是唯一还没被排除的候选，而且它影响面最大。**
+### 第 3 条值得重新考虑
+
+Round 73 我用"engram 只有 2 层（ids 1, 14）"排除了它。
+
+**但这个推理有漏洞**：残差流是逐层累积的，**第 1 层出错会污染后面全部 39 层**。
+"只有 2 层"说的是 engram 注入点少，不是"错误影响小"。
+
+**这不是我能靠读代码确定的，但它把 engram 重新排到了候选第一位。**
 
