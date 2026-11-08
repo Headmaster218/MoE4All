@@ -727,21 +727,23 @@ fn run_expert_gemm_parity(dt: DType) {
         eprintln!("skip: no Vulkan device");
         return;
     };
-    // IQ1_M is driven with real weights, which are one 256-element block per expert: k*n = 256.
-    let (k, n, n_expert) = if dt == DType::Iq1M {
-        (256usize, 1usize, 5usize)
-    } else {
-        (256usize, 64usize, 5usize)
-    };
+    // The kernels require n % 64 == 0 (see the shaders' "Requires n%64, k%32" headers), so IQ1_M
+    // must also run at n=64. I first tried n=1 to make one real block per expert and got all
+    // zeros - that was MY violation of the kernel contract, not a defect. Each expert now carries
+    // k*n = 256*64 elements by tiling the five real blocks across its bank.
+    let (k, n, n_expert) = (256usize, 64usize, 5usize);
     let stride = k * n;
 
     let banks: Vec<Vec<u8>> = if dt == DType::Iq1M {
-        // Real weights (see REAL_IQ1M_BLOCKS): one 256-element block per expert, so each
-        // expert's bank is exactly k*n = 256 elements. n is reduced to 1 to honour that.
-        assert_eq!(k, 256, "REAL_IQ1M_BLOCKS carries exactly one 256-element block per expert");
-        assert_eq!(n, 1, "IQ1_M real-weight case drives a single output column");
+        // Real weights (see REAL_IQ1M_BLOCKS). One block is 256 elements; the bank needs
+        // k*n = 256*64, so the expert's block is tiled (k/256)*n times. Tiling keeps the data
+        // real - every 256-element group is genuine GGUF bytes - while satisfying n%64.
+        let blocks_per_expert = (k / 256) * n; // 64 here
         (0..n_expert)
-            .map(|e| REAL_IQ1M_BLOCKS[e * 56..(e + 1) * 56].to_vec())
+            .map(|e| {
+                let blk = &REAL_IQ1M_BLOCKS[e * 56..(e + 1) * 56];
+                blk.iter().cycle().take(blocks_per_expert * 56).copied().collect()
+            })
             .collect()
     } else {
         (0..n_expert)
