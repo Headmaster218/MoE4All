@@ -78,6 +78,24 @@ Measured, not guessed — each of these came out of an A/B that failed to move t
 - **MTP cannot be exercised with this checkpoint.** The code path is complete, but the
   GGUF carries no mtp/draft/nextn head (42 tensors, none of them).
 
+## How to check whether it works
+
+```
+scripts/check-v41-answers.sh <control.gguf> <v41.gguf>
+```
+
+Runs a known-answer prompt through both checkpoints. The control is the point: without it a
+V4.1 failure could equally be an engine fault, and "the output looks wrong" depends on the
+reader already knowing the answer. Current result:
+
+```
+PASS  control  qwen2.5-1.5b-q4_k_m   "2+2=4"
+FAIL  default  V4.1                  "We need answer. The question is"
+FAIL  batched  V4.1                  "The user wants me to translate the analysis"
+```
+
+Until this passes, no throughput figure in this branch measures a working model.
+
 ## Testing
 
 - `grid_mmq_parity`: `iq1m_expert_gemm_matches_host` and
