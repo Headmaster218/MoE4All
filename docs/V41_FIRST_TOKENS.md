@@ -2,48 +2,50 @@
 
 ---
 
-## Round 63（续）：ubatch 是 prefill 与 decode 的真实权衡
+## Round 64：撤回 Round 62 的带宽天花板结论
 
-### A/B（同一模型、同一 prompt）
+### 我用错了带宽上限
 
-| ubatch | prefill | decode | hit_rate |
-|---|---|---|---|
-| **256**（默认） | 25 tok/s | **6.2 tok/s** | 61.0% |
-| **512** | **27 tok/s** | **5.5 tok/s** | **51.8%** |
+Round 62 说「decode 的 6.6 GB/s 相对 9.5 GB/s 上限已用 70%，本机天花板约 9 tok/s」。
 
-### 结果解读
+**那个 9.5 GB/s 是错的。** 它来自本机**另一个引擎（Strata）的 PCIe probe**，
+且是离散 GPU 的 host→device 单向读数。本机是 **Intel Arc（BMG G31），走统一内存**。
 
-- **prefill 快了 8%**（25 → 27）
-- **decode 慢了 11%**（6.2 → 5.5）
-- **命中率反而下降**（61.0% → 51.8%）
+### 本仓库自己的探针
 
-### 为什么命中率会下降
+```
+cargo test -p infr-vulkan probe_zero_fill_bandwidth_by_size -- --ignored --nocapture
+```
 
-我原本预期「arena 变大 → 更多专家常驻 → 命中率上升」。
+```
+zero-fill [CpuToGpu] mib= 32  ms=0.369  GBps= 89.46
+zero-fill [CpuToGpu] mib= 47  ms=0.293  GBps=112.74
+zero-fill [GpuOnly]  mib= 32  ms=0.722  GBps= 45.78
+zero-fill [GpuOnly]  mib= 47  ms=0.728  GBps= 45.36
+```
 
-**实际相反。** 可能的原因：arena 变大后，缓存策略的驱逐粒度也变了，
-或者大 arena 下的划分让**单位时间内的复用机会变少**。
+### 正确的对比
 
-**具体机制还没查清，但方向明确：ubatch 增大并不改善 decode 的命中率。**
+| | 带宽 | decode 6.6 GB/s 占比 |
+|---|---|---|
+| CpuToGpu（上限） | **112.74 GB/s** | **5.9%** |
+| GpuOnly | 45.36 GB/s | 14.6% |
 
-### 结论
+**decode 只用了带宽的 6%–15%。根本不是带宽受限。**
 
-**ubatch 256 是 decode 的最优点，512 是 prefill 的最优点。**
+### 结论反转
 
-这不是 bug，是两者对 batch 大小的相反需求：
-- prefill 要大批次（提高并行度）
-- decode 要小批次（减少每 token 的换入压力）
+| Round 62 的说法 | 实际情况 |
+|---|---|
+| 上限约 9 tok/s | **错误** |
+| 27.7 需要 34.4 GB/s，本机给不了 | **本机给得起（上限 112）** |
+| decode 已用 70% 带宽 | **只用 6%** |
 
-### 可行动的建议
+**所以「decode 已到硬件极限」这个结论作废。** 还有大量空间，只是我还没找到瓶颈在哪。
 
-**按用途分别配置**：prefill 密集场景用 `--ubatch 512`（+8%），
-交互式 decode 场景用默认 256。
+### 教训
 
-**这也说明 25 vs 27 tok/s 的 prefill 差距是可以拿到的**，只要场景匹配。
-
-### 到此为止的判断
-
-在**单一配置**下，已经没有进一步的调优空间：
-- decode 6.2（带宽 70%）
-- prefill 25（ubatch 256）/ 27（ubatch 512）
+**用别的引擎/别的硬件测出的数字来判定当前系统的上限，是错的。**
+必须用本仓库自己的探针，而且要注意该探针测的是什么（zero-fill 的 GpuOnly 是写带宽，
+CpuToGpu 是传输带宽，两者不同）。
 
