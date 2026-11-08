@@ -2,41 +2,43 @@
 
 ---
 
-## Round 90–91：bind 没做成，但我把卡点定位清楚了
+## Round 94：上传点找错了路径
 
-### 做到哪一步
+### 我插探针的位置属于 qwen4exp
 
-| 步骤 | 状态 |
+第 0 层的 bind 后面紧跟 `be.execute`，看起来是上传的正确位置。但细看那段代码：
+
+```rust
+let worker = ple_worker
+    .as_ref()
+    .ok_or_else(|| anyhow!("qwen4exp session has no PLE worker"))?;
+for (&lane, range) in batch_lanes.iter().zip(&ranges) {
+    ids.extend(parallel.prompts[lane][range.clone()].iter().map(|&token| token as i32));
+    tickets.push(worker.submit_range(...));
+}
+```
+
+**`ple_worker` 是硬性要求，没有它直接报错。** 这段只会跑在 qwen4exp 上——**V4.1 根本不进这里**。
+
+所以 `ids`、`batches`、`ple_rows` 这些变量对 V4.1 无意义，我差点把 engram 的 gather 接在一条 V4.1 永不执行的路径上。
+
+### 已确认可用的部分
+
+| 事实 | 状态 |
 |---|---|
-| 声明 input | ✅ `eedad6c` |
-| 发射计算 | ✅ `3557766` |
-| 分配 buffer | ✅ `fb01704` |
-| **bind** | ❌ **放弃** |
-| host gather | ❌ 未开始 |
+| `cached`（已处理 token，`SeamKv::cached_tokens`）在调用点可见 | ✅ 探针验证通过 |
+| `engram_emb_buf` 在 7 个调用点都可见 | ✅ |
+| `gather_for_layer` 编译通过 | ✅ |
 
-### bind 为什么卡住
-
-要 bind，得让 `engram_emb_buf` 到达 `bind_parallel_layer_io` 内部。它接收 `primary_ple_embd` 这类参数，而该函数有 **7 个调用点**，层层套在 `generate_dense_backend_inner` 的嵌套块里。
-
-**我试了把 `engram_emb_buf` 沿这条链传下去，失败两次：**
-
-1. **第一次**：改 `bind_layer_io` 签名 → 发现它有 **10 个调用点**，立刻撤销
-2. **第二次**：改 `bind_parallel_layer_io` 签名 + 7 个调用点传参 → 编译器报 7 处 `cannot find value engram_emb_buf`
-
-第 2 次报错让我困惑了很久，因为我确认分配（`3907`）和调用点（`9479`）在同一个函数里，`ple_embd_buf`（`3896`）明明能被看到。
-
-**真实原因我没找出来。** 可能是某个我没识别出的块边界，也可能是我插入的位置被 `git checkout` 前的某次编辑污染了。
-
-### 我这一轮的判断失误
-
-**在一个 14000 行文件的深层嵌套里做参数穿透，风险远大于收益。** 我已经在两个不同的地方踩了同一个坑（第一次 10 个调用点、第二次 7 个调用点），每次都要花好几轮编译-报错-再编译。
-
-**正确做法本来应该是**：不动任何函数签名，直接在那 7 个调用点旁边各写一句 `bindings0.bind(h.engram_emb, ...)`。调用点里 `h0`/`h1` 就在手边，`ple_embd_buf` 也可用，**根本不需要传参**。
+**缺的是"V4.1 的 prefill 走哪条路径"这个认知。**
 
 ### 这一轮的实际产出
 
-**工作树干净、编译通过**（2 个原有警告）。三个 feat 提交都在，逻辑完整：
-声明 → 计算 → 缓冲。
+- 排除了一个错误的接线位置（比接错后再 debug 便宜得多）
+- 确认 `cached` 在调用点可用，下一轮直接用
+- 工作树干净、编译通过
 
-**bind 是独立的一小块**，下一轮用「调用点旁直接 bind」的方式做，不再碰签名。
+### 下一步
+
+找 V4.1 的实际 prefill 路径，把 gather 接在**真正执行**的那条上。
 
