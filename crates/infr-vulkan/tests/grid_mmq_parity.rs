@@ -690,8 +690,12 @@ fn iq1m_expert_gemm_matches_host() {
     // IQ2_S is the CONTROL: it goes through the exact same dispatch path and is already a
     // trusted member of MOE_MMQ_DTYPES. If IQ2_S passes here and IQ1_M returns zeros, the
     // harness is sound and the defect is in the IQ1_M kernel/bank layout - not the test.
+    // SINGLE EXPERT FIRST: `wbase = pc.w_base + ex * pc.m` is round 38's remaining suspect, and
+    // with one expert that term is `0 * pc.m = 0` whatever pc.m means. Run it before the
+    // 5-expert case so its verdict is not masked by a panic in the later one.
+    run_expert_gemm_parity(DType::Iq1M, 1);
     for dt in [DType::Iq2S, DType::Iq1M] {
-        run_expert_gemm_parity(dt);
+        run_expert_gemm_parity(dt, 5);
     }
 }
 
@@ -722,7 +726,7 @@ const REAL_IQ1M_BLOCKS: [u8; 280] = [
         0xad, 0x86, 0x1b, 0xd7, 0x2a, 0x99, 0xfd, 0x1c,
 ];
 
-fn run_expert_gemm_parity(dt: DType) {
+fn run_expert_gemm_parity(dt: DType, n_expert: usize) {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -731,7 +735,7 @@ fn run_expert_gemm_parity(dt: DType) {
     // must also run at n=64. I first tried n=1 to make one real block per expert and got all
     // zeros - that was MY violation of the kernel contract, not a defect. Each expert now carries
     // k*n = 256*64 elements by tiling the five real blocks across its bank.
-    let (k, n, n_expert) = (256usize, 64usize, 5usize);
+    let (k, n) = (256usize, 64usize);
     let stride = k * n;
 
     let banks: Vec<Vec<u8>> = if dt == DType::Iq1M {
@@ -761,7 +765,7 @@ fn run_expert_gemm_parity(dt: DType) {
     be.upload(w.as_ref(), &padded).unwrap();
 
     // 200 rows -> avg 40/expert -> BM=64 path.
-    let counts_host = vec![50u32, 40, 45, 35, 30];
+    let counts_host: Vec<u32> = (0..n_expert).map(|i| 50u32 - 5 * i as u32).collect();
     let offsets_host: Vec<u32> = {
         let mut acc = 0u32;
         counts_host
