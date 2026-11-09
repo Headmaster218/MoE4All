@@ -10381,12 +10381,18 @@ fn generate_dense_backend_inner(
             for lane in 0..lanes {
                 let start_pos = parallel.prepared[lane].start;
                 let end = start_pos + rows_per_lane;
+                // Everything this lane consumed before the window is its predecessor history;
+                // the window itself is what this forward is about to eat.
+                history.extend(
+                    parallel.feeds[lane][..start_pos]
+                        .iter()
+                        .map(|&id| id as u32),
+                );
                 batch_toks.extend(
                     parallel.feeds[lane][start_pos..end]
                         .iter()
                         .map(|&id| id as u32),
                 );
-                let _ = &mut history;
             }
             for &(layer, id) in &h1.engram_emb {
                 let _ = id;
