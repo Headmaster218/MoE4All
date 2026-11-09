@@ -2570,7 +2570,7 @@ mod tests {
             qwen_wide_buf: None,
             ple_embd_buf: None,
             ple_state_buf: ple_state,
-            engram_emb_buf: None,
+            engram_emb_buf: Vec::new(),
             mtp_verify_bufs: None,
             max_ctx: 16,
             kv_ring: false,
