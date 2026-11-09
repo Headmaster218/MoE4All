@@ -2,71 +2,63 @@
 
 ---
 
-## Round 106：发现设计缺陷 —— 两个 engram 层共用一个 input 张量
+## Round 107：按层拆分改造 —— 失败并回退
 
-### 证据链
+### 做了什么
 
-**① `row_indices` 按 `slot` 切片**（`engram.rs:211-213`）：
+尝试把 `engram_emb` / `engram_emb_buf` 从单张量改成按层（`Vec<(u32, TensorId)>`），
+涉及 3 处声明、2 处分配、`bind_layer_io` / `bind_parallel_layer_io` 两处签名、20 个调用点。
 
-```rust
-let base = self.slot * self.n_gram;
-let mult = &self.multipliers[base..base + self.n_gram];
-...
-let bucket_base = self.slot * self.n_bucket();
+### 失败过程
+
+| 阶段 | 错误数 |
+|---|---|
+| 改 3 处声明 | 20 个位置报错（预期） |
+| 改 2 处分配 | 37 |
+| 改 `bind_layer_io` 签名+函数体 | 37（调用点还没跟上） |
+| 改 `engram_emb` 生成处 | 37 |
+| 改 `engram_apply` + 调用点 | 37 |
+| 统一类型为 `(u32, Box<dyn Buffer>)` | 26 |
+| **脚本批量改调用点** | **34（涨了）** |
+| 修一处漏改的签名 | 33 |
+| **回退** | **0** |
+
+### 失败原因
+
+**又是脚本批量改结构性代码。**
+
+```
+把每行 strip() == 'engram_emb_buf,' 的地方都改成 '&engram_emb_buf[..],'
 ```
 
-`self.slot` 是**层在 engram 列表中的下标**（层 1 → slot 0，层 14 → slot 1）。
-`multipliers` / `primes` / `offsets` 全部按 `slot` 切片。
+这条规则同时命中了：
+- `bind_layer_io(...)` 的**调用点**（该改）
+- `bind_parallel_layer_io(...)` 内部转发**调用点**（该改）
+- **函数签名里的参数行**（不该改）
+- **结构体字段赋值 `engram_emb_buf: ...`**（不该改，但被改成了 `&engram_emb_buf[..]:`）
 
-**⇒ 层 1 和层 14 对同一个 token 算出的 rows 完全不同。**
+最后报 `expected identifier, found '&'` —— 我把结构体字段写成了非法语法。
 
-**② 我们只分配了一个张量**（`runner.rs:4879`）：
+### 这是第二次犯同一个错误
 
-```rust
-let span_has_engram = c.deepseek41 && (l_first..l_end).any(|l| c.has_engram(l));
-let engram_emb = span_has_engram.then(|| g.input(f32d(...)));   // 单个
-```
-
-**③ `engram_apply` 两层都用同一个 `emb`**（`:5966`）：
-
-```rust
-let emb = engram_emb.expect("an engram layer needs the gathered engram input");
-```
-
-**④ 参考实现是每层一个**（`deepseek41.cpp:840`）：
-
-```cpp
-if (pmodel.engram_index(il) >= 0) {
-    inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
-}
-```
-
-`build_inp_engram(model, il)` 带层号，**每层生成自己的 `rows` 张量**。
-
-### 结论
-
-**当前设计下，层 14 会读到层 1 的 rows。** 即使把 gather 接上、上传正确的值，第二层仍是错的。
-
-**这也是为什么必须先把 gather 接上才能暴露这个问题**——在此之前 buffer 是空的，两层读到的都是垃圾，
-错得一样，看不出差异。
-
-### 需要的改动
-
-| 项 | 现状 | 目标 |
+| 轮次 | 场景 | 结果 |
 |---|---|---|
-| `DecodeHandles::engram_emb` | `Option<TensorId>` | `Vec<(u32, TensorId)>` 按层 |
-| `PendingSeamSlot::engram_emb_buf` | `Option<Box<dyn Buffer>>` | `Vec<Box<dyn Buffer>>` 按层 |
-| `SeamKv::engram_emb_buf` | 同上 | 同上 |
-| `bind_layer_io` | 绑一个 | 按 `h` 所属层绑对应的 |
-| `engram_apply` | 用共享 `emb` | 用本层的 `emb` |
+| Round 99 | 给 `bind_layer_io` 加参数，脚本按参数名匹配 | 失败，回退 |
+| **Round 107** | 按行内容匹配改 20 处 | **失败，回退** |
 
-**影响 20 处引用、2 个分配点、跨 `runner.rs`/`weights.rs`。**
+**Round 100 成功那次**用的是**按已知行号 + 括号匹配**定位，不是按内容模式匹配。
 
-### 这一轮为什么没动手
+### 下一次的正确做法
 
-改动跨文件且耦合紧（bind 链路刚在 Round 100 才理清）。
-**半途而废的重构风险高于收益**——尤其它不能部分生效：只改声明不改 bind 会 unbound，
-只改 bind 不改分配会越界。
+**不要用内容模式匹配。** 按这个顺序：
+1. 改**函数签名**（2 处，行号已知）
+2. `cargo check` → 编译器逐个报出调用点行号
+3. **按行号**逐个改（20 处），每批改 5 个就编译一次
+4. 结构体字段赋值单独处理（`engram_emb_buf: xxx` 是冒号形式，与参数形式 `engram_emb_buf,` 可区分）
 
-**先把缺陷记下来，下次有完整时间块一次性改完。**
+**关键区分**：参数是 `name,`（逗号结尾），字段是 `name: value`（冒号）。脚本必须用这个区分，
+而不是 `strip() == 'engram_emb_buf,'`——后者看似安全，实际上 `bind_layer_io` 内部的转发
+**也**是这种形式，但那本身是对的，问题是**签名行也是这种形式**。
+
+**状态**：已全部 `git checkout` 回退，工作树干净，编译通过，77 个提交不变。
 
