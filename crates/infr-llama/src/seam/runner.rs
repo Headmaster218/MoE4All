@@ -14379,6 +14379,36 @@ fn generate_dense_backend_inner(
                             .map_err(|e| anyhow!("{e}"))?;
                         have_frontier_logits = true;
                         crate::sampling::ensure_finite_logits(&logits, "single-stream logits")?;
+                        if std::env::var_os("INFR_LOGIT_PROBE").is_some() {
+                            // Top-5 and softmax entropy. A healthy model on a sharp prompt puts
+                            // most mass on one token; flat logits, or a winner that changes every
+                            // step, means information is not surviving the residual stream.
+                            let mut idx: Vec<u32> = (0..c.vocab as u32).collect();
+                            idx.sort_unstable_by(|&a, &b| {
+                                logits[b as usize]
+                                    .partial_cmp(&logits[a as usize])
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            let max = logits[idx[0] as usize];
+                            let z: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum();
+                            let mut parts = Vec::new();
+                            for &i in idx.iter().take(5) {
+                                let pr = ((logits[i as usize] - max) as f64).exp() / z;
+                                parts.push(format!("{}:{:.4}", i, pr));
+                            }
+                            let ent: f64 = logits
+                                .iter()
+                                .map(|&v| {
+                                    let pr = ((v - max) as f64).exp() / z;
+                                    if pr > 1e-12 { -pr * pr.ln() } else { 0.0 }
+                                })
+                                .sum();
+                            let mn = logits.iter().copied().fold(f32::INFINITY, f32::min);
+                            eprintln!(
+                                "LOGIT_PROBE max={max:.4} min={mn:.4} entropy={ent:.3} top5=[{}]",
+                                parts.join(", ")
+                            );
+                        }
                     }
                     // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
                     // is_decode row — the causal prefill's last-token logits — captured before sampling
