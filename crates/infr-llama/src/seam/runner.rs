@@ -5809,7 +5809,11 @@ fn generate_dense_backend_inner(
         // attention op, preserving one shared softmax across raw and compressed rows.
         let d4_comp_values = g.internal(f32d((2 * c.head_dim).max(1)));
         let d4_comp_scores = g.internal(f32d((2 * c.head_dim).max(1)));
-        let d4_comp = g.internal(f32d(c.head_dim.max(1)));
+        // `Op::Dsv4Compress` writes `width = if overlap { 2 * dim } else { dim }`, and overlap is
+        // `ratio == 4` - true for the first eighteen V4.1 layers. Sizing this at `head_dim` alone
+        // meant a ratio-4 source wrote 512 f32 (2 KiB) past the end, and every 4th position then
+        // copied those neighbours into the compressed KV cache via Dsv4CacheWrite.
+        let d4_comp = g.internal(f32d((2 * c.head_dim).max(1)));
         let d4_lid_values = g.internal(f32d((2 * c.indexer_head_size).max(1)));
         let d4_lid_scores = g.internal(f32d((2 * c.indexer_head_size).max(1)));
         let d4_lid = g.internal(f32d(c.indexer_head_size.max(1)));
