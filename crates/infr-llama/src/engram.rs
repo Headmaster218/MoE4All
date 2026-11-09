@@ -387,6 +387,8 @@ pub fn ggml_type_layout(ggml_type: u32) -> Result<(u64, u64)> {
         GGML_TYPE_ENGRAM_E4M3 => Ok((1, 1)),
         // E8M0 exponents, one per stored element (each already covers 32 embedding values).
         GGML_TYPE_ENGRAM_E8M0 => Ok((1, 1)),
+        // IQ4_NL: 32-element blocks of 18 bytes (f16 d + 16 bytes of 4-bit codes).
+        20 => Ok((18, 32)),
         other => Err(Error::Unsupported(format!(
             "engram table tensor has ggml type {other}; this reader decodes only type \
              {GGML_TYPE_ENGRAM_E4M3} (E4M3 codes) and {GGML_TYPE_ENGRAM_E8M0} (E8M0 scales)"
@@ -540,6 +542,11 @@ impl EngramTable {
         })?;
         let key_length = usize::try_from(layer.key_length)
             .map_err(|_| Error::Loader("engram key_length does not fit usize".into()))?;
+        eprintln!(
+            "ENGRAM_TENSORS layer={} all={:?}",
+            layer_id,
+            self.tensors.iter().take(6).map(|t| (t.name.clone(), t.shape.clone(), t.ggml_type, t.nbytes)).collect::<Vec<_>>()
+        );
         let (weight, scale) = self.tensor_pair(layer_id)?;
         let mut out = vec![0f32; rows.len() * key_length];
         for (b, &row) in rows.iter().enumerate() {
@@ -658,7 +665,8 @@ fn index_engram_layers(
         // bug in the reader to "fix" — it is what this converter wrote, and it is what makes a
         // row (one gathered unit) contiguous, which is the property the gather depends on.
         let (rows, key_length) = (info.shape[0], info.shape[1]);
-        if info.ggml_type != GGML_TYPE_ENGRAM_E4M3 {
+        eprintln!("ENGRAM_EMBD name={} shape={:?} type={} nbytes={}", info.name, info.shape, info.ggml_type, info.nbytes);
+        if info.ggml_type != GGML_TYPE_ENGRAM_E4M3 && info.ggml_type != 20 {
             return Err(Error::Unsupported(format!(
                 "engram table: '{}' is ggml type {}, expected {GGML_TYPE_ENGRAM_E4M3} (E4M3)",
                 info.name, info.ggml_type
