@@ -1,55 +1,47 @@
 
 ---
 
-## Round 170-171：修掉 engram 缓冲越界写 —— 置信度 2.7×，输入敏感性恢复
+## Round 172：缓冲宽度全面扫描 —— 没有再发现同类问题，但找到批量路径的第二个缺陷
 
-### 那个 bug
+### 方法
 
-```rust
-let hn = g.internal(f32d(batch * ne));            // 5120 个 f32
+列出 `runner.rs` 里全部约 90 处 `g.internal(f32d(...))` 分配，逐个与消费它的 op 的写入量对照。
 
-Op::QwenPleGate { dst: hn, hc: 4, n_embd: 5120 }  // 内核写 rows*hc*ne = 20480
-Op::Add { b: hn, n: batch * hcw }                 // 又读 20480
+### 结果一：默认路径（batch == 1）没有第二处越界
+
+`hcr`、`hc_pre_lag`、`engram_k_normed`、`engram_q_normed`、`engram_gated`、`q`、`k`、`v`、`attn`、`gu`、`sub`
+等全部与内核写入量一致。**Round 170 修的 `hn` 是唯一一处。**
+
+### 结果二：批量 prefill 路径有一整批不带 `batch` 的缓冲
+
+```
+5810: d4_comp_values = (2 * c.head_dim)           ← 应为 batch * ...
+5811: d4_comp_scores = (2 * c.head_dim)
+5812: d4_comp        = c.head_dim
+5813: d4_lid_values  = (2 * c.indexer_head_size)
+5814: d4_lid_scores  = (2 * c.indexer_head_size)
+5815: d4_lid         = c.indexer_head_size
+5816: d4_ix_q        = (c.indexer_n_head * c.indexer_head_size)
+5823: d4_ix_w        = c.indexer_n_head
 ```
 
-内核语义（`infr-cpu/src/lib.rs:3259`）是清楚的：
-输出按 `[token, hc, n_embd]` 写（20480），`value` 按 `[token, n_embd]` 读（5120）。
-**只有输出缓冲分配错了** —— 每层 engram 都往 `hn` 末尾之外写 15360 个 f32（60 KiB），
-落进图池的相邻缓冲，随后 `Op::Add` 又把那些相邻内容读进残差流。层 1 和 14 各来一次。
+`Op::Dsv4Compress` / `Op::Dsv4Indexer` 在 `batch > 1` 时会写 `batch × ...`，
+而这些缓冲只按单 token 分配 —— **与 `hn` 完全相同的越界模式。**
 
-修法：给 gate 的输出单独分配 `batch * hcw`。`engram_gated`（作为 value 输入，5120）
-和 `engram_k/q_normed`（20480）本来就对，核对过内核索引语义后确认无需改动。
+**但这不影响默认路径**（`batch == 1` 时 `batch * X == X`，尺寸恰好），
+而且 `INFR_DSV41_BATCHED_PREFILL` 已经是 opt-in，批量入口有 release 常驻断言拦截。
 
-### 修复效果
+**这解释了批量 prefill 为什么"数值不可信"** —— 不只是 Round 140 发现的"只写一行 KV"，
+这些缓冲也会越界。批量路径要真正可用，这两处都得修。
 
-| 指标 | 修复前 | 修复后 | 参考引擎 |
-|---|---|---|---|
-| `Hi` top-1 | 2619: **6.31%** | 343: **17.18%** | 2581: 91.60% |
-| `Hi` 熵 | 6.340 | 5.391 | ~0.5 |
+### 当前状态
 
-**更重要的是输入敏感性恢复了：**
+| 项 | 结果 |
+|---|---|
+| `hn` 越界（60 KiB/层） | ✅ 已修（Round 170），置信度 6.31%→17.18%，输入敏感性恢复 |
+| 默认路径还有同类越界？ | ❌ 扫描后确认没有 |
+| 批量路径的缓冲越界 | ⬜ 已知，待批量路径立项时一起修 |
+| `The capital of France is` → `294` | ❌ 仍错，剩余缺陷不属于"缓冲越界"类 |
 
-| 输入 | 修复前 top-1 | 修复后 top-1 |
-|---|---|---|
-| `Hi` | 2619:6.31% | 343:17.18% |
-| `Ho` | 2619:6.06% | **10:8.95%** |
-| `Hi there` | 2619:7.74% | — |
-| `The capital of France is` | — | **294:16.65%** |
-| `2+2=` | — | 294:6.91% |
-
-修复前三个不同输入全部落在 `2619`；修复后每换一个输入 top-1 就变。
-**信息第一次真正传到了输出层。**
-
-### 但还没修完
-
-`The capital of France is` → `294`（不是 Paris），`2+2=` → `294`（不是 4）。
-置信度 17% 距离参考的 92% 仍差 5 倍。
-
-**结论：这是真 bug，修得对，但不是全部。** 至少还有一处同类或异类缺陷。
-
-### 线索价值
-
-`INFR_ENGRAM_ZERO` 早先给出的信号（6.31% → 20.78%）一直指向这里：
-"关掉 engram 反而更好" 正是越界写在污染残差流的样子。
-**这个信号从 Round 155 就出现了，当时我去核对 engram 表是否用错，却没有检查 engram 的写入路径本身。**
+**⇒ 剩下的问题需要换一类假设。** 缓冲维度这条线已经走完。
 
