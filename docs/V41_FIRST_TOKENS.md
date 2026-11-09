@@ -1,49 +1,34 @@
 
 ---
 
-## Round 155：engram 注入确实在左右结果；IQ4_NL 表确认损坏
+## Round 156：engram 表核对通过 —— 这条线走完了，正式排除
 
-### 开关 A/B（对齐行 `mine[2]`）
+把 `engram-mxfp8.gguf` 打开对比：
 
-| 配置 | top5 | 熵 |
-|---|---|---|
-| 基线（`engram-mxfp8.gguf`） | 666:6.7%, 2619:3.4%, 201:3.3%, 29:3.3%, 223:2.8% | 6.411 |
-| `INFR_ENGRAM_ZERO=1` | **2581:78.4%, 671:4.5%**, 50249:2.7%, 43:1.2%, 16:0.8% | **1.556** |
-| 参考 `strata-dsv41` | 271:9.6%, 943:9.4%, 28:6.3% | ~6.0 |
+| 检查项 | 结果 |
+|---|---|
+| 表内张量 | `blk.1.engram_embd.weight/.scale`、`blk.14.engram_embd.weight/.scale` |
+| GGUF 声明 `engram_layer_ids` | `1, 14` ✅ |
+| 引擎查找名 | `"blk.{layer_id}.engram_embd.weight"` ✅ |
+| 格式 | ggml type 32 权重 / type 34 缩放，引擎只支持这两种 ✅ |
+| 体量 | 202.76 GB，2 层全精度 ✅ |
 
-**两个事实：**
+**四项全对。`engram-mxfp8.gguf` 就是这个 checkpoint 的配套表。**
 
-1. **engram 零注入让 `671` 出现了** —— 而 `671` 正是参考引擎生成序列里紧跟 `271` 的那个 token，
-   也正是 prompt 中间那段的首个 token。**说明 engram 注入正在把结果推离参考方向。**
-2. **但零注入同时把熵从 6.41 压到 1.56**（单 token 78%），这同样是错误的 ——
-   **不是"要不要 engram"，而是"engram 注入了什么"。**
+元数据里的 `deepseek41.engram.file = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"` 只是**原始发布名**，
+本机那份同名 IQ4_NL 文件（17.9 GB）是损坏的副本，与当前用的是否为同一张表无关。
 
-`INFR_NO_QKV_FUSE` 与 `INFR_NO_GATED_RMSNORM` 的结果**与基线逐位相同**，这不是证据：
-前者代码里明确写了 split 形式是 bit-identical（同点积、同固定顺序求和），本来就不该有差异。
+### 那 Round 155 的 `ENGRAM_ZERO` 现象怎么解释
 
-### IQ4_NL 表：确认损坏，但**不能因此断定 mxfp8 是错的**
+**说明 engram 确实在参与计算**，关掉必然改变输出。
+它"露出"了 `671`（参考也有的 token）**只是巧合**，不是"更接近正确" ——
+同时熵从 6.411 塌到 1.556（单 token 78%），这明显是错的。
 
-模型 GGUF 里写着：
+### 累计已排除（全部有运行证据）
 
-```
-deepseek41.engram.file = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
-```
+引擎通用路径 · prompt 构造 · YOCO · APE · warmup · 超连接滞后 · 配置 24 项 ·
+采样参数 · logits 尺度/形状 · 批量 prefill（已定位+守卫）· **engram 表本身** ·
+QKV 融合/拆分（设计上逐位等价）
 
-而本机那张 `engram-iq4nl.gguf`（17.9 GB）加载时报：
-
-```
-'blk.1.engram_embd.weight' occupies bytes 224..55296888416, past the 17901748448 bytes of the file
-```
-
-**文件被截断**（声称 55.3 GB，实际 17.9 GB），不可用。
-
-**但我不能仅凭元数据里一个文件名就断定 `engram-mxfp8.gguf` 用错了** ——
-它就在模型目录 `/data/models/dsv41-uncensored-iq2xxs/` 内，202 GB，体量与全精度 engram 相符，
-而 17.9 GB 的 IQ4_NL 明显更小且已损坏。元数据里的名字更可能只是原始发布名。
-
-### 下一步
-
-需要确认 `engram-mxfp8.gguf` 是否真的是这个 checkpoint 的配套表：
-比对它内部张量与 GGUF 里 `deepseek41.engram.*` 声明的形状/层号是否一致。
-这比继续换表更有意义 —— 一个能加载但内容不匹配的表，正是"语言能力完好、语义全错"的完美解释。
+**剩下未排除的主要嫌疑：压缩注意力（compressed attention / kv_source 复用）、hash MoE 路由。**
 
