@@ -9571,6 +9571,15 @@ fn generate_dense_backend_inner(
             let ple_batch = be
                 .alloc(batch * ple_row * 4, BufferUsage::Staging)
                 .map_err(|error| anyhow!("{error}"))?;
+            // NOTE for whoever next suspects hash routing: this probe never fires on V4.1, and that
+            // is correct. `is_hash_moe_layer` is `il < c.hash_layer_count`, and this checkpoint
+            // has `hash_layer_count = 0`, so `hash_gather` is false, `tok_ids` is never declared
+            // and no `Op::GatherI32` is emitted. V4.1 routes every MoE layer through the ordinary
+            // learned router. Kept behind the env gate so the day a hash-routed file is loaded,
+            // the ids can be checked without another edit.
+            if std::env::var_os("INFR_HASH_ID_PROBE").is_some() {
+                eprintln!("HASH_IDS ids={ids:?} positions={positions:?} batch={batch}");
+            }
             be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
                 .map_err(|error| anyhow!("{error}"))?;
             be.upload(pos_batch.as_ref(), bytemuck::cast_slice(&positions))
