@@ -2,53 +2,66 @@
 
 ---
 
-## Round 123：开关已默认打开 —— prefill 4.9 倍，decode 不变
+## Round 125：**根因找到 —— engram 表格式不匹配，模型声明的表我们从未加载过**
 
-### 改动
+### 决定性证据链
 
-`runner.rs`：`INFR_DSV41_BATCHED_PREFILL` 从 **默认关闭** 改为 **默认开启**。
-`=0` 仍可强制回退到旧的逐 token 路径（用于二分数值差异）。
+**① 模型自己声明了它需要哪个表**
 
-### 验证默认确实生效
+直接读 GGUF 头（`deepseek41.engram.file`，gguf type 8 = string）：
 
-| 命令 | pp512 |
+```
+deepseek41.engram.file = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+```
+
+**② 本机确实有那个表**
+
+```
+/data/models/dsv41-engram-iq4nl/engram-iq4nl.gguf   17.9 GB
+/home/dyy/engram-mxfp8/engram-mxfp8.gguf           202.8 GB   ← 我们一直在用这个
+```
+
+**③ 换成正确的表，引擎直接拒绝**
+
+```
+Error: unsupported: engram table tensor has ggml type 20;
+this reader decodes only type 32 (E4M3 codes) and 34 (E8M0 scales)
+```
+
+**④ 代码里的注释印证**
+
+`engram.rs:44-45`：
+
+```
+blk.N.engram_embd.weight  ggml type 32  [rows, 256]  E4M3 codes
+blk.N.engram_embd.scale   ggml type 34  [rows, 8]    E8M0 exponents
+```
+
+`engram.rs:100-102` 明确写着这是「**this converter's private E4M3 code-stream**」——
+即某个私有转换器的产物，**不是**模型公布的标准 IQ4_NL 格式。
+
+### 结论
+
+| 项 | 值 |
 |---|---|
-| 无环境变量（新默认） | **29.5 t/s** |
-| `INFR_DSV41_BATCHED_PREFILL=0` | **6.0 t/s** |
+| 模型声明的表 | **IQ4_NL，ggml type 20，17.9 GB** |
+| `engram.rs` 支持的 | **MXFP8 私有流，type 32/34，202 GB** |
+| 此前所有测试用的 | MXFP8 |
+| **后果** | **engram 两层读到完全错误的数据 ⇒ 答非所问** |
 
-### 当前阶段性能
+**这解释了为什么「模型收到正确的 `2+2=` 却答错」——错不在 prompt、不在 YOCO、不在注意力，
+而在 engram 层用了错的表。**
 
-| 指标 | 改动前 | 改动后 |
-|---|---|---|
-| **prefill pp512** | 6.0 t/s | **29.5 t/s**（4.9×）|
-| **prefill pp32** | 6.4 t/s | **15.7 t/s**（2.5×）|
-| **decode** | 5.9 t/s | **5.8 t/s**（不变，符合预期）|
+### 为什么之前所有 engram 验证都「通过」了
 
-**decode 不受影响** —— 批量路径只优化 prefill。
+我逐个核对过数学（gate 公式、偏移、广播）、数据（数值 O(1)、无 NaN、两层不同）——
+**这些都对，但它们验证的是「代码与 MXFP8 表一致」，而不是「MXFP8 表是本模型该用的表」。**
 
-### 对照 poorseek
+数学正确 + 数据源错误 = 结果错误。这是一个我没有设想过失败方式。
 
-| 指标 | poorseek（RTX 4090） | 本机（Arc BMG G31） |
-|---|---|---|
-| prefill | — | **29.5 t/s** |
-| **单 token decode** | **27.7 t/s** | **5.8 t/s** |
-| MTP decode | 35.9 t/s | 未测 |
+### 下一步
 
-**prefill 已达到可对比的水平；decode 仍有 4.8 倍差距。**
-
-### decode 为什么没跟上
-
-decode 是 batch=1，**批量路径对它不起作用**（无 batch 可批）。
-它的 6 t/s 仍来自 Round 120 发现的那个问题：**每 token 885 次专家 GEMV**，
-在 batch=1 时无法摊薄。
-
-**⇒ decode 的提速需要另一套手段**（MTP/投机解码、或减少每 token 的专家访问），
-不是这个开关能解决的。
-
-### 正确性仍未解决
-
-默认路径输出 `We need answer. Need to determine actual expected behavior. The user wants me to`
-—— 连贯但没答对 `2+2=`。
-
-**这是 goal 原定的 compressor/APE 那条线，尚未处理。**
+**必须给 `engram.rs` 加 IQ4_NL（ggml type 20）解码支持**，让它能读模型声明的那个表。
+标准 IQ4_NL 是 32 元素一块、每块 18 字节（2 字节 f16 scale + 16 字节 4-bit code），
+比 MXFP8 简单得多。
 
