@@ -97,6 +97,26 @@ use std::path::{Path, PathBuf};
 use infr_core::error::{Error, Result};
 use memmap2::Mmap;
 
+/// ggml type id of a standard `IQ4_NL` tensor — the format the model's `engram.file` metadata
+/// names. 32-element blocks of 18 bytes: an f16 `d` plus 16 bytes of 4-bit codebook indices.
+///
+/// This is the REAL engram table format. The E4M3/E8M0 pair below is a private converter's
+/// stream, and a table in that format is not interchangeable with an IQ4_NL one: the tensor is
+/// also declared transposed (`[256, rows]` here versus `[rows, 256]` there), so reading either
+/// with the other's indexing walks the wrong bytes entirely.
+pub const GGML_TYPE_IQ4_NL: u32 = 20;
+
+/// Elements per IQ4_NL block.
+pub const IQ4_NL_BLOCK_ELEMS: usize = 32;
+/// Bytes per IQ4_NL block: 2 (f16 d) + 16 (4-bit codes).
+pub const IQ4_NL_BLOCK_BYTES: usize = 18;
+
+/// The 16 signed codebook entries an IQ4_NL 4-bit code indexes, from ggml's `kvalues_iq4nl`.
+pub const IQ4_NL_VALUES: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    89.0, 113.0,
+];
+
 /// ggml type id of the engram code tensor (unassigned in `ggml.h`; this converter's E4M3 stream).
 pub const GGML_TYPE_ENGRAM_E4M3: u32 = 32;
 /// ggml type id of the engram scale tensor (E8M0 exponents; NOT llama.cpp's `TQ1_0`).
@@ -319,6 +339,57 @@ pub fn dequant_mx_block(codes: &[u8], scale: u8, out: &mut [f32]) {
 /// `scales.len()` must be `key_length / 32`. Written as a standalone function (rather than inlined
 /// into [`EngramTable`]) so the row arithmetic is testable against the real file's bytes without
 /// a table handle.
+/// IEEE-754 binary16 bit pattern to `f32`.
+///
+/// `f16` is not stable in std, and pulling a crate in for one conversion is not worth it.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) << 31;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x3ff) as u32;
+    if exp == 0x1f {
+        // Infinity (mant == 0) or NaN.
+        return f32::from_bits(sign | (0xff << 23) | (mant << 13));
+    }
+    if exp == 0 {
+        // Zero, or a subnormal half: value is mant * 2^-24. Scale it into f32 by starting from
+        // the equivalent f32 exponent (2^-24 is a normal f32) instead of renormalising by hand.
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        // mant/2^24 == (mant * 2^13) / 2^37; emit as a normal f32 with exponent -24+127.
+        let v = (mant as f32) * (-24f32).exp2();
+        return if sign != 0 { -v } else { v };
+    }
+    // Normal half: rebias the exponent from 15 to 127.
+    f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
+}
+
+/// Decode one IQ4_NL row of `key_length` elements (a multiple of 32) to f32.
+///
+/// Layout per ggml (`block_iq4_nl`): each 32-element block is 18 bytes — a little-endian f16 `d`
+/// followed by 16 code bytes. Code byte `i` holds element `i` in its low nibble and element
+/// `i + 16` in its high nibble, and each nibble indexes [`IQ4_NL_VALUES`]; the element is
+/// `d * value`.
+pub fn dequant_iq4_nl_row(bytes: &[u8], key_length: usize) -> Vec<f32> {
+    debug_assert_eq!(key_length % IQ4_NL_BLOCK_ELEMS, 0);
+    let blocks = key_length / IQ4_NL_BLOCK_ELEMS;
+    debug_assert!(bytes.len() >= blocks * IQ4_NL_BLOCK_BYTES);
+    let mut out = vec![0f32; key_length];
+    for b in 0..blocks {
+        let base = b * IQ4_NL_BLOCK_BYTES;
+        // f16 is unstable in std, so decode the half manually: sign, 5-bit exponent, 10-bit
+        // mantissa; subnormals and the two infinities/NaN handled explicitly.
+        let d = half_to_f32(u16::from_le_bytes([bytes[base], bytes[base + 1]]));
+        let codes = &bytes[base + 2..base + IQ4_NL_BLOCK_BYTES];
+        let dst = &mut out[b * IQ4_NL_BLOCK_ELEMS..(b + 1) * IQ4_NL_BLOCK_ELEMS];
+        for (i, &byte) in codes.iter().enumerate() {
+            dst[i] = d * IQ4_NL_VALUES[(byte & 0x0f) as usize];
+            dst[i + 16] = d * IQ4_NL_VALUES[(byte >> 4) as usize];
+        }
+    }
+    out
+}
+
 pub fn dequant_mxfp8_row(codes: &[u8], scales: &[u8], key_length: usize) -> Vec<f32> {
     assert_eq!(
         key_length % MX_BLOCK_ELEMS,
@@ -1079,6 +1150,75 @@ pub fn resolve_table_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── IQ4_NL ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn half_to_f32_matches_known_values() {
+        // 0x3C00 = 1.0, 0x4000 = 2.0, 0xC000 = -2.0, 0x0000 = 0, 0x8000 = -0
+        assert_eq!(half_to_f32(0x3C00), 1.0);
+        assert_eq!(half_to_f32(0x4000), 2.0);
+        assert_eq!(half_to_f32(0xC000), -2.0);
+        assert_eq!(half_to_f32(0x0000), 0.0);
+        assert!(half_to_f32(0x8000).is_sign_negative());
+        // 0x3555 ~ 0.33325
+        assert!((half_to_f32(0x3555) - 0.333_251_95).abs() < 1e-6);
+        // Smallest positive subnormal 0x0001 = 2^-24
+        assert!((half_to_f32(0x0001) - f32::powi(2.0, -24)).abs() < 1e-12);
+        // Largest subnormal 0x03FF
+        assert!(half_to_f32(0x03FF) > 0.0 && half_to_f32(0x03FF) < 6.2e-5);
+        // Infinity
+        assert!(half_to_f32(0x7C00).is_infinite());
+        assert!(half_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn iq4_nl_row_decodes_nibbles_and_scale() {
+        // One 32-element block: d = 2.0, all 16 code bytes = 0xF0|0x01 pattern.
+        // Low nibbles are 1 -> IQ4_NL_VALUES[1] = -104; high nibbles are 0 -> -127.
+        let mut block = Vec::with_capacity(IQ4_NL_BLOCK_BYTES);
+        block.extend_from_slice(&0x4000u16.to_le_bytes()); // d = 2.0
+        for _ in 0..16 {
+            block.push(0xF1);
+        }
+        let out = dequant_iq4_nl_row(&block, 32);
+        assert_eq!(out.len(), 32);
+        // 0xF1: low nibble 1 -> IQ4_NL_VALUES[1] = -104, high nibble 15 -> IQ4_NL_VALUES[15] = 113.
+        for (i, v) in out.iter().enumerate() {
+            let want = if i < 16 { 2.0 * -104.0 } else { 2.0 * 113.0 };
+            assert!((v - want).abs() < 1e-3, "elem {i}: got {v}, want {want}");
+        }
+    }
+
+    #[test]
+    fn iq4_nl_row_spans_multiple_blocks() {
+        // Two blocks with different scales: 1.0 and 0.5, code 0 everywhere for the first,
+        // code 15 everywhere for the second. Code 0 -> -127, code 15 -> 113.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        bytes.extend(std::iter::repeat(0x00).take(16));
+        bytes.extend_from_slice(&0x3800u16.to_le_bytes()); // d = 0.5
+        bytes.extend(std::iter::repeat(0xFF).take(16));
+        let out = dequant_iq4_nl_row(&bytes, 64);
+        assert_eq!(out.len(), 64);
+        for v in &out[..32] {
+            assert!((v - -127.0).abs() < 1e-3, "block0: {v}");
+        }
+        for v in &out[32..] {
+            assert!((v - 0.5 * 113.0).abs() < 1e-3, "block1: {v}");
+        }
+    }
+
+    #[test]
+    fn iq4_nl_type_size_is_18_bytes_per_32_elems() {
+        // A [256, rows] IQ4_NL tensor: 256 elements per row = 8 blocks = 144 bytes per row.
+        assert_eq!(ggml_type_size(GGML_TYPE_IQ4_NL, 256).unwrap(), 8 * 18);
+        // The shipped blk.1 tensor: 256 * 384006168 elements.
+        assert_eq!(
+            ggml_type_size(GGML_TYPE_IQ4_NL, 256 * 384_006_168).unwrap(),
+            55_296_888_192
+        );
+    }
 
     fn map<'a>(
         multipliers: &'a [u64],
