@@ -626,11 +626,6 @@ impl EngramTable {
         })?;
         let key_length = usize::try_from(layer.key_length)
             .map_err(|_| Error::Loader("engram key_length does not fit usize".into()))?;
-        eprintln!(
-            "ENGRAM_TENSORS layer={} all={:?}",
-            layer_id,
-            self.tensors.iter().take(6).map(|t| (t.name.clone(), t.shape.clone(), t.ggml_type, t.nbytes)).collect::<Vec<_>>()
-        );
         // IQ4_NL layers are a single self-contained tensor; the E4M3/E8M0 pair is the only
         // layout with a second plane to fetch.
         let (weight, scale) = if layer.is_iq4_nl() {
