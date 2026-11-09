@@ -2,63 +2,46 @@
 
 ---
 
-## Round 107：按层拆分改造 —— 失败并回退
+## Round 110：定位 upload 的可行位置 —— `kv` 与 buffer 不在同一作用域
 
-### 做了什么
+### 已排除的位置
 
-尝试把 `engram_emb` / `engram_emb_buf` 从单张量改成按层（`Vec<(u32, TensorId)>`），
-涉及 3 处声明、2 处分配、`bind_layer_io` / `bind_parallel_layer_io` 两处签名、20 个调用点。
+| 位置 | `be`/`cfg` | `engram_emb_buf` | `state`/`kv` | 结论 |
+|---|---|---|---|---|
+| `build` 闭包内 | ✅ | ❌ | ❌ | **不行** |
+| `build` 调用点（如 `9516`） | ✅ | ❌ | ❌ | 不行 |
+| 7 个 bind 点（如 `9562`/`9643`） | ✅ | ✅ | ❌ | **`kv` 不可见** |
 
-### 失败过程
+**根因**：`engram_emb_buf` 属于 `SeamKv`，在 `build` 之后才建立；
+而 bind 点处 `kv` 已被解构成 `kbufs`/`vbufs`/`engram_emb_buf` 等局部变量，
+`state`/`kv` 本身不再可见。
 
-| 阶段 | 错误数 |
-|---|---|
-| 改 3 处声明 | 20 个位置报错（预期） |
-| 改 2 处分配 | 37 |
-| 改 `bind_layer_io` 签名+函数体 | 37（调用点还没跟上） |
-| 改 `engram_emb` 生成处 | 37 |
-| 改 `engram_apply` + 调用点 | 37 |
-| 统一类型为 `(u32, Box<dyn Buffer>)` | 26 |
-| **脚本批量改调用点** | **34（涨了）** |
-| 修一处漏改的签名 | 33 |
-| **回退** | **0** |
+### 但有一条出路
 
-### 失败原因
+**token 历史不必从 `kv` 取。** 在 bind 点处这些是可见的：
 
-**又是脚本批量改结构性代码。**
-
-```
-把每行 strip() == 'engram_emb_buf,' 的地方都改成 '&engram_emb_buf[..],'
+```rust
+for range in &ranges { ... }                    // 9449
+let batch = row_start;                           // 9458
+parallel.prompts[lane][range.clone()]            // 9481
 ```
 
-这条规则同时命中了：
-- `bind_layer_io(...)` 的**调用点**（该改）
-- `bind_parallel_layer_io(...)` 内部转发**调用点**（该改）
-- **函数签名里的参数行**（不该改）
-- **结构体字段赋值 `engram_emb_buf: ...`**（不该改，但被改成了 `&engram_emb_buf[..]:`）
+**prefill 阶段 token 就是 `ranges` + `parallel.prompts`**，decode 阶段 token 在当前 step 变量里。
 
-最后报 `expected identifier, found '&'` —— 我把结构体字段写成了非法语法。
+**所以 `upload_layer` 的 `history` 参数可以就地构造**，不需要 `cached_tokens()`。
 
-### 这是第二次犯同一个错误
+### 下一步
 
-| 轮次 | 场景 | 结果 |
-|---|---|---|
-| Round 99 | 给 `bind_layer_io` 加参数，脚本按参数名匹配 | 失败，回退 |
-| **Round 107** | 按行内容匹配改 20 处 | **失败，回退** |
+在 **7 个 bind 点之前**（buffer 已可见处）插入：
 
-**Round 100 成功那次**用的是**按已知行号 + 括号匹配**定位，不是按内容模式匹配。
+```rust
+for &(layer, dst) in &engram_emb_buf {
+    engram::upload_layer(be, c, table, layer, history, batch_tokens, dst.as_ref())?;
+}
+```
 
-### 下一次的正确做法
+其中 `history` / `batch_tokens` 由该点的 `ranges`/`prompts`/step 变量就地拼出。
+**`table` 从 `weights.engram_table` 取**——需要确认 bind 点能否访问 `weights`。
 
-**不要用内容模式匹配。** 按这个顺序：
-1. 改**函数签名**（2 处，行号已知）
-2. `cargo check` → 编译器逐个报出调用点行号
-3. **按行号**逐个改（20 处），每批改 5 个就编译一次
-4. 结构体字段赋值单独处理（`engram_emb_buf: xxx` 是冒号形式，与参数形式 `engram_emb_buf,` 可区分）
-
-**关键区分**：参数是 `name,`（逗号结尾），字段是 `name: value`（冒号）。脚本必须用这个区分，
-而不是 `strip() == 'engram_emb_buf,'`——后者看似安全，实际上 `bind_layer_io` 内部的转发
-**也**是这种形式，但那本身是对的，问题是**签名行也是这种形式**。
-
-**状态**：已全部 `git checkout` 回退，工作树干净，编译通过，77 个提交不变。
+**这是下一轮的第一件事：确认 `weights` 在 bind 点的可见性。**
 
