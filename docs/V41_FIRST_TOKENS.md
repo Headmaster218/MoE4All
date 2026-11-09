@@ -2,54 +2,64 @@
 
 ---
 
-## Round 144：**参考基准终于有了** —— 本机的 `strata-dsv41` 用同一份 GGUF，还能 `--dump-logits`
+## Round 146：**定量对比出来了 —— moe4all 的 logits 分布比参考尖锐 2-3 个数量级**
 
-### 前面十几轮为什么卡住
+### 参照格式已破解
 
-一直缺「同一份模型文件 + 能正确运行的引擎 + 可导出的中间值」这三样同时具备的参照：
-
-| 候选 | 为什么不行 |
-|---|---|
-| llama.cpp（`build-sycl/bin/llama-cli`） | 报 `blk.1.engram_embd.weight is missing` —— 这个 GGUF 不含 engram 张量，只有元数据 |
-| DeepInfer | Python 实现，130 GB 模型跑不动 |
-| Mach X（`auto-test-result.txt`） | FP8 safetensors，量化格式与代码路径都不同 |
-| qwen2.5 | 不同架构，只能证明引擎通用路径健康 |
-
-### 找到了：`/data/strata-new/build-sycl-jit/strata-dsv41`
-
-线索来自 `/data/models/dsv41-i8test/bench/bench-ab.sh`：
-
-```bash
-ENGINE=/data/strata-new/build-sycl-jit/strata-dsv41
-PACK=/data/models/dsv41-i8test/pack-q2k-all     # 指向同一份 IQ2_XXS
-```
-
-需要 `source /opt/intel/oneapi/setvars.sh`（否则缺 `libmkl_sycl_blas.so.6`）。
-
-### 实测：跑通了，且支持 `--dump-logits`
+`/tmp/ref-logits.bin`（`strata-dsv41 --dump-logits` 产出）：
 
 ```
-prompt: 989 tokens in 28234 ms (35.03 tok/s, windows of 16)
-455,4787,13769,46012,54994,1060,270,41638,6397,14,305,270
-decode: 12 tokens in 631 ms (17.42 tok/s)
+511,948,800 bytes / (129280 vocab × 4 bytes) = 990.0
 ```
 
-`/tmp/ref-logits.bin` 511 MB —— **逐 token 的 logits 参考值**。
+**990 行 = 989 prompt token + 1 生成 token，纯 f32，每 token 一行，无文件头。**
 
-### 这改变了什么
+### 两种实现的 logits 统计对比
 
-从现在起可以做**真正的数值比对**，而不是靠「范数看起来异常」这种间接判断：
+**参考引擎（strata-dsv41，同一份 IQ2_XXS）：**
 
-1. 拿同一段 prompt token ids 跑 moe4all
-2. 比对两者在**第一个 token 的 logits**
-3. 若第一个 token 就分叉 ⇒ 单次前向就有错，可以逐层二分
-4. 若前 N 个 token 一致后才分叉 ⇒ 错误在增量/缓存路径
+| row | max | 熵 | top-1 概率 | 第 2 名 |
+|---|---|---|---|---|
+| 0 | 14.51 | **6.34** | 19.8% | 2.3% |
+| 1 | 10.64 | **8.85** | 1.5% | 1.3% |
+| 2 | 15.05 | **3.61** | 59.5% | 2.6% |
 
-### 参考输出（已存档）
+**moe4all（Round 130 的 `INFR_LOGIT_PROBE`）：**
 
-```
-455,4787,13769,46012,54994,1060,270,41638,6397,14,305,270
-```
+| 步 | max | 熵 | top-1 概率 |
+|---|---|---|---|
+| 1 | 32.82 | **0.001** | 99.99% |
+| 2 | 26.97 | **0.018** | 99.79% |
+| 3 | 24.05 | **0.103** | 98.78% |
 
-同一份 `--ids @/data/models/dsv41-iq2xxs-pack-real/bench/1k.ids`（989 tokens）。
+### 结论
+
+| 指标 | 参考 | moe4all | 差距 |
+|---|---|---|---|
+| 熵 | 3.6 – 8.9 | 0.001 – 0.103 | **差 2–3 个数量级** |
+| top-1 | 1.5% – 59.5% | 98.8% – 99.99% | 几乎压死 |
+| logit 峰值 | 10.6 – 15.1 | 24.0 – 32.8 | **约 2.2 倍** |
+
+**正常的语言模型在序列早期的熵在 3–9 之间**，top-1 通常只有百分之十几到几十。
+moe4all 把几乎全部概率压在一个 token 上 —— 这正是「自信地胡说」的量化形态。
+
+**这不是“算错了一点”，而是 logits 尺度出了问题**：峰值高出约 2.2 倍，
+经 softmax 放大后就是数量级差异。
+
+### 这条证据为什么关键
+
+前面所有排除都是「排除某个部件」，这一条**第一次给出方向**：
+问题在**产生 logits 的那一步之前或之中**，且表现为**整体幅度偏大**，而不是随机噪声。
+
+幅度偏大最可能的来源：
+1. 输出投影 `output` 之后缺少/重复某个缩放（如 `routed_scaling_factor` 被误用在这里）
+2. 最终 RMSNorm 的归一化没生效（范数没被压到单位量级 ⇒ 后续点积整体放大）
+3. 注意力输出前的 softmax 温度（mscale）用错
+
+### 下一步
+
+需要 moe4all 也导出一份同样格式的 logits，做**逐元素比对**：
+若整体呈线性放大 ⇒ 确认是缩放问题；若形状就不同 ⇒ 更上游。
+
+目前 `infr` 没有 ids 输入与 logits 导出入口，这是要补的最后一块。
 
