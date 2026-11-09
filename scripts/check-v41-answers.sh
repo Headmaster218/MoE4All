@@ -80,6 +80,20 @@ else
 fi
 
 if [[ -n $v41 ]]; then
+    # The engram table is a separate mmap'd artifact; without it V4.1 runs with an unbound
+    # engram input and answers differently. Record both so a regression in either is visible.
+    if [[ -n ${INFR_ENGRAM_TABLE:-} ]]; then
+        for eg in with without; do
+            if [[ $eg == without ]]; then
+                answer="$(env -u INFR_ENGRAM_TABLE ask "$v41")"
+            else
+                answer="$(ask "$v41")"
+            fi
+            ok=0
+            [[ $answer == *"$expect"* ]] && ok=1
+            report "engram-$eg" "$v41" "$ok" "$answer"
+        done
+    fi
     for mode in default batched; do
         if [[ $mode == batched ]]; then
             answer="$(INFR_DSV41_BATCHED_PREFILL=1 ask "$v41")"
