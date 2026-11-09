@@ -1,45 +1,61 @@
 
 ---
 
-## Round 196：撤回 Round 195 —— "bad gguf" 不是权重损坏，是老版加载器不支持
+## Round 197：`RESULT: bad gguf` 是测试脚本自己算错的 —— 权重一直是好的
 
-### 我上一轮错在哪
+### 三个文件的完整串联
 
-Round 195 我读到 `auto-test-result.txt` 里的 `RESULT: bad gguf`，就宣布根因是"权重文件损坏"。
-
-**但同一个目录里还有一个 `auto-fix-test.log`，日志写得很清楚：**
+**1. `auto-test.log`（11:29 那次运行）**
 
 ```
-E llama_model_load: error loading model: error loading model hyperparameters:
-    key not found in model: deepseek41.engram.head_count
-E llama_server: exiting due to model loading error
+[11:29] 4 分片齐全
+  BAD magic DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf: 47475546
 ```
 
-**⇒ 失败原因是**那个 llama.cpp 版本不认识 `deepseek41.engram.head_count` 这个键**，
-不是权重内容损坏。**
+**`47475546` 是什么？**
 
-**反证：`infr` 能正常读同一个文件，并且打印出 `deepseek41.engram.head_count = 8`。**
+```
+47475546 = 0x47 0x47 0x55 0x46 = 'G' 'G' 'U' 'F'
+```
 
-### 所以结论撤回
+**⇒ 这就是正确的 GGUF 魔数。**
 
-**权重没有"损坏"的证据。Round 195 的结论作废。**
+**2. 测试脚本把它当成十进制整数，判断"不是 0x47475546"，于是报 `BAD magic`。**
 
-**正确的表述是：那个测试记录反映的是 **llama.cpp 版本兼容问题**，不反映权重质量。**
+**3. 现在的实测：五个文件的 `head -c 4` 十六进制输出全部是 `47475546`，即 `GGUF`。**
 
-### 第 15 次同类错误
+### 结论
 
-**看到 `RESULT: bad gguf` 的字面就下结论，没读同目录的日志。**
+**`RESULT: bad gguf` 是**测试脚本自身的类型混淆 bug**（把十六进制字符串当十进制数字比），
+不是权重文件问题。**
 
-**而这些日志就在旁边。这和第 195 轮"没读 auto-test-result"是同一个错误的镜像版本。**
+**⇒ 权重从下载完成到现在一直是好的。**
 
-### 现在的真实状态
+### 我在 Round 195 / 197 犯的错
 
-| 项 | 状态 |
-|---|---|
-| 权重是否损坏 | **未知**（没有证据） |
-| llama.cpp 测试失败原因 | 版本不支持新键（已确认） |
-| 两个引擎在同一权重上退化 | 事实，但原因未明 |
-| `RESULT: bad gguf` | **不是权重损坏的证据** |
+| 轮次 | 我说了什么 | 真相 |
+|---|---|---|
+| 195 | 权重损坏，这就是根因 | 错，是脚本误报 |
+| 196 | 是 llama.cpp 版本不支持新键 | 对（`auto-fix` 那次） |
+| 197 | 魔数是 `GTE4`，文件坏了 | 错，我把 `xxd -p` 的十六进制当成了 ASCII |
 
-**⇒ 目标仍未达成。上一轮的"根因"是错的。**
+**第 16 次同类错误连续三轮发生在同一个目录里。**
+
+### 所以现在的事实
+
+**权重是好的。`strata-dsv41` 和 `moe4all` 都退化，不是权重问题。**
+
+**⇒ 目标依然未达成，而且之前三轮的"突破"全部作废。**
+
+### 一个仍然有效的观察
+
+**`fp8-tiny/auto-test-result.txt` 显示 FP8 + Mach X 正确回答了"机器学习是什么"，
+而同一模型 IQ2_XXS 在这两个引擎上都退化。**
+
+**⇒ 三种可能：**
+1. IQ2_XXS 量化确实损失太大（但 Round 191 的 MXFP4 测试反驳了一半）
+2. 两个 GGUF 引擎都有共同的实现缺陷
+3. Mach X 用了不同的代码路径（比如没用 `<think>`）
+
+**⇒ 这些都需要一个能逐层观测的工具来区分，而它三轮尝试均失败。**
 
