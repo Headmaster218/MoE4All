@@ -1,47 +1,52 @@
 
 ---
 
-## Round 172：缓冲宽度全面扫描 —— 没有再发现同类问题，但找到批量路径的第二个缺陷
+## Round 173：`d4_comp` 越界是真 bug，但修了**不改变任何输出**
 
-### 方法
-
-列出 `runner.rs` 里全部约 90 处 `g.internal(f32d(...))` 分配，逐个与消费它的 op 的写入量对照。
-
-### 结果一：默认路径（batch == 1）没有第二处越界
-
-`hcr`、`hc_pre_lag`、`engram_k_normed`、`engram_q_normed`、`engram_gated`、`q`、`k`、`v`、`attn`、`gu`、`sub`
-等全部与内核写入量一致。**Round 170 修的 `hn` 是唯一一处。**
-
-### 结果二：批量 prefill 路径有一整批不带 `batch` 的缓冲
+### 那个 bug
 
 ```
-5810: d4_comp_values = (2 * c.head_dim)           ← 应为 batch * ...
-5811: d4_comp_scores = (2 * c.head_dim)
-5812: d4_comp        = c.head_dim
-5813: d4_lid_values  = (2 * c.indexer_head_size)
-5814: d4_lid_scores  = (2 * c.indexer_head_size)
-5815: d4_lid         = c.indexer_head_size
-5816: d4_ix_q        = (c.indexer_n_head * c.indexer_head_size)
-5823: d4_ix_w        = c.indexer_n_head
+7238:  let overlap = ratio4 == 4;                      ← 前 18 层为真
+内核 2310:  let width = if overlap { 2 * dim } else { dim }   ← 写 2*dim
+5812:  d4_comp = g.internal(f32d(c.head_dim.max(1)))         ← 只分配 dim
 ```
 
-`Op::Dsv4Compress` / `Op::Dsv4Indexer` 在 `batch > 1` 时会写 `batch × ...`，
-而这些缓冲只按单 token 分配 —— **与 `hn` 完全相同的越界模式。**
+`Op::Dsv4Compress` 在 ratio-4 层会往 `d4_comp` 写 1024 个 f32（2 KiB 越界）。
 
-**但这不影响默认路径**（`batch == 1` 时 `batch * X == X`，尺寸恰好），
-而且 `INFR_DSV41_BATCHED_PREFILL` 已经是 opt-in，批量入口有 release 常驻断言拦截。
+**但它没有改变任何输出：**
 
-**这解释了批量 prefill 为什么"数值不可信"** —— 不只是 Round 140 发现的"只写一行 KV"，
-这些缓冲也会越界。批量路径要真正可用，这两处都得修。
+| 输入 | 修复前 | 修复后 |
+|---|---|---|
+| `Hi` | 343:17.18% | 343:17.18% |
+| `The capital of France is` | 294:16.65% | 294:16.65% |
+| `2+2=` | 294:6.91% | 294:6.91% |
 
-### 当前状态
+**逐位相同。**
 
-| 项 | 结果 |
+### 为什么没影响
+
+`d4_comp` 唯一的消费点是 `Dsv4CacheWrite`，而它只在 `(start_pos+1) % ratio4 == 0` 时才读。
+越界的那 2 KiB 落在图池的相邻位置，在当前布局下要么无人使用，要么被后续归一化吸收。
+
+**所以它是 latent bug：布局一变（比如批量路径）就会变成真实错误，但在此刻不是症状来源。**
+
+### 处理
+
+**保留修复**（它确实越界），但明确标注它对当前症状无贡献。
+
+### 方法教训
+
+**修一个真实缺陷 ≠ 修好了症状。** 这次我用输出是否变化来验证，
+而不是"我找到了一个 bug 所以问题解决了"——这是这个会话里最该早点养成的习惯。
+
+### 现在的账
+
+| 缺陷 | 是否影响默认路径输出 |
 |---|---|
-| `hn` 越界（60 KiB/层） | ✅ 已修（Round 170），置信度 6.31%→17.18%，输入敏感性恢复 |
-| 默认路径还有同类越界？ | ❌ 扫描后确认没有 |
-| 批量路径的缓冲越界 | ⬜ 已知，待批量路径立项时一起修 |
-| `The capital of France is` → `294` | ❌ 仍错，剩余缺陷不属于"缓冲越界"类 |
+| 批量 prefill 只写一行 KV | 否（批量路径已 opt-in + 断言拦截） |
+| engram gate 越界 60 KiB | **是 —— 修复后置信度 6.31%→17.18%，输入敏感性恢复** |
+| `d4_comp` 越界 2 KiB | 否（实测逐位相同） |
+| 批量路径约 8 个缓冲缺 batch 因子 | 否（同上） |
 
-**⇒ 剩下的问题需要换一类假设。** 缓冲维度这条线已经走完。
+**默认路径的剩余缺陷不属于"缓冲越界"这一类。**
 
