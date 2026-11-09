@@ -9567,6 +9567,8 @@ fn generate_dense_backend_inner(
                 independent_rows,
             );
             drop(timeline_l0_bind);
+            // NOTE: `weights` and `c` are both in scope here, so the engram table and the
+            // per-layer upload can be emitted above this bind rather than threaded in.
             for &(layer, id) in &h0.engram_emb {
                 if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
                     bindings0.bind(id, buf.as_ref());
