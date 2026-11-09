@@ -1,57 +1,48 @@
 
 ---
 
-## Round 180：排除了两个重大假设，同时确认了缺陷真实存在
+## Round 181：`--no-think` 产生的是 `</think>`，不是空 —— Round 180 的对照不成立
 
-### 发现一：参考引擎在裸 prompt 上也会退化
-
-```
-The capital of France is (无 chat 模板)
-  参考引擎: 294, 270, 582, 79666, 294, 8760, 344, 201, 1   → "of the ... of France is"
-  moe4all:  294, 270, 201, ...                              → "of the. 2.2.0.0."
-```
-
-**两边 top-1 都是 `294`（= "of"），而且参考也确实输出 "of the ..."。**
-
-⇒ **"在裸 prompt 上重复输入里的词" 是这个模型的行为，不是 moe4all 的 bug。**
-
-这纠正了我 Round 179 的判断：那个 `of the` 退化不是缺陷特征，是模型对残缺 prompt 的正常反应。
-
-### 发现二：thinking 模式不是原因
+### 验证结果
 
 ```
-moe4all 默认 prompt: <System|>Reasoning Effort: 75 (range 1-100...)...<Assistant|><think>
+--no-think 的实际 prompt:
+<begin_of_sentence><User|>What is the capital of France? Answer in one word.<Assistant|></think>
+                                                                                       ^^^^^^^^
+
+参考引擎的干净格式:
+<begin_of_sentence><System|>You are a helpful assistant.<User|>What is the capital of France? ...<Assistant|>
+                                                                                                     ^^^^ 空
 ```
 
-用 `--no-think` 关掉后：`" to the **?  The **?  **"` —— **仍然是垃圾。**
+**⇒ `infr` 的 `--no-think` 追加的是 `</think>` 结束标记，而不是什么都不加。**
 
-⇒ **问题不在 thinking。**
+模型看到 `<Assistant|></think>` —— 一个"思考已结束但前面没有思考内容"的状态。
 
-### 发现三：但在相同格式下，差异是真实且巨大的
+### 这推翻了 Round 180 的第二个结论
 
-同一个问题、几乎相同的 chat 格式（我手工构造 `<System|>You are a helpful assistant.`）：
+Round 180 说"thinking 模式不是原因"，依据是 `--no-think` 后仍然输出垃圾。
+**但那次的 prompt 本身是病态的（`</think>` 前无内容），所以那个对照不成立。**
 
-```
-参考引擎: 271, 5, 223, 19, 16, 10793     ← 有意义
-moe4all:  " to the **?  The **?  **"     ← 垃圾
-```
+**正确表述**：`infr run` **无法产生**参考引擎那种 `<Assistant|>` 干净格式：
+- 默认：`<Assistant|><think>`
+- `--no-think`：`<Assistant|></think>`
 
-**⇒ 缺陷真实存在，而且与 prompt 格式无关。**
+两者都不是空。
 
-### 累计排除表（更新）
+### 因此，当前无法做同条件的文本层面对比
 
-| 假设 | 结论 | 证据 |
-|---|---|---|
-| 裸 prompt 上的 `of the` 退化 | **不是 bug** | 参考引擎同样如此 |
-| thinking 模式 | **不是原因** | `--no-think` 后仍错 |
-| engram 缓冲越界 | **是 bug，已修** | 置信度 6.31%→17.18%，输入敏感性恢复 |
-| 缓冲维度（默认路径） | 已全扫，无第二处 | Round 172 |
-| 注意力结构 / 输出投影 / 配置 | 无缺陷 | Round 174/176/143 |
+**这是本轮最重要的结论：在 `infr` 能输出和参考引擎相同的 prompt 之前，
+任何"相同 prompt 下两个引擎不同"的判断都是无效的。**
 
-**⇒ 真实的、尚未定位的缺陷依然存在：相同输入格式下，参考能回答而 moe4all 不能。**
+**已知能对齐的路径**：`INFR_PROMPT_DUMP` 抓 moe4all 的 prompt → `llama-tokenize --ids` → 喂
+`strata-dsv41 --ids`。这条路**保证 token 逐个相同**，Round 151 就是这么做的。
 
-### 方法教训（第 9 次）
+**问题在于**：Round 151 那次对齐后，输入是重复序列（`1k.ids` 风格），
+参考引擎也退化（重复输入），所以那个对比也不能说明语义能力。
 
-这一轮我差点把"裸 prompt 退化"当成 bug 继续追。**是跑了参考引擎的同条件对照才发现的。**
-**规则：任何"这是 bug"的判断，必须先在同一条件下让参考引擎跑一遍。**
+### 教训（第 10 次）
+
+**在说"两个引擎输入相同"之前，必须把两边的 prompt 都打出来逐字节比对。**
+这一轮我以为 `--no-think` = 空，实际是 `</think>`。**Round 180 的结论因此作废。**
 
