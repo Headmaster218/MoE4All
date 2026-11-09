@@ -2,52 +2,51 @@
 
 ---
 
-## Round 134：engram 真对照 —— 确定无罪；嫌疑只剩压缩注意力 / 超连接 / hash 路由
+## Round 139：超连接滞后调度排除（release 实测），嫌疑只剩压缩注意力 / hash 路由
 
-### 之前的「关掉 engram」为什么不算数
+### 做法
+
+`runner.rs:6592` 本来就有一条针对 HC 滞后的 `debug_assert!`：
 
 ```
-infr: INFR_ENGRAM_TABLE is unset; V4.1 engram will contribute garbage
+"deepseek41 layer {l}: the attention collapse reads lag slot [0] before layer {}'s
+ FFN sublayer wrote it — the HC lag schedule is broken, and every layer but the first
+ would silently consume a stale mix"
 ```
 
-不设表 = 让 engram **注入垃圾**，不是关掉它。Round 129 据此排除 engram 是错的（Round 133 已撤）。
+**但它只在 debug 构建生效，而我们唯一能跑这个模型的构建是 release。**
+读完代码「觉得对」不算证据。所以把它包进 `INFR_HC_LAG_CHECK`，让 `assert!` 在 release 也执行。
 
-### 这次是真对照：`INFR_ENGRAM_ZERO`
+### 实测
 
-在 `engram_apply` 闭包开头直接 `return`，跳过整个注入。
-**往残差流加零，与用一张全零表完全等价**，而后者的文件是 202 GB，不现实。
+```
+INFR_HC_LAG_CHECK=1 infr run ... "A B C D"
+→ [exit=0]，无 panic
+```
 
-（本机另有 `/data/models/dsv41-engram-stub/engram-q6k-stub.gguf`，数据区实测 0 非零字节，
-但它是 ggml type 14 / Q6_K，本 reader 只吃 32/34，用不了。）
+**⇒ V4.1 的「HC 系数滞后一个子层」调度是正确的。** 这是运行证据，不是阅读判断。
 
-### 实测（`A B C D`，temp 0，ctx 512）
+### 嫌疑范围
 
-| 配置 | 输出 |
-|---|---|
-| 有 engram（MXFP8 表） | `**  **  **  **  ** ` |
-| **零注入（真·无 engram）** | `- 0.5` |
+| # | 嫌疑 | 状态 |
+|---|---|---|
+| 1 | 超连接滞后 | ✅ **排除**（本轮）|
+| 2 | 压缩注意力（`kv_source_layer_ids=[2,8,14,20]` + 34 复用层） | 待查 |
+| 3 | MoE hash 路由（`ffn_gate_tid2eid`） | 待查 |
 
-**两种都错，但输出不同。**
+### 已排除清单（累计，全部有运行证据）
 
-### 两个结论
+- 引擎通用路径：qwen2.5-0.5b 在同一二进制上输出正常
+- prompt 构造：模型确实收到 `2+2=`
+- YOCO / `n_prefill_layer`：DeepInfer 默认 `off`
+- APE：V4.1 无该张量
+- warmup：`INFR_NO_WARMUP` A/B 输出几乎一致
+- engram：`INFR_ENGRAM_ZERO` 零注入仍错
+- logits 崩溃：熵 0.001–0.103，top1 98–99.99%，分布健康
+- **超连接滞后：`INFR_HC_LAG_CHECK` release 断言通过**
 
-1. **engram 无罪。** 完全不注入，模型照样答错。这是一次有效对照，与前几轮不同。
-2. **engram 确实在参与计算。** 有无之间输出不同（星号 vs `- 0.5`），
-   说明它注入的向量真的流进了残差流 —— 与更早的 A/B 结论一致。
-   它只是不是**根因**。
+### 仍未解决的硬约束
 
-### 嫌疑范围收敛到 3 个
-
-对照组（qwen2.5，Round 133）已证明引擎通用路径健康，所以只剩 V4.1 专有机制：
-
-1. **压缩注意力** —— `kv_source_layer_ids=[2,8,14,20]` 四个源层 + 34 个复用层，
-   源平面 gather 拓扑
-2. **超连接 `hyper_connection`** —— `hc` 份残差副本 + `post_layer_mix` / `comb_res_mix` 混合
-3. **MoE hash 路由** —— `ffn_gate_tid2eid` 按 token id 直查专家
-
-### 下一步判据
-
-超连接是最可疑的：它把残差流复制成 `hc` 份再混合，
-**任何一处 mix 系数或副本顺序错位，都会系统性地搅乱整个表示**
-——正好对应「语法完整、语义错位、logits 仍高置信」的症状画像。
+需要一个**可运行的参考实现**才能做数值比对。llama.cpp 报 `blk.1.engram_embd.weight is missing`
+（该 GGUF 不含 engram 张量，只有元数据），DeepInfer 是 Python 实现跑不动 130 GB。
 
