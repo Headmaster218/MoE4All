@@ -2,77 +2,60 @@
 
 ---
 
-## Round 120：找到额外开销 —— **MoE 在 prefill 里根本没批处理，逐 token 走 1 行 GEMV**
+## Round 122：**找到并验证了那笔额外开销 —— V4.1 默认被排除在批量 prefill 路径外**
 
-### 用户的判断是对的
+### 一句话
 
-我先前把 6 t/s 归因于「PCIe 链路上限」，并说 27.7 t/s 物理不可能。
-**这个结论错了**，错在把「观测到的带宽」当成了「带宽上限」。
-用户指出：Vulkan 图灵完备，达不到就是还有预期外开销。
+**`INFR_DSV41_BATCHED_PREFILL=1` 让 pp512 从 6.0 t/s 变成 29.5 t/s —— 4.9 倍，且设备完好。**
 
-### 决定性探针
+### 实测（同一命令，仅差这一个环境变量）
 
-**① 速度与工作量完全无关（bench 实测）**
+| prompt | 逐 token（默认） | 批量路径 | 倍数 |
+|---|---|---|---|
+| pp32 | 6.4 t/s | **15.7 t/s** | 2.45× |
+| pp64 | — | **18.1 t/s** | — |
+| pp128 | 6.2 t/s | **21.5 t/s** | **3.5×** |
+| pp256 | — | **28.7 t/s** | — |
+| **pp512** | **6.0 t/s** | **29.5 t/s** | **4.9×** |
 
-| 配置 | 吞吐 |
+**设备状态**：跑完后 `infr devices` 仍能枚举到 BMG G31，**没有挂死**。
+
+### 为什么这是「额外开销」
+
+代码注释写得很清楚（`runner.rs:12650` 附近）：
+
+> **“DeepSeek V4 is excluded from the batched path outright.”**
+> V4.1 的批量路径被 `INFR_DSV41_BATCHED_PREFILL` 挡在门外，默认关闭。
+
+所以默认情况下，**每一个 V4.1 的 prefill token 都在走 decode 的逐行路径**。
+这不是硬件限制，也不是 Vulkan 的限制 —— **是一个默认关闭的开关。**
+
+### 与历史记录的矛盾
+
+注释里写着（2026-11-08 实测）：
+
+> *“41 tok @ 8 t/s vs 7 per-token”*，以及 *“2032-token prompt loses the DEVICE”*
+
+**但今天实测：pp32 15.7、pp512 29.5，且设备未丢。**
+
+差异可能来自：
+- 之后的提交修复了部分问题
+- 当时的测量条件不同（缓存状态、内存压力）
+- 2032 token 才是真正的临界点，512 还远未触及
+
+**这一条需要复测确认**，但 512 以内目前是安全的。
+
+### 对用户问题的直接回答
+
+| 问题 | 答案 |
 |---|---|
-| pp32 | 5.9 t/s |
-| pp128 | 6.1 t/s |
-| pp512 | 6.0 t/s |
-| pp512, ub=32 | 6.0 t/s |
-| pp512, ub=128 | 6.0 t/s |
-| pp512, ub=4096 | 6.0 t/s |
+| Vulkan 能否达到 SYCL 相当的速度？ | **能。29.5 t/s 已超过 poorseek 的 27.7 t/s** |
+| 之前 6 t/s 是不是硬件上限？ | **不是，是默认关闭的批量路径** |
+| 用户「图灵完备必有预期外开销」的判断 | **正确** |
 
-**16 倍工作量、128 倍 ubatch 差异，吞吐恒定在 6.0。** 这不是带宽受限的特征。
+### 下一步
 
-**② 门控探针（`INFR_MMQ_PROBE`）**
-
-```
-57848  rows=1 thr=8 rows_ok=FALSE dtypes全OK(Iq1M/Iq1M/Iq1M)
-37188  rows=1 thr=8 rows_ok=FALSE Iq2Xxs/Iq2Xxs/Iq1M
-20660  rows=1 thr=8 rows_ok=FALSE Iq2Xs/Iq2Xs/Iq1M
-```
-
-**每一条都是 `rows=1`，`rows_ok=false`。**
-
-**③ 形状探针（决定性）**
-
-```
-MMQ_SHAPE ne=5120 numel=5120 rows=1
-```
-
-**prefill 32 个 token，MoE 输入张量却只有 `numel=5120 = ne`，即 1 行。**
-
-### 根因
-
-`paged_mmq_selected` 的门控里有 **`rows > small_m_threshold(8)`**。
-MoE 的 `rows = graph.desc(x).numel() / ne`，而 prefill 时 **MoE 被逐 token 调用了 32 次、每次 1 行**，
-所以 `rows=1` 永远小于 8，**永远走不到 MMQ 快路径**，落在 `native_idm_iq1m_paged` 这个
-**1-output-per-workgroup 的 GEMV** 上（commit `1224cf8` 注释实测 **0.26 TFLOPS**）。
-
-**这解释全部现象：**
-
-| 观测 | 解释 |
-|---|---|
-| pp32 = pp512 = 6.0 t/s | MoE 逐 token 处理，batch 维度完全没进入 |
-| ubatch 32/128/4096 全无影响 | 改的是外层分块，MoE 内部照样逐行 |
-| `native_idm_iq1m_paged` 31432 次 × 880µs = 27.7s (39%) | 正是这些 1 行 GEMV |
-| `copy_strided` 453120 次 | 每行都要搬一次专家数据 |
-
-### 排除掉的测量假象
-
-`INFR_PROF_OPS` 默认把 **`zero_fill` 报成 22.4s (31.7%)**。
-用 `INFR_STAMP_AFTER_BARRIER=1` 重测后它**完全消失**，时间转移到
-`native_idm_iq1m_paged`（7.09s → 27.7s）。**zero_fill 的耗时里绝大部分是「等待之前的计算完成」**，
-代码注释早已写明这是 ~160× 的误归因。
-
-### 量级与下一步
-
-| | GEMV（当前） | MMQ（应有） |
-|---|---|---|
-| 算术强度 | 1 行/次，0.26 TFLOPS | prefill 批量，int8 峰值 40+ TFLOPS |
-| 行利用率 (pp512) | 1/512 | 满 |
-
-**下一步：让 prefill 的 MoE 按 batch 行数一次发射，而不是逐 token 循环。**
-这才是真正的额外开销。
+1. **复测 1024 / 2048**，找出真实的挂死临界点
+2. 若 512 稳定，考虑**把开关默认打开**（或按 prompt 长度自动选择）
+3. 同步 PR #183
 
