@@ -181,6 +181,10 @@ impl DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if std::env::var_os("INFR_PROMPT_DUMP").is_some() {
+            std::fs::write("/tmp/turn-prompt.txt", prompt).ok();
+            eprintln!("PROMPT_DUMP wrote {} bytes", prompt.len());
+        }
         if self.wants_qwen4_mtp(req)? {
             self.ensure_qwen4_mtp()?;
             let vk = self.mtp_vk.as_ref().expect("ensure_qwen4_mtp set it");
