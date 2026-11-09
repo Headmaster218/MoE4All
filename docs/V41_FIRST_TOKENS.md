@@ -2,61 +2,56 @@
 
 ---
 
-## Round 117：用官方检查脚本取基线 —— engram 的 A/B 已固化进脚本
+## Round 118：追 tokenizer —— 两次错判，最后发现是 warmup 干扰
 
-### 发现现成的验证工具
+### 错误判断 1：token 23166 = "Hi" ⇒ prompt 被替换
 
-`scripts/check-v41-answers.sh` 早就存在，而且它的设计思路与我 Round 116 的结论**完全一致**：
+我用 `/data/models/dsv41-official-meta/tokenizer.json` 查 `23166` 得到 `'Hi'`，
+据此认为 prompt 被错误替换。
 
-> *"The point of this script is the control model. Reading V4.1's output and deciding whether it
-> 'looks wrong' is not a test — it depends on the reader knowing the answer, and it gives no way to
-> tell a broken model path from a broken engine."*
+**错在**：该 `tokenizer.json` 的 id 空间与 GGUF 内嵌的 tokenizer **不一致**
+（它把 `'2'` 映射到 20，而实际喂入的是 23166）。
 
-它还带 `flock` 保护（GPU 是单例资源），符合"一次一个 GPU 作业"的硬规则。
+### 错误判断 2：三个不同 prompt 都 `len=1` ⇒ MESSAGE 没传到模型
 
-### 基线数据（本机无对照模型，只测 V4.1）
+我又测了三个不同 prompt，全部得到 `ENGRAM_PROMPT len=1 ids=[23166]`，
+据此认为 CLI 丢弃了消息。
 
-| engram | 模式 | 输出 |
+**错在**：没有意识到**每个进程都会先跑一次 warmup**。
+
+### 真相（`ENGRAM_TURN` 探针）
+
+```
+ENGRAM_TURN prompt="Hi"                          ← warmup
+ENGRAM_PROMPT len=1 ids=[23166]
+
+ENGRAM_TURN prompt="...2+2=..."                  ← 真正的用户 turn
+ENGRAM_PROMPT len=35 ids=[0, 128799, 77666, ...] ← 35 token，完全正常
+```
+
+**`"Hi"` 是引擎的 warmup 调用。** 我看到的每个 `len=1` 都是 warmup，不是我的 prompt。
+
+**⇒ 真实 prompt 有 35 个 token，tokenizer 和 CLI 都正常。**
+
+### 方法教训（第三次同类）
+
+| 轮次 | 我凭什么下结论 | 错在哪 |
 |---|---|---|
-| **有** | default | `** 0.0.0` |
-| **无** | default | `We need answer. The question is "` |
-| 有 | batched | `We need answer. We need to reason` |
-| 无 | batched | `The user wants me to translate the analysis` |
+| Round 111-113 | 分支代码看起来对 | 没跑 runtime 证据 |
+| **Round 118a** | 一个**不同来源**的 tokenizer.json | 没验证两个 tokenizer 是否同源 |
+| **Round 118b** | 三次观测都一致 | 没意识到采样的是**同一个 warmup**，而非三次调用 |
 
-### 这批数据的意义
+**共同模式：证据的「一致性」不等于「正确性」** —— 三次相同观测若都来自同一个非目标对象，
+一致性反而会强化错误结论。
 
-**① engram 的 A/B 差异是稳定可复现的**
-有 engram 出 `** 0.0.0`（含数字），无 engram 出纯散文。**两次独立运行都是这个模式。**
+### 现在确知的事实
 
-**② 两条路径都答不对**，但错的**方式**完全不同：
-- default：`** 0.0.0` —— 出了 markdown 和数字
-- batched：`We need answer...` —— 纯英文思考流
-
-**③ batched 路径的注释早就说明了**：
-
-> *"runner.rs documents that no batch>1 V4 graph has executed correctly, so a batched PASS
-> would be surprising and a batched FAIL alone says nothing about the default path."*
-
-### 脚本改进
-
-把 engram A/B 固化进 `check-v41-answers.sh`——设置了 `INFR_ENGRAM_TABLE` 时，
-自动跑 `engram-with` / `engram-without` 两组，**任何一侧退化都能看到**。
-
-### 现状判断
-
-| 问题 | 状态 |
+| 项 | 状态 |
 |---|---|
-| engram 是否参与计算 | ✅ 已证明（A/B 稳定可复现）|
-| engram 数学实现 | ✅ 逐项核对正确 |
-| engram 数据 | ✅ 数值健康 |
-| **整模型能否答对** | **❌ 两条路径都不行** |
+| prompt 分词 | ✅ 35 token，正常 |
+| CLI 参数传递 | ✅ 正常 |
+| 引擎 warmup | ✅ 存在，输出 `"Hi"` |
+| **engram 在真实 turn 中的行为** | **待重新验证** |
 
-**⇒ engram 这条线已经做完了能做的部分。** 剩下的是模型级的问题，
-本 goal 里列出的 compressor / APE 那条线很可能就是主因。
-
-### 下一步
-
-既然本机没有对照模型，**先确认 batched 与 default 之外的第三条线索**：
-`** 0.0.0` 这个输出形态很特殊——markdown 加粗 + 数字，像是**在输出格式模板**而不是在算数。
-下一轮看它是不是 chat template 的问题（prompt 未按对话格式构造）。
+**之前 engram 的 A/B 结论可能被 warmup 污染过**——需要重跑，只统计真实 turn 的 `ENGRAM_FEED`。
 
