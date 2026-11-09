@@ -10370,6 +10370,39 @@ fn generate_dense_backend_inner(
             spans,
             if has_ple { Some(1..c.n_layer) } else { None },
         );
+        // DeepSeek V4.1 engram: gather each engram layer's rows for this batch and upload them
+        // into that layer's staging buffer, before the plan that reads them is compiled/executed.
+        // The rows are hashed per layer (`EngramMap::slot`), so this is per layer, not one blob.
+        if let Some(table) = weights.engram_table.as_ref() {
+            // Token stream for this forward: lane `l` contributes feeds[l][start..end].
+            // `history` is everything before each lane's window; `batch` is the window itself.
+            let mut history: Vec<u32> = Vec::new();
+            let mut batch_toks: Vec<u32> = Vec::new();
+            for lane in 0..lanes {
+                let start_pos = parallel.prepared[lane].start;
+                let end = start_pos + rows_per_lane;
+                batch_toks.extend(
+                    parallel.feeds[lane][start_pos..end]
+                        .iter()
+                        .map(|&id| id as u32),
+                );
+                let _ = &mut history;
+            }
+            for &(layer, id) in &h1.engram_emb {
+                let _ = id;
+                if let Some((_, dst)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                    crate::engram::upload_layer(
+                        be,
+                        c,
+                        table.as_ref(),
+                        layer,
+                        &history,
+                        &batch_toks,
+                        dst.as_ref(),
+                    )?;
+                }
+            }
+        }
         let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
         let mut bindings1 = Bindings::new();
         if let Some(id) = h1.tok_ids {
