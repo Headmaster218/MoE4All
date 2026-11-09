@@ -1000,7 +1000,7 @@ fn bind_layer_io<'a>(
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
     ple_state_buf: &'a Option<Box<dyn Buffer>>,
-    engram_emb_buf: &'a Option<Box<dyn Buffer>>,
+    engram_emb_buf: &'a [(u32, Box<dyn Buffer>)],
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
@@ -1036,8 +1036,12 @@ fn bind_layer_io<'a>(
     // DeepSeek V4.1 engram rows. This is precisely the class of bind the doc comment above warns
     // about: every execution path goes through here, so an engram input left to the callers is
     // unbound for whichever path forgot it - which is what `unbound tensor 3` was.
-    if let (Some(id), Some(buf)) = (h.engram_emb, engram_emb_buf.as_ref()) {
-        b.bind(id, buf.as_ref());
+    // One tensor and one buffer per engram layer (the row indices are hashed with that layer's
+    // own multipliers), so bind each layer to its own buffer.
+    for &(layer, id) in &h.engram_emb {
+        if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+            b.bind(id, buf.as_ref());
+        }
     }
 }
 
@@ -1082,7 +1086,7 @@ fn bind_parallel_layer_io<'a>(
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
     primary_ple_state: &'a Option<Box<dyn Buffer>>,
-    engram_emb_buf: &'a Option<Box<dyn Buffer>>,
+    engram_emb_buf: &'a [(u32, Box<dyn Buffer>)],
     wide: Option<&'a dyn Buffer>,
     ple_embd: Option<&'a dyn Buffer>,
     peers: &'a [SeamKv],
@@ -1496,7 +1500,7 @@ pub(super) struct DecodeHandles {
     /// block per token. `crate::engram` computes the row indices and dequantizes them out of the
     /// mmapped table on the host (ggml has no 64-bit xor for the hash), so this arrives as an
     /// input exactly as `ple_embd` does. Present only on a span containing an engram layer.
-    engram_emb: Option<TensorId>,
+    engram_emb: Vec<(u32, TensorId)>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     mtp_k_trace: Vec<Option<TensorId>>,
@@ -1599,7 +1603,7 @@ struct PendingSeamSlot {
     ple_state_buf: Option<Box<dyn Buffer>>,
     /// DeepSeek V4.1 engram: the host-gathered rows for one step, `n_cols * key_length` per
     /// token. Sized for the widest batch this slot will see, as `ple_embd_buf` is.
-    engram_emb_buf: Option<Box<dyn Buffer>>,
+    engram_emb_buf: Vec<(u32, Box<dyn Buffer>)>,
     turn_recurrent_ckpts: [Option<TurnRecurrentCkpt>; super::TURN_CHECKPOINT_COUNT],
     mtp_delta_ckpt: Option<MtpDeltaCkpt>,
     mtp_verify_bufs: Option<QwenMtpVerifyBuffers>,
@@ -1757,18 +1761,24 @@ fn allocate_pending_seam_slot(
     };
     // DeepSeek V4.1 engram: one gathered row block per token, `n_cols * key_length` wide — which is
     // exactly `wkv`'s input width. Sized per token like `qwen_wide_buf`, not per batch.
-    let engram_emb_buf = if cfg.deepseek41 && !cfg.engram_layer_ids.is_empty() {
-        let n_cols = (cfg.engram_max_ngram.saturating_sub(1)) * cfg.engram_n_head;
-        Some(
-            be.alloc(
-                n_cols.max(1) * cfg.engram_key_length.max(1) * 4,
-                BufferUsage::Staging,
-            )
-            .map_err(|e| anyhow!("{e}"))?,
-        )
-    } else {
-        None
-    };
+    let engram_emb_buf: Vec<(u32, Box<dyn Buffer>)> =
+        if cfg.deepseek41 && !cfg.engram_layer_ids.is_empty() {
+            let n_cols = (cfg.engram_max_ngram.saturating_sub(1)) * cfg.engram_n_head;
+            let mut v = Vec::with_capacity(cfg.engram_layer_ids.len());
+            for &layer in &cfg.engram_layer_ids {
+                v.push((
+                    layer,
+                    be.alloc(
+                        n_cols.max(1) * cfg.engram_key_length.max(1) * 4,
+                        BufferUsage::Staging,
+                    )
+                    .map_err(|e| anyhow!("{e}"))?,
+                ));
+            }
+            v
+        } else {
+            Vec::new()
+        };
 
     Ok(PendingSeamSlot {
         kbufs,
@@ -4035,18 +4045,24 @@ fn generate_dense_backend_inner(
             .map_err(|e| anyhow!("{e}"))?;
         // DeepSeek V4.1 engram staging: one gathered row block per token, `n_cols * key_length`
         // wide (= wkv's input width). Sized per token, not per batch, like `qwen_wide_buf`.
-        let engram_emb_buf = if c.deepseek41 && !c.engram_layer_ids.is_empty() {
-            let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
-            Some(
-                be.alloc(
-                    n_cols.max(1) * c.engram_key_length.max(1) * 4,
-                    BufferUsage::Staging,
-                )
-                .map_err(|e| anyhow!("{e}"))?,
-            )
-        } else {
-            None
-        };
+        let engram_emb_buf: Vec<(u32, Box<dyn Buffer>)> =
+            if c.deepseek41 && !c.engram_layer_ids.is_empty() {
+                let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
+                let mut v = Vec::with_capacity(c.engram_layer_ids.len());
+                for &layer in &c.engram_layer_ids {
+                    v.push((
+                        layer,
+                        be.alloc(
+                            n_cols.max(1) * c.engram_key_length.max(1) * 4,
+                            BufferUsage::Staging,
+                        )
+                        .map_err(|e| anyhow!("{e}"))?,
+                    ));
+                }
+                v
+            } else {
+                Vec::new()
+            };
         *state = Some(SeamKv {
             weights,
             stable: std::sync::Arc::clone(&stable),
@@ -4875,11 +4891,23 @@ fn generate_dense_backend_inner(
         // gathered rows of `key_length` each, already dequantized on the host. `n_cols` is
         // `(max_ngram - 1) * n_head` — 24 on the real model — and `wkv`'s input width is exactly
         // `n_cols * key_length` (6144 there), so no reshaping is needed on this side.
-        let span_has_engram = c.deepseek41 && (l_first..l_end).any(|l| c.has_engram(l));
-        let engram_emb = span_has_engram.then(|| {
+        // One input per engram layer in this span. The row indices are hashed with that layer's
+        // own multipliers/primes/offsets (EngramMap::slot), so two layers need different rows for
+        // the same token and cannot share one tensor.
+        let engram_emb: Vec<(u32, TensorId)> = if c.deepseek41 {
             let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
-            g.input(f32d(batch * n_cols.max(1) * c.engram_key_length.max(1)))
-        });
+            (l_first..l_end)
+                .filter(|&l| c.has_engram(l))
+                .map(|l| {
+                    (
+                        l as u32,
+                        g.input(f32d(batch * n_cols.max(1) * c.engram_key_length.max(1))),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let trace_recurrent = mtp_verify
             && mtp_trace.is_some_and(|(rows, _)| rows == batch || parallel_mtp_rows == Some(rows));
         let mtp_trace_rows = mtp_trace.map_or(0, |(_, trace_rows)| trace_rows);
@@ -5962,8 +5990,13 @@ fn generate_dense_backend_inner(
         // One projection produces hc keys then a single shared value. The file's `wkv` is
         // `[n_cols*key_length, hc*n_embd + n_embd]` in ggml order, so the two halves are two
         // offset GEMVs over the SAME activation, exactly the split `weights.rs` documents.
-        let engram_apply = |g: &mut Graph, ew: &crate::seam::weights::EngramW, res: TensorId| {
-            let emb = engram_emb.expect("an engram layer needs the gathered engram input");
+        let engram_apply =
+            |g: &mut Graph, ew: &crate::seam::weights::EngramW, res: TensorId, layer: u32| {
+            let emb = engram_emb
+                .iter()
+                .find(|(l, _)| *l == layer)
+                .map(|(_, t)| *t)
+                .expect("an engram layer needs its own gathered engram input");
             let n_cols = (c.engram_max_ngram.saturating_sub(1)) * c.engram_n_head;
             // key half: rows [0, hc*n_embd)
             g.push(Op::Linear {
@@ -6384,7 +6417,7 @@ fn generate_dense_backend_inner(
             // engram first, before any hyper-connection mix reads the stream (`deepseek41.cpp`
             // 840 injects at the top of the layer, ahead of its first `build_hc_mixes`).
             if let Some(ew) = &lw.engram {
-                engram_apply(&mut g, ew, hcr[0]);
+                engram_apply(&mut g, ew, hcr[0], l as u32);
             }
             if let Some(pw) = &lw.ple {
                 let wide = qwen_wide.expect("a qwen4exp PLE layer needs qwen_wide");
@@ -9526,7 +9559,7 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-                engram_emb_buf,
+                &engram_emb_buf[..],
                 Some(wide_batch.as_ref()),
                 None,
                 &*parallel.peers,
@@ -9534,8 +9567,10 @@ fn generate_dense_backend_inner(
                 independent_rows,
             );
             drop(timeline_l0_bind);
-            if let (Some(id), Some(buf)) = (h0.engram_emb, engram_emb_buf.as_ref()) {
-                bindings0.bind(id, buf.as_ref());
+            for &(layer, id) in &h0.engram_emb {
+                if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                    bindings0.bind(id, buf.as_ref());
+                }
             }
             let timeline_l0_execute = infr_core::timeline::span("prefill_l0_execute");
             be.execute(plan0.as_ref(), &bindings0)
@@ -9605,15 +9640,17 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-                engram_emb_buf,
+                &engram_emb_buf[..],
                 Some(wide_batch.as_ref()),
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
                 Some(&batch_lanes),
                 independent_rows,
             );
-            if let (Some(id), Some(buf)) = (h1.engram_emb, engram_emb_buf.as_ref()) {
-                bindings1.bind(id, buf.as_ref());
+            for &(layer, id) in &h1.engram_emb {
+                if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                    bindings1.bind(id, buf.as_ref());
+                }
             }
             drop(timeline_main_bind);
             let timeline_main_execute = infr_core::timeline::span("prefill_main_execute");
@@ -9975,7 +10012,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
-        engram_emb_buf,
+        &engram_emb_buf[..],
         );
         if plan_sc {
             if dyn_sc {
@@ -10285,15 +10322,17 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-                engram_emb_buf,
+                &engram_emb_buf[..],
                 Some(fixed.wide.as_ref()),
                 None,
                 &*parallel.peers,
                 None,
                 independent,
             );
-            if let (Some(id), Some(buf)) = (h0.engram_emb, engram_emb_buf.as_ref()) {
-                bindings0.bind(id, buf.as_ref());
+            for &(layer, id) in &h0.engram_emb {
+                if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                    bindings0.bind(id, buf.as_ref());
+                }
             }
             bind_parallel_mtp_traces(&mut bindings0, &h0, mtp_delta_ckpt, parallel.peers);
             be.execute(plan0.as_ref(), &bindings0)
@@ -10355,15 +10394,17 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
-            engram_emb_buf,
+            &engram_emb_buf[..],
             Some(fixed.wide.as_ref()),
             has_ple.then_some(fixed.ple.as_ref()),
             &*parallel.peers,
             None,
             independent,
         );
-        if let (Some(id), Some(buf)) = (h1.engram_emb, engram_emb_buf.as_ref()) {
-            bindings1.bind(id, buf.as_ref());
+        for &(layer, id) in &h1.engram_emb {
+            if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                bindings1.bind(id, buf.as_ref());
+            }
         }
         bind_parallel_mtp_traces(&mut bindings1, &h1, mtp_delta_ckpt, parallel.peers);
         bindings1.bind(h1.logits.expect("MTP VERIFY logits"), fixed.logits.as_ref());
@@ -10697,7 +10738,7 @@ fn generate_dense_backend_inner(
                     qwen_wide_buf,
                     ple_embd_buf,
                     ple_state_buf,
-                engram_emb_buf,
+                &engram_emb_buf[..],
                 );
                 vb0.bind(
                     vh0.qwen_wide.expect("Qwen VERIFY head has a wide residual"),
@@ -10759,7 +10800,7 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
-            engram_emb_buf,
+            &engram_emb_buf[..],
             );
             vb.bind(
                 vh.qwen_wide.expect("Qwen VERIFY has a wide residual"),
@@ -10934,7 +10975,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
-        engram_emb_buf,
+        &engram_emb_buf[..],
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -11536,15 +11577,17 @@ fn generate_dense_backend_inner(
                             qwen_wide_buf,
                             ple_embd_buf,
                             ple_state_buf,
-                            engram_emb_buf,
+                            &engram_emb_buf[..],
                             wide_batch.as_deref(),
                             None,
                             &*parallel.peers,
                             None,
                             independent_rows,
                         );
-                        if let (Some(id), Some(buf)) = (h0.engram_emb, engram_emb_buf.as_ref()) {
-                            b0.bind(id, buf.as_ref());
+                        for &(layer, id) in &h0.engram_emb {
+                            if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                                b0.bind(id, buf.as_ref());
+                            }
                         }
                         Some((plan0, b0))
                     };
@@ -11579,15 +11622,17 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
-                        engram_emb_buf,
+                        &engram_emb_buf[..],
                         wide_batch.as_deref(),
                         ple_batch.as_deref(),
                         &*parallel.peers,
                         None,
                         independent_rows,
                     );
-                    if let (Some(id), Some(buf)) = (h1.engram_emb, engram_emb_buf.as_ref()) {
-                        b1.bind(id, buf.as_ref());
+                    for &(layer, id) in &h1.engram_emb {
+                        if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                            b1.bind(id, buf.as_ref());
+                        }
                     }
                     if logits_rows > 0 {
                         b1.bind(
@@ -11764,15 +11809,17 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
-                                    engram_emb_buf,
+                                    &engram_emb_buf[..],
                                     wide_batch.as_deref(),
                                     if is_main { ple_batch.as_deref() } else { None },
                                     &*parallel.peers,
                                     None,
                                     independent_rows,
                                 );
-                                if let (Some(id), Some(buf)) = (handles.engram_emb, engram_emb_buf.as_ref()) {
-                                    bindings.bind(id, buf.as_ref());
+                                for &(layer, id) in &handles.engram_emb {
+                                    if let Some((_, buf)) = engram_emb_buf.iter().find(|(l, _)| *l == layer) {
+                                        bindings.bind(id, buf.as_ref());
+                                    }
                                 }
                                 if is_main {
                                     if let Some(id) = handles.logits {
@@ -13065,7 +13112,7 @@ fn generate_dense_backend_inner(
                                 ple_embd_buf
                             },
                             ple_state_buf,
-                        engram_emb_buf,
+                        &engram_emb_buf[..],
                         );
                         debug_assert!(
                             pf_h.logits.is_none(),
@@ -13371,7 +13418,7 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
-        engram_emb_buf,
+        &engram_emb_buf[..],
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -13907,15 +13954,17 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
-                                engram_emb_buf,
+                                &engram_emb_buf[..],
                                 );
                                 // DeepSeek V4.1 engram rows for this step. Bound here, in the
                                 // decode loop, because the plan is precompiled from immutable
                                 // metadata alone - `prepare_decode_plan` never sees buffers.
-                                if let (Some(id), Some(buf)) =
-                                    (handles.engram_emb, engram_emb_buf.as_ref())
-                                {
-                                    bindings.bind(id, buf.as_ref());
+                                for &(layer, id) in &handles.engram_emb {
+                                    if let Some((_, buf)) =
+                                        engram_emb_buf.iter().find(|(l, _)| *l == layer)
+                                    {
+                                        bindings.bind(id, buf.as_ref());
+                                    }
                                 }
                                 if let Some(id) = handles.logits {
                                     bindings.bind(id, logits_buf.as_ref());
@@ -14013,7 +14062,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
-                    engram_emb_buf,
+                    &engram_emb_buf[..],
                     );
                     let ple_buf = ple_embd_buf
                         .as_ref()
@@ -14045,7 +14094,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
-                    engram_emb_buf,
+                    &engram_emb_buf[..],
                     );
                     b1.bind(
                         h1.logits.expect("qwen4exp tail build has logits"),
@@ -14151,7 +14200,7 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
-                    engram_emb_buf,
+                    &engram_emb_buf[..],
                     );
                     b.bind(
                         h.logits.expect("decode build has logits"),
