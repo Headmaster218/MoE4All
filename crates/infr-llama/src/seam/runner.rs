@@ -13564,6 +13564,10 @@ fn generate_dense_backend_inner(
             main: prepare_decode_plan(shape, false)?,
         })
     };
+    // Tokens this turn has fed, recorded at the injection point. Neither `out` nor `cur` is
+    // appended on the record-once decode path, so both stay at the prompt and the engram window
+    // would never advance; this is written where the token is actually handed to the forward.
+    let mut engram_seen: Vec<u32> = Vec::new();
     infr_core::step_pipeline::with_step_preparation(
         prepare_ahead,
         |(shape, context): (Shape, Option<infr_core::timeline::Context>)| {
@@ -13745,8 +13749,10 @@ fn generate_dense_backend_inner(
                     // exceeds it. The sequence so far is the prompt plus every token emitted
                     // this turn; `pos` is the absolute index of `tok`, which is the one about to
                     // be fed and therefore not in either slice yet.
+                    // `engram_seen` holds the tokens this loop has already handed to the forward,
+                    // in feed order, so it is exactly the predecessor history for `tok`.
                     let mut history: Vec<u32> = prompt.to_vec();
-                    history.extend(out.iter().copied());
+                    history.extend(engram_seen.iter().copied());
                     let batch_toks = [tok as u32];
                     // The buffers carry their own layer ids, so this does not need the graph
                     // handles (`engram_emb` is out of scope in the decode pipeline).
@@ -13761,6 +13767,7 @@ fn generate_dense_backend_inner(
                             dst.as_ref(),
                         )?;
                     }
+                    engram_seen.push(tok as u32);
                 }
                 if !gpu_embed_tok {
                     // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
