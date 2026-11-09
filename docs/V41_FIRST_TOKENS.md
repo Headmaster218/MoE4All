@@ -1,56 +1,43 @@
 
 ---
 
-## Round 200：主 GGUF + 独立 engram 表的设计与索引，全部自洽
+## Round 203：rebase 后重新验证 —— 修复的实测数据仍然成立
 
-### 主分片的张量清单
-
-```
-shard1: tensors=42, 其中 engram 相关 4 个
-  engram_token_map.weight    [129280]   I16
-  engram_primes.weight       [24, 2]    I32
-  engram_offsets.weight      [24, 2]    I32
-  engram_multipliers.weight  [4, 2]     I32
-```
-
-**主 GGUF 只有**索引元数据**，189 GB 的 embedding 表在独立文件里。`bench-iq2.log` 里
-`blk.1.engram_embd.weight is missing` 正是这个设计的结果——单独加载主文件必然缺表。**
-
-### 元数据数组与代码期望的长度
+git 历史被 rebase 到 `upstream/main` 后（PR #199），重跑同一条验证：
 
 ```
-deepseek41.engram.primes      len=48   = 2 slots × 24 buckets
-deepseek41.engram.offsets     len=48
-deepseek41.engram.multipliers len=8    = 2 slots × 4 ngram
+./infr run <model> "Hi" --max-new 1 --temp 0 --ctx 512 --dev Vulkan1
+  with INFR_LOGIT_PROBE=1 INFR_NO_GPU_ARGMAX=1 INFR_NO_GPU_SAMPLE=1
+
+top5 = [343:0.1718, 16:0.0876, 33:0.0575, 201:0.0390, 29:0.0268]
+max = 15.6292   entropy = 5.391
 ```
 
-`n_bucket = (4-1) × 8 = 24`，与 `primes` 的第一维 `[24, 2]` 一致。
+**与 rebase 前逐位相同。** PR #199 里引用的 6.31% → 17.18% 是可信的。
 
-### 数值结构自洽
+### 为什么值得记这一笔
 
+rebase 会重放 229 个补丁，理论上任何一处冲突解决都可能改变行为。**在把数据写进 PR 之前重跑一遍，
+是让 PR 里每个数字都对得上它声称的树。** 这次对上了。
+
+### 一个仍需注意的坑：`INFR_PROMPT_OVERRIDE` 的正确用法
+
+对比两个引擎时必须保证 token 逐个相同。正确流程：
+
+```bash
+# 1. 让 infr 把你的问题渲染成完整 prompt 并落盘
+INFR_PROMPT_DUMP=1 infr run <model> "<question>" --max-new 1 ...
+cat /tmp/turn-prompt.txt
+
+# 2. 用同一个 tokenizer 编码，确认 ids
+llama-tokenize -m <model.gguf> -f /tmp/turn-prompt.txt --ids
+
+# 3. 把同一份文件喂给 infr（绕过模板），同一组 ids 喂给参考引擎
+INFR_PROMPT_OVERRIDE=/tmp/turn-prompt.txt infr run <model> x ...
+strata-dsv41 ... --ids "<上一步的 ids>"
 ```
-primes[0..3]  = [16000057, 16000079, 16000081]
-offsets[0..3] = [0, 16000057, 32000136]
 
-offsets 每段跳 ~1600 万 = engram_vocab_size
-num_embeddings[0] = 384006168 = 24 × 16000257 ≈ 24 个 bucket × 1600 万行
-```
-
-**每个 bucket 占 1600 万行，24 个 bucket 共 3.84 亿行 —— 与表的第一维完全对上。**
-
-### 结论
-
-**engram 的索引设计（token_map / primes / offsets / multipliers）、行数分配、
-元数据与外部表的一致性，逐项自洽。**
-
-**⇒ engram 不是缺陷来源。这是本会话第 4 次独立确认。**
-
-### 状态
-
-**核心问题（两个引擎在同一权重上退化）仍未解释。**
-
-**已排除的完整清单（含本轮）：**
-缓冲越界（已修一条）· 哈希算法 · 窗口顺序 · slot 映射 · 元数据键冲突 ·
-表与模型配套性 · 索引数组长度与数值结构 · 专家量化（MXFP4 局部替换无效）·
-prompt 三种格式 · chat template · 注意力结构 · 输出投影 · 配置键
+**为什么不能省这一步**：infr 的模板默认在 `<|Assistant|>` 后追加 `<|think>`，`--no-think` 追加的是
+`</think>` 而不是空——两者都不是参考引擎拿到的干净结尾。**本会话有 10 次以上因为没做这一步
+而拿"不同输入"做了对比、得出了错误结论。** 这个 flag 就是把那个坑填掉的。
 
