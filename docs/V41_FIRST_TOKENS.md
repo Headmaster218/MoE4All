@@ -2,66 +2,53 @@
 
 ---
 
-## Round 142：找到本机的正确参照；采样参数排除；问题确定在 logits 之前
+## Round 143：配置全项核对通过（加了 `INFR_CFG_DUMP`），配置类错误排除
 
-### 本机有一个**能正确回答的 V4.1 实现**
+### 背景
 
-`/data/models/dsv41-fp8-e64/auto-test-result.txt`（2026-10-28）：
+`/data/models/dsv41-i8test/pack/ds4.txt` 是一份**权威的模型配置快照**（45 行，与 `deepseek4.cpp`
+同源），比逐个字段读代码可靠。于是加 `INFR_CFG_DUMP`，把引擎解析出来的配置按同样的键名打出来，
+两边直接 diff。
 
-```
-model:   mrfakename/DeepSeek-V4.1-Flash-1017-abliterated (FP8 safetensors)
-engine:  Mach X build-jit/src/ie
-prompt:  用一句话解释什么是机器学习。
-output:  机器学习是让计算机从数据中自动学习规律，并据此进行预测或决策的方法。
-decode_tok_s: 1.23
-```
+### 核对结果：**没有一项错**
 
-**⇒ V4.1 这个模型家族本身是能对答的。问题在 moe4all 的 V4.1 实现里。**
-
-注意差异：Mach X 跑的是 **FP8 safetensors**，我们跑的是 **IQ2_XXS GGUF**，量化格式完全不同，
-所以这条只能证明「模型家族没问题」，不能直接用来数值比对。
-
-### 官方推荐采样参数不是原因
-
-那份日志还记了官方推荐采样：
-
-```
-thinking temperature 1 top_p 0.95 top_k 0 min_p 0 ...
-```
-
-我此前一直用 `temp=0`（贪心），怀疑贪心在平坦分布上会陷入重复循环 —— 这个怀疑合理，
-因为症状正是 `We need answer. Need answer.` 的自重复。
-
-实测 `temp=1.0 --top-p 0.95 --top-k 0`：
-
-```
-||  ** (*)， extending across **50̑zp. We RP can be stated the VERY*/**N.GR █ [300 3*; ...
-```
-
-**不是变得更好，而是出现 `█`、`̑`、`N.GR` 这类乱码。**
-
-### 结论：问题在 logits 之前
-
-| 采样方式 | 输出 | 性质 |
+| 项 | 权威 | 引擎 |
 |---|---|---|
-| `temp=0`（argmax） | `. Wait, the answer is 100. So` | 语法对、内容错 |
-| `temp=1`（采样） | `█ 50̑zp N.GR` 乱码 | 连语义都没有 |
+| vocab_size | 129280 | 129280 |
+| hidden_size | 5120 | 5120 |
+| num_hidden_layers | 40 | 40 |
+| head_dim | 512 | 512 |
+| qk_rope_head_dim | 64 | 64 |
+| hc_mult | 4 | 4 |
+| hc_sinkhorn_iters | 20 | 20 |
+| index_head_dim | 128 | 128 |
+| index_topk | 512 | 512 |
+| engram_layer_ids | 1,14 | [1, 14] |
+| engram_n_head / max_ngram / key_length | 8 / 4 / 256 | 8 / 4 / 256 |
+| n_routed_experts | 384 | 384 |
+| num_experts_per_tok | 6 | 6 |
+| moe_intermediate_size | 2304 | 2304 |
+| routed_scaling_factor | 1.5 | 1.5 |
+| rms_norm_eps | 9.9999997e-21 | 1e-20 |
+| rope_theta / compress_rope_theta | 10000 / 160000 | 10000 / 160000 |
+| rope_scaling.factor | 16.0 | 16 |
+| sliding_window | 128 | 128 |
+| swiglu_limit | 10.0 | 10.0 ×40 |
+| compress_ratios | 43 项，roles `0,0,2*18,1*20` | 相同（引擎裁到 40） |
+| kv_source_layer_ids | 2,8,14,20 | 展开图与之一致 |
+| index_source_layer_ids | 2,8,14,20,24,28,32,36 | 8 个源，是 KV 源的超集 ✓ |
 
-**两条互不相关的采样路径都错 ⇒ 错在 logits 之前，不是采样、不是温度。**
+两处曾被我误判为错，都是**我自己 dump 错了字段**：
+`rms_norm_eps` 我一开始打了 `norm_eps`（那是非 RMS LayerNorm 的，V4 不用），
+`rope_scaling_factor` 我一开始漏打了。补上后两者都正确。
 
-再结合 Round 130 测到的 `entropy=0.001 / top1=0.9999` ——
-**分布形状是合法且尖锐的（所以 argmax 能产出合法 token），但分布内容是错的。**
+`rope_yarn_log_mul = 0` 也不是问题：GGUF 里确实没有 `yarn_log_multiplier` 这个键，
+而 DeepSeek 的 mscale 由 `rope.scaling.factor`（已正确读为 16）决定，频率缩放走 factor。
+在这台机器上只有 512 token 的上下文，YaRN 的 ramp 根本没被触发。
 
-这与「某个上游 op 把残差流算偏了、但幅度仍在合理范围」完全一致，
-也正是「语法完整、语义错位」的机制。
+### 结论
 
-### 现有排除清单（累计，均有运行证据）
+**配置类错误排除。** 缺陷只能在计算图 / kernel 的数值实现里。
 
-引擎通用路径（qwen 对照）· prompt 构造 · YOCO · APE · warmup ·
-engram（零注入对照）· logits 崩溃/NaN · 超连接滞后（release 断言）·
-批量 prefill（已定位为单行缺陷并加常驻守卫）· 采样参数与温度
-
-**下一步方向：需要在 logits 之前定位第一个偏离点。**
-目前的硬约束仍是没有可做数值比对的参考实现
-（Mach X 是 FP8 safetensors 且为闭源构建；llama.cpp 缺 engram 张量；DeepInfer 跑不动 130 GB）。
+`INFR_CFG_DUMP` 留着：以后再遇到「怀疑配置读错」，一条命令就能把 40 项打全，不必逐字段读代码。
 

@@ -4011,6 +4011,40 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
+        if std::env::var_os("INFR_CFG_DUMP").is_some() {
+            // Print the parsed config in the same shape as the reference's ds4.txt so the two can
+            // be diffed directly. Comparing 40 keys by eye across two files is how config bugs get
+            // missed; a diff does not miss them.
+            eprintln!("CFG vocab_size {}", c.vocab);
+            eprintln!("CFG hidden_size {}", c.n_embd);
+            eprintln!("CFG num_hidden_layers {}", c.n_layer);
+            eprintln!("CFG head_dim {}", c.head_dim);
+            eprintln!("CFG qk_rope_head_dim {}", c.rope_dim);
+            eprintln!("CFG hc_mult {}", c.hc_mult);
+            eprintln!("CFG hc_sinkhorn_iters {}", c.hc_sinkhorn_iters);
+            eprintln!("CFG index_head_dim {}", c.indexer_head_size);
+            eprintln!("CFG index_topk {}", c.indexer_top_k);
+            eprintln!("CFG engram_layer_ids {:?}", c.engram_layer_ids);
+            eprintln!("CFG engram_n_head {}", c.engram_n_head);
+            eprintln!("CFG engram_max_ngram_size {}", c.engram_max_ngram);
+            eprintln!("CFG engram_key_length {}", c.engram_key_length);
+            eprintln!("CFG rope_theta {}", c.rope_theta);
+            eprintln!("CFG compress_rope_theta {}", c.compress_rope_theta);
+            eprintln!("CFG rope_scaling_factor {}", c.rope_scaling_factor);
+            eprintln!("CFG rope_yarn_log_mul {}", c.rope_yarn_log_mul);
+            eprintln!("CFG rms_norm_eps {:e}", c.rms_eps);
+            eprintln!("CFG compress_ratios {:?}", c.compress_ratios);
+            eprintln!("CFG dsv41_kv_source {:?}", c.dsv41_kv_source);
+            eprintln!("CFG dsv41_index_topk_source {:?}", c.dsv41_index_topk_source);
+            if let Some(m) = c.moe.as_ref() {
+                eprintln!("CFG n_routed_experts {}", m.n_expert);
+                eprintln!("CFG num_experts_per_tok {}", m.n_used);
+                eprintln!("CFG moe_intermediate_size {}", m.n_ff_exp);
+                eprintln!("CFG routed_scaling_factor {}", m.scale);
+            }
+            eprintln!("CFG swiglu_clamp_exp {:?}", c.swiglu_clamp_exp);
+            eprintln!("CFG sliding_window {}", c.swa_window);
+        }
         let weights = std::sync::Arc::new(SeamWeights {
             wbufs,
             wspecs,
