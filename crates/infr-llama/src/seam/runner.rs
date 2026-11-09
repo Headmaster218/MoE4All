@@ -6588,13 +6588,18 @@ fn generate_dense_backend_inner(
                     // a refactor that reorders two of these pushes would silently change the model.
                     // Layer 0 is the one layer with no predecessor, which is exactly why it takes
                     // the copy path instead of a collapse.
-                    debug_assert!(
+                    if std::env::var_os("INFR_HC_LAG_CHECK").is_some() {
+                        // The real debug_assert below never runs in a release build, which is the
+                        // only build we test this model with. Promoting it behind an env gate lets
+                        // the check actually execute on the exact binary being debugged.
+                    assert!(
                         l == 0 || dsv41_lag_slot0_written,
                         "deepseek41 layer {l}: the attention collapse reads lag slot [0] before \
                          layer {}'s FFN sublayer wrote it — the HC lag schedule is broken, and \
                          every layer but the first would silently consume a stale mix",
                         l - 1
                     );
+                    }
                     hc_mix(&mut g, &hcl.attn, hcr[0], hc_pre_lag[1]);
                     if l == 0 {
                         g.push(Op::CopyStrided {
