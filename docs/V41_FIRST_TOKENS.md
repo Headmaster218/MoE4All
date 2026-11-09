@@ -2,62 +2,50 @@
 
 ---
 
-## Round 115：找到并修复 history 的真 bug —— decode 阶段窗口曾是静态的
+## Round 116：逐项核对 engram 数学与数据 —— 全部正确，问题不在这些地方
 
-### 探针直接照出问题
+### 核对清单（对照 `deepseek41.cpp` 的 `build_engram`）
 
-在 `gather_for_layer` 里打印 `tokens` 与 `prev`：
+| 项 | 参考 | 本项目 | 结论 |
+|---|---|---|---|
+| key half 偏移 | `[0, hc_dim)` | `w_off: 0`, `out_f: hcw` | ✅ |
+| value half 偏移 | `[hc_dim, hc_dim+n_embd)` | `w_off: hcw`, `out_f: ne` | ✅ |
+| key 归一化 | `grouped_norm(key, engram_k)` | `QwenHcNorm{x: engram_kv, norm: ew.k}` | ✅ |
+| query 归一化 | `grouped_norm(x, engram_q)` | `QwenHcNorm{x: res, norm: ew.q}` | ✅ |
+| gate | `sigmoid(sgn(s)·sqrt(|s| clamp 1e-6))` | `QwenPleGate` 同式 | ✅ |
+| value 广播 | `ggml_repeat_4d(v, n_embd, hc, nt, 1)` | `row[d] = vs[r*ne + d] * scale`（`r = rh/hc`）| ✅ |
+| 残差合并 | `x + v*gate` | `Op::Add{a: res, b: hn, dst: res}` | ✅ |
+| eps | `norm_rms_eps` | `c.rms_eps` | ✅ |
 
-```
-tokens=[23166] prev=[[2, 2, 2]]         ← prefill 第 1 个，无前驱，正确
-tokens=[60170] prev=[[2, 2, 23166]]    ← prefill 第 2 个，正确
-tokens=[0]     prev=[[2, 2, 2]]        ← **decode 第 1 个，前驱全部退化为 pad**
-```
-
-### 根因
-
-我写的是 `history = prompt[..pos.min(prompt.len())]`。
-
-**prefill 阶段正确**（`pos` 在 prompt 内）。
-**decode 阶段 `pos` 超过 `prompt.len()`** ⇒ 切片被 clamp 成整个 prompt ⇒ `tok` 是生成的
-token，而它的前驱窗口是对一个**停止增长的序列**算的。
-
-**⇒ 整个 decode 阶段（V4.1 几乎所有步都在这里）的 engram gate 都在读 padding 上下文。**
-
-### 修复
-
-```rust
-let mut history: Vec<u32> = prompt.to_vec();
-history.extend(out.iter().copied());
-```
-
-序列 = **prompt + 本轮已生成的 token**。`tok` 本身是即将喂进去的那个，
-所以正确地不在两个切片里。
-
-### 修复后（窗口开始滑动）
+### 数值探针：数据完全健康
 
 ```
-tokens=[23166] prev=[[2, 2, 23166]]       ← 有前驱了
-tokens=[27526] prev=[[2, 23166, 27526]]   ← 窗口在滑动
+ENGRAM_ROWS layer=1  n=6144 first=-0.117188 max_abs=3.750000 nonfinite=false
+ENGRAM_ROWS layer=14 n=6144 first=-0.281250 max_abs=3.250000 nonfinite=false
 ```
 
-### 顺带确认布局是对的
+- `n = 6144 = 24 × 256`（`n_cols × key_length`）✓
+- 量级 O(1)（`max_abs` 3–4），**无 NaN/Inf** ✓
+- 两层数值**不同**（层 1 `-0.117` vs 层 14 `-0.281`）✓ ⇒ 按层 hash 生效
 
-探针还显示：**两层用同一个 token、同一个前驱窗口，只有 row index 不同**——
-这正是 `EngramMap::slot` 应有的行为。
+### 结论
 
-而且布局链是对的：`gather_for_layer` 按 token 拼 bucket（token-major）、
-`gather_rows` 每个 row 展成 `key_length` 个 float ⇒ **`[token][bucket][key]`**，
-与参考的 `reshape(key_length*n_cols, n_tokens)` 一致（ggml 的 `ne0` 是最快变化维）。
+**engram 的公式、偏移、广播、eps、数据解量化——全部正确。**
 
-**上一轮怀疑的布局问题不存在。**
+上一轮我怀疑的布局问题（Round 114）和这一轮怀疑的偏移问题，**都不存在**。
 
-### 但答案还不完整
+### 那 `2+2=` 输出 `0` 是为什么
 
-输出是 `0`（单字），不是 `4`。方向对了，但还差一点。
+**可能不是 engram 的问题。** 需要对照：**关掉 engram 时 `2+2=` 输出什么？**
+
+Round 114 的 A/B 里，无 engram 输出 `We need answer. The question is "2+2". So 2+`——
+**那个输出同样不是 `4`**。
+
+**⇒ 不带 engram 的基线本来就不对。** V4.1 在 moe4all 上还有其他未修的问题
+（如本轮程序 `goal` 里列出的 compressor/APE 那条线），engram 只是其中一环。
 
 ### 下一步
 
-`0` 至少是个数字。可能还差：**engram 是否应只在前缀 token 上生效**、
-或 **`rel`/`wkv` 的列切分偏移**。下一轮逐项核对。
+**先确认基线**：关掉 engram 时模型是否正确回答任何问题。
+若基线也不对，则 engram 再完美也无法验证——**需要先让基线答对**。
 
