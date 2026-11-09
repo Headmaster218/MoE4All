@@ -2,56 +2,75 @@
 
 ---
 
-## Round 118：追 tokenizer —— 两次错判，最后发现是 warmup 干扰
+## Round 119：找到并修复「窗口冻结」的第二个 bug —— out/cur 在 decode 路径上都不写
 
-### 错误判断 1：token 23166 = "Hi" ⇒ prompt 被替换
+### 探针证据
 
-我用 `/data/models/dsv41-official-meta/tokenizer.json` 查 `23166` 得到 `'Hi'`，
-据此认为 prompt 被错误替换。
-
-**错在**：该 `tokenizer.json` 的 id 空间与 GGUF 内嵌的 tokenizer **不一致**
-（它把 `'2'` 映射到 20，而实际喂入的是 23166）。
-
-### 错误判断 2：三个不同 prompt 都 `len=1` ⇒ MESSAGE 没传到模型
-
-我又测了三个不同 prompt，全部得到 `ENGRAM_PROMPT len=1 ids=[23166]`，
-据此认为 CLI 丢弃了消息。
-
-**错在**：没有意识到**每个进程都会先跑一次 warmup**。
-
-### 真相（`ENGRAM_TURN` 探针）
+真实 turn 里 `tok` 在变，`prev` 却纹丝不动：
 
 ```
-ENGRAM_TURN prompt="Hi"                          ← warmup
-ENGRAM_PROMPT len=1 ids=[23166]
-
-ENGRAM_TURN prompt="...2+2=..."                  ← 真正的用户 turn
-ENGRAM_PROMPT len=35 ids=[0, 128799, 77666, ...] ← 35 token，完全正常
+tok=27526  prev=[2, 23166, 27526]      ← prefill 最后一步，正常
+tok=0      prev=[31, 128804, 128821]   ← decode 第 1 步
+tok=128799 prev=[31, 128804, 128821]   ← 同一个
+tok=77666  prev=[31, 128804, 128821]   ← 同一个
+tok=288    prev=[31, 128804, 128821]   ← 同一个
 ```
 
-**`"Hi"` 是引擎的 warmup 调用。** 我看到的每个 `len=1` 都是 warmup，不是我的 prompt。
+再打 `history.len()` 确认：
 
-**⇒ 真实 prompt 有 35 个 token，tokenizer 和 CLI 都正常。**
+```
+ENGRAM_HIST pos=0 prompt=35 out=0 hist=35
+ENGRAM_HIST pos=6 prompt=35 out=0 hist=35   ← out 始终为 0
+```
 
-### 方法教训（第三次同类）
+### 根因
 
-| 轮次 | 我凭什么下结论 | 错在哪 |
-|---|---|---|
-| Round 111-113 | 分支代码看起来对 | 没跑 runtime 证据 |
-| **Round 118a** | 一个**不同来源**的 tokenizer.json | 没验证两个 tokenizer 是否同源 |
-| **Round 118b** | 三次观测都一致 | 没意识到采样的是**同一个 warmup**，而非三次调用 |
+**`out` 和 `cur` 在 record-once decode 路径上都不被追加。** 两者都停在 prompt 长度，
+所以 `history` 永远是 prompt，每一步的前驱窗口完全相同。
 
-**共同模式：证据的「一致性」不等于「正确性」** —— 三次相同观测若都来自同一个非目标对象，
-一致性反而会强化错误结论。
+**warmup 掩盖了这个 bug**：warmup 走的是会追加 `out` 的路径，所以第一版修复在 warmup 上
+看起来是对的。**这正是 Round 118 那个教训的延伸——观测对象选错，结论就错。**
 
-### 现在确知的事实
+### 修复
 
-| 项 | 状态 |
+在**注入点本身**记账，那里才是 token 真正交给 forward 的地方：
+
+```rust
+let mut engram_seen: Vec<u32> = Vec::new();   // 闭包外，可变捕获
+...
+let mut history: Vec<u32> = prompt.to_vec();
+history.extend(engram_seen.iter().copied());
+// ... gather + upload ...
+engram_seen.push(tok as u32);                 // 本步 gather 之后再记，避免看到自己
+```
+
+### 修复后：窗口正常推进（输出形态改变）
+
+| engram | `2+2=` 输出 |
 |---|---|
-| prompt 分词 | ✅ 35 token，正常 |
-| CLI 参数传递 | ✅ 正常 |
-| 引擎 warmup | ✅ 存在，输出 `"Hi"` |
-| **engram 在真实 turn 中的行为** | **待重新验证** |
+| **有** | `**  **  **  ** ` |
+| **无** | `We need answer. The question is "` |
 
-**之前 engram 的 A/B 结论可能被 warmup 污染过**——需要重跑，只统计真实 turn 的 `ENGRAM_FEED`。
+**两者仍然不同，且都错。** 但与修复前相比，有 engram 一侧从
+`** 0.0.0`（Round 117 观测）变成了纯 `**` 重复 —— 窗口推进确实改变了模型行为。
+
+### 诚实评估
+
+**又修好了一个真 bug，但答案依然不对。**
+
+engram 这条链现在：参与计算 ✅、数学正确 ✅、数据健康 ✅、
+**窗口正确推进 ✅**（本轮新达成）。但 `2+2=` 仍不是 `4`。
+
+**⇒ 剩余问题不在 engram。** 无 engram 时模型同样答错，说明是更上游的问题
+（本 goal 里的 compressor/APE 那条线仍未处理）。
+
+### 状态
+
+| 项 | 值 |
+|---|---|
+| 工作区 | 干净 |
+| 编译 | ✅ |
+| 本地提交 | **92 个** |
+| prefill | 6 tok/s |
+| decode | 5.7–6.4 tok/s |
 
