@@ -5750,6 +5750,16 @@ fn generate_dense_backend_inner(
         } else {
             (hc_pre, hc_pre, hc_pre, hc_pre)
         };
+        // `Op::QwenPleGate` writes `rows * hc * n_embd` (the value broadcast across the hc copies),
+        // so its destination must be `batch * hcw` wide. It used to write into `hn`, which is
+        // `batch * ne` - 15,360 f32 (60 KiB) past the end of the allocation, silently corrupting
+        // whatever the pool placed next, and `Op::Add { n: batch * hcw }` then read those
+        // neighbours straight into the residual stream.
+        let engram_wide = if c.deepseek41 {
+            g.internal(f32d(batch * hcw))
+        } else {
+            hc_pre
+        };
         // DeepSeek V4.1 holds the collapse weights one sublayer BEHIND (`deepseek41.cpp` 843-886).
         // The pair ping-pongs in step with `hcr`, so the parity is fixed rather than a running
         // index: every ATTENTION sublayer writes [1] and reads [0], every FFN writes [0] and reads
@@ -6089,7 +6099,7 @@ fn generate_dense_backend_inner(
                 key: engram_k_normed,
                 query: engram_q_normed,
                 value: engram_gated,
-                dst: hn,
+                dst: engram_wide,
                 rows: batch as u32,
                 hc: c.hc_mult as u32,
                 n_embd: ne as u32,
@@ -6097,7 +6107,7 @@ fn generate_dense_backend_inner(
             // x + gated value, written back over the residual stream the mixes are about to read
             g.push(Op::Add {
                 a: res,
-                b: hn,
+                b: engram_wide,
                 dst: res,
                 n: (batch * hcw) as u32,
             });
