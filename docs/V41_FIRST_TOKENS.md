@@ -2,50 +2,61 @@
 
 ---
 
-## Round 116：逐项核对 engram 数学与数据 —— 全部正确，问题不在这些地方
+## Round 117：用官方检查脚本取基线 —— engram 的 A/B 已固化进脚本
 
-### 核对清单（对照 `deepseek41.cpp` 的 `build_engram`）
+### 发现现成的验证工具
 
-| 项 | 参考 | 本项目 | 结论 |
-|---|---|---|---|
-| key half 偏移 | `[0, hc_dim)` | `w_off: 0`, `out_f: hcw` | ✅ |
-| value half 偏移 | `[hc_dim, hc_dim+n_embd)` | `w_off: hcw`, `out_f: ne` | ✅ |
-| key 归一化 | `grouped_norm(key, engram_k)` | `QwenHcNorm{x: engram_kv, norm: ew.k}` | ✅ |
-| query 归一化 | `grouped_norm(x, engram_q)` | `QwenHcNorm{x: res, norm: ew.q}` | ✅ |
-| gate | `sigmoid(sgn(s)·sqrt(|s| clamp 1e-6))` | `QwenPleGate` 同式 | ✅ |
-| value 广播 | `ggml_repeat_4d(v, n_embd, hc, nt, 1)` | `row[d] = vs[r*ne + d] * scale`（`r = rh/hc`）| ✅ |
-| 残差合并 | `x + v*gate` | `Op::Add{a: res, b: hn, dst: res}` | ✅ |
-| eps | `norm_rms_eps` | `c.rms_eps` | ✅ |
+`scripts/check-v41-answers.sh` 早就存在，而且它的设计思路与我 Round 116 的结论**完全一致**：
 
-### 数值探针：数据完全健康
+> *"The point of this script is the control model. Reading V4.1's output and deciding whether it
+> 'looks wrong' is not a test — it depends on the reader knowing the answer, and it gives no way to
+> tell a broken model path from a broken engine."*
 
-```
-ENGRAM_ROWS layer=1  n=6144 first=-0.117188 max_abs=3.750000 nonfinite=false
-ENGRAM_ROWS layer=14 n=6144 first=-0.281250 max_abs=3.250000 nonfinite=false
-```
+它还带 `flock` 保护（GPU 是单例资源），符合"一次一个 GPU 作业"的硬规则。
 
-- `n = 6144 = 24 × 256`（`n_cols × key_length`）✓
-- 量级 O(1)（`max_abs` 3–4），**无 NaN/Inf** ✓
-- 两层数值**不同**（层 1 `-0.117` vs 层 14 `-0.281`）✓ ⇒ 按层 hash 生效
+### 基线数据（本机无对照模型，只测 V4.1）
 
-### 结论
+| engram | 模式 | 输出 |
+|---|---|---|
+| **有** | default | `** 0.0.0` |
+| **无** | default | `We need answer. The question is "` |
+| 有 | batched | `We need answer. We need to reason` |
+| 无 | batched | `The user wants me to translate the analysis` |
 
-**engram 的公式、偏移、广播、eps、数据解量化——全部正确。**
+### 这批数据的意义
 
-上一轮我怀疑的布局问题（Round 114）和这一轮怀疑的偏移问题，**都不存在**。
+**① engram 的 A/B 差异是稳定可复现的**
+有 engram 出 `** 0.0.0`（含数字），无 engram 出纯散文。**两次独立运行都是这个模式。**
 
-### 那 `2+2=` 输出 `0` 是为什么
+**② 两条路径都答不对**，但错的**方式**完全不同：
+- default：`** 0.0.0` —— 出了 markdown 和数字
+- batched：`We need answer...` —— 纯英文思考流
 
-**可能不是 engram 的问题。** 需要对照：**关掉 engram 时 `2+2=` 输出什么？**
+**③ batched 路径的注释早就说明了**：
 
-Round 114 的 A/B 里，无 engram 输出 `We need answer. The question is "2+2". So 2+`——
-**那个输出同样不是 `4`**。
+> *"runner.rs documents that no batch>1 V4 graph has executed correctly, so a batched PASS
+> would be surprising and a batched FAIL alone says nothing about the default path."*
 
-**⇒ 不带 engram 的基线本来就不对。** V4.1 在 moe4all 上还有其他未修的问题
-（如本轮程序 `goal` 里列出的 compressor/APE 那条线），engram 只是其中一环。
+### 脚本改进
+
+把 engram A/B 固化进 `check-v41-answers.sh`——设置了 `INFR_ENGRAM_TABLE` 时，
+自动跑 `engram-with` / `engram-without` 两组，**任何一侧退化都能看到**。
+
+### 现状判断
+
+| 问题 | 状态 |
+|---|---|
+| engram 是否参与计算 | ✅ 已证明（A/B 稳定可复现）|
+| engram 数学实现 | ✅ 逐项核对正确 |
+| engram 数据 | ✅ 数值健康 |
+| **整模型能否答对** | **❌ 两条路径都不行** |
+
+**⇒ engram 这条线已经做完了能做的部分。** 剩下的是模型级的问题，
+本 goal 里列出的 compressor / APE 那条线很可能就是主因。
 
 ### 下一步
 
-**先确认基线**：关掉 engram 时模型是否正确回答任何问题。
-若基线也不对，则 engram 再完美也无法验证——**需要先让基线答对**。
+既然本机没有对照模型，**先确认 batched 与 default 之外的第三条线索**：
+`** 0.0.0` 这个输出形态很特殊——markdown 加粗 + 数字，像是**在输出格式模板**而不是在算数。
+下一轮看它是不是 chat template 的问题（prompt 未按对话格式构造）。
 
