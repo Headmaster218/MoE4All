@@ -3975,6 +3975,32 @@ fn generate_dense_backend_inner(
         };
         let ple_worker = super::ple::PleWorker::new(g, c, ec.kernels.ple_single_parallel)?
             .map(std::sync::Arc::new);
+        // DeepSeek V4.1 engram table. mmap'd once and shared by every slot, so a fork costs
+        // nothing. Absent when INFR_ENGRAM_TABLE is unset or the arch has no engram layers -
+        // `engram_emb_buf` then stays bound to an uninitialised buffer, which is silent garbage
+        // rather than a crash, so this is reported once at load.
+        let engram_table = if c.deepseek41 && !c.engram_layer_ids.is_empty() {
+            match std::env::var("INFR_ENGRAM_TABLE").ok().map(std::path::PathBuf::from) {
+                Some(path) if path.exists() => {
+                    Some(std::sync::Arc::new(crate::engram::EngramTable::open(&path)?))
+                }
+                Some(path) => {
+                    eprintln!(
+                        "infr: INFR_ENGRAM_TABLE={} does not exist; V4.1 engram will contribute garbage",
+                        path.display()
+                    );
+                    None
+                }
+                None => {
+                    eprintln!(
+                        "infr: INFR_ENGRAM_TABLE is unset; V4.1 engram will contribute garbage"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let weights = std::sync::Arc::new(SeamWeights {
             wbufs,
             wspecs,
@@ -3985,6 +4011,7 @@ fn generate_dense_backend_inner(
             ple_worker,
             mtp_token_embd_index,
             mtp_lm_head_index,
+            engram_table,
         });
         let mut preallocated_siblings = Vec::with_capacity(pending_siblings.len());
         for pending in pending_siblings {

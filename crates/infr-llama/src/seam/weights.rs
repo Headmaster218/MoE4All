@@ -1204,6 +1204,10 @@ pub(crate) struct SeamWeights {
     /// `wbufs`/`wspecs`; the sidecar deliberately omits both tensors.
     pub(super) mtp_token_embd_index: usize,
     pub(super) mtp_lm_head_index: usize,
+    /// DeepSeek V4.1 engram table, mmap'd once and shared by every slot. `None` for every other
+    /// arch, and for V4.1 when `INFR_ENGRAM_TABLE` is unset - the rows are gathered on the host
+    /// from this mmap (runner.rs:2794), so without it the graph input has nothing to carry.
+    pub(super) engram_table: Option<std::sync::Arc<crate::engram::EngramTable>>,
 }
 
 type MtpSharedWeight<'a> = (&'a dyn Buffer, DType, usize);
@@ -2531,6 +2535,7 @@ mod tests {
                 ple_worker: None,
                 mtp_token_embd_index: 0,
                 mtp_lm_head_index: 0,
+                engram_table: None,
             }),
             stable: Arc::new(SessionStable {
                 has_wv: Vec::new(),
