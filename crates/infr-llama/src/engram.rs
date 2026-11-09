@@ -1785,13 +1785,6 @@ pub fn gather_for_layer(
             prev.len()
         )));
     }
-    eprintln!(
-        "ENGRAM_GATHER layer={} tokens={:?} prev={:?} n_cols={}",
-        layer_id,
-        &tokens[..tokens.len().min(4)],
-        &prev[..prev.len().min(1)],
-        n_cols
-    );
     let mut rows = Vec::with_capacity(tokens.len() * n_cols);
     for (i, &tok) in tokens.iter().enumerate() {
         if prev[i].len() != expected_prev {

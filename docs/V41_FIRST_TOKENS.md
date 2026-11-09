@@ -2,76 +2,62 @@
 
 ---
 
-## Round 114：**engram 第一次真正参与计算** —— A/B 对照证明
+## Round 115：找到并修复 history 的真 bug —— decode 阶段窗口曾是静态的
 
-### 用 backtrace 终结猜测
+### 探针直接照出问题
 
-在 `engram_apply` 里打 backtrace，得到 V4.1 的**真实执行路径**：
+在 `gather_for_layer` 里打印 `tokens` 与 `prev`：
 
 ```
-0: closure#48  engram_apply    runner.rs:5999
-1: closure#73  层循环           runner.rs:6426
-2: closure#290                runner.rs:13540   ← prepare_decode_plan
-3: closure#291                runner.rs:13570
-4: closure#293                runner.rs:13896   ← execute_decode
+tokens=[23166] prev=[[2, 2, 2]]         ← prefill 第 1 个，无前驱，正确
+tokens=[60170] prev=[[2, 2, 23166]]    ← prefill 第 2 个，正确
+tokens=[0]     prev=[[2, 2, 2]]        ← **decode 第 1 个，前驱全部退化为 pad**
 ```
 
-**`batch=1`，两层（layer=1、layer=14）各被调用一次。**
+### 根因
 
-**V4.1 是一个 token 一个 token 地解码**，不走我之前改的批量 prefill 路径。
-这和 Round 95 的发现完全一致——**round 95 的判断从头到尾都是对的**。
+我写的是 `history = prompt[..pos.min(prompt.len())]`。
 
-### 正确的接入点
+**prefill 阶段正确**（`pos` 在 prompt 内）。
+**decode 阶段 `pos` 超过 `prompt.len()`** ⇒ 切片被 clamp 成整个 prompt ⇒ `tok` 是生成的
+token，而它的前驱窗口是对一个**停止增长的序列**算的。
 
-每步注入 token id 的地方（`13742` 的 `be.upload(dec_ids_buf, ...)` 旁）：
+**⇒ 整个 decode 阶段（V4.1 几乎所有步都在这里）的 engram gate 都在读 padding 上下文。**
+
+### 修复
 
 ```rust
-if let Some(table) = weights.engram_table.as_ref() {
-    let history: Vec<u32> = prompt[..pos.min(prompt.len())].to_vec();
-    let batch_toks = [tok as u32];
-    for (layer, dst) in engram_emb_buf.iter() {
-        crate::engram::upload_layer(be, c, table, *layer, &history, &batch_toks, dst)?;
-    }
-}
+let mut history: Vec<u32> = prompt.to_vec();
+history.extend(out.iter().copied());
 ```
 
-**`pos` 就是 `tok` 的绝对位置，`prompt[..pos]` 正是前驱历史。**
+序列 = **prompt + 本轮已生成的 token**。`tok` 本身是即将喂进去的那个，
+所以正确地不在两个切片里。
 
-**`engram_emb` 在这个作用域不可见（rustc: E0425）**，但 `engram_emb_buf` 可见，
-**且 buffer 自带层号** ⇒ 遍历 buffer 即可，不需要 graph handle。
-
-### A/B 对照（决定性证据）
-
-| 配置 | `2+2=` 输出 |
-|---|---|
-| **无 engram** | `We need answer. The question is "2+2". So 2+` |
-| **有 engram** | `**  **  **  **  **  **  **  ** ` |
-
-**两者完全不同。engram 数据确实进入了计算路径。**
-
-### 但答案还是不对
-
-输出从"语法通顺但答错"变成了**重复的 markdown 符号**。
-**engram 现在有影响，但影响的方向不对。**
-
-最可能的原因：**upload 的 rows 布局与图期望的不一致**。
-参考实现是 `reshape(key_length*n_cols, n_tokens)`——token-major、
-**每个 token 内 24 个 bucket 连续**。而 `gather_rows` 返回 bucket-major，
-`gather_for_layer` 按 token 顺序拼 bucket——**方向可能反了**。
-
-### 一个意外收获
-
-加载器自己确认了 engram 元数据完整：
+### 修复后（窗口开始滑动）
 
 ```
-GGUF: skipped 4 redundant engram lookup table(s) (engram_{token_map,primes,offsets,multipliers}.weight,
-integer dtypes, duplicated verbatim by the deepseek41.engram.* metadata arrays)
+tokens=[23166] prev=[[2, 2, 23166]]       ← 有前驱了
+tokens=[27526] prev=[[2, 23166, 27526]]   ← 窗口在滑动
 ```
+
+### 顺带确认布局是对的
+
+探针还显示：**两层用同一个 token、同一个前驱窗口，只有 row index 不同**——
+这正是 `EngramMap::slot` 应有的行为。
+
+而且布局链是对的：`gather_for_layer` 按 token 拼 bucket（token-major）、
+`gather_rows` 每个 row 展成 `key_length` 个 float ⇒ **`[token][bucket][key]`**，
+与参考的 `reshape(key_length*n_cols, n_tokens)` 一致（ggml 的 `ne0` 是最快变化维）。
+
+**上一轮怀疑的布局问题不存在。**
+
+### 但答案还不完整
+
+输出是 `0`（单字），不是 `4`。方向对了，但还差一点。
 
 ### 下一步
 
-**核对 rows 的内存布局**：`engram_emb` 声明是
-`f32d(batch * n_cols * key_length)`，而 `engram_apply` 把它当 `x` 传给 `Op::Linear`。
-需要确认 `row_indices` 生成的顺序与 `gather_rows` 的输出拼接，是否与参考的
-`(key_length*n_cols) × n_tokens` 一致。
+`0` 至少是个数字。可能还差：**engram 是否应只在前缀 token 上生效**、
+或 **`rel`/`wkv` 的列切分偏移**。下一轮逐项核对。
 
