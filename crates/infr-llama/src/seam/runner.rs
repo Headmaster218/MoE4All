@@ -7144,7 +7144,12 @@ fn generate_dense_backend_inner(
                 if rd > 0 {
                     rope_tail(&mut g, d4_kv, d4_rkv, 1, hd4, rd, theta4, ff4, false);
                 }
-                debug_assert_eq!(batch, 1, "DeepSeek V4 currently builds scalar forwards");
+                if std::env::var_os("INFR_V4_BATCH_CHECK").is_some() {
+                    // Never executes in release, which is the only build that can run this model.
+                    // Dsv4CacheWrite right below hardcodes `rows: 1` and a single `row:`, so a
+                    // batch > 1 here would silently write only the first row's KV.
+                    assert_eq!(batch, 1, "DeepSeek V4 currently builds scalar forwards");
+                }
                 g.push(Op::Dsv4CacheWrite {
                     src: d4_kv,
                     cache: k_cache[l],

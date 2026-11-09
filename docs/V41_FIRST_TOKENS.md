@@ -2,51 +2,52 @@
 
 ---
 
-## Round 139：超连接滞后调度排除（release 实测），嫌疑只剩压缩注意力 / hash 路由
+## Round 140：**抓到批量 prefill 的 KV 只写第一行** —— 那条断言在 release 里被编译掉了
 
-### 做法
+### 发现
 
-`runner.rs:6592` 本来就有一条针对 HC 滞后的 `debug_assert!`：
+`runner.rs:7147` 本来就有一条断言：
 
+```rust
+debug_assert_eq!(batch, 1, "DeepSeek V4 currently builds scalar forwards");
+g.push(Op::Dsv4CacheWrite {
+    src: d4_kv, cache: k_cache[l],
+    rows: 1,                              // ← 硬编码 1
+    row:  (start_pos % layout4.raw_rows) as u32,   // ← 单行
 ```
-"deepseek41 layer {l}: the attention collapse reads lag slot [0] before layer {}'s
- FFN sublayer wrote it — the HC lag schedule is broken, and every layer but the first
- would silently consume a stale mix"
-```
 
-**但它只在 debug 构建生效，而我们唯一能跑这个模型的构建是 release。**
-读完代码「觉得对」不算证据。所以把它包进 `INFR_HC_LAG_CHECK`，让 `assert!` 在 release 也执行。
+**`rows: 1` 与 `row:` 都是单行的。** 所以 `batch > 1` 时，只有第一行被写进 KV cache。
+
+而这条守卫是 `debug_assert_eq!` —— **在 release 构建里被完全编译掉**，
+而 release 是我们唯一能跑这个 130 GB 模型的构建。于是它一直在静默发生。
 
 ### 实测
 
-```
-INFR_HC_LAG_CHECK=1 infr run ... "A B C D"
-→ [exit=0]，无 panic
-```
+把断言包进 `INFR_V4_BATCH_CHECK` 让它在 release 生效：
 
-**⇒ V4.1 的「HC 系数滞后一个子层」调度是正确的。** 这是运行证据，不是阅读判断。
+| 路径 | 结果 |
+|---|---|
+| 默认（逐 token） | 断言**不触发**，`batch == 1` ✅ |
+| **`INFR_DSV41_BATCHED_PREFILL=1`** | **panic**：`assertion left == right failed: DeepSeek V4 currently builds scalar forwards` |
 
-### 嫌疑范围
+### 结论一：4.9 倍提速那条路径是**带数值错误**的
 
-| # | 嫌疑 | 状态 |
-|---|---|---|
-| 1 | 超连接滞后 | ✅ **排除**（本轮）|
-| 2 | 压缩注意力（`kv_source_layer_ids=[2,8,14,20]` + 34 复用层） | 待查 |
-| 3 | MoE hash 路由（`ffn_gate_tid2eid`） | 待查 |
+`INFR_DSV41_BATCHED_PREFILL` 让 `batch > 1` 进入一段只写一行的代码，
+**KV cache 其余行是垃圾**。之前 Round 123 观察到「批量路径输出错误」现在有了机制解释。
 
-### 已排除清单（累计，全部有运行证据）
+**所以 Round 123 把这条路径默认打开是错的**（Round 125 已回退为 opt-in，现在知道了确切原因）。
+**在修好 Dsv4CacheWrite 的批量写入之前，这条路径的 4.9 倍不能算可用收益。**
 
-- 引擎通用路径：qwen2.5-0.5b 在同一二进制上输出正常
-- prompt 构造：模型确实收到 `2+2=`
-- YOCO / `n_prefill_layer`：DeepInfer 默认 `off`
-- APE：V4.1 无该张量
-- warmup：`INFR_NO_WARMUP` A/B 输出几乎一致
-- engram：`INFR_ENGRAM_ZERO` 零注入仍错
-- logits 崩溃：熵 0.001–0.103，top1 98–99.99%，分布健康
-- **超连接滞后：`INFR_HC_LAG_CHECK` release 断言通过**
+### 结论二：这**不是**默认路径答错的原因
 
-### 仍未解决的硬约束
+默认路径实测 `batch == 1`，断言不触发，但它同样答错。
+⇒ **存在两个独立缺陷：**
 
-需要一个**可运行的参考实现**才能做数值比对。llama.cpp 报 `blk.1.engram_embd.weight is missing`
-（该 GGUF 不含 engram 张量，只有元数据），DeepInfer 是 Python 实现跑不动 130 GB。
+- **缺陷 A**：批量 prefill 的 `Dsv4CacheWrite` 只写第一行（本轮发现，机制清楚）
+- **缺陷 B**：默认逐 token 路径也答错（更早就在，尚未定位）
+
+### 下一步
+
+缺陷 A 有明确的修法：让 `Dsv4CacheWrite` 按 `batch` 写多行（`rows: batch`，逐行 `row`）。
+修完再看批量路径的输出是否变正确——如果变正确，还能反过来帮助孤立缺陷 B。
 
