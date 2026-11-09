@@ -5992,12 +5992,6 @@ fn generate_dense_backend_inner(
         // offset GEMVs over the SAME activation, exactly the split `weights.rs` documents.
         let engram_apply =
             |g: &mut Graph, ew: &crate::seam::weights::EngramW, res: TensorId, layer: u32| {
-            eprintln!(
-                "ENGRAM_APPLY layer={} batch={} bt=\n{}",
-                layer,
-                batch,
-                std::backtrace::Backtrace::force_capture()
-            );
             let emb = engram_emb
                 .iter()
                 .find(|(l, _)| *l == layer)

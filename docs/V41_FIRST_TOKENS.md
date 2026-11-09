@@ -2,54 +2,76 @@
 
 ---
 
-## Round 113：第一次端到端验证 —— 发现 V4.1 不走我以为的那条路径
+## Round 114：**engram 第一次真正参与计算** —— A/B 对照证明
 
-### 三件事逐一定实
+### 用 backtrace 终结猜测
 
-| 检查 | 结果 |
+在 `engram_apply` 里打 backtrace，得到 V4.1 的**真实执行路径**：
+
+```
+0: closure#48  engram_apply    runner.rs:5999
+1: closure#73  层循环           runner.rs:6426
+2: closure#290                runner.rs:13540   ← prepare_decode_plan
+3: closure#291                runner.rs:13570
+4: closure#293                runner.rs:13896   ← execute_decode
+```
+
+**`batch=1`，两层（layer=1、layer=14）各被调用一次。**
+
+**V4.1 是一个 token 一个 token 地解码**，不走我之前改的批量 prefill 路径。
+这和 Round 95 的发现完全一致——**round 95 的判断从头到尾都是对的**。
+
+### 正确的接入点
+
+每步注入 token id 的地方（`13742` 的 `be.upload(dec_ids_buf, ...)` 旁）：
+
+```rust
+if let Some(table) = weights.engram_table.as_ref() {
+    let history: Vec<u32> = prompt[..pos.min(prompt.len())].to_vec();
+    let batch_toks = [tok as u32];
+    for (layer, dst) in engram_emb_buf.iter() {
+        crate::engram::upload_layer(be, c, table, *layer, &history, &batch_toks, dst)?;
+    }
+}
+```
+
+**`pos` 就是 `tok` 的绝对位置，`prompt[..pos]` 正是前驱历史。**
+
+**`engram_emb` 在这个作用域不可见（rustc: E0425）**，但 `engram_emb_buf` 可见，
+**且 buffer 自带层号** ⇒ 遍历 buffer 即可，不需要 graph handle。
+
+### A/B 对照（决定性证据）
+
+| 配置 | `2+2=` 输出 |
 |---|---|
-| 表是否加载 | **✅ `ENGRAM_LOADED` 打印了**（`deepseek41=true`、`layer_ids=[1,14]`）|
-| upload 是否执行 | **❌ `ENGRAM_UPLOAD` 没打印** |
-| `bind_layer_io` 是否被调用 | **❌ backtrace 探针也没打印** |
+| **无 engram** | `We need answer. The question is "2+2". So 2+` |
+| **有 engram** | `**  **  **  **  **  **  **  ** ` |
 
-### 关键矛盾
+**两者完全不同。engram 数据确实进入了计算路径。**
 
-**模型能跑完 prefill 35 tok、decode 2 tok，却既没走我插入 upload 的分支，
-也没走 `bind_layer_io`。**
+### 但答案还是不对
 
-**那 engram 的绑定是怎么完成的？** 答案只能是：**根本没绑定，也没上传**——
-而模型依然能跑，因为 `engram_emb` 是可选 input，未绑定不报错（Round 100 之前是报 unbound 的，
-后来加了绑定才不报）。
+输出从"语法通顺但答错"变成了**重复的 markdown 符号**。
+**engram 现在有影响，但影响的方向不对。**
 
-**换句话说：现在跑的这条路径上，engram 完全不参与。**
+最可能的原因：**upload 的 rows 布局与图期望的不一致**。
+参考实现是 `reshape(key_length*n_cols, n_tokens)`——token-major、
+**每个 token 内 24 个 bucket 连续**。而 `gather_rows` 返回 bucket-major，
+`gather_for_layer` 按 token 顺序拼 bucket——**方向可能反了**。
 
-### 两次错误判断
+### 一个意外收获
 
-| 轮次 | 我以为 | 实际 |
-|---|---|---|
-| Round 112 | `10399` 的 `bind_parallel_layer_io` 是 V4.1 路径 | **没被调用** |
-| 本轮 | 表加载了就会生效 | **加载了但不被使用** |
+加载器自己确认了 engram 元数据完整：
 
-**共同点：我又一次靠"这个分支看起来对"来推断，而不是靠运行时证据。**
+```
+GGUF: skipped 4 redundant engram lookup table(s) (engram_{token_map,primes,offsets,multipliers}.weight,
+integer dtypes, duplicated verbatim by the deepseek41.engram.* metadata arrays)
+```
 
-### 检查方法也错了一次
+### 下一步
 
-我用 `grep -c engram-mxfp8 /proc/PID/maps` 判断表是否映射，得到 0。
-**这个方法是错的**——202 GB 的 mmap 在 `/proc/maps` 里的条目形式与我的 grep 不匹配，
-且进程可能已退出。改用 `eprintln!` 后才拿到真答案。
-
-### 正确的下一步
-
-**不要再猜分支。** 直接在 `engram_apply` 闭包（发射 engram 计算的地方）里打 backtrace，
-它会打印出**真正执行的那条路径**——Round 95 用过这个方法，一次就定位到
-`prepare_decode_plan`。
-
-### 状态
-
-| 项 | 值 |
-|---|---|
-| 工作树 | 干净（诊断已回退）|
-| 编译 | ✅ |
-| 本地提交 | **84 个** |
-| 运行 | 能跑、能出 token、**engram 未参与** |
+**核对 rows 的内存布局**：`engram_emb` 声明是
+`f32d(batch * n_cols * key_length)`，而 `engram_apply` 把它当 `x` 传给 `Op::Linear`。
+需要确认 `row_indices` 生成的顺序与 `gather_rows` 的输出拼接，是否与参考的
+`(key_length*n_cols) × n_tokens` 一致。
 
