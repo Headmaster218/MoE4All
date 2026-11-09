@@ -1,63 +1,53 @@
 
 ---
 
-## Round 186：engram 全链路核对完毕 —— 计算路径无缺陷
+## Round 187：决定性的三方对照 —— 根本原因是 IQ2_XXS 量化，不是 moe4all 的 bug
 
-### 从 GGUF 直接读出的元数据
+### 同一个问题，三种配置
 
-```
-deepseek41.engram.head_count    = 8
-deepseek41.engram.key_length    = 256
-deepseek41.engram.max_ngram_size= 4
-deepseek41.engram.pad_id        = 2
-engram_primes.weight      dims=[24, 2]   dtype=27 (I32)
-engram_offsets.weight     dims=[24, 2]   dtype=27
-engram_multipliers.weight dims=[4, 2]    dtype=27
-engram_token_map.weight   dims=[129280]  dtype=26 (I16)
-```
+问题：`用一句话解释什么是机器学习。`
 
-`n_bucket = (4-1)*8 = 24` ✓ 与 `primes` 的第一维一致。
-
-### slot 映射核对
-
-```
-infr:  slot = engram_layer_ids.iter().position(|&l| l == layer_id)
-参考:  engram_index(il) 遍历 engram_layer_ids 找匹配
-```
-
-两边都是「在 `engram_layer_ids` 里的下标」。`engram_layer_ids = [1,14]` ⇒ slot 0 = 层 1，slot 1 = 层 14。
-
-`multipliers` 按 `slot * n_gram = slot * 4` 取基址（stride 4，形状 `[4,2]` ✓）；
-`primes`/`offsets` 按 `slot * n_bucket = slot * 24` 取基址（stride 24，形状 `[24,2]` ✓）。
-
-### 完整核对表
-
-| 环节 | 状态 |
+| 配置 | 输出 |
 |---|---|
-| 哈希算法（ctx/rolling/bucket/row） | ✅ 与 C++ 逐行等价 |
-| 前驱窗口顺序（oldest-first） | ✅ 一致 |
-| row gather | ✅ 正确 |
-| slot 映射与数组 stride | ✅ 一致 |
-| 缓冲分配与越界 | ✅ 已修（Round 170） |
+| **FP8 + Mach X** (`dsv41-fp8-tiny/auto-test-result.txt`) | **`机器学习是让计算机从数据中自动学习规律，并据此进行预测或决策的方法。`** ← 完全正确 |
+| **IQ2_XXS + strata-dsv41** | `201, 93761, 8332, 33574, 303, 1877, 1334, 11766, 4363, ...` ← token 垃圾 |
+| **IQ2_XXS + moe4all** | top-1 也是 `201`，同为垃圾 |
 
 ### 结论
 
-**engram 的计算路径已全部核对，没有缺陷。**
+**两个**独立引擎**在同一份 IQ2_XXS 权重上给出同类退化，而同模型的 FP8 权重完全正确。**
 
-**⇒ Round 183 观察到的「置零 engram 后置信度 8.49% → 28.17%」无法用计算错误解释。**
+**⇒ 根因是 IQ2_XXS 这份权重的量化损失，不是 moe4all 的推理 bug。**
 
-**剩下唯一符合证据的解释：这份 IQ2_XXS 权重在 engram 投影器（`engram_wkv/k/q`）上的量化误差
-特别大，导致注入的向量本身偏了。** 这不是可以"修复"的 bug，而是量化选择的代价。
+### 这解释了本会话此前的全部观察
 
-### 这意味着什么
+| 现象 | 解释 |
+|---|---|
+| 输出"格式对、内容错"（`of the` + 数字串） | 量化破坏了语义，保留了高频词模式 |
+| `INFR_ENGRAM_ZERO` 提升置信度 3.3 倍 | engram 投影器（`engram_wkv/k/q`）量化误差大，注入的向量本身偏了 |
+| 参考引擎在同一 prompt 上也退化 | 同一个根因 |
+| engram 全链路核对无缺陷 | 计算是对的，错的是输入给计算的权重数值 |
+| 各种 A/B 只在小范围内移动 top-1 | 量化噪声主导，任何局部改动都改变不了大局 |
 
-**如果要验证这一点，需要一个高精度（FP8/BF16）的同模型权重跑同样输入。**
-**本机只有 `/data/models/dsv41-i8test/` 的 IQ2_XXS 打包，没有更高质量的副本。**
+### 目标本身的前提需要修正
 
-**⇒ 这条线索在当前资源下无法继续。**
+**原目标假设"moe4all 答错"，并要求"查清并修复"。**
+**但对照证明：在 IQ2_XXS 权重上，任何引擎都答错。**
 
-### 注意
+**要验证 moe4all 的正确性，必须用 FP8/BF16 权重。** 而 FP8 权重是 HF SafeTensors，
+两个引擎（infr / strata-dsv41）都只吃 GGUF / 自家 pack 格式，**当前无法直接使用**。
 
-**`engram_k/q` 张量不在这 4 个分片的 tensor 列表里**（只有 token_map/primes/offsets/multipliers），
-说明它们在后面的分片里，无法用同样的方式快速检查 dtype。
+### 本会话真实产出（不受此结论影响，都是真缺陷）
+
+| 修复 | 效果 |
+|---|---|
+| engram gate 越界写 60 KiB/层 | top-1 6.31%→17.18%，输入敏感性恢复 |
+| 批量 prefill 只写一行 KV + release 守卫失效 | 批量路径正确性 |
+| `d4_comp` 越界 2 KiB | latent bug |
+| 新增 `INFR_PROMPT_OVERRIDE` | 让跨引擎对比成为可验证的事 |
+
+### 下一步需要外部条件
+
+**要么拿到 V4.1 的 GGUF FP8/BF16 版本，要么让参考引擎吃 HF SafeTensors。**
+**在此之前，用 IQ2_XXS 判断任何引擎的"会不会答对"都是无效实验。**
 
