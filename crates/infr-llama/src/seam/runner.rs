@@ -5990,8 +5990,19 @@ fn generate_dense_backend_inner(
         // One projection produces hc keys then a single shared value. The file's `wkv` is
         // `[n_cols*key_length, hc*n_embd + n_embd]` in ggml order, so the two halves are two
         // offset GEMVs over the SAME activation, exactly the split `weights.rs` documents.
+        // INFR_ENGRAM_ZERO: the honest "no engram" control.
+        //
+        // Omitting INFR_ENGRAM_TABLE is NOT that control - the loader warns that engram then
+        // "contributes garbage", so a run without the table tests garbage-engram, not no-engram.
+        // A table of zeros is the real thing but the shipped one is 202 GB. Adding zero to the
+        // residual stream is what a zero table does, so skipping the add is exactly equivalent
+        // and costs nothing.
+        let engram_zero = std::env::var_os("INFR_ENGRAM_ZERO").is_some();
         let engram_apply =
             |g: &mut Graph, ew: &crate::seam::weights::EngramW, res: TensorId, layer: u32| {
+            if engram_zero {
+                return;
+            }
             let emb = engram_emb
                 .iter()
                 .find(|(l, _)| *l == layer)
