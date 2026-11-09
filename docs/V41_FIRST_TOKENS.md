@@ -2,60 +2,49 @@
 
 ---
 
-## Round 131：模型能答对翻译，却把「法国首都」答成 100 —— 指向输出层映射
+## Round 133：引擎通用路径是好的 —— 缺陷只在 V4.1 专有代码里
 
-### 关键对照数据（`temp=0`，无 engram）
+### 对照组实验（终于做了）
 
-| prompt | 输出 | 判定 |
-|---|---|---|
-| `Translate hello to French:` | `. Wait, the answer is "Bonjour".` | ✅ **正确** |
-| `What are the first five primes?` | `We need answer. Need interpret. Need likely ask` | ❌ |
-| `The capital of France is` | `. Wait, the answer is 100. So` | ❌ **荒谬** |
-| `5+3=` | `We need answer. The question is "8". Wait,` | ⚠️ 答案对，表述乱 |
-| `1+1=` | `. Wait, the answer is 2` | ✅ |
-| `Name three colors:` | `. Wait, I need to output in the final answer.` | ❌ |
-| `France`（单词续写） | `. The user wants me to translate the` | ❌ |
-| `Paris`（单词续写） | `. The question is: "What is` | ❌ |
+同一个 `infr` 二进制、同一台设备 `Vulkan1`、同样走 Vulkan seam：
 
-### 结论一：模型没有全盘失效
+| 模型 | prompt | 输出 | 判定 |
+|---|---|---|---|
+| **qwen2.5-0.5b** | `A B C D E F G` | `I'm sorry, but I don't understand what` | ✅ **正常** |
+| **DeepSeek-V4.1** | `A B C D` | `-` | ❌ |
 
-它能答对 `Bonjour`、`8`、`2`。**知识和能力都在。**
+qwen 同时给出 `prefill 249 t/s / decode 127.6 t/s`，速度也正常。
 
-### 结论二：输出形式被锁死在一个模板
+**⇒ 引擎的通用推理路径是健康的。** 问题被限制在 V4.1 这条 arch 专有分支上。
 
-几乎每条都以 `. Wait, the answer is X` 收尾。**模板固定，X 才变化。**
-「法国首都是 100」——**算术题的答案串到了知识题上**。
+### 这条排除为什么重要
 
-### 结论三：warmup 不是污染源（已 A/B 排除）
+我前面几轮反复怀疑「输出层映射」「lm_head 绑定」这类**通用**环节。
+对照组直接否定了这个方向 —— 通用环节若坏了，qwen 也会错。
 
-`INFR_NO_WARMUP=1` 跳过抛掷式的 `"Hi"` 预热轮：
+**缺陷范围现在只剩 V4.1 专有代码：**
+1. **engram**（两层注入；引擎自己警告不设表会「contribute garbage」）
+2. **压缩注意力**（`kv_source_layer_ids=[2,8,14,20]` 四个源层 + 34 个复用层）
+3. **超连接 `hyper_connection`**（`hc` 份残差副本 + 混合）
+4. **MoE 路由**（含 hash routing `ffn_gate_tid2eid`）
+
+### 同时撤销 Round 129 的无效排除
 
 ```
-A: 有 warmup  →  <think>. Wait, the answer is 100. So
-B: 无 warmup   →  . Wait, the answer is 100. So
+infr: INFR_ENGRAM_TABLE is unset; V4.1 engram will contribute garbage
 ```
 
-**上下文完全干净时，模型仍然说「法国首都是 100」。** 唯一差别是 A 有 `<think>`、B 没有。
-⇒ `reset_kv` 是干净的，warmup 无罪。
+引擎明确警告：不提供表就会注入垃圾。所以 Round 129 用「不设 engram 仍答错」来排除 engram
+**是无效对照** —— 那不是「关掉 engram」，是「用垃圾 engram」。**engram 重新列为嫌疑。**
 
-### 当前最强假设：输出层权重映射错位
+### 症状汇总（供后续定位）
 
-症状自洽地指向「语言模型形式正确、内容错位」：
+- `Once upon a time` → `. Wait, I need to produce the final answer. The answer is 100 ... 10`
+  —— **语法完整、逻辑自洽、主题与输入毫无关系**
+- 所有输出坍缩到 `. Wait, the answer is X` 模板
+- logits 健康（熵 0.001–0.103，top1 98–99.99%）
+- `A B C D` 接不出 `E`，`1 2 3` 接不出 `4`
+- 偶尔「对」（`Bonjour`、`8`、`2`），但更像高频关联碰巧命中
 
-1. 形式完全符合 LM（会写 `. Wait, the answer is`）
-2. 内容系统性错位（`100` 出现在知识题里）
-3. logits 高置信（Round 130：entropy 0.001–0.103，top1 99%+）——
-   错位的映射本身也是自洽的，所以不会出现低置信
-4. 换 prompt 输出模板相同
-
-**具体怀疑：`lm_head` 与 `token_embd` 的绑定（tied embedding）挂反或挂错。**
-DeepSeek 系列常用权重绑定；若 GGUF 分开存而引擎取了错的张量，
-就会得到「语法对、语义错」的输出。
-
-### 下一步
-
-核对 `lm_head.weight` 与 `token_embd.weight`：
-1. 模型里两者是否都存在、形状是否一致
-2. 引擎实际挂的是哪一个
-3. 如果模型声明了 tying，引擎有没有遵守
+**这些共同指向：模型看到的上下文表示被系统性偏移了，而偏移来源在 V4.1 专有路径。**
 
