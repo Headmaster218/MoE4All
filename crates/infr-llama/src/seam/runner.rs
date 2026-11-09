@@ -5992,6 +5992,12 @@ fn generate_dense_backend_inner(
         // offset GEMVs over the SAME activation, exactly the split `weights.rs` documents.
         let engram_apply =
             |g: &mut Graph, ew: &crate::seam::weights::EngramW, res: TensorId, layer: u32| {
+            eprintln!(
+                "ENGRAM_APPLY layer={} batch={} bt=\n{}",
+                layer,
+                batch,
+                std::backtrace::Backtrace::force_capture()
+            );
             let emb = engram_emb
                 .iter()
                 .find(|(l, _)| *l == layer)
@@ -13735,6 +13741,27 @@ fn generate_dense_backend_inner(
                 if gpu_embed_tok || hash_ids {
                     be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
                         .map_err(|e| anyhow!("{e}"))?;
+                }
+                // DeepSeek V4.1 engram: this is the per-step token injection, so `pos` is the
+                // absolute position of `tok` and the history is prompt[..pos]. Gathered and
+                // uploaded per layer because the row indices hash with each layer's own
+                // multipliers, and uploaded before the plan that reads them executes.
+                if let Some(table) = weights.engram_table.as_ref() {
+                    let history: Vec<u32> = prompt[..pos.min(prompt.len())].to_vec();
+                    let batch_toks = [tok as u32];
+                    // The buffers carry their own layer ids, so this does not need the graph
+                    // handles (`engram_emb` is out of scope in the decode pipeline).
+                    for (layer, dst) in engram_emb_buf.iter() {
+                        crate::engram::upload_layer(
+                            be,
+                            c,
+                            table.as_ref(),
+                            *layer,
+                            &history,
+                            &batch_toks,
+                            dst.as_ref(),
+                        )?;
+                    }
                 }
                 if !gpu_embed_tok {
                     // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
