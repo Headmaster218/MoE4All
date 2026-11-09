@@ -495,12 +495,25 @@ pub struct EngramLayerTable {
     pub scale_row_bytes: u64,
     /// `key_length` (`weight` shape's `ne[0]`), equal to [`EngramMap::n_bucket`]'s row width.
     pub key_length: u64,
+    /// True when this layer is a standard IQ4_NL tensor (ggml type 20).
+    ///
+    /// An IQ4_NL row is self-contained: its 32-element blocks carry their own f16 `d`, so there
+    /// is no separate `engram_embd.scale` tensor and [`Self::scale_row_bytes`] is 0. It is also
+    /// declared transposed relative to the MXFP8 converter's stream — `[key_length, rows]` rather
+    /// than `[rows, key_length]` — so the caller must not read one layout's dims off the other.
+    pub iq4_nl: bool,
 }
 
 impl EngramLayerTable {
     /// Bytes this layer's two tensors occupy in the file.
     pub fn total_bytes(&self) -> u64 {
         self.rows * (self.row_bytes + self.scale_row_bytes)
+    }
+
+    /// Whether rows of this layer decode through [`dequant_iq4_nl_row`] rather than the
+    /// E4M3/E8M0 pair.
+    pub fn is_iq4_nl(&self) -> bool {
+        self.iq4_nl
     }
 }
 
@@ -618,7 +631,20 @@ impl EngramTable {
             layer_id,
             self.tensors.iter().take(6).map(|t| (t.name.clone(), t.shape.clone(), t.ggml_type, t.nbytes)).collect::<Vec<_>>()
         );
-        let (weight, scale) = self.tensor_pair(layer_id)?;
+        // IQ4_NL layers are a single self-contained tensor; the E4M3/E8M0 pair is the only
+        // layout with a second plane to fetch.
+        let (weight, scale) = if layer.is_iq4_nl() {
+            let wname = format!("blk.{layer_id}.engram_embd.weight");
+            let weight = self
+                .tensors
+                .iter()
+                .find(|t| t.name == wname)
+                .ok_or_else(|| Error::Loader(format!("engram table: missing '{wname}'")))?;
+            (weight, None)
+        } else {
+            let (w, s) = self.tensor_pair(layer_id)?;
+            (w, Some(s))
+        };
         let mut out = vec![0f32; rows.len() * key_length];
         for (b, &row) in rows.iter().enumerate() {
             let row_index = u64::from(row);
@@ -631,13 +657,14 @@ impl EngramTable {
                 )));
             }
             let codes = self.row_slice(weight, row_index, layer.row_bytes)?;
-            let scales = self.row_slice(scale, row_index, layer.scale_row_bytes)?;
             let dst = &mut out[b * key_length..(b + 1) * key_length];
-            dst.copy_from_slice(&dequant_mxfp8_row(
-                codes,
-                scales,
-                key_length,
-            ));
+            if layer.is_iq4_nl() {
+                dst.copy_from_slice(&dequant_iq4_nl_row(codes, key_length));
+            } else {
+                let scale = scale.expect("non-IQ4_NL layers always have a scale plane");
+                let scales = self.row_slice(scale, row_index, layer.scale_row_bytes)?;
+                dst.copy_from_slice(&dequant_mxfp8_row(codes, scales, key_length));
+            }
         }
         Ok(out)
     }
@@ -735,11 +762,28 @@ fn index_engram_layers(
         // So `rows` is ne[0] here, the opposite of the generic ggml convention. That is not a
         // bug in the reader to "fix" — it is what this converter wrote, and it is what makes a
         // row (one gathered unit) contiguous, which is the property the gather depends on.
-        let (rows, key_length) = (info.shape[0], info.shape[1]);
-        eprintln!("ENGRAM_EMBD name={} shape={:?} type={} nbytes={}", info.name, info.shape, info.ggml_type, info.nbytes);
-        if info.ggml_type != GGML_TYPE_ENGRAM_E4M3 && info.ggml_type != 20 {
+        // TWO LAYOUTS live here and they are transposes of each other. Read the type first,
+        // then take the dims the way THAT type declares them.
+        //
+        // MXFP8 (type 32 codes + type 34 scales, a private converter's stream):
+        //   declared [rows, 256] and [rows, 8] — `ne[0]` is the ROW count. 8 = 256/32 only
+        //   works under that reading, and 384006168 * 256 = 98_305_579_008 is exactly the gap
+        //   between the code plane and the scale plane, so a row is contiguous in the file.
+        //   This is the opposite of generic ggml, and it is what that converter wrote.
+        //
+        // IQ4_NL (type 20, what `deepseek41.engram.file` names): declared [256, rows] — the
+        // standard ggml convention, `ne[0]` = elements per row. Each 32-element block carries its
+        // own f16 `d`, so there is no separate scale tensor at all.
+        let is_iq4_nl = info.ggml_type == GGML_TYPE_IQ4_NL;
+        let (rows, key_length) = if is_iq4_nl {
+            (info.shape[1], info.shape[0])
+        } else {
+            (info.shape[0], info.shape[1])
+        };
+        if info.ggml_type != GGML_TYPE_ENGRAM_E4M3 && !is_iq4_nl {
             return Err(Error::Unsupported(format!(
-                "engram table: '{}' is ggml type {}, expected {GGML_TYPE_ENGRAM_E4M3} (E4M3)",
+                "engram table: '{}' is ggml type {}, expected {GGML_TYPE_ENGRAM_E4M3} (E4M3) or \
+                 {GGML_TYPE_IQ4_NL} (IQ4_NL)",
                 info.name, info.ggml_type
             )));
         }
@@ -750,6 +794,45 @@ fn index_engram_layers(
                 info.name
             )));
         }
+
+        if is_iq4_nl {
+            // No scale tensor, no second plane: the whole layer is this one tensor, and its byte
+            // count must match 18 bytes per 32 elements exactly.
+            let want = crate::engram::ggml_type_size(GGML_TYPE_IQ4_NL, rows * key_length)?;
+            if info.nbytes != want {
+                return Err(Error::Loader(format!(
+                    "engram table: '{}' declares {} bytes but {rows} rows x {key_length} \
+                     IQ4_NL elements needs {want} (18 bytes per {IQ4_NL_BLOCK_ELEMS})",
+                    info.name, info.nbytes
+                )));
+            }
+            if info.offset.saturating_add(info.nbytes) > file_bytes {
+                return Err(Error::Loader(format!(
+                    "engram table {}: '{}' occupies bytes {}..{}, past the {file_bytes} bytes of \
+                     the file",
+                    path.display(),
+                    info.name,
+                    info.offset,
+                    info.offset + info.nbytes
+                )));
+            }
+            if out.iter().any(|l| l.layer_id == layer_id) {
+                return Err(Error::Loader(format!(
+                    "engram table: block {layer_id} appears twice"
+                )));
+            }
+            out.push(EngramLayerTable {
+                layer_id,
+                rows,
+                row_bytes: key_length / IQ4_NL_BLOCK_ELEMS as u64
+                    * IQ4_NL_BLOCK_BYTES as u64,
+                scale_row_bytes: 0,
+                key_length,
+                iq4_nl: true,
+            });
+            continue;
+        }
+
         let scale_name = format!("blk.{layer_id}.engram_embd.scale");
         let scale = tensors
             .iter()
@@ -776,8 +859,6 @@ fn index_engram_layers(
                 scale.shape, info.name
             )));
         }
-        // The weight plane's declared size must be exactly the codes of `rows` rows; the scale
-        // plane must follow it immediately (the shipped file lays them back to back).
         let want_weight = rows * key_length;
         if info.nbytes != want_weight {
             return Err(Error::Loader(format!(
@@ -819,6 +900,7 @@ fn index_engram_layers(
             row_bytes: key_length,
             scale_row_bytes,
             key_length,
+            iq4_nl: false,
         });
     }
     if out.is_empty() {
