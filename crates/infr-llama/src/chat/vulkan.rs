@@ -263,6 +263,11 @@ impl ChatModel for DenseSeamChat {
     fn warmup(&mut self) -> Result<()> {
         // The shared session warmup (throwaway generate + reset so the first real prompt prefills
         // clean slots from row 0), wrapped in the INFR_PROF_OPS suppression the Vulkan recorders need.
+        if std::env::var_os("INFR_NO_WARMUP").is_some() {
+            // A/B: skip the throwaway turn entirely. If output quality improves, the warmup's
+            // "Hi" turn is contaminating the KV/position state that reset_kv fails to clear.
+            return Ok(());
+        }
         crate::with_profiling_suppressed(|| {
             self.generate_turn_impl(
                 "Hi",
