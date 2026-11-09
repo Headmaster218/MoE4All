@@ -2,52 +2,55 @@
 
 ---
 
-## Round 140：**抓到批量 prefill 的 KV 只写第一行** —— 那条断言在 release 里被编译掉了
+## Round 141：把单行守卫变成 release 常驻，而不是硬修
 
-### 发现
+### 为什么不是「把 rows: 1 改成 batch」
 
-`runner.rs:7147` 本来就有一条断言：
+读了整段才发现，**不止 KV 写入是单行的**：
 
 ```rust
-debug_assert_eq!(batch, 1, "DeepSeek V4 currently builds scalar forwards");
+if rd > 0 {
+    rope_tail(&mut g, d4_kv, d4_rkv, 1, hd4, rd, theta4, ff4, false);
+    //                                  ^ batch 位置传的是常量 1
+}
 g.push(Op::Dsv4CacheWrite {
-    src: d4_kv, cache: k_cache[l],
-    rows: 1,                              // ← 硬编码 1
-    row:  (start_pos % layout4.raw_rows) as u32,   // ← 单行
+    rows: 1,                                     // 只写一行
+    row: (start_pos % layout4.raw_rows) as u32,  // 单行索引
 ```
 
-**`rows: 1` 与 `row:` 都是单行的。** 所以 `batch > 1` 时，只有第一行被写进 KV cache。
+**RoPE 也只旋转第 1 行。** 所以 batch > 1 时，其余行会带着未旋转的 K、
+且 KV cache 里根本没有它们的任何东西，一起进 attention。
 
-而这条守卫是 `debug_assert_eq!` —— **在 release 构建里被完全编译掉**，
-而 release 是我们唯一能跑这个 130 GB 模型的构建。于是它一直在静默发生。
+只把 `rows` 改成 `batch` 会让「KV 有了但 RoPE 没做」，**错误会变得更隐蔽**。
 
-### 实测
+### 实际改动
 
-把断言包进 `INFR_V4_BATCH_CHECK` 让它在 release 生效：
+把 `debug_assert_eq!` 换成**无条件 `assert_eq!`**，并写清原因：
+
+```
+DeepSeek V4's attention block is single-row: KV write and rope both handle only row 0,
+so batch > 1 would silently write one KV row and leave the rest unrotated
+(this guard must stay in release builds)
+```
+
+### 验证
 
 | 路径 | 结果 |
 |---|---|
-| 默认（逐 token） | 断言**不触发**，`batch == 1` ✅ |
-| **`INFR_DSV41_BATCHED_PREFILL=1`** | **panic**：`assertion left == right failed: DeepSeek V4 currently builds scalar forwards` |
+| 默认（逐 token） | 0 次 panic ✅ |
+| `INFR_DSV41_BATCHED_PREFILL=1` | panic，信息准确 ✅ |
 
-### 结论一：4.9 倍提速那条路径是**带数值错误**的
+**这条路径以前静默产生垃圾 KV，现在会立刻失败。** 这是纯收益：
+任何未来误把 batch > 1 送进来的人，会当场看到原因，而不是拿到一个能跑但答错的模型。
 
-`INFR_DSV41_BATCHED_PREFILL` 让 `batch > 1` 进入一段只写一行的代码，
-**KV cache 其余行是垃圾**。之前 Round 123 观察到「批量路径输出错误」现在有了机制解释。
+### 对「4.9 倍提速」的影响
 
-**所以 Round 123 把这条路径默认打开是错的**（Round 125 已回退为 opt-in，现在知道了确切原因）。
-**在修好 Dsv4CacheWrite 的批量写入之前，这条路径的 4.9 倍不能算可用收益。**
+**要在 V4 上真正启用批量 prefill，需要把整段 attention block 改成逐行的**
+（KV 写、RoPE、以及这一块里其他隐含 batch==1 的地方），不是一行补丁。
+在那之前，`INFR_DSV41_BATCHED_PREFILL` 必须保持 opt-in。
 
-### 结论二：这**不是**默认路径答错的原因
+### 缺陷 B 仍未定位
 
-默认路径实测 `batch == 1`，断言不触发，但它同样答错。
-⇒ **存在两个独立缺陷：**
-
-- **缺陷 A**：批量 prefill 的 `Dsv4CacheWrite` 只写第一行（本轮发现，机制清楚）
-- **缺陷 B**：默认逐 token 路径也答错（更早就在，尚未定位）
-
-### 下一步
-
-缺陷 A 有明确的修法：让 `Dsv4CacheWrite` 按 `batch` 写多行（`rows: batch`，逐行 `row`）。
-修完再看批量路径的输出是否变正确——如果变正确，还能反过来帮助孤立缺陷 B。
+默认路径 `batch == 1`、守卫通过、**但依然答错**。
+所以 V4.1 的答错问题是独立的，不在这条批量路径上。
 

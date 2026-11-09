@@ -7144,12 +7144,22 @@ fn generate_dense_backend_inner(
                 if rd > 0 {
                     rope_tail(&mut g, d4_kv, d4_rkv, 1, hd4, rd, theta4, ff4, false);
                 }
-                if std::env::var_os("INFR_V4_BATCH_CHECK").is_some() {
-                    // Never executes in release, which is the only build that can run this model.
-                    // Dsv4CacheWrite right below hardcodes `rows: 1` and a single `row:`, so a
-                    // batch > 1 here would silently write only the first row's KV.
-                    assert_eq!(batch, 1, "DeepSeek V4 currently builds scalar forwards");
-                }
+                // ALWAYS checked, not debug_assert: this must fire in release too.
+                //
+                // Everything in this block is written for one row - `Dsv4CacheWrite { rows: 1,
+                // row: (start_pos % raw_rows) }` writes a single cache row, and the `rope_tail`
+                // above passes batch = 1 so only the first row is even rotated. With batch > 1
+                // the remaining rows reach the attention with unrotated K and no KV in the cache.
+                // A debug_assert here is compiled out of release, which is the only build that can
+                // load a 130 GB model, so a batched prefill silently produced garbage instead of
+                // failing. `INFR_DSV41_BATCHED_PREFILL` reaches this path and is opt-in for that
+                // reason; do not default it on before this whole block is made row-wise.
+                assert_eq!(
+                    batch, 1,
+                    "DeepSeek V4's attention block is single-row: KV write and rope both handle \
+                     only row 0, so batch > 1 would silently write one KV row and leave the rest \
+                     unrotated (this guard must stay in release builds)"
+                );
                 g.push(Op::Dsv4CacheWrite {
                     src: d4_kv,
                     cache: k_cache[l],
