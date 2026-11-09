@@ -14445,6 +14445,29 @@ fn generate_dense_backend_inner(
                         have_frontier_logits = true;
                         crate::sampling::ensure_finite_logits(&logits, "single-stream logits")?;
                         if std::env::var_os("INFR_LOGIT_PROBE").is_some() {
+                            // INFR_DUMP_LOGITS=<path>: append this step's full [vocab] row as raw
+                            // f32, one row per token, no header — byte-identical layout to
+                            // `strata-dsv41 --dump-logits`, so the two engines' logits can be
+                            // compared elementwise instead of only by summary statistics.
+                            if let Some(path) = std::env::var_os("INFR_DUMP_LOGITS") {
+                                use std::io::Write as _;
+                                let bytes: Vec<u8> = logits
+                                    .iter()
+                                    .flat_map(|v| v.to_le_bytes())
+                                    .collect();
+                                match std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&path)
+                                {
+                                    Ok(mut f) => {
+                                        if let Err(e) = f.write_all(&bytes) {
+                                            eprintln!("INFR_DUMP_LOGITS write failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => eprintln!("INFR_DUMP_LOGITS open failed: {e}"),
+                                }
+                            }
                             // Top-5 and softmax entropy. A healthy model on a sharp prompt puts
                             // most mass on one token; flat logits, or a winner that changes every
                             // step, means information is not surviving the residual stream.
