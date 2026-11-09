@@ -13741,7 +13741,12 @@ fn generate_dense_backend_inner(
                 // uploaded per layer because the row indices hash with each layer's own
                 // multipliers, and uploaded before the plan that reads them executes.
                 if let Some(table) = weights.engram_table.as_ref() {
-                    let history: Vec<u32> = prompt[..pos.min(prompt.len())].to_vec();
+                    // Decode runs past the prompt, so `prompt[..pos]` empties out once pos
+                    // exceeds it. The sequence so far is the prompt plus every token emitted
+                    // this turn; `pos` is the absolute index of `tok`, which is the one about to
+                    // be fed and therefore not in either slice yet.
+                    let mut history: Vec<u32> = prompt.to_vec();
+                    history.extend(out.iter().copied());
                     let batch_toks = [tok as u32];
                     // The buffers carry their own layer ids, so this does not need the graph
                     // handles (`engram_emb` is out of scope in the decode pipeline).
