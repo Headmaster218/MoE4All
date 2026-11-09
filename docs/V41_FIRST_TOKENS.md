@@ -1,56 +1,41 @@
 
 ---
 
-## Round 189：最干净的证据 —— IQ2_XXS 连 `Germany is` → `Paris` 都答不了
+## Round 190：找到同引擎、不同精度的对照条件 —— `dsv41-mixed-mxfp4-l0-19`
 
-### 测试
+### 之前我说"本机没有高精度权重"，是错的（第 13 次未穷尽检查）
 
-```
-输入: The capital of France is Paris. The capital of Germany is
-ids:  [671,6102,294,8760,344,11111,16,455,6102,294,10322,344]
-期望: Berlin
-```
-
-**`strata-dsv41` 输出：**
+`--pack-info` 直接读出的结果：
 
 ```
-11111, 16, 455, 6102, 294, 8760, 344, 11111
- ↑Paris  and  The capital  of  France  is  Paris
+40 layers x 384 experts, 6 used; dim 5120, ff 2304, vocab 129280
+expert tensors by type:  IQ1_M 18   IQ2_XS 14   IQ2_XXS 28   MXFP4 60
+dense types:             BF16 F32 F8_E4M3 F8_E8M0 Q5_K Q6_K Q8_0
+engram layers: 1,14
+files: 5, all present and long enough
 ```
 
-**它把前一句的答案 `Paris` 复制过来，然后重复整个句式。**
+**第 0-19 层专家是 MXFP4（18.8 MB/expert），其余是 IQ1_M / IQ2_XXS / IQ2_XS（7.7-10.2 MB）。**
 
-**这不是"风格不同"或"质量下降"，这是完全失去语义理解——典型的复读机行为。**
+**⇒ 这是一份**部分高精度**的权重，且 `strata-dsv41` 能直接读（`format gguf`）。**
 
-### 三方证据现在完整
+### 为什么它有价值
 
-| 配置 | 任务 | 结果 |
+**这是本会话第一次拿到「同一个引擎、不同专家精度」的对照条件：**
+
+| 对照 | 专家精度 | 能回答什么 |
 |---|---|---|
-| **FP8 + Mach X** | `用一句话解释什么是机器学习` | ✅ `机器学习是让计算机从数据中自动学习规律…` |
-| **IQ2_XXS + strata** | `The capital of Germany is` | ❌ 复读 `Paris` 并重复句式 |
-| **IQ2_XXS + moe4all** | 各种问题 | ❌ 重复 token 模式 |
+| `pack-q2k-all`（已测） | 全部 IQ2_XXS | ❌ `Germany is` → `Paris`（Round 189） |
+| `dsv41-mixed-mxfp4-l0-19`（待测） | 前 20 层 MXFP4 | ？ |
 
-### 最终结论
+**如果 MXFP4 前 20 层能让 strata 答对，就直接证明专家精度是根因。**
+**如果仍不行，说明还有别的问题（后 20 层的低精度，或非专家路径）。**
 
-**IQ2_XXS 这份权重已损坏语义能力，两个独立引擎都无法用它做最基本的推理。**
+**两种结果都能推进判断，所以这个实验值得做。**
 
-**⇒ 原目标"查清 moe4all 答错的原因并修复"，在现有可用权重上不可完成。**
+### 已确认的旁证
 
-**⇒ 这不是推论，是三个配置的实测对比。**
-
-### 目标需要的条件
-
-**需要 V4.1 的 GGUF 格式 FP8/BF16 权重。** 本机的 FP8 是 HF SafeTensors，
-`infr` 和 `strata-dsv41` 都只吃 GGUF / 自家 pack 格式。
-
-**在拿到这样的权重之前，任何用 IQ2_XXS 判断引擎正确性的实验都无效。**
-
-### 本会话的真缺陷修复（独立于这个问题，都是真的）
-
-| 修复 | 验证 |
-|---|---|
-| engram gate 越界写 60 KiB/层 | top-1 6.31%→17.18%，输入敏感性恢复（Release 断言级证据） |
-| 批量 prefill 只写一行 KV，守卫被 debug_assert 编译掉 | 改为 release 常驻 assert |
-| `d4_comp` 越界 2 KiB | 实测逐位无影响，latent bug |
-| 新增 `INFR_PROMPT_OVERRIDE` | 让跨引擎对比可逐 token 验证 |
+`dense layers.1.engram.embed.{weight,scale}` 和 `layers.14` 是 **F8_E4M3 / F8_E8M0**，
+而本会话用的独立 engram 表是 MXFP8 —— **两种表示不同**。这可能是 engram 行为差异的一个来源，
+但需要单独验证。
 
