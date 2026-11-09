@@ -2,62 +2,63 @@
 
 ---
 
-## Round 128：IQ4_NL 解码已实现并接入，但**本机那份 IQ4_NL 表文件是坏的**
+## Round 130：logits 探针终于命中 —— 模型是「确信地」答错
 
-### 已完成（真正有价值的成果）
+### 探针位置（前几轮绕圈的教训）
 
-`engram.rs` 现在支持 **ggml type 20（IQ4_NL）**：
+单请求走**单流 decode**，它在 `runner.rs` 的 `if is_decode && at_frontier` 分支里：
 
-- 块格式：32 元素 / 18 字节（f16 `d` + 16 字节 4-bit code）
-- codebook：ggml `kvalues_iq4nl` 的 16 项
-  `[-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113]`
-- nibble 顺序：字节 `i` 的低半字节给元素 `i`，高半字节给 `i+16`
-- 半精度转换手写（`f16` 在 std 未稳定）：正规数重偏置、次正规数按 `2^-24` 缩放、显式 Inf/NaN
-- 维度按表类型分支：IQ4_NL 是 `[key_length, rows]`，MXFP8 是 `[rows, key_length]`，
-  **两者互为转置**，用错读法会整片错位
-- IQ4_NL 单张量（scale 内嵌），`tensor_pair` 已能返回单张量
-
-**字节数校验通过**：`256 × 384006168 × 18/32 = 55,296,888,192`。
-单元测试 **27 passed, 0 failed**，抓到我自己两个错：
-`half_to_f32` 的次正规数算错；以及我的测试期望写错（`0xF1` 高半字节是 15 → 113，不是 -127）。
-
-### 但：`/data/models/dsv41-engram-iq4nl/engram-iq4nl.gguf` 不可用
-
-加载时报：
-
-```
-'blk.1.engram_embd.weight' occupies bytes 224..55296888416,
-past the 17901748448 bytes of the file
+```rust
+if !(gpu_argmax || gpu_sample) || logits_out.is_some() {
+    be.download(logits_buf, cast_slice_mut(&mut logits))?;   // ← 真正的出口
 ```
 
-**声明的 55.3 GB 比整个文件的 17.9 GB 大三倍。**
+**关键**：默认 `temp=0` 走 GPU argmax，**logits 根本不下回主机**，所以前三次把探针加在
+`logits_out_buf`、并行采样循环、`req.out_logits` 上全都落空。
 
-手查头部原始字节，问题更明确：
+命中条件：`INFR_LOGIT_PROBE=1 INFR_NO_GPU_ARGMAX=1 INFR_NO_GPU_SAMPLE=1`，
+逼它走 host 采样路径。
 
-- 头部声明 `n_kv = 2, n_t = 1`
-- 但实际至少有两个张量（`blk.1.engram_embd.weight`、`blk.14.engram_embd.weight`）
-- 且第二个"元数据键"读出来是 `blk.1.engram_embd.weight` 配一个 type-2 值 256 ——
-  **元数据区和张量目录区发生了错位**
+**教训：加探针前先确认那条代码路径会被执行，不要对着候选点逐个试。**
 
-**⇒ 这个文件的头部计数是错的，是一个残缺/损坏的文件，不是模型声明的那份。**
-它缺少 MXFP8 表里的全部 `deepseek41.engram.*` 元数据（层 ID、词表大小、dims）。
+### 实测数据
 
-**注意：我按损坏的头部解析得到了 `[256, 384006168]` 这个形状，并据此写了 Round 126 的
-「转置关系」结论。形状里 `384006168` 恰好等于 `blk.1` 张量自身的字节偏移量，
-所以那个解读很可能是被损坏的头部误导的，需要等拿到一份完好的 IQ4_NL 表再复核。**
+`What are the first five primes?`，无 engram：
 
-### 所以现在的真实状态
+```
+max=32.8237 min=-19.7105 entropy=0.001 top5=[1309:0.9999, 477:0.0000, ...]  → "We"
+max=26.9747 min=-15.4691 entropy=0.018 top5=[3287:0.9979, 304:0.0015, ...]  → " need"
+max=24.0455 min=-15.2429 entropy=0.103 top5=[16:0.9878, 4888:0.0033, ...]    → " answer"
+```
 
-| 项 | 状态 |
-|---|---|
-| IQ4_NL 解码器 | ✅ 已实现、已测 |
-| 维度分支 | ✅ 已实现 |
-| 26 个 engram 单测 | ✅ 全过 |
-| **IQ4_NL 表文件** | ❌ **本机这份损坏，用不了** |
-| 答错根因是否已确认 | ⚠️ **降级为「高度可疑」——表不匹配是真的，但正确形状待复核** |
+（前两行 `entropy=3.342 / 4.560` 是 warmup 那一轮 `"Hi"` 的，不算数。）
 
-### 下一步
+### 结论：**不是崩溃，是确信地错**
 
-需要一份**完好的 `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`**。
-在此之前，用 MXFP8 表跑出来的任何答案都不能当真，而 IQ4_NL 这条路走不通。
+| 指标 | 值 | 说明 |
+|---|---|---|
+| softmax 熵 | **0.001 – 0.103** | 极集中 |
+| top-1 概率 | **99.99% – 98.78%** | 几乎确定 |
+| top-2 及以后 | 全部 < 0.3% | 完全分化 |
+
+**分布是健康的、尖锐的、稳定的。** 模型非常确定自己应该接着说
+`We need answer. Need interpret. Need likely ask. Need answer.` ——
+一种自我重复的泛化话术，而不是针对 `What are the first five primes?` 的回答。
+
+### 这排除了什么
+
+- ❌ logits 崩溃 / NaN / 平坦
+- ❌ 数值不稳定
+- ❌ 采样 bug（而且 `temp=0` 是确定性的）
+- ❌ RoPE 配置错误 —— 引擎的 `role==0 → 10000 无 YaRN`、`role 1/2 → 160000 带 YaRN`
+  与 `config.rs:1126-1146` 注释记录的参考实现一致
+
+### 剩下的是什么
+
+模型**确信**它在回答一个泛化问题，而不是这个具体问题。
+⇒ 上下文表示（attention 输出 / KV 内容）没有把「质数」这个具体信息带下去，
+但残差流仍然稳定，所以输出层照常高置信度地生成套话。
+
+**下一步应该 dump 中间层**：第 1 层 attention 输出、第 1 层 MoE 输出，
+看残差流里到底有没有 prompt 的信息。
 
