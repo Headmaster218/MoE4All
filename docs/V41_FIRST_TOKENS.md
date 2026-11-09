@@ -2,46 +2,54 @@
 
 ---
 
-## Round 110：定位 upload 的可行位置 —— `kv` 与 buffer 不在同一作用域
+## Round 113：第一次端到端验证 —— 发现 V4.1 不走我以为的那条路径
 
-### 已排除的位置
+### 三件事逐一定实
 
-| 位置 | `be`/`cfg` | `engram_emb_buf` | `state`/`kv` | 结论 |
-|---|---|---|---|---|
-| `build` 闭包内 | ✅ | ❌ | ❌ | **不行** |
-| `build` 调用点（如 `9516`） | ✅ | ❌ | ❌ | 不行 |
-| 7 个 bind 点（如 `9562`/`9643`） | ✅ | ✅ | ❌ | **`kv` 不可见** |
+| 检查 | 结果 |
+|---|---|
+| 表是否加载 | **✅ `ENGRAM_LOADED` 打印了**（`deepseek41=true`、`layer_ids=[1,14]`）|
+| upload 是否执行 | **❌ `ENGRAM_UPLOAD` 没打印** |
+| `bind_layer_io` 是否被调用 | **❌ backtrace 探针也没打印** |
 
-**根因**：`engram_emb_buf` 属于 `SeamKv`，在 `build` 之后才建立；
-而 bind 点处 `kv` 已被解构成 `kbufs`/`vbufs`/`engram_emb_buf` 等局部变量，
-`state`/`kv` 本身不再可见。
+### 关键矛盾
 
-### 但有一条出路
+**模型能跑完 prefill 35 tok、decode 2 tok，却既没走我插入 upload 的分支，
+也没走 `bind_layer_io`。**
 
-**token 历史不必从 `kv` 取。** 在 bind 点处这些是可见的：
+**那 engram 的绑定是怎么完成的？** 答案只能是：**根本没绑定，也没上传**——
+而模型依然能跑，因为 `engram_emb` 是可选 input，未绑定不报错（Round 100 之前是报 unbound 的，
+后来加了绑定才不报）。
 
-```rust
-for range in &ranges { ... }                    // 9449
-let batch = row_start;                           // 9458
-parallel.prompts[lane][range.clone()]            // 9481
-```
+**换句话说：现在跑的这条路径上，engram 完全不参与。**
 
-**prefill 阶段 token 就是 `ranges` + `parallel.prompts`**，decode 阶段 token 在当前 step 变量里。
+### 两次错误判断
 
-**所以 `upload_layer` 的 `history` 参数可以就地构造**，不需要 `cached_tokens()`。
+| 轮次 | 我以为 | 实际 |
+|---|---|---|
+| Round 112 | `10399` 的 `bind_parallel_layer_io` 是 V4.1 路径 | **没被调用** |
+| 本轮 | 表加载了就会生效 | **加载了但不被使用** |
 
-### 下一步
+**共同点：我又一次靠"这个分支看起来对"来推断，而不是靠运行时证据。**
 
-在 **7 个 bind 点之前**（buffer 已可见处）插入：
+### 检查方法也错了一次
 
-```rust
-for &(layer, dst) in &engram_emb_buf {
-    engram::upload_layer(be, c, table, layer, history, batch_tokens, dst.as_ref())?;
-}
-```
+我用 `grep -c engram-mxfp8 /proc/PID/maps` 判断表是否映射，得到 0。
+**这个方法是错的**——202 GB 的 mmap 在 `/proc/maps` 里的条目形式与我的 grep 不匹配，
+且进程可能已退出。改用 `eprintln!` 后才拿到真答案。
 
-其中 `history` / `batch_tokens` 由该点的 `ranges`/`prompts`/step 变量就地拼出。
-**`table` 从 `weights.engram_table` 取**——需要确认 bind 点能否访问 `weights`。
+### 正确的下一步
 
-**这是下一轮的第一件事：确认 `weights` 在 bind 点的可见性。**
+**不要再猜分支。** 直接在 `engram_apply` 闭包（发射 engram 计算的地方）里打 backtrace，
+它会打印出**真正执行的那条路径**——Round 95 用过这个方法，一次就定位到
+`prepare_decode_plan`。
+
+### 状态
+
+| 项 | 值 |
+|---|---|
+| 工作树 | 干净（诊断已回退）|
+| 编译 | ✅ |
+| 本地提交 | **84 个** |
+| 运行 | 能跑、能出 token、**engram 未参与** |
 
