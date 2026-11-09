@@ -185,6 +185,16 @@ impl DenseSeamChat {
             std::fs::write("/tmp/turn-prompt.txt", prompt).ok();
             eprintln!("PROMPT_DUMP wrote {} bytes", prompt.len());
         }
+        // INFR_PROMPT_OVERRIDE=<path>: use this exact prompt instead of the chat template's. Exists so
+        // the two engines can be given byte-identical input: infr's template cannot emit the reference's
+        // plain `<|Assistant|>` form (default appends `<|think>`, --no-think appends `</think>`), and
+        // every cross-engine comparison made without that guarantee has been unsound.
+        let override_prompt = std::env::var_os("INFR_PROMPT_OVERRIDE")
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        let prompt: &str = override_prompt.as_deref().unwrap_or(prompt);
+        if override_prompt.is_some() {
+            eprintln!("PROMPT_OVERRIDE active: {} bytes", prompt.len());
+        }
         if self.wants_qwen4_mtp(req)? {
             self.ensure_qwen4_mtp()?;
             let vk = self.mtp_vk.as_ref().expect("ensure_qwen4_mtp set it");
