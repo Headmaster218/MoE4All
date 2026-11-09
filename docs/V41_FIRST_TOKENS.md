@@ -2,39 +2,53 @@
 
 ---
 
-## Round 122（三）：正确性对比 —— 批量路径的输出质量明显更高
+## Round 123：开关已默认打开 —— prefill 4.9 倍，decode 不变
 
-### 同一 prompt `2+2=`，greedy，8 token
+### 改动
 
-| 路径 | 输出 | prefill |
+`runner.rs`：`INFR_DSV41_BATCHED_PREFILL` 从 **默认关闭** 改为 **默认开启**。
+`=0` 仍可强制回退到旧的逐 token 路径（用于二分数值差异）。
+
+### 验证默认确实生效
+
+| 命令 | pp512 |
+|---|---|
+| 无环境变量（新默认） | **29.5 t/s** |
+| `INFR_DSV41_BATCHED_PREFILL=0` | **6.0 t/s** |
+
+### 当前阶段性能
+
+| 指标 | 改动前 | 改动后 |
 |---|---|---|
-| 逐 token（默认） | `**  **  **  ** ` | 6 t/s |
-| **批量** | **`We need answer. Need to determine actual`** | **14 t/s** |
+| **prefill pp512** | 6.0 t/s | **29.5 t/s**（4.9×）|
+| **prefill pp32** | 6.4 t/s | **15.7 t/s**（2.5×）|
+| **decode** | 5.9 t/s | **5.8 t/s**（不变，符合预期）|
 
-### 这比单纯的速度更有意义
+**decode 不受影响** —— 批量路径只优化 prefill。
 
-逐 token 路径输出的是**重复的 markdown 星号** —— 明显是退化的。
-批量路径输出的是**连贯的英文推理流** —— 模型在正常思考。
+### 对照 poorseek
 
-**虽然两条都还没答到 `4`，但批量路径的输出质量显著更高。**
+| 指标 | poorseek（RTX 4090） | 本机（Arc BMG G31） |
+|---|---|---|
+| prefill | — | **29.5 t/s** |
+| **单 token decode** | **27.7 t/s** | **5.8 t/s** |
+| MTP decode | 35.9 t/s | 未测 |
 
-### 对早前观察的重新解释
+**prefill 已达到可对比的水平；decode 仍有 4.8 倍差距。**
 
-之前多轮里，「有 engram」→ `** ** ** **`，「无 engram」→ `We need answer...`，
-我一直以为那是 **engram 的影响**。
+### decode 为什么没跟上
 
-**现在看，那更可能是 prefill 路径的差异** —— 因为批量路径（也是 prefill 层的事）
-同样把输出从星号变成了连贯句子。
+decode 是 batch=1，**批量路径对它不起作用**（无 batch 可批）。
+它的 6 t/s 仍来自 Round 120 发现的那个问题：**每 token 885 次专家 GEMV**，
+在 batch=1 时无法摊薄。
 
-### 尚未解决
+**⇒ decode 的提速需要另一套手段**（MTP/投机解码、或减少每 token 的专家访问），
+不是这个开关能解决的。
 
-- 两条路径都还没答对 `2+2=`
-- 说明还有**别的**正确性问题（本 goal 原定的 compressor/APE 那条线仍未处理）
+### 正确性仍未解决
 
-### 但今天的两件事是确定的
+默认路径输出 `We need answer. Need to determine actual expected behavior. The user wants me to`
+—— 连贯但没答对 `2+2=`。
 
-1. **额外开销找到了**：V4.1 被默认排除在批量 prefill 之外，pp512 6.0 → 29.5 t/s（4.9×）
-2. **批量路径不挂设备**，且输出质量更好（pp2048 也正常）
-
-**下一步：把开关默认打开，然后回到正确性问题。**
+**这是 goal 原定的 compressor/APE 那条线，尚未处理。**
 
