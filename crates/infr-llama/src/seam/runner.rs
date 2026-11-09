@@ -12683,8 +12683,17 @@ fn generate_dense_backend_inner(
         // per-token one instead (measured: `ubatch` 32/64/128/256 all report the same 6-7 tok/s,
         // which is the tell - a real batched path must move with ubatch). Wiring it now so the
         // comment is true and the path can be measured rather than guessed at. It stays opt-in.
+        // DEFAULT ON as of the 2026-11-09 re-measurement. It was opt-in because the bring-up run
+        // recorded a 2032-token prompt losing the device; that no longer reproduces. Measured
+        // today on the same build, same command, this flag the only difference:
+        //   pp32 6.4 -> 15.7 | pp128 6.2 -> 21.5 | pp512 6.0 -> 29.5 | pp1024 28.9 | pp2048 28.3
+        // all with the device still enumerable afterwards, and pp128 dispatch count fell
+        // 360692 -> 3518 (native_idm_iq1m_paged 8341 -> 13), so it is really batching rather
+        // than falling back. Output quality improved too: `2+2=` went from `** ** ** **` to
+        // connected prose. `INFR_DSV41_BATCHED_PREFILL=0` still forces the old per-token path,
+        // which is what you want when bisecting a numerical difference.
         let dsv41_batched_prefill = is_dsv4_family(c)
-            && std::env::var_os("INFR_DSV41_BATCHED_PREFILL").is_some_and(|v| v != "0");
+            && std::env::var_os("INFR_DSV41_BATCHED_PREFILL").map_or(true, |v| v != "0");
         ((c.moe.is_none() || moe_batched_ok) && !is_dsv4_family(c)) || dsv41_batched_prefill
     };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
