@@ -2,75 +2,77 @@
 
 ---
 
-## Round 119：找到并修复「窗口冻结」的第二个 bug —— out/cur 在 decode 路径上都不写
+## Round 120：找到额外开销 —— **MoE 在 prefill 里根本没批处理，逐 token 走 1 行 GEMV**
 
-### 探针证据
+### 用户的判断是对的
 
-真实 turn 里 `tok` 在变，`prev` 却纹丝不动：
+我先前把 6 t/s 归因于「PCIe 链路上限」，并说 27.7 t/s 物理不可能。
+**这个结论错了**，错在把「观测到的带宽」当成了「带宽上限」。
+用户指出：Vulkan 图灵完备，达不到就是还有预期外开销。
+
+### 决定性探针
+
+**① 速度与工作量完全无关（bench 实测）**
+
+| 配置 | 吞吐 |
+|---|---|
+| pp32 | 5.9 t/s |
+| pp128 | 6.1 t/s |
+| pp512 | 6.0 t/s |
+| pp512, ub=32 | 6.0 t/s |
+| pp512, ub=128 | 6.0 t/s |
+| pp512, ub=4096 | 6.0 t/s |
+
+**16 倍工作量、128 倍 ubatch 差异，吞吐恒定在 6.0。** 这不是带宽受限的特征。
+
+**② 门控探针（`INFR_MMQ_PROBE`）**
 
 ```
-tok=27526  prev=[2, 23166, 27526]      ← prefill 最后一步，正常
-tok=0      prev=[31, 128804, 128821]   ← decode 第 1 步
-tok=128799 prev=[31, 128804, 128821]   ← 同一个
-tok=77666  prev=[31, 128804, 128821]   ← 同一个
-tok=288    prev=[31, 128804, 128821]   ← 同一个
+57848  rows=1 thr=8 rows_ok=FALSE dtypes全OK(Iq1M/Iq1M/Iq1M)
+37188  rows=1 thr=8 rows_ok=FALSE Iq2Xxs/Iq2Xxs/Iq1M
+20660  rows=1 thr=8 rows_ok=FALSE Iq2Xs/Iq2Xs/Iq1M
 ```
 
-再打 `history.len()` 确认：
+**每一条都是 `rows=1`，`rows_ok=false`。**
+
+**③ 形状探针（决定性）**
 
 ```
-ENGRAM_HIST pos=0 prompt=35 out=0 hist=35
-ENGRAM_HIST pos=6 prompt=35 out=0 hist=35   ← out 始终为 0
+MMQ_SHAPE ne=5120 numel=5120 rows=1
 ```
+
+**prefill 32 个 token，MoE 输入张量却只有 `numel=5120 = ne`，即 1 行。**
 
 ### 根因
 
-**`out` 和 `cur` 在 record-once decode 路径上都不被追加。** 两者都停在 prompt 长度，
-所以 `history` 永远是 prompt，每一步的前驱窗口完全相同。
+`paged_mmq_selected` 的门控里有 **`rows > small_m_threshold(8)`**。
+MoE 的 `rows = graph.desc(x).numel() / ne`，而 prefill 时 **MoE 被逐 token 调用了 32 次、每次 1 行**，
+所以 `rows=1` 永远小于 8，**永远走不到 MMQ 快路径**，落在 `native_idm_iq1m_paged` 这个
+**1-output-per-workgroup 的 GEMV** 上（commit `1224cf8` 注释实测 **0.26 TFLOPS**）。
 
-**warmup 掩盖了这个 bug**：warmup 走的是会追加 `out` 的路径，所以第一版修复在 warmup 上
-看起来是对的。**这正是 Round 118 那个教训的延伸——观测对象选错，结论就错。**
+**这解释全部现象：**
 
-### 修复
-
-在**注入点本身**记账，那里才是 token 真正交给 forward 的地方：
-
-```rust
-let mut engram_seen: Vec<u32> = Vec::new();   // 闭包外，可变捕获
-...
-let mut history: Vec<u32> = prompt.to_vec();
-history.extend(engram_seen.iter().copied());
-// ... gather + upload ...
-engram_seen.push(tok as u32);                 // 本步 gather 之后再记，避免看到自己
-```
-
-### 修复后：窗口正常推进（输出形态改变）
-
-| engram | `2+2=` 输出 |
+| 观测 | 解释 |
 |---|---|
-| **有** | `**  **  **  ** ` |
-| **无** | `We need answer. The question is "` |
+| pp32 = pp512 = 6.0 t/s | MoE 逐 token 处理，batch 维度完全没进入 |
+| ubatch 32/128/4096 全无影响 | 改的是外层分块，MoE 内部照样逐行 |
+| `native_idm_iq1m_paged` 31432 次 × 880µs = 27.7s (39%) | 正是这些 1 行 GEMV |
+| `copy_strided` 453120 次 | 每行都要搬一次专家数据 |
 
-**两者仍然不同，且都错。** 但与修复前相比，有 engram 一侧从
-`** 0.0.0`（Round 117 观测）变成了纯 `**` 重复 —— 窗口推进确实改变了模型行为。
+### 排除掉的测量假象
 
-### 诚实评估
+`INFR_PROF_OPS` 默认把 **`zero_fill` 报成 22.4s (31.7%)**。
+用 `INFR_STAMP_AFTER_BARRIER=1` 重测后它**完全消失**，时间转移到
+`native_idm_iq1m_paged`（7.09s → 27.7s）。**zero_fill 的耗时里绝大部分是「等待之前的计算完成」**，
+代码注释早已写明这是 ~160× 的误归因。
 
-**又修好了一个真 bug，但答案依然不对。**
+### 量级与下一步
 
-engram 这条链现在：参与计算 ✅、数学正确 ✅、数据健康 ✅、
-**窗口正确推进 ✅**（本轮新达成）。但 `2+2=` 仍不是 `4`。
+| | GEMV（当前） | MMQ（应有） |
+|---|---|---|
+| 算术强度 | 1 行/次，0.26 TFLOPS | prefill 批量，int8 峰值 40+ TFLOPS |
+| 行利用率 (pp512) | 1/512 | 满 |
 
-**⇒ 剩余问题不在 engram。** 无 engram 时模型同样答错，说明是更上游的问题
-（本 goal 里的 compressor/APE 那条线仍未处理）。
-
-### 状态
-
-| 项 | 值 |
-|---|---|
-| 工作区 | 干净 |
-| 编译 | ✅ |
-| 本地提交 | **92 个** |
-| prefill | 6 tok/s |
-| decode | 5.7–6.4 tok/s |
+**下一步：让 prefill 的 MoE 按 batch 行数一次发射，而不是逐 token 循环。**
+这才是真正的额外开销。
 
