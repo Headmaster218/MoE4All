@@ -1799,3 +1799,83 @@ pub fn gather_for_layer(
     }
     table.gather_rows(layer_id, &rows)
 }
+
+/// The predecessor windows `gather_for_layer` needs, for a batch that starts at `history.len()`.
+///
+/// `history` is every token already consumed this turn (the KV cache's materialised ids) and
+/// `batch` is the tokens being processed now, in order. The window for the token at absolute
+/// position `p` is `[p-n_prev, p)` oldest-first, and positions before the sequence start are
+/// filled with `pad_id` - the reference marks those "blocked" and reads padding from there on,
+/// which is what `-1` becomes inside `row_indices`. Waiting for the token's own predecessors to
+/// exist is why this is computed before the forward rather than during it.
+pub fn engram_windows(
+    n_gram: usize,
+    pad_id: i32,
+    history: &[u32],
+    batch: &[u32],
+) -> Vec<Vec<i32>> {
+    let n_prev = n_gram.saturating_sub(1);
+    let mut out = Vec::with_capacity(batch.len());
+    // Absolute position -> token id, spanning history and the batch (the batch is not in
+    // `history` yet: it is what this forward is about to consume).
+    let at = |p: usize| -> i32 {
+        if p < history.len() {
+            history[p] as i32
+        } else {
+            batch[p - history.len()] as i32
+        }
+    };
+    for i in 0..batch.len() {
+        let pos = history.len() + i;
+        let mut win = Vec::with_capacity(n_prev);
+        // Oldest first, as `row_indices` expects: slot s of the window is the token s
+        // positions back, so the oldest one is n_prev positions back.
+        for s in (1..=n_prev).rev() {
+            let p = pos as isize - s as isize;
+            win.push(if p < 0 { pad_id } else { at(p as usize) });
+        }
+        out.push(win);
+    }
+    out
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::engram_windows;
+
+    #[test]
+    fn first_token_has_no_predecessors_and_reads_padding() {
+        // n_gram 4 => three predecessors; a token at position 0 has none, so all three are pad.
+        let w = engram_windows(4, 2, &[], &[100]);
+        assert_eq!(w, vec![vec![2, 2, 2]]);
+    }
+
+    #[test]
+    fn windows_are_oldest_first_and_span_the_batch() {
+        // History [10, 11], batch [12, 13]. For 12 the window is 11,10,pad (oldest first);
+        // for 13 it is 12,11,10 - crossing the history/batch boundary, which is the case a
+        // history-only implementation gets wrong.
+        // For 12: three positions back is before the start (pad), then 10, then 11 - oldest
+        // first, i.e. most distant first. For 13: reaches back into the batch for 12.
+        let w = engram_windows(4, 2, &[10, 11], &[12, 13]);
+        assert_eq!(w, vec![vec![2, 10, 11], vec![10, 11, 12]]);
+    }
+
+    #[test]
+    fn a_full_history_fills_every_slot() {
+        // Oldest (most distant) first: 7, then 8, then 9.
+        let w = engram_windows(4, 2, &[7, 8, 9], &[10]);
+        assert_eq!(w, vec![vec![7, 8, 9]]);
+    }
+
+    #[test]
+    fn bigram_needs_one_predecessor() {
+        let w = engram_windows(2, 2, &[5], &[6]);
+        assert_eq!(w, vec![vec![5]]);
+    }
+
+    #[test]
+    fn empty_batch_yields_no_windows() {
+        assert!(engram_windows(4, 2, &[1, 2, 3], &[]).is_empty());
+    }
+}
