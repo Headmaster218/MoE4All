@@ -2,66 +2,44 @@
 
 ---
 
-## Round 125：**根因找到 —— engram 表格式不匹配，模型声明的表我们从未加载过**
+## Round 126：IQ4_NL 表的结构已探明 —— 与 MXFP8 是**转置关系**
 
-### 决定性证据链
+### 两个表的实际张量声明
 
-**① 模型自己声明了它需要哪个表**
+| 表 | `blk.1.engram_embd.weight` shape | ggml type | 字节 |
+|---|---|---|---|
+| **MXFP8**（此前一直用） | `[384006168, 256]` | 32 (E4M3) | 98.3 GB |
+| **IQ4_NL**（模型声明） | `[256, 384006168]` | 20 (IQ4_NL) | 55.3 GB |
 
-直接读 GGUF 头（`deepseek41.engram.file`，gguf type 8 = string）：
+**行数完全相同（384006168 = 两层合计），但 `ne0`/`ne1` 位置对调。**
 
-```
-deepseek41.engram.file = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
-```
+GGUF 约定 `ne0` 是最快变化维：
 
-**② 本机确实有那个表**
+- **MXFP8**：`ne0 = rows(384006168)`，`ne1 = 256` —— 行是外层，每行 256 个 E4M3 码，
+  另有独立 `blk.N.engram_embd.scale` 张量 `[384006168, 8]`（E8M0，8 个指数覆盖 256 元素）。
+- **IQ4_NL**：`ne0 = 256`，`ne1 = rows(384006168)` —— 标准 ggml 声明，
+  每「行」是一个 256 元素的 embedding，**scale 内嵌在块里**（每 32 元素一个 f16 d）。
 
-```
-/data/models/dsv41-engram-iq4nl/engram-iq4nl.gguf   17.9 GB
-/home/dyy/engram-mxfp8/engram-mxfp8.gguf           202.8 GB   ← 我们一直在用这个
-```
+**⇒ 这不只是量化格式不同，是两种张量布局约定。** 用 MXFP8 的读法去读 IQ4_NL 表，
+或者反过来，读到的都是完全错位的数据。
 
-**③ 换成正确的表，引擎直接拒绝**
-
-```
-Error: unsupported: engram table tensor has ggml type 20;
-this reader decodes only type 32 (E4M3 codes) and 34 (E8M0 scales)
-```
-
-**④ 代码里的注释印证**
-
-`engram.rs:44-45`：
+### MXFP8 表的每层行数
 
 ```
-blk.N.engram_embd.weight  ggml type 32  [rows, 256]  E4M3 codes
-blk.N.engram_embd.scale   ggml type 34  [rows, 8]    E8M0 exponents
+blk.1.engram_embd.weight   [384006168, 256] type 32
+blk.1.engram_embd.scale    [384006168, 8]   type 34
+blk.14.engram_embd.weight  [384016682, 256] type 32
+blk.14.engram_embd.scale   [384016682, 8]   type 34
 ```
 
-`engram.rs:100-102` 明确写着这是「**this converter's private E4M3 code-stream**」——
-即某个私有转换器的产物，**不是**模型公布的标准 IQ4_NL 格式。
+两层行数略不同（384006168 / 384016682），与 `engram_vocab_size` 的分配方案相符。
 
-### 结论
+### 需要做的事
 
-| 项 | 值 |
-|---|---|
-| 模型声明的表 | **IQ4_NL，ggml type 20，17.9 GB** |
-| `engram.rs` 支持的 | **MXFP8 私有流，type 32/34，202 GB** |
-| 此前所有测试用的 | MXFP8 |
-| **后果** | **engram 两层读到完全错误的数据 ⇒ 答非所问** |
-
-**这解释了为什么「模型收到正确的 `2+2=` 却答错」——错不在 prompt、不在 YOCO、不在注意力，
-而在 engram 层用了错的表。**
-
-### 为什么之前所有 engram 验证都「通过」了
-
-我逐个核对过数学（gate 公式、偏移、广播）、数据（数值 O(1)、无 NaN、两层不同）——
-**这些都对，但它们验证的是「代码与 MXFP8 表一致」，而不是「MXFP8 表是本模型该用的表」。**
-
-数学正确 + 数据源错误 = 结果错误。这是一个我没有设想过失败方式。
-
-### 下一步
-
-**必须给 `engram.rs` 加 IQ4_NL（ggml type 20）解码支持**，让它能读模型声明的那个表。
-标准 IQ4_NL 是 32 元素一块、每块 18 字节（2 字节 f16 scale + 16 字节 4-bit code），
-比 MXFP8 简单得多。
+1. `ggml_type_layout(20)` → `(18, 32)`：32 元素一块、每块 18 字节（**已加**）。
+2. 行/列索引要按表类型分支：type 20 用 `shape[1]` 作行数、`shape[0]` 作 key_length；
+   type 32 相反。
+3. 新增 `dequant_iq4_nl_row`：每 32 元素读 2 字节 f16 d + 16 字节 4-bit code，
+   查 16 项 codebook。
+4. type 20 没有独立 scale 张量，`tensor_pair` 要能返回单张量。
 
