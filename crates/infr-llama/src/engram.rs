@@ -1879,3 +1879,40 @@ mod window_tests {
         assert!(engram_windows(4, 2, &[1, 2, 3], &[]).is_empty());
     }
 }
+
+/// Gather one engram layer's rows for this step and upload them into that layer's staging buffer.
+///
+/// Called once per engram layer before the forward, because the windows depend on the batch
+/// about to be consumed and the rows on the layer. `history` is the KV cache's materialised ids
+/// (the batch is not in it yet); `batch` is the tokens this forward processes, in order.
+#[allow(clippy::too_many_arguments)]
+pub fn upload_layer(
+    be: &dyn infr_core::backend::Backend,
+    cfg: &crate::Config,
+    table: &EngramTable,
+    layer_id: u32,
+    history: &[u32],
+    batch: &[u32],
+    dst: &dyn infr_core::backend::Buffer,
+) -> Result<()> {
+    let rows = gather_layer(cfg, table, layer_id, history, batch)?;
+    be.upload(dst, bytemuck::cast_slice(&rows))
+        .map_err(|e| Error::Backend(e.to_string()))
+}
+
+/// [`gather_for_layer`] with the predecessor windows built from the raw token stream.
+pub fn gather_layer(
+    cfg: &crate::Config,
+    table: &EngramTable,
+    layer_id: u32,
+    history: &[u32],
+    batch: &[u32],
+) -> Result<Vec<f32>> {
+    let prev = engram_windows(
+        cfg.engram_max_ngram,
+        cfg.engram_pad_id as i32,
+        history,
+        batch,
+    );
+    gather_for_layer(cfg, table, layer_id, batch, &prev)
+}
