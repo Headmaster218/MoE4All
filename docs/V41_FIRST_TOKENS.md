@@ -2,53 +2,54 @@
 
 ---
 
-## Round 143：配置全项核对通过（加了 `INFR_CFG_DUMP`），配置类错误排除
+## Round 144：**参考基准终于有了** —— 本机的 `strata-dsv41` 用同一份 GGUF，还能 `--dump-logits`
 
-### 背景
+### 前面十几轮为什么卡住
 
-`/data/models/dsv41-i8test/pack/ds4.txt` 是一份**权威的模型配置快照**（45 行，与 `deepseek4.cpp`
-同源），比逐个字段读代码可靠。于是加 `INFR_CFG_DUMP`，把引擎解析出来的配置按同样的键名打出来，
-两边直接 diff。
+一直缺「同一份模型文件 + 能正确运行的引擎 + 可导出的中间值」这三样同时具备的参照：
 
-### 核对结果：**没有一项错**
+| 候选 | 为什么不行 |
+|---|---|
+| llama.cpp（`build-sycl/bin/llama-cli`） | 报 `blk.1.engram_embd.weight is missing` —— 这个 GGUF 不含 engram 张量，只有元数据 |
+| DeepInfer | Python 实现，130 GB 模型跑不动 |
+| Mach X（`auto-test-result.txt`） | FP8 safetensors，量化格式与代码路径都不同 |
+| qwen2.5 | 不同架构，只能证明引擎通用路径健康 |
 
-| 项 | 权威 | 引擎 |
-|---|---|---|
-| vocab_size | 129280 | 129280 |
-| hidden_size | 5120 | 5120 |
-| num_hidden_layers | 40 | 40 |
-| head_dim | 512 | 512 |
-| qk_rope_head_dim | 64 | 64 |
-| hc_mult | 4 | 4 |
-| hc_sinkhorn_iters | 20 | 20 |
-| index_head_dim | 128 | 128 |
-| index_topk | 512 | 512 |
-| engram_layer_ids | 1,14 | [1, 14] |
-| engram_n_head / max_ngram / key_length | 8 / 4 / 256 | 8 / 4 / 256 |
-| n_routed_experts | 384 | 384 |
-| num_experts_per_tok | 6 | 6 |
-| moe_intermediate_size | 2304 | 2304 |
-| routed_scaling_factor | 1.5 | 1.5 |
-| rms_norm_eps | 9.9999997e-21 | 1e-20 |
-| rope_theta / compress_rope_theta | 10000 / 160000 | 10000 / 160000 |
-| rope_scaling.factor | 16.0 | 16 |
-| sliding_window | 128 | 128 |
-| swiglu_limit | 10.0 | 10.0 ×40 |
-| compress_ratios | 43 项，roles `0,0,2*18,1*20` | 相同（引擎裁到 40） |
-| kv_source_layer_ids | 2,8,14,20 | 展开图与之一致 |
-| index_source_layer_ids | 2,8,14,20,24,28,32,36 | 8 个源，是 KV 源的超集 ✓ |
+### 找到了：`/data/strata-new/build-sycl-jit/strata-dsv41`
 
-两处曾被我误判为错，都是**我自己 dump 错了字段**：
-`rms_norm_eps` 我一开始打了 `norm_eps`（那是非 RMS LayerNorm 的，V4 不用），
-`rope_scaling_factor` 我一开始漏打了。补上后两者都正确。
+线索来自 `/data/models/dsv41-i8test/bench/bench-ab.sh`：
 
-`rope_yarn_log_mul = 0` 也不是问题：GGUF 里确实没有 `yarn_log_multiplier` 这个键，
-而 DeepSeek 的 mscale 由 `rope.scaling.factor`（已正确读为 16）决定，频率缩放走 factor。
-在这台机器上只有 512 token 的上下文，YaRN 的 ramp 根本没被触发。
+```bash
+ENGINE=/data/strata-new/build-sycl-jit/strata-dsv41
+PACK=/data/models/dsv41-i8test/pack-q2k-all     # 指向同一份 IQ2_XXS
+```
 
-### 结论
+需要 `source /opt/intel/oneapi/setvars.sh`（否则缺 `libmkl_sycl_blas.so.6`）。
 
-**配置类错误排除。** 缺陷只能在计算图 / kernel 的数值实现里。
+### 实测：跑通了，且支持 `--dump-logits`
 
-`INFR_CFG_DUMP` 留着：以后再遇到「怀疑配置读错」，一条命令就能把 40 项打全，不必逐字段读代码。
+```
+prompt: 989 tokens in 28234 ms (35.03 tok/s, windows of 16)
+455,4787,13769,46012,54994,1060,270,41638,6397,14,305,270
+decode: 12 tokens in 631 ms (17.42 tok/s)
+```
+
+`/tmp/ref-logits.bin` 511 MB —— **逐 token 的 logits 参考值**。
+
+### 这改变了什么
+
+从现在起可以做**真正的数值比对**，而不是靠「范数看起来异常」这种间接判断：
+
+1. 拿同一段 prompt token ids 跑 moe4all
+2. 比对两者在**第一个 token 的 logits**
+3. 若第一个 token 就分叉 ⇒ 单次前向就有错，可以逐层二分
+4. 若前 N 个 token 一致后才分叉 ⇒ 错误在增量/缓存路径
+
+### 参考输出（已存档）
+
+```
+455,4787,13769,46012,54994,1060,270,41638,6397,14,305,270
+```
+
+同一份 `--ids @/data/models/dsv41-iq2xxs-pack-real/bench/1k.ids`（989 tokens）。
 
