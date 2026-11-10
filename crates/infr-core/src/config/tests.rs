@@ -645,6 +645,7 @@ fn speculative_paths_preserve_explicit_runtime_ab_controls() {
     assert_eq!(defaults.kernels.vulkan.decode_gpu_resident_copy_groups, 0);
     assert!(defaults.kernels.vulkan.qsa_verify_split);
     assert!(!defaults.kernels.vulkan.verify_shared_iq2_nr8);
+    assert!(!defaults.kernels.vulkan.verify_iq4nl_down_nr4);
     assert!(defaults.kernels.vulkan.verify_pair);
     assert!(defaults.spec.mtp_tail_kv_only);
     assert!(defaults.spec.mtp_vocab.is_none());
@@ -681,6 +682,19 @@ fn shared_iq2_verify_nr8_preserves_explicit_reference_path() {
         for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
             let cfg = Config::load_from_layers(&[layer]);
             assert_eq!(cfg.kernels.vulkan.verify_shared_iq2_nr8, enabled);
+        }
+    }
+}
+
+#[test]
+fn verify_iq4nl_down_nr4_defaults_off_and_keeps_explicit_reference_path() {
+    assert!(!Config::default().kernels.vulkan.verify_iq4nl_down_nr4);
+    for enabled in [false, true] {
+        let setting = format!("kernels.vulkan.verify_iq4nl_down_nr4={enabled}");
+        let toml = format!("[kernels.vulkan]\nverify_iq4nl_down_nr4={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kernels.vulkan.verify_iq4nl_down_nr4, enabled);
         }
     }
 }

@@ -15831,7 +15831,20 @@ impl<'a> Recorder<'a> {
             }
         }
         if rows > 1 {
-            let nr = self.gemv().id_grid_nr;
+            // Causal Verify's IQ4_NL Down cohort has its own measured NR; every other multi-row
+            // shape keeps the device's tuned grid NR (and IQ4_NL its NR1 baseline) when the knob
+            // is off, so the knob alone is the A/B switch.
+            let nr = if crate::adapter::verify_pair::iq4nl_down_nr4_applies(
+                self.be.cfg().kernels.vulkan.verify_iq4nl_down_nr4,
+                dtype,
+                [rows, in_f, out_f],
+                n_used,
+                x_per_slot,
+            ) {
+                4
+            } else {
+                self.gemv().id_grid_nr
+            };
             if let Some((name, spv)) = crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr) {
                 let k = self.be.kernel(name, spv, 5, 44);
                 let groups = (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
@@ -23068,6 +23081,388 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The causal-VERIFY IQ4_NL Down dispatch, on the exact nonshared paged ABI the graph uses
+    /// (`native_idm_iq4nl_paged` at K=640, N=2560, 10 routed slots, per-slot input, 4 rows) — the
+    /// single largest FFN dispatch in the Verify batch. `nr == 1` is the production kernel, so the
+    /// ratio is admitted-vs-candidate, not a stand-in. IQ2_S gate/up (K=2560, N=640) is the harness
+    /// control: its NR8 arm is already qualified, so a probe that cannot reproduce that gain here
+    /// would not be trusted for IQ4_NL either.
+    ///
+    /// NR order rotates every round and each arm keeps its median: a forward NR1→NR8 sweep
+    /// otherwise charges the clock ramp to whichever arm ran first.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; verify IQ4_NL Down NR parity and rotated-median probe"]
+    fn verify_iq4nl_down_nr_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        use infr_core::DType;
+        let be = VulkanBackend::new().unwrap();
+        const ROUTED: usize = 10;
+        const ROWS: usize = 4;
+        for (dtype, k, n, x_per_slot, control) in [
+            (DType::Iq4Nl, 640usize, 2560usize, true, false),
+            (DType::Iq2S, 2560usize, 640usize, false, true),
+        ] {
+            let experts = 64usize;
+            let weight_bytes = infr_testkit::synth_weight(dtype, k * n * experts, 456);
+            let stride = infr_testkit::synth_weight(dtype, k * n, 456).len();
+            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+            let lut_words = (0..experts)
+                .flat_map(|e| {
+                    let address = weight.device_addr().unwrap() + (e * stride) as u64;
+                    [address as u32, (address >> 32) as u32]
+                })
+                .collect::<Vec<_>>();
+            let ids = (0..ROWS)
+                .flat_map(|r| (0..ROUTED).map(move |s| ((s + r * 3) % experts) as u32))
+                .collect::<Vec<_>>();
+            let x_len = if x_per_slot {
+                ROWS * ROUTED * k
+            } else {
+                ROWS * k
+            };
+            let x = (0..x_len)
+                .map(|i| (i as f32 * 0.031).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let lut = be
+                .alloc(lut_words.len() * 4, BufferUsage::Activations)
+                .unwrap();
+            let ids_b = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+            let output = be
+                .alloc(ROWS * ROUTED * n * 4, BufferUsage::Readback)
+                .unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be.upload(lut.as_ref(), bytemuck::cast_slice(&lut_words))
+                .unwrap();
+            be.upload(ids_b.as_ref(), bytemuck::cast_slice(&ids))
+                .unwrap();
+            let mut push = [0u8; 44];
+            for (word, value) in [
+                k as u32,
+                n as u32,
+                ROUTED as u32,
+                0, // lut window base
+                u32::from(x_per_slot),
+                ROWS as u32,
+                weight.device_addr().unwrap() as u32,
+                (weight.device_addr().unwrap() >> 32) as u32,
+                stride as u32,
+                (1u32 << ROUTED) - 1,
+                0, // static active_mask, no per-row bank
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            let run = |nr: u32, reps: usize| {
+                let (name, spv) = if control {
+                    // IQ2_S NR1 is the plain paged build; only its NR>=2 arms live in the grid
+                    // table, exactly as the production selector composes them.
+                    if nr == 1 {
+                        crate::gemm::native_idm_paged_build_spv(dtype).map(|spv| {
+                            (
+                                crate::linear::native_idm_paged_kernel_name(dtype).unwrap(),
+                                spv,
+                            )
+                        })
+                    } else {
+                        crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr)
+                    }
+                } else {
+                    crate::gemm::native_idm_iq4nl_nr_probe_spv(nr)
+                }
+                .unwrap_or_else(|| panic!("{dtype:?} NR={nr} has no probe build"));
+                let kernel = be.kernel(name, spv, 5, 44);
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.dispatch_wide(
+                        kernel,
+                        &[
+                            Recorder::vkb(lut.as_ref()),
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(ids_b.as_ref()),
+                            Recorder::vkb(lut.as_ref()),
+                            Recorder::vkb(output.as_ref()),
+                        ],
+                        1,
+                        &push,
+                        (ROWS * ROUTED * n.div_ceil(nr as usize)) as u32,
+                    );
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                (name, start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            // The control family only ships the two arms the engine already distinguishes.
+            let ars: Vec<u32> = if control {
+                vec![1, 8]
+            } else {
+                vec![1, 2, 4, 8]
+            };
+            // Parity: every NR must match the production NR1 output bit for bit.
+            let measure = |nr: u32| {
+                be.upload(output.as_ref(), &vec![0u8; output.len_bytes()])
+                    .unwrap();
+                run(nr, 1);
+                let mut values = vec![0u8; output.len_bytes()];
+                be.download(output.as_ref(), &mut values).unwrap();
+                values
+            };
+            let reference = measure(1);
+            for &nr in &ars[1..] {
+                assert_eq!(
+                    &measure(nr),
+                    &reference,
+                    "{dtype:?} NR={nr} differs from NR1 at K={k}, N={n}, per_slot={x_per_slot}"
+                );
+            }
+            let names = ars
+                .iter()
+                .map(|&nr| run(nr, 1).0)
+                .collect::<Vec<&'static str>>();
+            let rounds = 5usize;
+            let mut samples = vec![vec![0f64; ars.len()]; rounds];
+            for (round, row) in samples.iter_mut().enumerate() {
+                for slot in 0..ars.len() {
+                    // Rotate which arm is measured first each round, but always store by arm.
+                    let idx = (slot + round) % ars.len();
+                    row[idx] = run(ars[idx], 32).1;
+                }
+            }
+            let mut out = Vec::new();
+            for (slot, &base) in ars.iter().enumerate() {
+                let mut v = samples.iter().map(|r| r[slot]).collect::<Vec<_>>();
+                v.sort_by(|a, b| a.total_cmp(b));
+                out.push((base, v[v.len() / 2]));
+            }
+            let nr1 = out[0].1;
+            println!(
+                "verify_iq4nl_down_nr_probe {dtype:?} K={k} N={n} per_slot={x_per_slot} names={names:?}: {}",
+                out.iter()
+                    .map(|(nr, t)| format!("NR{nr}={t:.1}us({}%)", (100.0 * t / nr1 - 100.0).round()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+
+    /// Isolated bandwidth probe for the dense Q8_0 multi-row GEMV at the shapes the Verify batch
+    /// actually dispatches. `INFR_PROF_OPS` absolutes inflate (~2.5x) and interleave with phase
+    /// markers, so a share-derived GB/s is not trustworthy — this measures one kernel alone.
+    /// Two suspect geometries: `in_f=320` gives nsub=10, so 54 of the 64 threads have no sub-block
+    /// to own; `out_f=320` gives only 320 workgroups, far below this device's thread capacity.
+    /// Also reports the m-scaling at a full-width shape, which is what decides whether the inner
+    /// loop is issue-bound (cost grows with m) or bandwidth-bound (cost stays flat).
+    #[test]
+    #[ignore = "requires a Vulkan GPU; dense mrow Q8_0 isolated bandwidth probe"]
+    fn mrow_q8_bandwidth_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        let be = VulkanBackend::new().unwrap();
+        for (in_f, out_f, rows) in [
+            (320usize, 10240usize, 4usize),
+            (10240, 320, 4),
+            (2560, 10240, 4),
+            (6144, 2560, 4),
+            (2560, 10240, 1),
+            (2560, 10240, 2),
+            (2560, 10240, 8),
+        ] {
+            let weight_bytes = infr_testkit::synth_weight(infr_core::DType::Q8_0, in_f * out_f, 77);
+            let wbytes = weight_bytes.len() as f64;
+            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+            let x = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.017).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let output = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let mut push = [0u8; 24];
+            for (word, value) in [
+                rows as u32,
+                in_f as u32,
+                out_f as u32,
+                0,
+                weight.device_addr().unwrap() as u32,
+                (weight.device_addr().unwrap() >> 32) as u32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            let run = |reps: usize| {
+                // m==1 is the per-row streamed GEMV; m>=2 is the weight-shared mrow build. Both
+                // take the same 24-byte push and the same [x, x, y] bindings.
+                let (name, spv) = if rows == 1 {
+                    crate::gemm::native_streamed_build_spv(infr_core::DType::Q8_0, false).unwrap()
+                } else {
+                    crate::gemm::native_mrow_spv(infr_core::DType::Q8_0, rows).unwrap()
+                };
+                let kernel = be.kernel(name, spv, 3, 24);
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.dispatch_wide(
+                        kernel,
+                        &[
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(output.as_ref()),
+                        ],
+                        1,
+                        &push,
+                        out_f as u32,
+                    );
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                (name, start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            run(4);
+            let mut samples = Vec::new();
+            let mut name = "";
+            for _ in 0..5 {
+                let (n, us) = run(32);
+                name = n;
+                samples.push(us);
+            }
+            samples.sort_by(|a, b| a.total_cmp(b));
+            let us = samples[samples.len() / 2];
+            println!(
+                "mrow_q8 in_f={in_f} out_f={out_f} rows={rows} nsub={} {name}: {us:.1}us {:.0}GB/s",
+                in_f / 32,
+                wbytes / (us * 1e-6) / 1e9
+            );
+        }
+    }
+
+    /// CLOSED LEVER, kept as the measurement record. Output packing (`-DOR=N`) for the Q8_0 m=4
+    /// multi-row GEMV: OR=1 is the production grid, OR>1 gives each output 64/OR lanes.
+    ///
+    /// Measured (rotated medians, RX 7900 XTX): OR=4 wins 2.5x at in_f=320 (the OR=1 grid idles 54 of
+    /// 64 lanes when nsub=10), 1.5x at 2560x10240 and 1.35x at vocab width — but LOSES 3-6x at
+    /// 10240x320 (packing shrinks an already-thin grid) and 6144x2560 (OR=1 already balances nsub=192).
+    /// So it is a shape-gated win, never a global one.
+    ///
+    /// Why it is NOT admitted: the per-output sum becomes lane-order instead of the subgroupAdd tree,
+    /// i.e. reassociation-tolerant (max abs ~1e-5, max rel inflated only by near-zero elements). On
+    /// the real Flash-Next model that flips greedy output — two processes per arm reproduced the same
+    /// divergent text (baseline sha 992eb29c…, packed sha 6949a147…, 686 packed dispatches). MTP
+    /// verify and independent decode rows carry a precision contract, so they must keep OR=1; the
+    /// only bar-free surface is ordinary short-suffix prefill at exactly m=4, which is negligible.
+    /// Excluding the precision partners made the packed dispatch count 0 and restored the baseline
+    /// sha, confirming the gate logic — and confirming the lever delivers nothing there. Production
+    /// admission was therefore reverted; the OR shader branch and these builds remain probe-only.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; narrow-in_f mrow OR packing probe"]
+    fn mrow_narrow_or_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        let be = VulkanBackend::new().unwrap();
+        for (in_f, out_f, rows) in [
+            (320usize, 10240usize, 4usize),
+            (10240, 320, 4),
+            (2560, 10240, 4),
+            (6144, 2560, 4),
+            (2560, 65536, 4),
+        ] {
+            let weight_bytes = infr_testkit::synth_weight(infr_core::DType::Q8_0, in_f * out_f, 77);
+            let wbytes = weight_bytes.len() as f64;
+            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+            let x = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.017).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let output = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let mut push = [0u8; 24];
+            for (word, value) in [
+                rows as u32,
+                in_f as u32,
+                out_f as u32,
+                0,
+                weight.device_addr().unwrap() as u32,
+                (weight.device_addr().unwrap() >> 32) as u32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            let run = |or: u32, reps: usize| {
+                let (name, spv) = crate::gemm::native_mrow_or_probe_spv(or).unwrap();
+                let kernel = be.kernel(name, spv, 3, 24);
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.dispatch_wide(
+                        kernel,
+                        &[
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(output.as_ref()),
+                        ],
+                        1,
+                        &push,
+                        out_f.div_ceil(or as usize) as u32,
+                    );
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                (name, start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            let ars = [1u32, 4, 8];
+            // Numerics first: capture each arm's output and its deviation from the OR=1 grid.
+            let mut reference: Vec<f32> = Vec::new();
+            let mut errors = Vec::new();
+            for &or in &ars {
+                be.upload(output.as_ref(), &vec![0u8; output.len_bytes()])
+                    .unwrap();
+                run(or, 4);
+                let mut bytes = vec![0u8; output.len_bytes()];
+                be.download(output.as_ref(), &mut bytes).unwrap();
+                let values: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+                if or == 1 {
+                    reference = values.clone();
+                    errors.push((0f32, 0f32, 0usize, values.len()));
+                } else {
+                    let (mut max_abs, mut max_rel, mut differing) = (0f32, 0f32, 0usize);
+                    for (got, want) in values.iter().zip(&reference) {
+                        let d = (got - want).abs();
+                        if d > 0.0 {
+                            differing += 1;
+                        }
+                        max_abs = max_abs.max(d);
+                        max_rel = max_rel.max(d / want.abs().max(1e-6));
+                    }
+                    errors.push((max_abs, max_rel, differing, values.len()));
+                }
+            }
+            // One rotated timing pass for every arm: a fixed 1->4->8 sweep would charge the clock
+            // ramp to whichever arm ran first, and a 2x claim deserves a clean number.
+            let mut per_arm = vec![Vec::new(); ars.len()];
+            let mut names = vec![""; ars.len()];
+            for round in 0..5usize {
+                for slot in 0..ars.len() {
+                    let idx = (slot + round) % ars.len();
+                    let (n, us) = run(ars[idx], 32);
+                    names[idx] = n;
+                    per_arm[idx].push(us);
+                }
+            }
+            for (idx, &or) in ars.iter().enumerate() {
+                let mut v = per_arm[idx].clone();
+                v.sort_by(|a, b| a.total_cmp(b));
+                let us = v[v.len() / 2];
+                let (max_abs, max_rel, differing, n) = errors[idx];
+                println!(
+                    "mrow_or in_f={in_f} out_f={out_f} OR={or} {}: {us:.1}us {:.0}GB/s \
+                     max_abs={max_abs:.3e} max_rel={max_rel:.3e} differing={differing}/{n}",
+                    names[idx],
+                    wbytes / (us * 1e-6) / 1e9
+                );
             }
         }
     }

@@ -1978,6 +1978,19 @@ fn main() {
             "native_mrow_q8_0_m4",
             &["-DFMT_Q8_0", "-DMR=4"],
         ),
+        // Narrow-in_f packing probe (NOT auto-selected): in_f=320 leaves 54 of 64 lanes idle in the
+        // one-output grid. OR packs that many outputs per workgroup so the lanes are filled; the
+        // per-output sum becomes lane-order, so these are reassociation-tolerant, not bit-identical.
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m4_or4",
+            &["-DFMT_Q8_0", "-DMR=4", "-DOR=4"],
+        ),
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m4_or8",
+            &["-DFMT_Q8_0", "-DMR=4", "-DOR=8"],
+        ),
         ("native_gemv_mrow", "native_mrow_bf16", &["-DFMT_BF16"]),
         ("native_gemv_mrow", "native_mrow_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemv_mrow", "native_mrow_q4_1", &["-DFMT_Q4_1"]),
@@ -2314,6 +2327,24 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq4nl_paged",
             &["-DFMT_IQ4NL", "-DPAGED"],
+        ),
+        // NR=n amortizes one decoded IQ4_NL block scale and one per-slot activation row across n
+        // adjacent output rows. Causal Verify's Down (`native_idm_iq4nl_paged` at rows=4) is the
+        // dominant FFN dispatch, so this family is measured before any admission.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_nr2_paged",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_nr4_paged",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_nr8_paged",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DNR=8"],
         ),
         (
             "native_gemv_id_multi",

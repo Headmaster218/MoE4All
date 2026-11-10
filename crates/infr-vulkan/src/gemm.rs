@@ -247,6 +247,29 @@ pub(crate) fn native_mrow_spv(
     }
 }
 
+/// Probe-only accessor for the narrow-in_f output-packing arms (`-DOR=N`). No production selector
+/// reaches these until the bandwidth win and the reassociation error are both qualified.
+pub(crate) fn native_mrow_or_probe_spv(or: u32) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match or {
+        1 => native_mrow_spv(infr_core::DType::Q8_0, 4),
+        4 => v!("native_mrow_q8_0_m4_or4"),
+        8 => v!("native_mrow_q8_0_m4_or8"),
+        _ => None,
+    }
+}
+
 /// The multi-output-row decode GEMV (`RM` rows/workgroup, bit-identical per row to the RM=1 native
 /// GEMV) — kernel-cache name + SPIR-V, the ONLY weight build for this family (the bound-SSBO
 /// resident build died with the eager `Recorder::linear_native_rm` caller, its sole consumer). `rm`
@@ -489,6 +512,37 @@ pub(crate) fn native_idm_grid_nr_paged_build_spv(
         (Iq2S, 2) => v!("native_idm_iq2s_nr2_paged"),
         (Iq2S, 4) => v!("native_idm_iq2s_nr4_paged"),
         (Iq2S, 8) => v!("native_idm_iq2s_nr8_paged"),
+        // Reached only through `iq4nl_down_nr4_applies`; the device's own grid NR never selects
+        // an IQ4_NL build.
+        (Iq4Nl, 4) => v!("native_idm_iq4nl_nr4_paged"),
+        _ => None,
+    }
+}
+
+/// Probe-only accessor for the unadmitted IQ4_NL multi-row builds at the causal-Verify Down
+/// geometry. `nr == 1` returns the exact production kernel, so the baseline arm of the probe is
+/// the dispatched binary rather than a stand-in.
+pub(crate) fn native_idm_iq4nl_nr_probe_spv(nr: u32) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match nr {
+        1 => Some((
+            "native_idm_iq4nl_paged",
+            native_idm_paged_build_spv(infr_core::DType::Iq4Nl)?,
+        )),
+        2 => v!("native_idm_iq4nl_nr2_paged"),
+        4 => v!("native_idm_iq4nl_nr4_paged"),
+        8 => v!("native_idm_iq4nl_nr8_paged"),
         _ => None,
     }
 }

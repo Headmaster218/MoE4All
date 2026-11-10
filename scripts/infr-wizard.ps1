@@ -4166,16 +4166,23 @@ if (-not $reuseSavedSettings) {
             Write-Host '前置条件：Qwen3.5/3.6/3.8 架构、Q8_0/Q8_0 KV、kv.dynamic 开启、且存在统一显存 arena（专家被分页才会建立；整机全部常驻的显存充裕设备没有 arena）。不满足时启动会拒绝并逐条列出未满足的条件。' -ForegroundColor Yellow
             Write-Host 'Prerequisites: a Qwen3.5/3.6/3.8 model, Q8_0/Q8_0 KV, kv.dynamic on, and a unified VRAM arena (it is only built when MoE experts are paged - a fully resident model on a roomy device has none). A startup that misses a prerequisite now lists exactly which.' -ForegroundColor DarkGray
             # The tree and its host-RAM frame pool are separate choices: with no pool every frame
-            # stays inside the VRAM corridor and a cold prefix evicts instead of sinking.
-            $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default ([bool]$kvPagedCacheMax)
+            # stays inside the VRAM corridor and a cold prefix evicts instead of sinking. The
+            # corridor is sized to the LIVE sessions' own context, so without a pool several
+            # conversations evict exactly the chain the next request would hit and every revisit
+            # reports cached_tokens=0. Recommend the pool on a fresh install; a reconfiguration
+            # keeps whatever the operator saved (an explicit decline saves an empty cap).
+            Write-Host '推荐开启 RAM 帧池：显存走廊只装得下活跃会话自己的上下文，没有帧池时几个会话的 KV 加起来超过走廊就会互相驱逐，交替请求永远命中不了（cached_tokens=0）。实测三个会话各 1812 token、ctx 4096：开 2GiB 帧池后回访命中 1792/1812（98.9%），单次耗时从约 1200ms 降到约 190ms。' -ForegroundColor Yellow
+            Write-Host 'Recommended: the VRAM corridor only holds the live sessions own context, so without a frame pool several conversations evict exactly the chain the next request would hit and every revisit reports cached_tokens=0. Measured with three 1812-token conversations at ctx 4096: a 2GiB pool gives 1792/1812 (98.9%) reuse on revisit and cuts a request from ~1200ms to ~190ms.' -ForegroundColor DarkGray
+            $ramPoolDefault = if ($null -eq $script:Saved) { $true } else { [bool]$kvPagedCacheMax }
+            $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（推荐；显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (recommended; cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default $ramPoolDefault
             if ($kvPagedRamPool) {
                 if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
                 Write-Host '帧按实际下沉量惰性增长、开机不预占，也不从专家 store 的额度里预扣——分页树建立时按当时的空闲物理内存夹紧帧数（留 1 GiB 不花），夹不住的冷前缀直接逐出、不再下沉。/ Frames grow lazily with actual demotions, reserve nothing at boot and are no longer pre-carved from the expert store budget: on Windows the paged tree clamps the frame count against the free physical RAM it sees, leaving 1 GiB unspent, and a cold prefix that cannot fit evicts instead of sinking.' -ForegroundColor DarkGray
                 $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限 / Paged KV RAM frame-pool cap' -Default $kvPagedCacheMax -Required
             } else {
                 $kvPagedCacheMax = ''
-                Write-Host '不分配 RAM 帧池：树只使用显存帧走廊，冷前缀直接逐出、不再下沉。混合递归模型续接所需的状态快照仍保留 512 MiB 主机内存上限，按快照逐个分配、不预占。' -ForegroundColor Yellow
-                Write-Host 'No RAM frame pool: every frame stays in the VRAM corridor and cold prefixes evict instead of sinking. Recurrent/PLE state snapshots keep a 512 MiB host cap, claimed one snapshot at a time.' -ForegroundColor DarkGray
+                Write-Host '不分配 RAM 帧池：树只使用显存帧走廊，冷前缀直接逐出、不再下沉。多个会话的 KV 加起来超过走廊时会互相驱逐，交替请求的复用率会是 0；只有单个会话在走廊内重放才命中。混合递归模型续接所需的状态快照仍保留 512 MiB 主机内存上限，按快照逐个分配、不预占。' -ForegroundColor Yellow
+                Write-Host 'No RAM frame pool: every frame stays in the VRAM corridor and cold prefixes evict instead of sinking. Once several conversations hold more KV than the corridor they evict each other, so alternating requests reuse nothing; only a single conversation replayed inside the corridor hits. Recurrent/PLE state snapshots keep a 512 MiB host cap, claimed one snapshot at a time.' -ForegroundColor DarkGray
                 Write-Host '没有 RAM 帧池时磁盘帧层不生效：冷链不经过内存就无法落到磁盘。No disk frame tier without a pool: a cold chain cannot reach the file without a host frame to sink through.' -ForegroundColor DarkGray
             }
             if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }

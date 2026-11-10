@@ -37,9 +37,24 @@ layout(binding = 2) buffer YB { float y_buf[]; };
 #ifndef MR
 #define MR 8
 #endif
+// Outputs per workgroup. OR=1 (default) is the established one-output-per-workgroup grid, whose
+// thread t owns sub-blocks t, t+64, ... — when in_f/32 < 64 most lanes own NOTHING (in_f=320 gives
+// nsub=10, so 54 of 64 lanes idle: measured 64 GB/s vs ~350 at full width). OR>1 packs OR outputs
+// into the workgroup and gives each 64/OR lanes, so a narrow-in_f projection fills its lanes.
+// The per-output sum then runs over 64/OR lane partials in lane order instead of the subgroupAdd
+// tree, so OR>1 is REASSOCIATION-TOLERANT, not bit-identical (same f32 terms, different grouping).
+#ifndef OR
+#define OR 1
+#endif
 const uint MAX_ROWS = MR;
+const uint OUT_PER_WG = OR;
+const uint LANES_PER_OUT = 64u / OR;
 const uint MAX_SG = 8u;             // 64 threads / min 8-wide subgroup
+#if OR > 1
+shared float part[OR][MAX_ROWS][LANES_PER_OUT]; // OR*LANES_PER_OUT == 64, so this is 64*MR floats
+#else
 shared float part[MAX_ROWS * MAX_SG]; // one partial per (row, subgroup)
+#endif
 
 #include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
@@ -50,35 +65,70 @@ void main() {
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
     // an explicit early return is needed (the final `y_buf[...+o]` write below is unconditional on
     // o, unlike native_gemv_rm/sg's per-output-guarded writes).
-    uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+#if OR > 1
+    // grid = ceil(out_f / OR): one workgroup owns OR consecutive outputs, LANES_PER_OUT lanes each.
+    uint o0 = wg * OUT_PER_WG;
+    if (o0 >= pc.out_f) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint oi = t / LANES_PER_OUT;
+    uint lane = t - oi * LANES_PER_OUT;
+    uint o = o0 + oi;
+    // A tail workgroup's out-of-range outputs keep their lanes at zero and still reach the barrier.
+    bool live = o < pc.out_f;
+#else
+    uint o = wg; // grid = out_f: one wg/output
     if (o >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
+    uint lane = t;
+    bool live = true;
+#endif
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint wbase = pc.w_base + o * pc.in_f;
     uint nsub = pc.in_f / 32u;
     uint in_f4 = pc.in_f >> 2u;
     float acc[MAX_ROWS];
     for (uint r = 0u; r < MAX_ROWS; r++) { acc[r] = 0.0; }
-    for (uint s = t; s < nsub; s += 64u) {
-        float v[32];
-        dqblk(wbase + s * 32u, v);
-        // Repack the decoded sub-block into vec4s once; each row then runs 8 vec4 dots.
-        vec4 v4[8];
-        for (uint w4 = 0u; w4 < 8u; w4++) {
-            v4[w4] = vec4(v[4u * w4], v[4u * w4 + 1u], v[4u * w4 + 2u], v[4u * w4 + 3u]);
-        }
-        uint xo4 = s * 8u;
-        for (uint r = 0u; r < MAX_ROWS; r++) {
-            if (r < pc.rows) {
-                uint b = r * in_f4 + xo4;
-                vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
-                a += v4[2] * x4[b + 2u] + v4[3] * x4[b + 3u];
-                a += v4[4] * x4[b + 4u] + v4[5] * x4[b + 5u];
-                a += v4[6] * x4[b + 6u] + v4[7] * x4[b + 7u];
-                acc[r] += a.x + a.y + a.z + a.w;
+    if (live) {
+        for (uint s = lane; s < nsub; s += LANES_PER_OUT) {
+            float v[32];
+            dqblk(wbase + s * 32u, v);
+            // Repack the decoded sub-block into vec4s once; each row then runs 8 vec4 dots.
+            vec4 v4[8];
+            for (uint w4 = 0u; w4 < 8u; w4++) {
+                v4[w4] = vec4(v[4u * w4], v[4u * w4 + 1u], v[4u * w4 + 2u], v[4u * w4 + 3u]);
+            }
+            uint xo4 = s * 8u;
+            for (uint r = 0u; r < MAX_ROWS; r++) {
+                if (r < pc.rows) {
+                    uint b = r * in_f4 + xo4;
+                    vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
+                    a += v4[2] * x4[b + 2u] + v4[3] * x4[b + 3u];
+                    a += v4[4] * x4[b + 4u] + v4[5] * x4[b + 5u];
+                    a += v4[6] * x4[b + 6u] + v4[7] * x4[b + 7u];
+                    acc[r] += a.x + a.y + a.z + a.w;
+                }
             }
         }
     }
+#if OR > 1
+    // Lane-order partials per (output, row): no subgroupAdd, because a wave now spans several
+    // outputs and summing it would mix them. Same f32 terms as OR=1, different grouping.
+    for (uint r = 0u; r < MAX_ROWS; r++) {
+        if (r < pc.rows) { part[oi][r][lane] = acc[r]; }
+    }
+    barrier();
+    if (t < OUT_PER_WG * pc.rows) {
+        uint oo = t / pc.rows;
+        uint r = t - oo * pc.rows;
+        uint yo = o0 + oo;
+        if (yo < pc.out_f) {
+            float tot = 0.0;
+            for (uint l = 0u; l < LANES_PER_OUT; l++) { tot += part[oo][r][l]; }
+            y_buf[r * pc.out_f + yo] = tot;
+        }
+    }
+#else
     for (uint r = 0u; r < MAX_ROWS; r++) {
         if (r < pc.rows) {
             float sg = subgroupAdd(acc[r]);
@@ -91,4 +141,5 @@ void main() {
         for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[t * MAX_SG + s]; }
         y_buf[t * pc.out_f + o] = tot;
     }
+#endif
 }

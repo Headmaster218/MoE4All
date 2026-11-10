@@ -275,6 +275,15 @@ try {
         Assert ($state.kv_paged_tree -and -not $state.kv_paged_cache_max) 'The corridor-only tree choice was not saved'
         Assert (-not $state.server_session_cache) 'The paged tree must turn off the mutually exclusive disk session cache'
     }
+    # A fresh install is RECOMMENDED the pool: accepting the default must emit a budget, because a
+    # corridor-only tree evicts the very chain an alternating session would hit (cached_tokens=0).
+    Test-Flow 'fresh API paged tree takes the recommended RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', '') -Check {
+        Assert ('kv.paged=true' -in $nativeArgs) 'The paged tree was not emitted'
+        Assert ('kv.paged_cache_max=16GiB' -in $nativeArgs) 'Accepting the recommended default must emit the RAM frame-pool cap'
+        Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The recommended tree lost the frame page size'
+        Assert ($state.kv_paged_cache_max -eq '16GiB') 'The recommended pool cap was not saved'
+        Assert (@($script:Output | Where-Object { $_ -match '98\.9%' }).Count) 'The recommendation did not explain the measured reuse consequence'
+    }
     # The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout, so a saved profile that
     # pairs it with another KV format must heal rather than emit a command line the engine refuses.
     $f16TreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'f16'; kv_type_k = 'f16'; kv_type_v = 'f16'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }

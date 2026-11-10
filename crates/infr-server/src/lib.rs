@@ -919,9 +919,14 @@ pub struct OAIFunction {
     pub arguments: String,
 }
 
+/// Prompt-side cache accounting. `cached_tokens` is the OpenAI-compatible prefix-cache hit count;
+/// `uncached_tokens` is its complement — the suffix this request actually had to prefill — so a
+/// client can see a miss without subtracting, and a zero-hit request is distinguishable from a
+/// generator that never reported reuse at all.
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u32,
+    pub uncached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -953,6 +958,7 @@ pub struct TimingInfo {
 
 impl UsageInfo {
     fn from_outcome(outcome: ChatOutcome) -> Self {
+        let cached_tokens = outcome.cached_prompt_tokens.min(outcome.prompt_tokens);
         Self {
             prompt_tokens: outcome.prompt_tokens,
             completion_tokens: outcome.completion_tokens,
@@ -960,7 +966,8 @@ impl UsageInfo {
                 .prompt_tokens
                 .saturating_add(outcome.completion_tokens),
             prompt_tokens_details: PromptTokensDetails {
-                cached_tokens: outcome.cached_prompt_tokens.min(outcome.prompt_tokens),
+                cached_tokens,
+                uncached_tokens: outcome.prompt_tokens.saturating_sub(cached_tokens),
             },
         }
     }
@@ -2004,12 +2011,23 @@ impl TimingInfo {
 /// Emit one request's completion line at INFO. The counterpart to the arrival line
 /// ([`log_request_start`]), joined to it by `req`.
 fn log_request_done(req_id: u64, model: &str, stream: bool, rec: &ReqRecord) {
+    let cached = rec.cached_prompt_tokens.min(rec.prompt_tokens);
+    let uncached = rec.prompt_tokens.saturating_sub(cached);
+    // The rate is what an operator actually scans for: absolute counts hide a 20-token tail miss
+    // inside a 26K prompt, and hide a total miss inside a short one.
+    let reuse_pct = if rec.prompt_tokens == 0 {
+        0.0
+    } else {
+        f64::from(cached) * 100.0 / f64::from(rec.prompt_tokens)
+    };
     tracing::info!(
         req = req_id,
         model,
         stream,
         prompt_tokens = rec.prompt_tokens,
-        cached_tokens = rec.cached_prompt_tokens,
+        cached_tokens = cached,
+        uncached_tokens = uncached,
+        cache_reuse_pct = format_args!("{reuse_pct:.1}"),
         gen_tokens = rec.gen_tokens,
         context_tokens = rec.prompt_tokens.saturating_add(rec.gen_tokens),
         context_limit = ?rec.context_limit,
@@ -5040,7 +5058,10 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
+                prompt_tokens_details: PromptTokensDetails {
+                    cached_tokens: 0,
+                    uncached_tokens: 10,
+                },
             },
             timings: TimingInfo::default(),
         };
@@ -5075,7 +5096,10 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
+                prompt_tokens_details: PromptTokensDetails {
+                    cached_tokens: 0,
+                    uncached_tokens: 0,
+                },
             },
             timings: TimingInfo::default(),
         };
@@ -5116,7 +5140,10 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
+                prompt_tokens_details: PromptTokensDetails {
+                    cached_tokens: 0,
+                    uncached_tokens: 0,
+                },
             },
             timings: TimingInfo::default(),
         };
@@ -5630,6 +5657,7 @@ mod tests {
         let usage = UsageInfo::from_outcome(outcome);
         assert_eq!(usage.total_tokens, 22);
         assert_eq!(usage.prompt_tokens_details.cached_tokens, 0);
+        assert_eq!(usage.prompt_tokens_details.uncached_tokens, 17);
         assert_eq!(
             usage.total_tokens,
             usage.prompt_tokens + usage.completion_tokens
@@ -5646,7 +5674,33 @@ mod tests {
         });
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.prompt_tokens_details.cached_tokens, 76);
+        assert_eq!(usage.prompt_tokens_details.uncached_tokens, 24);
         assert_eq!(usage.total_tokens, 104);
+    }
+
+    /// The hit/miss pair must always partition the prompt, including when a generator over-reports
+    /// reuse (the hit count is clamped to the prompt, so the miss count cannot go negative).
+    #[test]
+    fn usage_cache_hit_and_miss_partition_the_prompt() {
+        for (prompt, cached) in [(0u32, 0u32), (17, 0), (100, 76), (100, 100), (10, 99)] {
+            let usage = UsageInfo::from_outcome(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: prompt,
+                cached_prompt_tokens: cached,
+                completion_tokens: 1,
+            });
+            let d = &usage.prompt_tokens_details;
+            assert_eq!(
+                d.cached_tokens,
+                cached.min(prompt),
+                "prompt={prompt} cached={cached}"
+            );
+            assert_eq!(
+                d.cached_tokens + d.uncached_tokens,
+                prompt,
+                "prompt={prompt} cached={cached}"
+            );
+        }
     }
 
     /// End-to-end: the non-streaming handler must surface the generator's REAL counts (EchoGen

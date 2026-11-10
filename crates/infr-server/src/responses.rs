@@ -1824,9 +1824,18 @@ fn note_handle_withheld(response: &mut Value, withheld: bool) {
 fn responses_usage(chat_usage: &Value) -> Value {
     // Local model thinking is emitted as visible reasoning text and included in output_tokens.
     // The backend exposes no separately metered hidden reasoning tokens.
+    let input = chat_usage["prompt_tokens"].as_u64().unwrap_or(0);
+    let cached = chat_usage["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    // Prefer the producer's own miss count; fall back to the complement so a usage object built
+    // without the field still reports a consistent pair.
+    let uncached = chat_usage["prompt_tokens_details"]["uncached_tokens"]
+        .as_u64()
+        .unwrap_or_else(|| input.saturating_sub(cached));
     json!({
         "input_tokens":chat_usage["prompt_tokens"],
-        "input_tokens_details":{"cached_tokens":chat_usage["prompt_tokens_details"]["cached_tokens"]},
+        "input_tokens_details":{"cached_tokens":cached,"uncached_tokens":uncached},
         "output_tokens":chat_usage["completion_tokens"],
         "output_tokens_details":{"reasoning_tokens":0},
         "total_tokens":chat_usage["total_tokens"]
@@ -2724,6 +2733,30 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    #[test]
+    fn responses_usage_reports_the_hit_miss_pair_and_derives_a_missing_miss() {
+        let full = json!({
+            "prompt_tokens": 100, "completion_tokens": 4, "total_tokens": 104,
+            "prompt_tokens_details": {"cached_tokens": 76, "uncached_tokens": 24}
+        });
+        let u = responses_usage(&full);
+        assert_eq!(u["input_tokens"], 100);
+        assert_eq!(u["input_tokens_details"]["cached_tokens"], 76);
+        assert_eq!(u["input_tokens_details"]["uncached_tokens"], 24);
+        // A usage object built without the miss field still reports a consistent partition.
+        let legacy = json!({
+            "prompt_tokens": 100, "completion_tokens": 4, "total_tokens": 104,
+            "prompt_tokens_details": {"cached_tokens": 76}
+        });
+        let u = responses_usage(&legacy);
+        assert_eq!(u["input_tokens_details"]["uncached_tokens"], 24);
+        // No reuse reported at all: the whole prompt is the miss.
+        let cold = json!({"prompt_tokens": 17, "completion_tokens": 1, "total_tokens": 18});
+        let u = responses_usage(&cold);
+        assert_eq!(u["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(u["input_tokens_details"]["uncached_tokens"], 17);
+    }
+
     #[tokio::test]
     async fn non_streaming_preserves_usage_and_metadata() {
         let response = post(
@@ -2741,6 +2774,7 @@ mod tests {
         assert_eq!(body["output"][1]["content"][0]["text"], "hello");
         assert_eq!(body["usage"]["input_tokens"], 20);
         assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 12);
+        assert_eq!(body["usage"]["input_tokens_details"]["uncached_tokens"], 8);
         assert_eq!(body["temperature"], 0.25);
         assert_eq!(body["metadata"]["trace"], "local");
         assert_eq!(body["prompt_cache_key"], "harness-test");

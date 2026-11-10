@@ -14310,11 +14310,20 @@ fn resident_copy_requested(
     }
     match policy {
         None => {
-            !graph.mtp_verify
-                && decode_token_rows(graph).is_some_and(|rows| {
+            if graph.mtp_verify {
+                // The same causal-Verify cohort the explicit opt-in below already admits. Qualified
+                // E2E on RX 7900 XTX / Qwen3.8-Flash-Next (merged v1.3.0 tree): paired two-round A/B
+                // gave verify median 104.0 -> 98.9 ms and cycle median 109.6 -> 104.3 ms (-4.8%),
+                // with the committed text byte-identical across two processes per arm. Independent
+                // rows and row counts outside 2..=4 stay on the host-service boundary.
+                !graph.independent_rows
+                    && layouts.iter().all(|layout| (2..=4).contains(&layout.rows))
+            } else {
+                decode_token_rows(graph).is_some_and(|rows| {
                     (1..=crate::GPU_RESIDENT_MAX_ROWS).contains(&rows)
                         && layouts.iter().all(|layout| layout.rows == rows)
                 })
+            }
         }
         Some(true) => {
             !graph.mtp_verify

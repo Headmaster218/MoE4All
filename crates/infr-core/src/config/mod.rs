@@ -731,6 +731,12 @@ cfg_struct! {
         /// Default off pending real-engine E2E qualification against the nonfused graph.
         /// Other shapes, independent rows, SG and buffer-grid paths remain unchanged.
         verify_shared_iq2_nr8: bool = false,
+        /// Causal Verify's IQ4_NL Down projection reuses one decoded input row and one block
+        /// scale across 4 adjacent output rows (`-DNR=4`), measured 15% faster per dispatch than
+        /// the NR1 `native_idm_iq4nl_paged_shexp` at the 640x2560 Verify geometry. Bit-identical
+        /// output. Default off pending E2E qualification; every other dtype, role, row count and
+        /// independent-row decode keeps the established kernel.
+        verify_iq4nl_down_nr4: bool = false,
         /// Reuse native expert weight decoding across adjacent causal Verify rows.
         /// Unqualified dtypes/shapes and insufficient row reuse keep the baseline kernel.
         verify_pair: bool = true,

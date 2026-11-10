@@ -1948,6 +1948,30 @@ impl ParallelSeam {
                 tree = %tree.stats_line(),
                 "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, image spans keyed by picture content so visual KV survives any other request; cold chains sink to the RAM tier and cascade to the disk tier before eviction when a RAM tier is configured, and evict outright when there is none)"
             );
+            // The corridor is sized to the LIVE sessions' full context (`n_slots * max_ctx`), so a
+            // pool-less tree has no guaranteed room for a published chain: once the conversations
+            // together hold more than the corridor, every swap evicts a chain instead of sinking
+            // it, and alternating sessions evict exactly the chain the next request would hit.
+            // That reads as "the KV was thrown away, not pooled" from the client (cached_tokens
+            // stays 0), so name the tier that fixes it rather than leaving it to the stats line.
+            let corridor_tokens = vram_frames as u64 * page_tokens as u64;
+            let live_tokens = n_slots as u64 * meta.max_ctx as u64;
+            if ram_frames == 0 && corridor_tokens.saturating_sub(live_tokens) < page_tokens as u64 {
+                tracing::warn!(
+                    corridor_tokens,
+                    live_tokens,
+                    slots = n_slots,
+                    max_ctx = meta.max_ctx,
+                    "paged KV tree has no RAM tier and no corridor headroom ({} tokens of corridor \
+                     for {} tokens of live sessions): conversations whose KV together exceed the \
+                     corridor evict each other instead of being retained, so alternating sessions \
+                     report cached_tokens=0. Set kv.paged_cache_max (e.g. 2GiB) to sink cold chains \
+                     to host RAM and keep them reusable; a single conversation replayed within the \
+                     corridor still hits.",
+                    corridor_tokens,
+                    live_tokens
+                );
+            }
             let tree = Arc::new(Mutex::new(tree));
             self.paged_cache = Some(Arc::clone(&tree));
             for slot in &mut self.pool.lock().expect("fresh pool").slots {
@@ -3237,11 +3261,17 @@ impl ParallelSeam {
                 // allocated frames cover both tree chains and live sessions, so `free` is what a
                 // growing request can still claim before cold eviction starts.
                 let reused = tree_attached.max(continuation_prefix);
+                let reuse_pct = if prompt.is_empty() {
+                    0.0
+                } else {
+                    reused as f64 * 100.0 / prompt.len() as f64
+                };
                 tracing::info!(
                     slot = target,
                     prompt_tokens = prompt.len(),
                     reused_tokens = reused,
                     prefill_tokens = prompt.len().saturating_sub(reused),
+                    reuse_pct = format_args!("{reuse_pct:.1}"),
                     cache = %tree.stats_line(),
                     "paged KV prefix cache status"
                 );
@@ -3812,11 +3842,17 @@ impl ParallelSeam {
                     kv.set_image_cache_spans(cache_spans);
                 }
                 let reused = tree_attached.max(continuation_prefix);
+                let reuse_pct = if prompt.is_empty() {
+                    0.0
+                } else {
+                    reused as f64 * 100.0 / prompt.len() as f64
+                };
                 tracing::info!(
                     slot = target,
                     prompt_tokens = prompt.len(),
                     reused_tokens = reused,
                     prefill_tokens = prompt.len().saturating_sub(reused),
+                    reuse_pct = format_args!("{reuse_pct:.1}"),
                     cache = %tree.stats_line(),
                     "paged KV prefix cache status"
                 );
