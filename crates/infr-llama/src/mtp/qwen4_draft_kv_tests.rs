@@ -859,8 +859,8 @@ fn confidence_readback_is_one_execution_and_preserves_fixed_and_compact_id_mappi
                             } else {
                                 (0..head.cfg.vocab as i32).collect()
                             };
-                            let vocab = draft_vocab::DraftVocab::mock(&be, head.cfg.n_embd, &ids)
-                                .unwrap();
+                            let vocab =
+                                draft_vocab::DraftVocab::mock(&be, head.cfg.n_embd, &ids).unwrap();
                             Arc::get_mut(&mut head.fixed).unwrap().draft_vocab = Some(vocab);
                         }
                         let numel = head.cfg.n_embd * head.cfg.vocab;
@@ -887,7 +887,10 @@ fn confidence_readback_is_one_execution_and_preserves_fixed_and_compact_id_mappi
                             .unwrap();
                         let fused = supports_prob && want_probs && compact == 0;
                         assert_eq!(draft.tokens, expected);
-                        assert_eq!(draft.probabilities, if fused { probabilities } else { vec![] });
+                        assert_eq!(
+                            draft.probabilities,
+                            if fused { probabilities } else { vec![] }
+                        );
                         assert_eq!(*be.executions.lock().unwrap(), 1);
                         assert_eq!(*be.allocations.lock().unwrap(), allocations);
                         assert!(be.copy_batches.lock().unwrap().is_empty());
@@ -903,10 +906,15 @@ fn confidence_readback_is_one_execution_and_preserves_fixed_and_compact_id_mappi
                         });
                         for (index, op) in predictions {
                             let raw = match *op {
-                                Op::ArgmaxProb { dst_id, dst_prob, .. } => {
+                                Op::ArgmaxProb {
+                                    dst_id, dst_prob, ..
+                                } => {
                                     assert!(fused);
                                     assert_eq!(graph.kind(dst_prob), TensorKind::Output);
-                                    assert_eq!(graph.desc(dst_prob), &TensorDesc::new(vec![1], DType::F32));
+                                    assert_eq!(
+                                        graph.desc(dst_prob),
+                                        &TensorDesc::new(vec![1], DType::F32)
+                                    );
                                     dst_id
                                 }
                                 Op::Argmax { dst, .. } => {
@@ -915,7 +923,9 @@ fn confidence_readback_is_one_execution_and_preserves_fixed_and_compact_id_mappi
                                 }
                                 _ => unreachable!(),
                             };
-                            assert!(matches!(&graph.ops[index + 1], Op::GatherI32 { ids, .. } if *ids == raw));
+                            assert!(
+                                matches!(&graph.ops[index + 1], Op::GatherI32 { ids, .. } if *ids == raw)
+                            );
                         }
                         head.settle_draft(&be, 0).unwrap();
                         let fixed = head
@@ -923,7 +933,10 @@ fn confidence_readback_is_one_execution_and_preserves_fixed_and_compact_id_mappi
                             .unwrap();
                         assert_eq!(fixed, expected);
                         let graph = be.compiled.lock().unwrap().take().unwrap();
-                        assert!(!graph.ops.iter().any(|op| matches!(op, Op::ArgmaxProb { .. })));
+                        assert!(!graph
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op, Op::ArgmaxProb { .. })));
                         assert_eq!(graph.outputs.len(), width - 1);
                         assert_eq!(*be.executions.lock().unwrap(), 2);
                         assert_eq!(*be.allocations.lock().unwrap(), allocations);
@@ -971,8 +984,16 @@ fn invalid_confidence_aborts_and_restores_live_ring_before_the_next_draft() {
                     assert!(error.to_string().contains("invalid probability"));
                     let kv = head.kv.lock().unwrap();
                     assert!(kv.draft_journal.pending.is_none());
-                    for (cache, bytes) in [(kv.k.as_ref(), &before[0]), (kv.v.as_ref(), &before[1])] {
-                        assert_eq!(&cache.as_any().downcast_ref::<JournalBuffer>().unwrap().bytes(), bytes);
+                    for (cache, bytes) in [(kv.k.as_ref(), &before[0]), (kv.v.as_ref(), &before[1])]
+                    {
+                        assert_eq!(
+                            &cache
+                                .as_any()
+                                .downcast_ref::<JournalBuffer>()
+                                .unwrap()
+                                .bytes(),
+                            bytes
+                        );
                     }
                 }
             }
