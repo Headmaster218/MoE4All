@@ -1004,6 +1004,10 @@ cfg_struct! {
         /// accepts 0.4 of its drafts makes the server measurably slower (measured 29 vs 46 tok/s
         /// on a 7900 XTX with the shared Q4_K_M head). `0` disables the breaker.
         mtp_min_alpha: f32 = 0.9,
+        /// Choose Qwen3.8 VERIFY widths by measured cost per committed row, with periodic reprobes.
+        mtp_adaptive_width: bool = false,
+        /// Draft prefix-probability floor for adaptive VERIFY trimming; not a target acceptance rate.
+        mtp_slot_min_accept: f32 = 0.5,
         /// Let two active Qwen3.8 lanes probe batched MTP VERIFY. Disabled by default because the
         /// ordinary batched path is faster and does not need to maintain detached side state.
         mtp_concurrent: bool = false,

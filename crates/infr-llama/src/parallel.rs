@@ -57,6 +57,10 @@ const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
 const MAX_DECODE_BATCH: usize = infr_core::backend::MAX_DECODE_ROWS;
 const SHORT_PREFILL_TOKENS: usize = 96;
 const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
+/// Ordinary group size while the adaptive policy compares decode modes. Measured cadence-
+/// insensitive: 8 and a growing 8..64 schedule land within noise of each other, so the residual
+/// cost of plain decode under MTP is per token, not per group.
+const MTP_ADAPTIVE_PLAIN_QUANTUM: usize = 8;
 const MTP_CONCURRENT_PROBE_CYCLES: usize = 8;
 const MTP_CONCURRENT_MIN_ACCEPT_PERCENT: usize = 80;
 const LOOKUP_CALIBRATION_TOKENS: usize = 16;
@@ -926,6 +930,8 @@ struct BatchWork {
 
 struct MtpSlotState {
     head: Arc<crate::mtp::Qwen4MtpSession>,
+    policy: crate::speculative_verify::MtpCostPolicy,
+    last_policy_rows: usize,
     cached: Vec<u32>,
     last_h: Vec<f32>,
     turn_checkpoints:
@@ -1584,6 +1590,8 @@ impl ParallelSeam {
                         Arc::clone(&catch),
                         model.engine_cfg().spec.mtp_context,
                     )?),
+                    policy: crate::speculative_verify::MtpCostPolicy::default(),
+                    last_policy_rows: 0,
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
                     turn_checkpoints: std::array::from_fn(|_| None),
@@ -4895,6 +4903,12 @@ impl ParallelSeam {
             .as_ref()
             .map(std::slice::from_ref)
             .unwrap_or(indices);
+        let mtp_t0 = (sync_mtp
+            && active.len() == 1
+            && active[indices[0]].mtp_ready
+            && active[indices[0]].phase == BatchPhase::Decode
+            && self.model.engine_cfg().spec.mtp_adaptive_width)
+            .then(Instant::now);
         let lookup_t0 = (indices.len() == 1
             && active[indices[0]].lookup.is_some()
             && active[indices[0]].phase == BatchPhase::Decode)
@@ -5056,7 +5070,7 @@ impl ParallelSeam {
         } else {
             // Keep Lookup's post-ACK indexing/yield and the MTP/Prefill callback order intact.
             let mut stream = |lane: usize, id: u32| {
-                let delivery_t0 = lookup_t0.map(|_| Instant::now());
+                let delivery_t0 = lookup_t0.or(mtp_t0).map(|_| Instant::now());
                 let timeline_output = infr_core::timeline::span("decode_output_progress");
                 streamed[lane] += 1;
                 let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
@@ -5148,6 +5162,21 @@ impl ParallelSeam {
         }
         if sync_mtp {
             self.sync_mtp_after_plain_decode(active, indices, &outputs, &result.hidden)?;
+        }
+        if let Some(t0) = mtp_t0 {
+            let seconds = (t0.elapsed().as_secs_f64() - lookup_delivery_secs).max(0.0);
+            self.mtp_heads
+                .as_ref()
+                .expect("MTP scheduler has heads")
+                .lock()
+                .expect("MTP heads poisoned")[active[indices[0]].slot]
+                .policy
+                .record(1, seconds, outputs[0].len());
+            tracing::debug!(
+                rows = outputs[0].len(),
+                elapsed_ms = seconds * 1000.0,
+                "Qwen3.8 adaptive MTP ordinary cost sample"
+            );
         }
         let cfg = self.model.config();
         for (lane, &index) in indices.iter().enumerate() {
@@ -5725,9 +5754,69 @@ impl ParallelSeam {
                 self.retire_finished_work(&mut active);
                 continue;
             }
+            let initial_frontiers = (0..active.len())
+                .filter(|&index| active[index].mtp_ready && active[index].generated == 0)
+                .collect::<Vec<_>>();
+            if let Err(error) = self.materialize_mtp_frontiers(&mut active, &initial_frontiers) {
+                self.fail_unified_scheduler(&mut active, error);
+                return;
+            }
+            self.retire_finished_work(&mut active);
+            if active.is_empty() {
+                continue;
+            }
+            let adaptive = active.len() == 1 && self.model.engine_cfg().spec.mtp_adaptive_width;
+            let mut policy_change = None;
+            let choice = if adaptive {
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .expect("MTP scheduler has heads")
+                    .lock()
+                    .expect("MTP heads poisoned");
+                let lane = &mut heads[active[0].slot];
+                let choice = lane.policy.choose(verify_rows, true);
+                if lane.last_policy_rows != choice.rows {
+                    policy_change = Some((lane.last_policy_rows, choice.rows, choice.probe));
+                    lane.last_policy_rows = choice.rows;
+                }
+                choice
+            } else {
+                crate::speculative_verify::MtpChoice {
+                    rows: verify_rows,
+                    probe: false,
+                }
+            };
+            if let Some((previous, rows, probe)) = policy_change {
+                tracing::info!(
+                    slot = active[0].slot,
+                    previous_rows = previous,
+                    rows,
+                    probe,
+                    "Qwen3.8 adaptive MTP selected decode mode"
+                );
+            }
+            if choice.rows == 1 {
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &[0]) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                if active.is_empty() {
+                    continue;
+                }
+                if let Err(error) =
+                    self.run_token_group(&mut active, &[0], MTP_ADAPTIVE_PLAIN_QUANTUM, true)
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
             let mut indices = (0..active.len()).collect::<Vec<_>>();
             indices.sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
-            let cycle = match self.run_mtp_verify_cycle(&mut active, &indices, req) {
+            let cycle = match self.run_mtp_verify_cycle(&mut active, &indices, req, choice) {
                 Ok(cycle) => cycle,
                 Err(error) => {
                     self.fail_unified_scheduler(&mut active, error);
@@ -5781,11 +5870,14 @@ impl ParallelSeam {
         active: &mut [BatchWork],
         indices: &[usize],
         req: &RequestCtx,
+        choice: crate::speculative_verify::MtpChoice,
     ) -> Result<MtpBatchCycleStats> {
         let cfg = self.model.config();
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
-        let rows = mtp_verify_rows(ec.spec.k);
+        let adaptive = indices.len() == 1 && ec.spec.mtp_adaptive_width;
+        let want_probs = adaptive && !choice.probe && choice.rows > 2 && ec.spec.gpu_draft_prob;
+        let mut rows = choice.rows;
         let timeline_positions = indices
             .iter()
             .map(|&index| active[index].kv().cached_len())
@@ -5819,16 +5911,25 @@ impl ParallelSeam {
                 let physical_position = work.kv().cached_len();
                 let rope_position =
                     multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
-                let candidates = lane.head.draft_with_tail_mode(
+                let draft = lane.head.draft_with_confidence(
                     self.vk.as_ref(),
                     pending,
                     &lane.last_h,
                     physical_position,
                     rope_position,
-                    rows,
+                    choice.rows,
                     work.kv().mtp_shared_weights(),
                     ec.spec.mtp_tail_kv_only,
+                    want_probs,
                 )?;
+                if want_probs {
+                    rows = crate::mtp::confidence_verify_rows(
+                        &draft.probabilities,
+                        choice.rows,
+                        ec.spec.mtp_slot_min_accept,
+                    );
+                }
+                let candidates = draft.tokens[..rows - 1].to_vec();
                 let mut feed = work.kv().cached_tokens().to_vec();
                 feed.push(pending);
                 feed.extend_from_slice(&candidates);
@@ -5897,7 +5998,7 @@ impl ParallelSeam {
         for (lane_index, &index) in indices.iter().enumerate() {
             let timeline_accept = infr_core::timeline::span("mtp_accept_emit");
             let work = &mut active[index];
-            let first_cycle = work.generated == 0;
+            let first_cycle = work.kv().cached_len() == work.prompt_end + rows;
             let pending_emitted = self
                 .mtp_heads
                 .as_ref()
@@ -6027,8 +6128,18 @@ impl ParallelSeam {
             work.generated += emitted;
             work.stats.n_gen += emitted;
             let restore_secs = restore_t0.elapsed().as_secs_f64();
-            work.stats.decode_secs += compute_secs + restore_secs;
+            let cycle_secs = snapshot_secs + compute_secs + restore_secs;
+            work.stats.decode_secs += cycle_secs;
             work.finished = stopped || work.generated >= work.max_new;
+            if adaptive {
+                self.mtp_heads
+                    .as_ref()
+                    .expect("MTP scheduler has heads")
+                    .lock()
+                    .expect("MTP heads poisoned")[work.slot]
+                    .policy
+                    .record(rows, cycle_secs, committed);
+            }
             if first_cycle {
                 tracing::info!(
                     slot = work.slot,

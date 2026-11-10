@@ -700,6 +700,23 @@ fn verify_iq4nl_down_nr4_defaults_off_and_keeps_explicit_reference_path() {
 }
 
 #[test]
+fn mtp_adaptive_width_defaults_off_and_keeps_explicit_reference_path() {
+    let d = Config::default();
+    assert!(!d.spec.mtp_adaptive_width);
+    assert_eq!(d.spec.mtp_slot_min_accept, 0.5);
+    for enabled in [false, true] {
+        let setting = format!("spec.mtp_adaptive_width={enabled}");
+        let toml = format!("[spec]\nmtp_adaptive_width={enabled}\nmtp_slot_min_accept=0.6\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.spec.mtp_adaptive_width, enabled);
+        }
+    }
+    let cfg = Config::load_from_layers(&[file_layer("[spec]\nmtp_slot_min_accept=0.6\n")]);
+    assert_eq!(cfg.spec.mtp_slot_min_accept, 0.6);
+}
+
+#[test]
 fn lookup_width_policy_can_be_compared_without_changing_target_verification() {
     assert!(Config::default().spec.lookup_adaptive_width);
     for enabled in [false, true] {

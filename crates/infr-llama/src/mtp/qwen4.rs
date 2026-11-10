@@ -15,6 +15,64 @@ mod draft_vocab;
 
 pub const DRAFT_TOKENS: usize = 4;
 
+/// Tokens are original vocabulary IDs. Probabilities, when available, are the full-vocabulary
+/// draft head's conditional top-1 probabilities, one per token; never target acceptance rates.
+#[derive(Debug)]
+pub(crate) struct Qwen4MtpDraft {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) probabilities: Vec<f32>,
+}
+
+/// Trim a VERIFY window using cumulative draft-prefix confidence, keeping at least two rows.
+/// This is a heuristic, NOT an acceptance-rate guarantee. Empty confidence leaves `rows` unchanged;
+/// widths below two are also left unchanged (this helper never widens a window). A short nonempty
+/// slice cannot justify extra rows. Invalid confidence/floors stop extension conservatively; actual
+/// device probabilities are validated, with journal abort on failure, before reaching this helper.
+pub(crate) fn confidence_verify_rows(probabilities: &[f32], rows: usize, floor: f32) -> usize {
+    if rows <= 2 || probabilities.is_empty() {
+        return rows;
+    }
+    let mut prefix = 1.0f64;
+    let mut kept = 2;
+    for (slot, &probability) in probabilities.iter().take(rows - 1).enumerate() {
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            break;
+        }
+        prefix *= f64::from(probability);
+        if !floor.is_finite() || !(0.0..=1.0).contains(&floor) || prefix < f64::from(floor) {
+            break;
+        }
+        kept = slot + 2;
+    }
+    kept
+}
+
+fn validate_draft_probabilities(probabilities: &[f32]) -> Result<()> {
+    for (step, &probability) in probabilities.iter().enumerate() {
+        anyhow::ensure!(
+            probability.is_finite() && (0.0..=1.0).contains(&probability),
+            "MTP draft at step {step} returned invalid probability {probability}"
+        );
+    }
+    Ok(())
+}
+
+fn runtime_draft_choice(
+    policy: &mut crate::speculative_verify::MtpCostPolicy,
+    k: usize,
+    adaptive: bool,
+) -> crate::speculative_verify::MtpChoice {
+    if adaptive {
+        // The standalone runtime does not support switching to ordinary decode yet.
+        policy.choose(k, false)
+    } else {
+        crate::speculative_verify::MtpChoice {
+            rows: k.clamp(2, DRAFT_TOKENS),
+            probe: false,
+        }
+    }
+}
+
 /// Draft acceptance (`accepted / drafted`) measured by the most recent MTP cycles, published so
 /// the NEXT request can decide whether a VERIFY cycle still pays for itself (`spec.mtp_min_alpha`).
 /// `u32::MAX` means "no cycle yet". Cycles before the fourth are ignored: the first few carry the
@@ -1189,6 +1247,7 @@ struct DraftHandles {
     lm_head: TensorId,
     vocab_map: Option<TensorId>,
     raw_ids: Vec<TensorId>,
+    probabilities: Vec<TensorId>,
     #[cfg(test)]
     ids: Vec<TensorId>,
 }
@@ -1243,6 +1302,7 @@ fn build_draft_graph_impl<const LAST_STEP_KV_ONLY: bool>(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_draft_graph_vocab_impl<const LAST_STEP_KV_ONLY: bool>(
     cfg: &crate::Config,
@@ -1254,6 +1314,35 @@ fn build_draft_graph_vocab_impl<const LAST_STEP_KV_ONLY: bool>(
     steps: usize,
     fuse_down_inject: bool,
     vocab_rows: Option<usize>,
+) -> (Graph, DraftHandles) {
+    build_draft_graph_confidence_impl::<LAST_STEP_KV_ONLY>(
+        cfg,
+        specs,
+        shared,
+        kv_capacity,
+        attention_window,
+        start_pos,
+        steps,
+        fuse_down_inject,
+        vocab_rows,
+        false,
+    )
+}
+
+// `fuse_prob` is gated by backend capability and absence of a compact projection at the caller.
+// `vocab_rows` also describes the full-vocabulary safety identity map, not just compact heads.
+#[allow(clippy::too_many_arguments)]
+fn build_draft_graph_confidence_impl<const LAST_STEP_KV_ONLY: bool>(
+    cfg: &crate::Config,
+    specs: &[(DType, usize)],
+    shared: [(DType, usize); 2],
+    kv_capacity: usize,
+    attention_window: usize,
+    start_pos: usize,
+    steps: usize,
+    fuse_down_inject: bool,
+    vocab_rows: Option<usize>,
+    fuse_prob: bool,
 ) -> (Graph, DraftHandles) {
     let mut g = Graph::new();
     // Unrolled steps have distinct KV/RoPE positions, even with only one Attention at width two.
@@ -1277,6 +1366,7 @@ fn build_draft_graph_vocab_impl<const LAST_STEP_KV_ONLY: bool>(
     #[cfg(test)]
     let mut out_ids = Vec::with_capacity(steps.saturating_sub(1));
     let mut raw_ids = Vec::with_capacity(steps.saturating_sub(1));
+    let mut probabilities = Vec::new();
     for (step, &position) in positions.iter().enumerate() {
         emit_bridge(&mut g, cfg, 1, prev_id, prev_h, &weights, &scratch, None);
         if LAST_STEP_KV_ONLY && step + 1 == steps {
@@ -1349,14 +1439,25 @@ fn build_draft_graph_vocab_impl<const LAST_STEP_KV_ONLY: bool>(
         } else {
             argmax_id
         };
-        g.push(Op::Argmax {
-            x: logits,
-            dst: argmax_id,
-            n: output_rows as u32,
-            rows: 1,
-        });
+        if fuse_prob {
+            let probability = g.output(f32d(1));
+            g.push(Op::ArgmaxProb {
+                x: logits,
+                dst_id: argmax_id,
+                dst_prob: probability,
+                n: output_rows as u32,
+            });
+            probabilities.push(probability);
+        } else {
+            g.push(Op::Argmax {
+                x: logits,
+                dst: argmax_id,
+                n: output_rows as u32,
+                rows: 1,
+            });
+        }
         if let Some(table) = vocab_map {
-            // Vulkan Argmax/GatherI32 carry raw integer words, including in the F32 id outputs.
+            // Argmax/ArgmaxProb/GatherI32 carry raw integer words, even in F32 id outputs.
             // Remap before the next bridge; a host-only readback remap would chain the wrong token.
             g.push(Op::GatherI32 {
                 ids: argmax_id,
@@ -1385,6 +1486,7 @@ fn build_draft_graph_vocab_impl<const LAST_STEP_KV_ONLY: bool>(
             lm_head: weights.lm_head,
             vocab_map,
             raw_ids,
+            probabilities,
             #[cfg(test)]
             ids: out_ids,
         },
@@ -1608,6 +1710,7 @@ pub(crate) struct Qwen4MtpSession {
     draft_h: Box<dyn Buffer>,
     draft_positions: [Box<dyn Buffer>; DRAFT_TOKENS],
     draft_ids: [Box<dyn Buffer>; DRAFT_TOKENS],
+    draft_probabilities: [Box<dyn Buffer>; DRAFT_TOKENS - 1],
 }
 
 pub(crate) struct Qwen4MtpPrimeCapture {
@@ -1910,6 +2013,11 @@ impl Qwen4MtpSession {
             alloc(4, BufferUsage::Readback)?,
             alloc(4, BufferUsage::Readback)?,
         ];
+        let draft_probabilities = [
+            alloc(4, BufferUsage::Readback)?,
+            alloc(4, BufferUsage::Readback)?,
+            alloc(4, BufferUsage::Readback)?,
+        ];
         let catch_batch = catch
             .buffers
             .lock()
@@ -1952,6 +2060,7 @@ impl Qwen4MtpSession {
             draft_h,
             draft_positions,
             draft_ids,
+            draft_probabilities,
         })
     }
 
@@ -2529,6 +2638,7 @@ impl Qwen4MtpSession {
     }
 
     /// Same execution/transaction path for runtime A/B; only the final graph step differs.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draft_with_tail_mode(
         &self,
@@ -2541,7 +2651,37 @@ impl Qwen4MtpSession {
         shared: SharedWeights<'_>,
         tail_kv_only: bool,
     ) -> Result<Vec<u32>> {
-        self.draft_with_projection(
+        self.draft_with_confidence(
+            be,
+            token,
+            h,
+            start_pos,
+            rope_start_pos,
+            verify_tokens,
+            shared,
+            tail_kv_only,
+            false,
+        )
+        .map(|draft| draft.tokens)
+    }
+
+    /// One unrolled execution; confidence adds only scalar outputs in persistent readback buffers.
+    /// Unsupported backends and compact vocabularies keep Argmax and return empty probabilities.
+    /// Success leaves the usual draft journal pending: callers must settle even a trimmed window.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draft_with_confidence(
+        &self,
+        be: &dyn Backend,
+        token: u32,
+        h: &[f32],
+        start_pos: usize,
+        rope_start_pos: i32,
+        verify_tokens: usize,
+        shared: SharedWeights<'_>,
+        tail_kv_only: bool,
+        want_probs: bool,
+    ) -> Result<Qwen4MtpDraft> {
+        self.draft_with_projection_confidence(
             be,
             token,
             h,
@@ -2551,9 +2691,11 @@ impl Qwen4MtpSession {
             shared,
             tail_kv_only,
             self.fixed.draft_vocab.as_ref(),
+            want_probs,
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn draft_with_projection(
         &self,
@@ -2567,6 +2709,35 @@ impl Qwen4MtpSession {
         tail_kv_only: bool,
         draft_vocab: Option<&draft_vocab::DraftVocab>,
     ) -> Result<Vec<u32>> {
+        self.draft_with_projection_confidence(
+            be,
+            token,
+            h,
+            start_pos,
+            rope_start_pos,
+            verify_tokens,
+            shared,
+            tail_kv_only,
+            draft_vocab,
+            false,
+        )
+        .map(|draft| draft.tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draft_with_projection_confidence(
+        &self,
+        be: &dyn Backend,
+        token: u32,
+        h: &[f32],
+        start_pos: usize,
+        rope_start_pos: i32,
+        verify_tokens: usize,
+        shared: SharedWeights<'_>,
+        tail_kv_only: bool,
+        draft_vocab: Option<&draft_vocab::DraftVocab>,
+        want_probs: bool,
+    ) -> Result<Qwen4MtpDraft> {
         anyhow::ensure!(
             (2..=DRAFT_TOKENS).contains(&verify_tokens),
             "Qwen3.8 MTP verify width {verify_tokens} is outside 2..={DRAFT_TOKENS}"
@@ -2585,6 +2756,11 @@ impl Qwen4MtpSession {
             bail!("Qwen3.8 MTP draft exceeds {} token cache", self.max_ctx);
         }
         let mut kv = self.kv_for_depth(be, draft_end)?;
+        let profile = infr_core::pager_profile::active();
+        let elapsed_ms = |start: Option<std::time::Instant>| {
+            start.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1e3)
+        };
+        let t_upload = profile.then(std::time::Instant::now);
         be.upload(self.draft_id.as_ref(), bytemuck::bytes_of(&(token as i32)))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(self.draft_h.as_ref(), bytemuck::cast_slice(h))
@@ -2598,6 +2774,11 @@ impl Qwen4MtpSession {
             be.upload(buffer.as_ref(), bytemuck::bytes_of(&position))
                 .map_err(|e| anyhow!("{e}"))?;
         }
+        let upload_ms = elapsed_ms(t_upload);
+        let t_build = profile.then(std::time::Instant::now);
+        // A subset-normalized probability is not full-vocabulary confidence, even if this asset
+        // happens to contain every row. No calibration is attempted here.
+        let fuse_prob = want_probs && draft_vocab.is_none() && be.capabilities().argmax_prob;
         let output_rows = draft_vocab.map_or(self.cfg.vocab, draft_vocab::DraftVocab::rows);
         let id_map = if let Some(vocab) = draft_vocab {
             vocab.id_map.as_ref()
@@ -2614,9 +2795,9 @@ impl Qwen4MtpSession {
             }),
         ];
         let build_graph = if tail_kv_only {
-            build_draft_graph_vocab_impl::<true>
+            build_draft_graph_confidence_impl::<true>
         } else {
-            build_draft_graph_vocab_impl::<false>
+            build_draft_graph_confidence_impl::<false>
         };
         let (graph, handles) = build_graph(
             &self.cfg,
@@ -2628,8 +2809,14 @@ impl Qwen4MtpSession {
             verify_tokens,
             self.fixed.fuse_down_inject,
             Some(output_rows),
+            fuse_prob,
         );
+        let build_ms = elapsed_ms(t_build);
+        // Positions and attention KV lengths are baked into this plan; do not cache by width.
+        let t_compile = profile.then(std::time::Instant::now);
         let plan = be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
+        let compile_ms = elapsed_ms(t_compile);
+        let t_journal = profile.then(std::time::Instant::now);
         {
             let Qwen4MtpKvCache {
                 k,
@@ -2639,6 +2826,7 @@ impl Qwen4MtpSession {
             } = &mut *kv;
             draft_journal.begin(be, k.as_ref(), v.as_ref(), start_pos, verify_tokens)?;
         }
+        let journal_ms = elapsed_ms(t_journal);
         let mut bindings = Bindings::new();
         bindings.bind(handles.id, self.draft_id.as_ref());
         bindings.bind(handles.h, self.draft_h.as_ref());
@@ -2648,6 +2836,13 @@ impl Qwen4MtpSession {
             bindings.bind(id, buffer.as_ref());
         }
         for (id, buffer) in handles.raw_ids.into_iter().zip(&self.draft_ids) {
+            bindings.bind(id, buffer.as_ref());
+        }
+        for (id, buffer) in handles
+            .probabilities
+            .into_iter()
+            .zip(&self.draft_probabilities)
+        {
             bindings.bind(id, buffer.as_ref());
         }
         self.bind_common(
@@ -2661,23 +2856,45 @@ impl Qwen4MtpSession {
         if let Some(id) = handles.vocab_map {
             bindings.bind(id, id_map);
         }
-        let result = (|| -> Result<Vec<u32>> {
-            be.execute(plan.as_ref(), &bindings)
-                .map_err(|e| anyhow!("{e}"))?;
-            let mut result = vec![0u32; verify_tokens - 1];
-            for (dst, buffer) in result.iter_mut().zip(&self.draft_ids) {
+        let t_execute = profile.then(std::time::Instant::now);
+        let executed = be.execute(plan.as_ref(), &bindings).map_err(|e| anyhow!("{e}"));
+        let execute_ms = elapsed_ms(t_execute);
+        let t_readback = profile.then(std::time::Instant::now);
+        let result = executed.and_then(|()| -> Result<Qwen4MtpDraft> {
+            let mut tokens = vec![0u32; verify_tokens - 1];
+            for (dst, buffer) in tokens.iter_mut().zip(&self.draft_ids) {
                 be.download(buffer.as_ref(), bytemuck::bytes_of_mut(dst))
                     .map_err(|e| anyhow!("{e}"))?;
             }
-            draft_vocab::validate_raw_ids(&result, output_rows)?;
+            draft_vocab::validate_raw_ids(&tokens, output_rows)?;
             if let Some(vocab) = draft_vocab {
-                for id in &mut result {
+                for id in &mut tokens {
                     *id = vocab.original_id(*id);
                 }
             }
-            Ok(result)
-        })();
+            let mut probabilities = if fuse_prob {
+                vec![0.0f32; verify_tokens - 1]
+            } else {
+                Vec::new()
+            };
+            // All scalar outputs were written by the same execute. No packing copy or per-token
+            // execution: mapped readbacks are not command submissions.
+            for (dst, buffer) in probabilities.iter_mut().zip(&self.draft_probabilities) {
+                be.download(buffer.as_ref(), bytemuck::bytes_of_mut(dst))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            validate_draft_probabilities(&probabilities)?;
+            Ok(Qwen4MtpDraft { tokens, probabilities })
+        });
+        let readback_ms = elapsed_ms(t_readback);
         drop(bindings);
+        if profile {
+            // API wall times, not GPU submission counts; upload/readback may just be mapped copies.
+            tracing::info!(
+                "[qwen4 mtp draft] rows={verify_tokens} probs={fuse_prob} ok={} build={build_ms:.3}ms compile={compile_ms:.3}ms upload={upload_ms:.3}ms journal={journal_ms:.3}ms execute={execute_ms:.3}ms readback={readback_ms:.3}ms",
+                result.is_ok(),
+            );
+        }
         if let Err(error) = result {
             let Qwen4MtpKvCache {
                 k,
@@ -2704,6 +2921,8 @@ pub(crate) struct Qwen4MtpRuntime {
     head: Qwen4MtpSession,
     trunk: Option<crate::seam::SeamKv>,
     max_ctx: usize,
+    /// Measured cost per committed token with periodic probes; unused by fixed-width requests.
+    cost_policy: crate::speculative_verify::MtpCostPolicy,
 }
 
 impl Qwen4MtpRuntime {
@@ -2713,6 +2932,10 @@ impl Qwen4MtpRuntime {
         sidecar_path: &Path,
         max_ctx: usize,
     ) -> Result<Self> {
+        // Sized at the trunk ubatch: the Prefill hidden tap hands the head one chunk at a time and
+            // `catch_up_from_target` cannot split a device buffer, so a smaller workspace would fail
+            // on any primed prompt longer than the cap. The head's VRAM cost is its 1.8 GiB of
+            // weights, not this workspace (measured: a 1024-row cap returns only 0.26 GB).
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
         let fixed = Qwen4MtpSession::load_fixed_vulkan_with_vocab(
             vk,
@@ -2732,6 +2955,7 @@ impl Qwen4MtpRuntime {
             head,
             trunk: None,
             max_ctx,
+            cost_policy: Default::default(),
         })
     }
 
@@ -2775,9 +2999,8 @@ impl Qwen4MtpRuntime {
     ) -> Result<(crate::GenStats, super::MtpTiming)> {
         let cfg = model.config();
         let ec = model.engine_cfg();
-        // The fixed MTP runtime supports two through four VERIFY rows. Keep the configured width
-        // effective so kernel improvements can change the best batch size without a hidden cap.
-        let verify_tokens = ec.spec.k.clamp(2, DRAFT_TOKENS);
+        // Fixed `spec.k` by default; adaptive requests choose by measured cost each cycle, then
+        // may trim non-probe windows using full-vocabulary draft-prefix confidence.
         let h_width = cfg.hc_mult * cfg.n_embd;
         let prompt_tokens = model.encode(prompt)?;
         if prompt_tokens.is_empty() {
@@ -2865,16 +3088,27 @@ impl Qwen4MtpRuntime {
         {
             cycle += 1;
             let n_past = committed.len();
+            let choice = runtime_draft_choice(
+                &mut self.cost_policy,
+                ec.spec.k,
+                ec.spec.mtp_adaptive_width,
+            );
+            let mut verify_tokens = choice.rows;
+            // Probe the chosen width without clipping, so the policy can measure its actual cost.
+            let want_probs = ec.spec.mtp_adaptive_width
+                && !choice.probe
+                && verify_tokens > 2
+                && ec.spec.gpu_draft_prob;
 
             let t_draft = std::time::Instant::now();
-            let candidates = {
+            let draft = {
                 let _profile = PhaseProfile::new("draft");
                 let shared = self
                     .trunk
                     .as_ref()
                     .expect("target trunk remains initialized")
                     .mtp_shared_weights();
-                self.head.draft_with_tail_mode(
+                self.head.draft_with_confidence(
                     vk,
                     pending_token,
                     &pending_h,
@@ -2884,11 +3118,20 @@ impl Qwen4MtpRuntime {
                     verify_tokens,
                     shared,
                     ec.spec.mtp_tail_kv_only,
+                    want_probs,
                 )?
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
             timing.draft_secs += draft_secs;
             timing.total_drafted += verify_tokens - 1;
+            if want_probs {
+                verify_tokens = confidence_verify_rows(
+                    &draft.probabilities,
+                    verify_tokens,
+                    ec.spec.mtp_slot_min_accept,
+                );
+            }
+            let candidates = draft.tokens;
 
             refill_verify_feed(
                 &mut feed,
@@ -3001,6 +3244,13 @@ impl Qwen4MtpRuntime {
             let emitted = new_tokens.to_vec();
             let catchup_secs = t_catchup.elapsed().as_secs_f64();
             timing.catchup_secs += catchup_secs;
+            if ec.spec.mtp_adaptive_width {
+                self.cost_policy.record(
+                    verify_tokens,
+                    draft_secs + verify_secs + catchup_secs,
+                    retained,
+                );
+            }
 
             if ec.prof.stages || infr_core::pager_profile::active() {
                 tracing::info!(
@@ -3067,10 +3317,89 @@ mod draft_gpu_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        generation_budget, hidden_shift_copy_lengths, mtp_kv_spec, push_bounded, DeviceCatchPlanKey,
+        confidence_verify_rows, generation_budget, hidden_shift_copy_lengths, mtp_kv_spec,
+        push_bounded, runtime_draft_choice, validate_draft_probabilities, DeviceCatchPlanKey,
+        DRAFT_TOKENS,
     };
+    use crate::speculative_verify::MtpCostPolicy;
     use infr_core::tensor::DType;
     use std::collections::VecDeque;
+
+    #[test]
+    fn fixed_width_keeps_the_original_clamp_without_advancing_cost_policy() {
+        for trained in [false, true] {
+            let mut policy = MtpCostPolicy::default();
+            let mut control = MtpCostPolicy::default();
+            if trained {
+                for width in 2..=DRAFT_TOKENS {
+                    policy.record(width, width as f64 * 0.01, 1);
+                    control.record(width, width as f64 * 0.01, 1);
+                }
+            }
+            for k in [0, 1, 2, 3, 4, 5, usize::MAX] {
+                let choice = runtime_draft_choice(&mut policy, k, false);
+                assert_eq!(choice.rows, k.clamp(2, DRAFT_TOKENS));
+                assert!(!choice.probe);
+            }
+            // Fixed requests must not consume exploratory choices, even after adaptive use.
+            for _ in 0..16 {
+                let actual = runtime_draft_choice(&mut policy, 4, true);
+                let expected = control.choose(4, false);
+                assert_eq!((actual.rows, actual.probe), (expected.rows, expected.probe));
+                assert!((2..=DRAFT_TOKENS).contains(&actual.rows));
+            }
+        }
+    }
+
+    #[test]
+    fn confidence_uses_the_entire_prefix_not_individual_slot_thresholds() {
+        assert_eq!(confidence_verify_rows(&[0.8, 0.8, 0.8], 4, 0.5), 4);
+        assert_eq!(confidence_verify_rows(&[0.8, 0.8, 0.8], 4, 0.55), 3);
+        assert_eq!(confidence_verify_rows(&[0.6, 0.6, 0.9], 4, 0.5), 2);
+        assert_eq!(confidence_verify_rows(&[0.1, 1.0, 1.0], 4, 0.5), 2);
+        assert_eq!(confidence_verify_rows(&[1.0, 1.0, 1.0], 3, 0.5), 3);
+    }
+
+    #[test]
+    fn confidence_handles_empty_short_and_boundary_inputs_without_widening() {
+        for rows in [0, 1, 2, 3, 4, 17] {
+            assert_eq!(confidence_verify_rows(&[], rows, 0.5), rows);
+            assert_eq!(confidence_verify_rows(&[1.0; 32], rows, 1.0), rows);
+            if rows >= 2 {
+                assert_eq!(confidence_verify_rows(&[0.0; 32], rows, 0.5), 2);
+                assert_eq!(confidence_verify_rows(&[0.0; 32], rows, 0.0), rows);
+            }
+        }
+        assert_eq!(confidence_verify_rows(&[1.0], 4, 0.5), 2);
+        assert_eq!(confidence_verify_rows(&[1.0, 1.0], 4, 0.5), 3);
+        assert_eq!(confidence_verify_rows(&[0.5, 0.5, 0.5], 4, 0.25), 3);
+        assert_eq!(
+            confidence_verify_rows(&[0.5, 0.5, 0.5], 4, 0.25 + f32::EPSILON),
+            2
+        );
+        assert_eq!(confidence_verify_rows(&[0.5, 0.5, 1.0], 4, 0.25), 4);
+    }
+
+    #[test]
+    fn confidence_rejects_nonfinite_and_out_of_range_device_probabilities() {
+        validate_draft_probabilities(&[]).unwrap();
+        validate_draft_probabilities(&[0.0, -0.0, 0.5, 1.0]).unwrap();
+        for bad in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -f32::EPSILON,
+            1.0 + f32::EPSILON,
+        ] {
+            for step in 0..3 {
+                let mut probabilities = [1.0; 3];
+                probabilities[step] = bad;
+                assert!(validate_draft_probabilities(&probabilities).is_err());
+                assert_eq!(confidence_verify_rows(&probabilities, 4, 0.5), (step + 1).max(2));
+            }
+            assert_eq!(confidence_verify_rows(&[1.0; 3], 4, bad), 2);
+        }
+    }
 
     #[test]
     fn generation_budget_clips_a_large_reply_to_the_remaining_context() {
