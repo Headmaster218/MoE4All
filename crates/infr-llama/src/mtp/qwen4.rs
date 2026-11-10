@@ -2857,7 +2857,9 @@ impl Qwen4MtpSession {
             bindings.bind(id, id_map);
         }
         let t_execute = profile.then(std::time::Instant::now);
-        let executed = be.execute(plan.as_ref(), &bindings).map_err(|e| anyhow!("{e}"));
+        let executed = be
+            .execute(plan.as_ref(), &bindings)
+            .map_err(|e| anyhow!("{e}"));
         let execute_ms = elapsed_ms(t_execute);
         let t_readback = profile.then(std::time::Instant::now);
         let result = executed.and_then(|()| -> Result<Qwen4MtpDraft> {
@@ -2884,7 +2886,10 @@ impl Qwen4MtpSession {
                     .map_err(|e| anyhow!("{e}"))?;
             }
             validate_draft_probabilities(&probabilities)?;
-            Ok(Qwen4MtpDraft { tokens, probabilities })
+            Ok(Qwen4MtpDraft {
+                tokens,
+                probabilities,
+            })
         });
         let readback_ms = elapsed_ms(t_readback);
         drop(bindings);
@@ -2933,9 +2938,9 @@ impl Qwen4MtpRuntime {
         max_ctx: usize,
     ) -> Result<Self> {
         // Sized at the trunk ubatch: the Prefill hidden tap hands the head one chunk at a time and
-            // `catch_up_from_target` cannot split a device buffer, so a smaller workspace would fail
-            // on any primed prompt longer than the cap. The head's VRAM cost is its 1.8 GiB of
-            // weights, not this workspace (measured: a 1024-row cap returns only 0.26 GB).
+        // `catch_up_from_target` cannot split a device buffer, so a smaller workspace would fail
+        // on any primed prompt longer than the cap. The head's VRAM cost is its 1.8 GiB of
+        // weights, not this workspace (measured: a 1024-row cap returns only 0.26 GB).
         let catch_batch = crate::seam::ubatch_rows(model.engine_cfg());
         let fixed = Qwen4MtpSession::load_fixed_vulkan_with_vocab(
             vk,
@@ -3088,11 +3093,8 @@ impl Qwen4MtpRuntime {
         {
             cycle += 1;
             let n_past = committed.len();
-            let choice = runtime_draft_choice(
-                &mut self.cost_policy,
-                ec.spec.k,
-                ec.spec.mtp_adaptive_width,
-            );
+            let choice =
+                runtime_draft_choice(&mut self.cost_policy, ec.spec.k, ec.spec.mtp_adaptive_width);
             let mut verify_tokens = choice.rows;
             // Probe the chosen width without clipping, so the policy can measure its actual cost.
             let want_probs = ec.spec.mtp_adaptive_width
@@ -3395,7 +3397,10 @@ mod tests {
                 let mut probabilities = [1.0; 3];
                 probabilities[step] = bad;
                 assert!(validate_draft_probabilities(&probabilities).is_err());
-                assert_eq!(confidence_verify_rows(&probabilities, 4, 0.5), (step + 1).max(2));
+                assert_eq!(
+                    confidence_verify_rows(&probabilities, 4, 0.5),
+                    (step + 1).max(2)
+                );
             }
             assert_eq!(confidence_verify_rows(&[1.0; 3], 4, bad), 2);
         }
