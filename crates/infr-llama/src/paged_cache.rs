@@ -164,6 +164,12 @@ struct ChainEntry {
     /// sorted by `boundary_tokens`. A session that resumes on a hybrid recurrent model (DeltaNet,
     /// KDA, PLE) must attach at exactly one of these lengths; a pure attention model ignores them.
     ckpts: Vec<Arc<PagedCkpt>>,
+    /// Frames the last attach actually reused ([`PagedKv::entry_chain_promoted`], after
+    /// [`PagedKv::hit_prefix`] cut the match to a resumable boundary). The sinker keeps this prefix
+    /// resident and moves the tail behind it: those are the frames a next hit would have to DMA
+    /// straight back, so sinking them pays the copy twice to free bytes nothing else wanted.
+    /// Zero until the first attach, which is what makes a fresh chain sink whole.
+    warm_frames: usize,
 }
 
 /// Host-resident recurrent state at one stable conversation boundary of a published chain. The
@@ -274,6 +280,10 @@ pub(crate) struct PagedKv {
     aux_refusals: u64,
     tier_demotions: u64,
     tier_promotions: u64,
+    /// Sinks that left a warm prefix in VRAM and moved only the tail behind it. Zero means every
+    /// sink still moved whole chains — either nothing is being reused, or RAM is so tight the
+    /// floor keeps getting overridden.
+    tail_sinks: u64,
     disk_demotions: u64,
     disk_promotions: u64,
     corridor_grows: u64,
@@ -369,6 +379,7 @@ impl PagedKv {
             aux_refusals: 0,
             tier_demotions: 0,
             tier_promotions: 0,
+            tail_sinks: 0,
             disk_demotions: 0,
             disk_promotions: 0,
             corridor_grows: 0,
@@ -446,7 +457,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} aux_refusals={} sunk={} promoted={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} aux_refusals={} sunk={} promoted={} tail_sinks={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -473,6 +484,7 @@ impl PagedKv {
             self.aux_refusals,
             self.tier_demotions,
             self.tier_promotions,
+            self.tail_sinks,
             self.disk_demotions,
             self.disk_promotions,
             self.corridor_grows,
@@ -637,47 +649,93 @@ impl PagedKv {
         }
     }
 
-    /// DMA the coldest RAM-eligible tree entry (leaf-first, LRU — the [`Self::evict_cold_one`]
-    /// order) into the RAM tier and rewrite its chain to RAM ids. Skips entries with any ACTIVE
-    /// frame (a session table points there — migration would corrupt it) and entries already sunk
-    /// (a second sink is a no-op). Returns whether at least one frame left VRAM. A DMA failure
-    /// rolls the entry back frame by frame: whatever already sank stays sunk (its bytes are safe
-    /// in the backing), the rest stay in VRAM, and the entry keeps a consistent mixed chain.
+    /// The suffix of an entry's `tier` run that may move one tier down, as `[keep, end)`.
+    ///
+    /// Two rules shape it. A chain stays a monotone gradient — device prefix, then RAM, then disk —
+    /// because [`Self::entry_chain_promoted`] truncates reuse at the first frame it has to fetch: a
+    /// host frame in the middle of the device prefix would throw away every page behind it. And the
+    /// last hit's reuse depth is a floor on the VRAM run, since those are the frames a next hit
+    /// would DMA straight back.
+    ///
+    /// The floor is a preference, not a veto: when it covers the whole run the run is offered
+    /// anyway. Bytes move down a tier before an entry is deleted, and a sinker that refused here
+    /// would hand a fully warm chain to the evictor instead.
+    fn sink_region(&self, entry: &ChainEntry, tier: Tier, protect: &[FrameId]) -> (usize, usize) {
+        fn rank(tier: Tier) -> u8 {
+            match tier {
+                Tier::Vram => 0,
+                Tier::Ram => 1,
+                Tier::Disk => 2,
+            }
+        }
+        let want = rank(tier);
+        let start = entry
+            .chain
+            .iter()
+            .take_while(|frame| rank(frame.tier()) < want)
+            .count();
+        let mut end = start;
+        while end < entry.chain.len() {
+            let frame = entry.chain[end];
+            if rank(frame.tier()) != want || self.pool.is_active(frame) || protect.contains(&frame)
+            {
+                break;
+            }
+            end += 1;
+        }
+        let keep = if tier == Tier::Vram {
+            entry.warm_frames.min(end)
+        } else {
+            start
+        };
+        if keep >= end {
+            (start, end)
+        } else {
+            (keep, end)
+        }
+    }
+
+    /// DMA the coldest tree entry's cold TAIL into the RAM tier and rewrite those frames to RAM
+    /// ids, leaving its hot prefix in VRAM. Skips a run with any ACTIVE frame (a session table
+    /// points there — migration would corrupt it) and stops at the first frame already sunk, so
+    /// the chain keeps its gradient. Returns whether at least one frame left VRAM.
+    ///
+    /// The tail is bounded by free RAM, not by the chain length: a long conversation whose whole
+    /// chain cannot fit used to be skipped here and then DELETED by the evictor, losing a prefix
+    /// that a partial sink keeps addressable. A DMA failure rolls back frame by frame — whatever
+    /// already sank stays sunk (its bytes are safe in the backing), the rest stay in VRAM.
     fn demote_coldest_entry<M: FrameDma + ?Sized>(&mut self, be: &M, protect: &[FrameId]) -> bool {
-        if self.pool.capacity_frames(Tier::Ram) == 0 {
+        if self.pool.capacity_frames(Tier::Ram) == 0 || self.pool.free_frames(Tier::Ram) == 0 {
             return false;
         }
-        let mut best: Option<(usize, usize)> = None; // (node, chain length)
+        let mut best: Option<(usize, usize, usize)> = None; // (node, keep, end)
         let mut best_key: Option<(bool, u64, usize)> = None;
         for (index, node) in self.nodes.iter().enumerate() {
             let Some(entry) = node.entry.as_ref() else {
                 continue;
             };
-            if entry.chain.is_empty()
-                || entry.chain.iter().any(|f| !matches!(f.tier(), Tier::Vram))
-                || entry.chain.iter().any(|f| self.pool.is_active(*f))
-                || entry.chain.iter().any(|f| protect.contains(f))
-            {
-                continue;
-            }
-            if self.pool.free_frames(Tier::Ram) < entry.chain.len() {
+            let (keep, end) = self.sink_region(entry, Tier::Vram, protect);
+            if keep >= end {
                 continue;
             }
             let key = (self.has_entry_below(index), node.last_access, index);
             if best_key.is_none_or(|current| key < current) {
                 best_key = Some(key);
-                best = Some((index, entry.chain.len()));
+                best = Some((index, keep, end));
             }
         }
-        let Some((node, len)) = best else {
+        let Some((node, keep, end)) = best else {
             return false;
         };
+        // Take from the TAIL: sinking from `keep` forward would move the hot end of the run and
+        // leave device frames behind host ones, and promotion truncates at the first host frame.
+        let take = (end - keep).min(self.pool.free_frames(Tier::Ram));
         let frame_bytes = self.pool.frame_bytes() as usize;
         let mut moved = 0usize;
-        for i in 0..len {
+        for i in (end - take)..end {
             let source = self.nodes[node].entry.as_ref().unwrap().chain[i];
             let Some(fresh) = self.pool.alloc(Tier::Ram) else {
-                break; // RAM filled mid-chain: the entry keeps a mixed chain, still consistent
+                break; // RAM filled mid-tail: the entry keeps a mixed chain, still consistent
             };
             let backing_off = fresh.slot() * frame_bytes;
             if self.ram_backing.len() < backing_off + frame_bytes {
@@ -698,6 +756,9 @@ impl PagedKv {
             self.pool.migrate_into(source, fresh);
             self.tier_demotions += 1;
             moved += 1;
+        }
+        if moved > 0 && keep > 0 {
+            self.tail_sinks += 1;
         }
         moved > 0
     }
@@ -750,42 +811,41 @@ impl PagedKv {
             .map_err(|error| anyhow!("disk backing read slot {slot}: {error}"))
     }
 
-    /// Sink the coldest ALL-RAM tree entry to the disk tier (the same leaf-first LRU order as
-    /// [`Self::demote_coldest_entry`], one tier down). Mixed chains (some frames still VRAM) are
-    /// skipped exactly like the VRAM sinker skips chains with host frames: a chain crosses tiers
-    /// only in the direction the cascade needs, never partially back. A write failure keeps the
-    /// entry's mixed RAM/disk chain consistent — whatever already sank stays sunk.
+    /// Sink the coldest tree entry's RAM TAIL to the disk tier, one tier down the same gradient.
+    /// The device prefix stays in RAM/VRAM and the frames behind it move to disk, so a chain that
+    /// only partly fit RAM can still relieve RAM pressure instead of blocking the cascade until
+    /// it is evicted. A write failure keeps the chain consistent — whatever already sank stays
+    /// sunk.
     fn demote_ram_coldest_entry(&mut self, protect: &[FrameId]) -> bool {
-        if self.disk.is_none() || self.pool.capacity_frames(Tier::Disk) == 0 {
+        if self.disk.is_none()
+            || self.pool.capacity_frames(Tier::Disk) == 0
+            || self.pool.free_frames(Tier::Disk) == 0
+        {
             return false;
         }
-        let mut best: Option<(usize, usize)> = None; // (node, chain length)
+        let mut best: Option<(usize, usize, usize)> = None; // (node, keep, end)
         let mut best_key: Option<(bool, u64, usize)> = None;
         for (index, node) in self.nodes.iter().enumerate() {
             let Some(entry) = node.entry.as_ref() else {
                 continue;
             };
-            if entry.chain.is_empty()
-                || entry.chain.iter().any(|f| !matches!(f.tier(), Tier::Ram))
-                || entry.chain.iter().any(|f| protect.contains(f))
-            {
-                continue;
-            }
-            if self.pool.free_frames(Tier::Disk) < entry.chain.len() {
+            let (keep, end) = self.sink_region(entry, Tier::Ram, protect);
+            if keep >= end {
                 continue;
             }
             let key = (self.has_entry_below(index), node.last_access, index);
             if best_key.is_none_or(|current| key < current) {
                 best_key = Some(key);
-                best = Some((index, entry.chain.len()));
+                best = Some((index, keep, end));
             }
         }
-        let Some((node, len)) = best else {
+        let Some((node, keep, end)) = best else {
             return false;
         };
+        let take = (end - keep).min(self.pool.free_frames(Tier::Disk));
         let frame_bytes = self.pool.frame_bytes() as usize;
         let mut moved = 0usize;
-        for i in 0..len {
+        for i in (end - take)..end {
             let source = self.nodes[node].entry.as_ref().unwrap().chain[i];
             let Some(fresh) = self.pool.alloc(Tier::Disk) else {
                 break; // disk filled mid-chain: mixed chain, still consistent
@@ -893,7 +953,8 @@ impl PagedKv {
         self.hits += 1;
         self.clock += 1;
         self.nodes[node].last_access = self.clock;
-        for &frame in &self.nodes[node].entry.as_ref().unwrap().chain[..pages] {
+        let entry = self.nodes[node].entry.as_mut().unwrap();
+        for &frame in &entry.chain[..pages] {
             self.pool.touch(frame);
         }
         Some((node, pages * self.page_tokens))
@@ -928,6 +989,15 @@ impl PagedKv {
         reusable: usize,
     ) -> Vec<FrameId> {
         let pages = reusable / self.page_tokens;
+        // Stamp the depth the caller will actually attach, which is NOT the depth `best_match`
+        // matched: a recurrent entry only resumes at a snapshot boundary, so `hit_prefix` can cut
+        // a 200-page token match down to nothing. Keeping the matched depth would pin a prefix no
+        // request can read and force eviction of bytes that WOULD have been reused.
+        self.nodes[node]
+            .entry
+            .as_mut()
+            .expect("matched node carries an entry")
+            .warm_frames = pages;
         let frame_bytes = self.pool.frame_bytes() as usize;
         let mut out = Vec::with_capacity(pages);
         for i in 0..pages {
@@ -1114,7 +1184,11 @@ impl PagedKv {
             self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&old.ckpts));
         }
         let ckpts = self.admit_ckpts(ckpts, node);
-        self.nodes[node].entry = Some(ChainEntry { chain, ckpts });
+        self.nodes[node].entry = Some(ChainEntry {
+            chain,
+            ckpts,
+            warm_frames: 0,
+        });
         if let Some(old) = old {
             for frame in old.chain {
                 self.pool.unpin(frame);
@@ -1523,6 +1597,32 @@ mod tests {
             frames: vram_frames,
         }]);
         (kv, path)
+    }
+
+    /// Every chain must stay a monotone gradient: device frames, then RAM, then disk. Promotion
+    /// truncates reuse at the first frame it has to fetch, so a host frame sitting in front of a
+    /// device one silently discards every page behind it. A sink that takes the wrong end of a
+    /// tier run produces exactly that, and no byte round-trip test would notice.
+    fn assert_gradient(kv: &PagedKv) {
+        fn rank(tier: Tier) -> u8 {
+            match tier {
+                Tier::Vram => 0,
+                Tier::Ram => 1,
+                Tier::Disk => 2,
+            }
+        }
+        for (index, node) in kv.nodes.iter().enumerate() {
+            let Some(entry) = node.entry.as_ref() else {
+                continue;
+            };
+            for pair in entry.chain.windows(2) {
+                assert!(
+                    rank(pair[0].tier()) <= rank(pair[1].tier()),
+                    "node {index} chain is not a gradient: {:?}",
+                    entry.chain.iter().map(|f| f.tier()).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     /// Deterministic "corridor content" for one frame byte: [`MockDma`] writes it on download
@@ -2210,11 +2310,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// One disk slot cannot hold a two-frame chain, and that used to mean the entry was DELETED:
+    /// the sinker's whole-chain capacity check skipped it, the cascade yielded nothing, and the
+    /// evictor took it. A tail sink keeps every byte instead — the slot takes the coldest frame
+    /// and the rest stays one tier up. Eviction is still the last resort, but only once no tier
+    /// below can take anything at all.
     #[test]
-    fn disk_too_small_to_host_a_chain_falls_back_to_eviction() {
-        // One disk slot cannot hold a two-frame chain: the RAM sinker skips the entry (capacity
-        // check), the cascade yields nothing, and eviction reclaims the tier exactly like the
-        // disk-closed Phase C path.
+    fn an_undersized_disk_takes_the_tail_and_eviction_waits_its_turn() {
         let (mut kv, path) = cache_disk(2, 2, 1);
         let dma = MockDma::default();
         let a = grow(&mut kv, 2);
@@ -2224,25 +2326,218 @@ mod tests {
         kv.publish((21..=28).collect(), b.clone()).unwrap();
         kv.session_release(&b);
         assert_eq!(kv.tier_demotions, 2, "A sank to RAM");
-        let c = kv
+
+        let c = kv.alloc_frame(&dma).expect("the tail sink freed a slot");
+        assert_eq!(
+            kv.disk_demotions, 1,
+            "the one disk slot took A's coldest frame"
+        );
+        assert_eq!(
+            kv.evictions, 0,
+            "nothing was deleted while a tier could still take bytes"
+        );
+        assert_eq!(
+            kv.tier_demotions, 3,
+            "B's tail sank into the RAM slot A left"
+        );
+        assert_eq!(kv.pool.held_frames(Tier::Disk), 1);
+        assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
+        assert_gradient(&kv);
+        let a_node = node_at(&kv, &(1..=8).collect::<Vec<u32>>());
+        let b_node = node_at(&kv, &(21..=28).collect::<Vec<u32>>());
+        assert_eq!(
+            kv.nodes[a_node]
+                .entry
+                .as_ref()
+                .unwrap()
+                .chain
+                .iter()
+                .map(|f| f.tier())
+                .collect::<Vec<_>>(),
+            vec![Tier::Ram, Tier::Disk],
+            "A is a gradient, not a hole"
+        );
+        assert_eq!(
+            kv.nodes[b_node]
+                .entry
+                .as_ref()
+                .unwrap()
+                .chain
+                .iter()
+                .map(|f| f.tier())
+                .collect::<Vec<_>>(),
+            vec![Tier::Vram, Tier::Ram],
+            "B kept its device prefix"
+        );
+
+        // Every tier is now full, so the next claim has nothing to sink into and eviction is the
+        // only move left. It drops the coldest entry (A), whose freed host slots then let B's
+        // remaining device frame sink — bytes still move down before anything else is deleted.
+        let d = kv
             .alloc_frame(&dma)
-            .expect("eviction freed the corridor when disk could not help");
+            .expect("eviction reclaimed the corridor");
+        assert_eq!(kv.evictions, 1, "only the coldest entry was dropped");
+        assert_eq!(kv.tier_demotions, 4);
         assert_eq!(
-            kv.disk_demotions, 0,
-            "the chain never half-sinks to an undersized disk"
+            kv.pool.held_frames(Tier::Disk),
+            0,
+            "A's disk slot came back"
         );
-        // Interleaving sinks with eviction: evicting A frees the RAM slots that let B SINK, so
-        // only the truly unpromotable cold entry (A) is lost.
-        assert_eq!(
-            kv.evictions, 1,
-            "only the undersized-disk entry was dropped"
-        );
-        assert_eq!(kv.tier_demotions, 4, "B sank once A's RAM slots came back");
-        assert_eq!(kv.pool.held_frames(Tier::Disk), 0);
         assert_eq!(kv.pool.held_frames(Tier::Ram), 2, "B rests in RAM");
-        kv.session_release(&[c]);
+        assert_gradient(&kv);
+        kv.session_release(&[c, d]);
         drop(kv);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The point of frame-level tiering: a hit that reused only the head of a long chain leaves
+    /// that head in VRAM and sinks the tail behind it, so the next full hit pays a DMA for the
+    /// tail alone instead of for every page. Whole-chain sinking moved the head too and bought it
+    /// straight back.
+    #[test]
+    fn a_hit_keeps_its_reused_prefix_resident_and_sinks_only_the_tail() {
+        let mut kv = cache_ram(4, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 4);
+        kv.publish((1..=16).collect(), a.clone()).unwrap();
+        kv.session_release(&a);
+
+        // A hit that consumes two of the four pages, through the production accessor.
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
+        assert_eq!(reusable, 8);
+        let head = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(head.len(), 2);
+        assert_eq!(kv.nodes[node].entry.as_ref().unwrap().warm_frames, 2);
+
+        let c1 = kv.alloc_frame(&dma).expect("the tail sink freed a slot");
+        let c2 = kv
+            .alloc_frame(&dma)
+            .expect("the second slot was already free");
+        assert_eq!(kv.tail_sinks, 1, "the sink kept a prefix behind");
+        assert_eq!(kv.tier_demotions, 2, "only the two cold frames moved");
+        assert_eq!(kv.evictions, 0);
+        assert_gradient(&kv);
+        assert_eq!(
+            kv.nodes[node]
+                .entry
+                .as_ref()
+                .unwrap()
+                .chain
+                .iter()
+                .map(|f| f.tier())
+                .collect::<Vec<_>>(),
+            vec![Tier::Vram, Tier::Vram, Tier::Ram, Tier::Ram],
+            "the reused head stayed addressable without a DMA"
+        );
+        kv.session_release(&[c1, c2]);
+
+        // The full hit now promotes the tail alone, and MockDma checks every byte round-tripped.
+        let (node, reusable) = kv
+            .best_match(&(1..=16).collect::<Vec<u32>>(), None)
+            .unwrap();
+        assert_eq!(reusable, 16);
+        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(back.len(), 4);
+        assert!(back.iter().all(|f| matches!(f.tier(), Tier::Vram)));
+        assert_eq!(
+            kv.tier_promotions, 2,
+            "the resident prefix was not copied back"
+        );
+        assert_gradient(&kv);
+    }
+
+    /// A chain longer than the whole RAM tier used to be skipped by the sinker and then deleted.
+    /// Now it sinks as far down as the host pool reaches and keeps the rest addressable.
+    #[test]
+    fn a_chain_longer_than_the_ram_tier_sinks_its_tail_instead_of_dying() {
+        let mut kv = cache_ram(6, 2);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 6);
+        kv.publish((1..=24).collect(), a.clone()).unwrap();
+        kv.session_release(&a);
+        assert_eq!(kv.pool.free_frames(Tier::Ram), 2);
+
+        let c = kv.alloc_frame(&dma).expect("a partial sink freed a slot");
+        assert_eq!(kv.evictions, 0, "the long chain was not deleted");
+        assert_eq!(kv.tier_demotions, 2, "exactly as much as RAM could host");
+        assert_gradient(&kv);
+        let node = node_of(&kv, a[0]);
+        let tiers: Vec<_> = kv.nodes[node]
+            .entry
+            .as_ref()
+            .unwrap()
+            .chain
+            .iter()
+            .map(|f| f.tier())
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                Tier::Vram,
+                Tier::Vram,
+                Tier::Vram,
+                Tier::Vram,
+                Tier::Ram,
+                Tier::Ram
+            ]
+        );
+
+        // The resident prefix still serves a hit with no DMA at all.
+        let (node, reusable) = kv
+            .best_match(&(1..=16).collect::<Vec<u32>>(), None)
+            .unwrap();
+        assert_eq!(reusable, 16);
+        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(back.len(), 4);
+        assert_eq!(
+            kv.tier_promotions, 0,
+            "a prefix hit inside the resident head is free"
+        );
+        kv.session_release(&[c]);
+    }
+
+    /// A recurrent entry only resumes where it carries a snapshot, so a deep TOKEN match can attach
+    /// nothing at all. The warm floor must follow the attach depth, not the match depth: stamping
+    /// the match would pin a prefix no request can read, and the sinker would then evict bytes that
+    /// a real hit WOULD have reused. This is the shape every Qwen3.5/3.6/3.8 conversation has —
+    /// one snapshot at the published end, nothing shallower.
+    #[test]
+    fn a_match_that_cannot_resume_does_not_pin_a_warm_prefix() {
+        let mut kv = cache_ram(4, 4);
+        let dma = MockDma::default();
+        let a = grow(&mut kv, 4);
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&a);
+
+        // Two pages of tokens match, but the only snapshot sits at four pages.
+        let (node, matched) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
+        assert_eq!(matched, 8);
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!((reusable, ckpt.is_none()), (0, true));
+        assert_eq!(
+            kv.nodes[node].entry.as_ref().unwrap().warm_frames,
+            0,
+            "an unusable match must not reserve VRAM"
+        );
+
+        // So the whole chain is sinkable, exactly like a never-hit chain.
+        let c1 = kv.alloc_frame(&dma).expect("the sink freed a slot");
+        let c2 = kv.alloc_frame(&dma).expect("the second slot too");
+        assert_eq!(kv.tail_sinks, 0, "nothing was held back");
+        assert_eq!(kv.tier_demotions, 4, "the whole chain sank");
+        assert_gradient(&kv);
+        kv.session_release(&[c1, c2]);
+
+        // A snapshot-backed attach DOES stamp its depth, and the next sink keeps that head.
+        let (node, matched) = kv
+            .best_match(&(1..=16).collect::<Vec<u32>>(), None)
+            .unwrap();
+        let (reusable, _) = kv.hit_prefix(node, true, matched);
+        assert_eq!(reusable, 16);
+        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(back.len(), 4);
+        assert_eq!(kv.nodes[node].entry.as_ref().unwrap().warm_frames, 4);
     }
 
     #[test]
@@ -2268,6 +2563,14 @@ mod tests {
             vbufs: Vec::new(),
             ple: None,
         })
+    }
+
+    /// The node a token path lands on. Unlike [`node_of`] this survives a sink: migration replaces
+    /// frame ids, so a handle captured before the bytes moved no longer names anything.
+    fn node_at(kv: &PagedKv, tokens: &[u32]) -> usize {
+        let (path, matched, _) = kv.walk(kv.root(None), tokens);
+        assert_eq!(matched, tokens.len(), "the path is not fully published");
+        *path.last().expect("the root is always on the path")
     }
 
     /// The node whose entry chain owns `frame` (tests only — never stamps the LRU clock).
