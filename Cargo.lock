@@ -1462,6 +1462,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures-util",
+ "getrandom 0.3.4",
  "http-body-util",
  "infr-audio",
  "infr-chat",

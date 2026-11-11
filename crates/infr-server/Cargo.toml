@@ -23,6 +23,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 subtle.workspace = true
+getrandom.workspace = true
 futures-util = "0.3"
 
 [dev-dependencies]

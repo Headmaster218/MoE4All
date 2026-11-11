@@ -128,7 +128,17 @@ pub(super) struct ResponseStore {
     /// Mirror of the store on disk (`serve.response_store_path`), rewritten after every mutation.
     /// `None` — the default — keeps everything in memory, so nothing a client said touches a disk.
     path: Option<PathBuf>,
+    /// A recency-only touch (GET, chain, item resolution) owes the mirror a write but must not pay
+    /// for one per request: a read burst would serialize and rewrite the whole store each time.
+    /// Merged into at most one write per [`RECENCY_FLUSH_INTERVAL`]; every `save` clears it.
+    recency_dirty: bool,
+    last_write: Instant,
 }
+
+/// How long recency-only touches are merged before the mirror is rewritten. The order they restore
+/// on restart is the LRU order, so a stale mirror evicts a frequently-read turn early — but the
+/// turns themselves are already durable from their own `put`.
+const RECENCY_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
 struct StoredResponse {
     /// Full history INCLUDING this turn's assistant output — exactly what a stateless client
@@ -198,6 +208,8 @@ impl ResponseStore {
             path: path
                 .filter(|_| capacity > 0)
                 .map(std::path::Path::to_path_buf),
+            recency_dirty: false,
+            last_write: Instant::now(),
         };
         let Some(path) = store.path.clone() else {
             return Ok(store);
@@ -251,13 +263,26 @@ impl ResponseStore {
     /// Mirror the store to disk after a mutation. A failed write is logged, never propagated: the
     /// generation already succeeded, and turning a full disk into a failed request would lose the
     /// answer as well as the mirror.
-    fn save(&self) {
+    fn save(&mut self) {
+        self.recency_dirty = false;
+        self.last_write = Instant::now();
         let Some(path) = &self.path else {
             return;
         };
         if let Err(error) = self.write(path) {
             tracing::warn!(path = %path.display(), %error, "could not persist the response store");
         }
+    }
+
+    /// Record that a read moved an entry's recency, and pay the mirror at most once per
+    /// [`RECENCY_FLUSH_INTERVAL`]. Without this the on-disk LRU order froze at the last `put`, so a
+    /// restart evicted the turns a client had been reading all along.
+    fn touch_recency(&mut self) {
+        self.recency_dirty = true;
+        if self.path.is_none() || self.last_write.elapsed() < RECENCY_FLUSH_INTERVAL {
+            return;
+        }
+        self.save();
     }
 
     fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -319,7 +344,9 @@ impl ResponseStore {
                 )
             })?;
             entry.last_used = self.clock;
-            return Ok(Some(entry.history.clone()));
+            let history = entry.history.clone();
+            self.touch_recency();
+            return Ok(Some(history));
         }
         if let Some(name) = conversation {
             if let Some(id) = self.conversations.get(name) {
@@ -332,7 +359,9 @@ impl ResponseStore {
                     )
                 })?;
                 entry.last_used = self.clock;
-                return Ok(Some(entry.history.clone()));
+                let history = entry.history.clone();
+                self.touch_recency();
+                return Ok(Some(history));
             }
             return Ok(None); // unknown name = start a new conversation, per OpenAI semantics
         }
@@ -388,7 +417,9 @@ impl ResponseStore {
         self.clock += 1;
         let entry = self.entries.get_mut(id)?;
         entry.last_used = self.clock;
-        Some(entry.response.clone())
+        let response = entry.response.clone();
+        self.touch_recency();
+        Some(response)
     }
 
     fn remove(&mut self, id: &str) -> Option<Value> {
@@ -424,11 +455,12 @@ impl ResponseStore {
         let owner = self.items.get(id).cloned()?;
         let entry = self.entries.get_mut(&owner)?;
         entry.last_used = self.clock;
-        entry.response["output"]
-            .as_array()?
-            .iter()
-            .find(|item| item["id"].as_str() == Some(id))
-            .cloned()
+        let item = entry.response["output"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["id"].as_str() == Some(id)))
+            .cloned();
+        self.touch_recency();
+        item
     }
 
     /// The complete item context of a stored response (replayed history + that turn's input).
@@ -436,12 +468,24 @@ impl ResponseStore {
         self.clock += 1;
         let entry = self.entries.get_mut(id)?;
         entry.last_used = self.clock;
-        Some(entry.input_items.clone())
+        let items = entry.input_items.clone();
+        self.touch_recency();
+        Some(items)
     }
 
     /// Stored responses, for `has_more` on a page.
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+impl Drop for ResponseStore {
+    /// Pay a recency write still owed when the store goes away — graceful shutdown drops the router
+    /// and its state, and the last reads of a session must not be the ones the mirror forgets.
+    fn drop(&mut self) {
+        if self.recency_dirty {
+            self.save();
+        }
     }
 }
 
@@ -1682,14 +1726,10 @@ fn response_id(chat_id: &str) -> String {
 }
 
 /// The id a streamed response gets when it is minted here instead of derived from the chat
-/// completion id: the same `resp_<ms>-<seq>` shape, from the same process counter, so it stays
-/// unique across two turns opened in one millisecond.
+/// completion id: the same `resp_<128-bit hex>` shape from the same entropy source, so a streamed
+/// turn is exactly as unguessable as a non-streamed one.
 fn mint_response_id() -> String {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("resp_{ms}-{}", ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!("resp_{}", random_id_suffix())
 }
 
 fn response_base(id: &str, created: i64, model: &str, meta: &Meta) -> Value {
@@ -2409,8 +2449,8 @@ fn stream_response(response: Response, meta: Meta, save: Option<SaveCtx>) -> Res
 // item context behind it. Nothing here re-runs a generation, so a stored id resolves to the same
 // bytes that were served the first time.
 
-/// Response ids are server-minted (`resp_<ms>-<seq>`); a path id longer than this is a probe, and
-/// the store is keyed by strings, so bound the work before the lookup.
+/// Response ids are server-minted (`resp_<128-bit hex>`); a path id longer than this is a probe,
+/// and the store is keyed by strings, so bound the work before the lookup.
 const MAX_ID_LEN: usize = 512;
 
 /// `limit`/`order` as OpenAI's list endpoints spell them. Both stay strings: a typed `u32` field
@@ -4202,6 +4242,63 @@ mod tests {
             std::env::temp_dir().join(format!("infr-responses-{name}-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    /// Both ways a response id is born — derived from the chat completion id, or minted to open a
+    /// stream — must land in the same unguessable namespace, and the reasoning handle must carry
+    /// the whole id through: a handle is a pointer at a stored turn, so a guessable one is a
+    /// readable one.
+    #[test]
+    fn response_ids_and_reasoning_handles_are_unguessable() {
+        let derived = response_id(&make_id());
+        let minted = mint_response_id();
+        for id in [&derived, &minted] {
+            let suffix = id.strip_prefix("resp_").expect("response id scheme");
+            assert_eq!(suffix.len(), 32, "128 bits, hex-encoded: {id}");
+            assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_ne!(derived, minted);
+        let handle = reasoning_handle(&derived);
+        assert_eq!(handle, format!("rehs_{derived}"));
+        assert_eq!(reasoning_item_id(&handle), Some(format!("rs_{derived}")));
+    }
+
+    /// A read moves recency and the mirror has to learn it, or a restart restores the LRU order of
+    /// the last PUT and evicts the turn the client kept reading. The write is debounced, so this
+    /// ages the last write past the interval instead of sleeping through it.
+    #[test]
+    fn a_read_touch_reaches_the_mirror_after_the_debounce_interval() {
+        let path = temp_store_path("recency");
+        let older = "resp_a";
+        let newer = "resp_b";
+        {
+            let mut store = ResponseStore::open(2, Some(&path)).unwrap();
+            for id in [older, newer] {
+                store.put(id, json!({"id":id}), Arc::new(Vec::new()), Vec::new(), None);
+            }
+            assert!(store.get(older).is_some());
+            assert!(store.recency_dirty, "a read must owe the mirror a write");
+
+            // Inside the interval the write is merged away: a restart still sees the put order.
+            let mid = ResponseStore::open(2, Some(&path)).unwrap();
+            assert_eq!(mid.oldest().as_deref(), Some(older));
+
+            // Past it, the next touch pays the debt.
+            store.last_write = Instant::now() - RECENCY_FLUSH_INTERVAL - Duration::from_secs(1);
+            assert!(store.get(older).is_some());
+            assert!(!store.recency_dirty);
+            // Paid while the store is still LIVE, not only on teardown: a killed process never
+            // runs Drop, and the mirror is what the next start reads.
+            let live = ResponseStore::open(2, Some(&path)).unwrap();
+            assert_eq!(live.oldest().as_deref(), Some(newer));
+        }
+        let reopened = ResponseStore::open(2, Some(&path)).unwrap();
+        assert_eq!(
+            reopened.oldest().as_deref(),
+            Some(newer),
+            "the read did not survive the restart"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

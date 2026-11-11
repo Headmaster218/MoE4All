@@ -2573,6 +2573,17 @@ pub async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()
     // server ends, no task is left ticking.
     let reporter = stats_interval(&state.cfg)
         .map(|period| tokio::spawn(stats_reporter(state.clone(), period)));
+    // A non-loopback bind with no key is reachable by every host on the network, and the Responses
+    // store answers a stored id with that turn's whole prompt, output and reasoning. Warn rather
+    // than refuse: an operator may have deliberately put this behind their own reverse proxy.
+    if !addr.ip().is_loopback() && configured_api_key(&state.cfg).is_none() {
+        tracing::warn!(
+            %addr,
+            "listening on a non-loopback address with no serve.api_key — any host on this network \
+             can use the model and read stored responses. Set serve.api_key (INFR_API_KEY) or bind \
+             127.0.0.1."
+        );
+    }
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %n_models, "infr-server listening");
@@ -3763,18 +3774,20 @@ fn json_body_error(error: axum::extract::rejection::JsonRejection) -> Response {
     response
 }
 
-/// Process-monotonic tie-breaker so two requests in the SAME millisecond (routine under
-/// `--parallel N`) never mint the same completion `id` — which also keeps the derived
-/// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
-static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// The unguessable part of every id this server mints: a completion id is a capability into the
+/// Responses store, so a timestamp+counter id would let any client walk its neighbours' ids and
+/// read their prompts, outputs and reasoning. Entropy failure is fatal — a predictable fallback
+/// would silently reopen exactly that hole.
+fn random_id_suffix() -> String {
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).expect("OS entropy for a server-minted id");
+    entropy.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
+/// Unique across requests minted in the same millisecond (routine under `--parallel N`), which also
+/// keeps the derived `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
 fn make_id() -> String {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{ms}-{seq}")
+    format!("chatcmpl-{}", random_id_suffix())
 }
 
 /// Default ceiling for `max_tokens`/`max_completion_tokens` when `INFR_MAX_TOKENS_CAP` is unset —
@@ -5637,10 +5650,26 @@ mod tests {
     #[test]
     fn make_id_is_unique_across_rapid_calls() {
         // Two completions minted in the same millisecond (routine under --parallel N) must NOT
-        // collide — the monotonic suffix guarantees it even when the ms component is identical.
+        // collide, and neither may the `call_{cid}_{idx}` tool-call ids derived from them.
         let n = 10_000;
         let ids: std::collections::HashSet<String> = (0..n).map(|_| make_id()).collect();
         assert_eq!(ids.len(), n, "make_id produced a collision");
+    }
+
+    #[test]
+    fn completion_ids_carry_entropy_instead_of_the_clock() {
+        // The enumeration attack read the millisecond timestamp off one id and walked the counter
+        // to its neighbours' stored turns. Neither component may survive in the id.
+        let id = make_id();
+        let suffix = id.strip_prefix("chatcmpl-").expect("completion id scheme");
+        assert_eq!(suffix.len(), 32, "128 bits, hex-encoded: {id}");
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        assert!(!suffix.contains(&ms), "id still embeds the clock: {id}");
     }
 
     // --- usage totals (audit finding 3) ------------------------------------
