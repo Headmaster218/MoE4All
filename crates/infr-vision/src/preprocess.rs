@@ -236,13 +236,13 @@ mod fetch {
             .host_str()
             .with_context(|| format!("image URL {target} has no host"))?;
         let port = target.port_or_known_default().unwrap_or(80);
-        let addresses: Vec<IpAddr> = match IpAddr::from_str(host) {
-            Ok(address) => vec![address],
+        let addresses: Vec<IpAddr> = match literal_address(host) {
+            Some(address) => vec![address],
             // A name resolves through the platform resolver here and the RESULT is judged. That is
             // not binding-proof: a public name whose resolver answers `127.0.0.1` on the second
             // lookup could still slip past. Closing that needs a resolver reqwest then has to use,
             // which is why the range list below is deliberately conservative.
-            Err(_) => (host, port)
+            None => (host, port)
                 .to_socket_addrs()
                 .with_context(|| format!("could not resolve the image host {host:?}"))?
                 .map(|socket| socket.ip())
@@ -252,6 +252,18 @@ mod fetch {
             return Ok(());
         }
         bail!("image URL {target} does not resolve to a public address")
+    }
+
+    /// The address a host string names, if it names one. `Url::host_str()` keeps the brackets on an
+    /// IPv6 literal ("[::1]"), which `IpAddr::from_str` rejects — handing the address to the
+    /// resolver instead of the range list. glibc refuses a bracketed name outright while the
+    /// Windows resolver answers it, so without this the guard's verdict depended on the platform.
+    pub(super) fn literal_address(host: &str) -> Option<IpAddr> {
+        let unbracketed = host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(host);
+        IpAddr::from_str(unbracketed).ok()
     }
 
     pub(super) fn is_public_address(address: IpAddr) -> bool {
@@ -713,6 +725,8 @@ mod tests {
     fn the_address_guard_judges_literal_targets() {
         let public = reqwest::Url::parse("http://8.8.8.8/a.png").expect("url");
         fetch::guard_target(&public, false).expect("a public literal is fetchable");
+        let public_v6 = reqwest::Url::parse("http://[2606:4700:4700::1111]/a.png").expect("url");
+        fetch::guard_target(&public_v6, false).expect("a public IPv6 literal is fetchable");
         for refused in [
             "http://127.0.0.1/a.png",
             "http://169.254.169.254/latest/meta-data/",
@@ -733,6 +747,33 @@ mod tests {
         let local = reqwest::Url::parse("http://127.0.0.1:8080/x.png").expect("url");
         assert!(fetch::guard_target(&local, false).is_err());
         fetch::guard_target(&local, true).expect("the hatch allows it");
+    }
+
+    /// The bracketed form is what `Url::host_str()` actually returns for IPv6, and a resolver's
+    /// opinion of it is platform-specific — glibc refuses "[::1]", Windows answers ::1 — so the
+    /// guard test above cannot see this bug on every OS. Parsing the literal is the invariant, and
+    /// it is checkable directly: no resolver, no network, same answer everywhere.
+    #[test]
+    fn bracketed_ipv6_literals_parse_as_addresses_not_names() {
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        for (host, expected) in [
+            ("[::1]", "::1"),
+            ("[2606:4700:4700::1111]", "2606:4700:4700::1111"),
+            ("[fe80::1]", "fe80::1"),
+            ("8.8.8.8", "8.8.8.8"),
+            ("127.0.0.1", "127.0.0.1"),
+        ] {
+            assert_eq!(
+                fetch::literal_address(host),
+                Some(IpAddr::from_str(expected).expect(expected)),
+                "{host}"
+            );
+        }
+        for name in ["example.com", "[example.com]", "[::1", "::1]", ""] {
+            assert_eq!(fetch::literal_address(name), None, "{name}");
+        }
     }
 
     /// The fetch itself, against a loopback server with a canned 200. Offline, no GPU, and the only
