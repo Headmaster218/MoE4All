@@ -1834,18 +1834,26 @@ impl ParallelSeam {
             // Phase C's DMA pool. The arena is sharded (~2 GiB ReBAR pieces), so this request arrives
             // as one corridor at small ctx and as several when it exceeds a shard's largest free gap.
             let budget_frames = n_slots * meta.max_ctx.div_ceil(page_tokens);
-            let corridors = Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, budget_frames)?
-                .ok_or_else(|| {
-                    anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
-                })?;
+            // `kv.paged_elastic` commits one chunk instead of the whole worst case and lets the
+            // tree claim the rest on demand, so the expert arena keeps every byte no conversation
+            // is using. The ceiling stays `budget_frames`: the arena's reserved KV corridor was
+            // sized for it, so growth never renegotiates the VRAM plan.
+            let elastic = ec.kv.paged_elastic;
+            let grow_chunk = (budget_frames / 8).max(128).min(budget_frames);
+            let initial_frames = if elastic { grow_chunk } else { budget_frames };
+            let corridors =
+                Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, initial_frames)?
+                    .ok_or_else(|| {
+                        anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
+                    })?;
             // The corridor tiling rounds every physical shard piece down to whole frames, so under
             // fragmentation the backend can place fewer frames than the budget. Trust what was
             // actually installed (FramePool::set_segments asserts capacity == corridor frames);
             // fewer frames only means cold tree entries evict earlier.
             let vram_frames: usize = corridors.iter().map(|corridor| corridor.frames).sum();
-            if vram_frames < budget_frames {
+            if vram_frames < initial_frames {
                 tracing::warn!(
-                    budget_frames,
+                    budget_frames = initial_frames,
                     placed_frames = vram_frames,
                     corridors = corridors.len(),
                     "paged KV frame pool is smaller than the full ctx budget; cold tree entries evict earlier"
@@ -1931,6 +1939,9 @@ impl ParallelSeam {
                 disk_path,
             );
             tree.set_vram_segments(&corridors);
+            if elastic {
+                tree.set_elastic_corridor(budget_frames, grow_chunk);
+            }
             if ram_frames == 0 {
                 // The `RAM tier / 8` derivation has no tier to divide. A zero aux cap is not a
                 // smaller cache here, it is NO cache: `PagedKv::hit_prefix` admits a recurrent
@@ -1946,6 +1957,9 @@ impl ParallelSeam {
                 frame_bytes,
                 corridors = corridors.len(),
                 corridor_bytes = frame_bytes * vram_frames as u64,
+                elastic,
+                elastic_chunk_frames = if elastic { grow_chunk } else { 0 },
+                elastic_ceiling_frames = if elastic { budget_frames } else { 0 },
                 ram_budget = ?ec.kv.paged_cache_max,
                 ram_frames,
                 ram_bytes = frame_bytes * ram_frames as u64,
@@ -1956,13 +1970,15 @@ impl ParallelSeam {
                 tree = %tree.stats_line(),
                 "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, image spans keyed by picture content so visual KV survives any other request; cold chains sink to the RAM tier and cascade to the disk tier before eviction when a RAM tier is configured, and evict outright when there is none)"
             );
-            // The corridor is sized to the LIVE sessions' full context (`n_slots * max_ctx`), so a
-            // pool-less tree has no guaranteed room for a published chain: once the conversations
-            // together hold more than the corridor, every swap evicts a chain instead of sinking
-            // it, and alternating sessions evict exactly the chain the next request would hit.
-            // That reads as "the KV was thrown away, not pooled" from the client (cached_tokens
-            // stays 0), so name the tier that fixes it rather than leaving it to the stats line.
-            let corridor_tokens = vram_frames as u64 * page_tokens as u64;
+            // The corridor is sized to the LIVE sessions' full context (`n_slots * max_ctx`) — at
+            // its ceiling when elastic — so a pool-less tree has no guaranteed room for a published
+            // chain: once the conversations together hold more than the corridor, every swap evicts
+            // a chain instead of sinking it, and alternating sessions evict exactly the chain the
+            // next request would hit. That reads as "the KV was thrown away, not pooled" from the
+            // client (cached_tokens stays 0), so name the tier that fixes it rather than leaving it
+            // to the stats line.
+            let corridor_frames = if elastic { budget_frames } else { vram_frames };
+            let corridor_tokens = corridor_frames as u64 * page_tokens as u64;
             let live_tokens = n_slots as u64 * meta.max_ctx as u64;
             if ram_frames == 0 && corridor_tokens.saturating_sub(live_tokens) < page_tokens as u64 {
                 tracing::warn!(

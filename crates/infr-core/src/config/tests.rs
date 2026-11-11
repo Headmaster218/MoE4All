@@ -437,6 +437,7 @@ fn default_config_matches_documented_defaults() {
     assert!(d.kv.dynamic);
     // §6.3: the paged tree is opt-in and its RAM tier is a SEPARATE opt-in on top of it.
     assert!(!d.kv.paged);
+    assert!(!d.kv.paged_elastic);
     assert_eq!(d.kv.paged_cache_max, None);
     assert_eq!(d.kv.paged_page_tokens, 32 * 1024);
     assert!(!d.kv.force_q8);
@@ -714,6 +715,19 @@ fn mtp_adaptive_width_defaults_off_and_keeps_explicit_reference_path() {
     }
     let cfg = Config::load_from_layers(&[file_layer("[spec]\nmtp_slot_min_accept=0.6\n")]);
     assert_eq!(cfg.spec.mtp_slot_min_accept, 0.6);
+}
+
+#[test]
+fn paged_elastic_corridor_defaults_off_and_roundtrips() {
+    assert!(!Config::default().kv.paged_elastic);
+    for enabled in [false, true] {
+        let setting = format!("kv.paged_elastic={enabled}");
+        let toml = format!("[kv]\npaged_elastic={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kv.paged_elastic, enabled);
+        }
+    }
 }
 
 #[test]
@@ -2261,6 +2275,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_SESSION_CACHE_TTL_HOURS",
         "INFR_KV_RAM_CACHE_MAX",
         "INFR_KV_PAGED",
+        "INFR_KV_PAGED_ELASTIC",
         "INFR_KV_PAGED_PAGE_TOKENS",
         "INFR_KV_PAGED_CACHE_MAX",
         "INFR_KV_DISK_CACHE_MAX",

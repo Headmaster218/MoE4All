@@ -216,6 +216,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
     p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
     p.kv.paged = flag(get, "INFR_KV_PAGED");
+    p.kv.paged_elastic = flag(get, "INFR_KV_PAGED_ELASTIC");
     p.kv.paged_page_tokens = num_pos(get, "INFR_KV_PAGED_PAGE_TOKENS");
     p.kv.paged_cache_max = opt_size(get, "INFR_KV_PAGED_CACHE_MAX");
     p.kv.disk_cache_max = opt_size(get, "INFR_KV_DISK_CACHE_MAX");

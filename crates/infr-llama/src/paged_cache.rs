@@ -72,6 +72,25 @@
 //! NVMe frame read is ~ms, and the alternative (an idle worker) is the PR #86 black hole. The
 //! backing is process-scoped: slots recycle without wiping, and a restart starts with an empty
 //! disk tier (content-addressed cross-process reuse stays out of scope).
+//!
+//! # The elastic corridor
+//!
+//! A fixed corridor leases `n_slots * ceil(max_ctx / page_tokens)` frames at init — the worst case
+//! every session could ever need — and holds that lease for the process's life. At a long context
+//! that freezes gigabytes of the shared expert arena while the resident conversations own a few
+//! percent of it, and the experts that lost those bytes pay for it in decode throughput. The
+//! blob/segmented KV path never had this problem: it reserves coordinates and commits only the
+//! segments a request actually reaches.
+//!
+//! `kv.paged_elastic` gives the frame pool the same discipline. Init commits ONE chunk; when the
+//! free list runs dry [`PagedKv::claim_frame`] claims another chunk from the arena (reusing the
+//! expert-victim reclaim every other KV claim goes through) before it sinks or evicts anything;
+//! and at each request boundary [`PagedKv::release_idle_corridors`] hands every fully-free segment
+//! above the retained chunk back, so the expert pager refills the bytes an idle conversation was
+//! squatting on. Growth is capped at the same worst-case ceiling the fixed corridor used, so the
+//! arena's KV corridor geometry — and therefore every other budget in the VRAM plan — is unchanged.
+//! Slot indices are never recycled across a shrink: retired slots stay as tombstones, so a live
+//! handle can never alias a released address.
 
 use crate::seam::kv_frame_pool::{FrameId, FramePool, Tier};
 use anyhow::{anyhow, Result};
@@ -89,6 +108,19 @@ pub(crate) trait FrameDma {
     fn download_frame(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()>;
     /// Copy one frame's host bytes into its corridor slot (`src.len() == frame_bytes`).
     fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()>;
+    /// Claim `count` more corridor frames from the shared device arena. An empty vector means the
+    /// arena has nothing left to give, so the tree falls back to its sink/evict ladder. The default
+    /// keeps a fixed corridor (host stand-ins, backends without an elastic arena).
+    fn grow_frames(&self, frame_bytes: u64, count: usize) -> Result<Vec<KvFrameCorridor>> {
+        let _ = (frame_bytes, count);
+        Ok(Vec::new())
+    }
+    /// Hand fully-free corridors back to the arena so experts can refill the same bytes. Every
+    /// frame must already be unowned and no dispatch may still name the segment.
+    fn release_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
+        let _ = corridors;
+        Ok(())
+    }
 }
 
 impl<T: Backend + ?Sized> FrameDma for T {
@@ -98,6 +130,15 @@ impl<T: Backend + ?Sized> FrameDma for T {
     }
     fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()> {
         self.kv_frame_upload(frame_addr, src)
+            .map_err(|error| anyhow!("{error}"))
+    }
+    fn grow_frames(&self, frame_bytes: u64, count: usize) -> Result<Vec<KvFrameCorridor>> {
+        Ok(self
+            .alloc_kv_frames(frame_bytes, count)?
+            .unwrap_or_default())
+    }
+    fn release_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
+        self.free_kv_frames(corridors)
             .map_err(|error| anyhow!("{error}"))
     }
 }
@@ -201,6 +242,15 @@ pub(crate) struct PagedKv {
     /// Cap on `aux_bytes`: an eighth of the RAM-tier frame backing, 0 when that tier is off. Aux
     /// is a restore accelerator, not a second KV copy — it never evicts frames, only itself.
     aux_budget: usize,
+    /// Elastic-corridor ceiling in frames; 0 keeps the corridor fixed at its init size.
+    vram_ceiling: usize,
+    /// Frames per growth transaction, and the floor below which idle segments are never handed
+    /// back: one chunk stays committed so a new request never starts from an empty corridor.
+    grow_chunk: usize,
+    /// A growth attempt that came back short or failed. Re-planning the arena per page would cost
+    /// more than the sink ladder it replaces, so the tree stops asking until a request boundary
+    /// ([`Self::release_idle_corridors`]) clears this.
+    grow_stalled: bool,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -210,6 +260,8 @@ pub(crate) struct PagedKv {
     tier_promotions: u64,
     disk_demotions: u64,
     disk_promotions: u64,
+    corridor_grows: u64,
+    corridor_shrinks: u64,
 }
 
 impl PagedKv {
@@ -280,6 +332,9 @@ impl PagedKv {
             // corridor-only tree (`kv.paged` with no pool) has nothing to divide, so its caller
             // overrides this — see [`Self::set_aux_budget`].
             aux_budget: (ram_frames * frame_bytes as usize) / 8,
+            vram_ceiling: 0,
+            grow_chunk: 0,
+            grow_stalled: false,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -289,6 +344,8 @@ impl PagedKv {
             tier_promotions: 0,
             disk_demotions: 0,
             disk_promotions: 0,
+            corridor_grows: 0,
+            corridor_shrinks: 0,
         }
     }
 
@@ -301,6 +358,19 @@ impl PagedKv {
     /// unified arena hands back several when the request exceeds a single shard's largest gap.
     pub(crate) fn set_vram_segments(&mut self, corridors: &[KvFrameCorridor]) {
         self.pool.set_segments(Tier::Vram, corridors);
+    }
+
+    /// Let the corridor breathe between `chunk_frames` (already committed at init, and retained
+    /// forever) and `ceiling_frames` (the worst case a fixed corridor would have leased outright).
+    /// Call once at init, after [`Self::set_vram_segments`]. The ceiling never exceeds the arena's
+    /// reserved KV corridor, so growth cannot steal bytes the VRAM plan gave to another owner.
+    pub(crate) fn set_elastic_corridor(&mut self, ceiling_frames: usize, chunk_frames: usize) {
+        assert!(
+            chunk_frames > 0,
+            "an elastic KV corridor needs a non-zero chunk"
+        );
+        self.vram_ceiling = ceiling_frames.max(self.pool.capacity_frames(Tier::Vram));
+        self.grow_chunk = chunk_frames.min(self.vram_ceiling);
     }
 
     /// Replace the aux (recurrent/PLE snapshot) budget implied by the RAM frame pool. Only the
@@ -332,7 +402,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} sunk={} promoted={} disk_sunk={} disk_promoted={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} sunk={} promoted={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -360,6 +430,9 @@ impl PagedKv {
             self.tier_promotions,
             self.disk_demotions,
             self.disk_promotions,
+            self.corridor_grows,
+            self.corridor_shrinks,
+            self.vram_ceiling,
         )
     }
 
@@ -402,6 +475,12 @@ impl PagedKv {
                 self.pool.set_active(frame, active);
                 return Some(frame);
             }
+            // An elastic corridor asks the shared arena for another chunk before it demotes
+            // anything: growing keeps the prefix in VRAM, where a sink would cost a DMA per frame
+            // now and a DMA per frame back on the next hit.
+            if self.grow_corridor(be) {
+                continue;
+            }
             if self.demote_coldest_entry(be, protect) || self.demote_ram_coldest_entry(protect) {
                 continue;
             }
@@ -409,6 +488,89 @@ impl PagedKv {
                 continue;
             }
             return None;
+        }
+    }
+
+    /// Claim one more chunk of corridor from the arena. Returns whether the slot space grew, so
+    /// [`Self::claim_frame`]'s loop only continues on strict progress. A short or failed grant
+    /// latches `grow_stalled`: the arena is out of KV space, and re-planning it for every page of
+    /// a long prefill would cost more than the sink ladder below.
+    fn grow_corridor<M: FrameDma + ?Sized>(&mut self, be: &M) -> bool {
+        if self.grow_chunk == 0 || self.grow_stalled {
+            return false;
+        }
+        let capacity = self.pool.capacity_frames(Tier::Vram);
+        if capacity >= self.vram_ceiling {
+            return false;
+        }
+        let want = self.grow_chunk.min(self.vram_ceiling - capacity);
+        let corridors = match be.grow_frames(self.pool.frame_bytes(), want) {
+            Ok(corridors) => corridors,
+            Err(error) => {
+                tracing::warn!(
+                    requested_frames = want,
+                    "elastic KV corridor growth failed, keeping {capacity} frames: {error}"
+                );
+                self.grow_stalled = true;
+                return false;
+            }
+        };
+        let added = self.pool.grow_vram(&corridors);
+        if added == 0 {
+            self.grow_stalled = true;
+            return false;
+        }
+        if added < want {
+            self.grow_stalled = true;
+        }
+        self.corridor_grows += 1;
+        tracing::debug!(
+            added_frames = added,
+            capacity_frames = capacity + added,
+            ceiling_frames = self.vram_ceiling,
+            "elastic KV corridor grew"
+        );
+        true
+    }
+
+    /// Hand every fully-free corridor segment above the retained chunk back to the arena, so the
+    /// expert pager can refill bytes an idle conversation was squatting on. Runs at a request
+    /// boundary under the GPU baton: no dispatch may still name a frame in a released segment.
+    ///
+    /// Highest segment first — growth appends, so the newest chunk is the one most likely to be
+    /// entirely free, and releasing top-down keeps the low addresses (where the hot prefix of a
+    /// long-lived conversation lives) resident. Pool slots are retired BEFORE the backend lease is
+    /// dropped: a failed release then leaks arena bytes, which is recoverable, instead of leaving
+    /// live frames pointing at memory the arena already handed to an expert.
+    pub(crate) fn release_idle_corridors<M: FrameDma + ?Sized>(&mut self, be: &M) {
+        self.grow_stalled = false;
+        if self.grow_chunk == 0 {
+            return;
+        }
+        while self.pool.capacity_frames(Tier::Vram) > self.grow_chunk {
+            let Some(index) = (0..self.pool.vram_segment_count())
+                .rev()
+                .find(|&index| self.pool.vram_segment_all_free(index))
+            else {
+                return;
+            };
+            let Some(corridor) = self.pool.take_free_vram_segment(index) else {
+                return;
+            };
+            if let Err(error) = be.release_frames(&[corridor]) {
+                tracing::warn!(
+                    base = corridor.base,
+                    frames = corridor.frames,
+                    "elastic KV corridor release failed, its arena bytes stay leased: {error}"
+                );
+                return;
+            }
+            self.corridor_shrinks += 1;
+            tracing::debug!(
+                released_frames = corridor.frames,
+                capacity_frames = self.pool.capacity_frames(Tier::Vram),
+                "elastic KV corridor returned to the expert arena"
+            );
         }
     }
 
@@ -1282,10 +1444,186 @@ mod tests {
     /// throwaway DMA is fine here — growth only claims free corridor frames (demotion needs
     /// pressure a free corridor cannot offer), tests that verify DMA carry their own handle.
     fn grow(kv: &mut PagedKv, pages: usize) -> Vec<FrameId> {
-        let dma = MockDma::default();
+        grow_with(kv, &MockDma::default(), pages)
+    }
+
+    fn grow_with<M: FrameDma + ?Sized>(kv: &mut PagedKv, dma: &M, pages: usize) -> Vec<FrameId> {
         (0..pages)
-            .map(|_| kv.alloc_frame(&dma).expect("corridor has room"))
+            .map(|_| kv.alloc_frame(dma).expect("corridor has room"))
             .collect()
+    }
+
+    /// Shared-arena stand-in for the elastic corridor: grants at most `left` frames of fresh space
+    /// per call, re-hands released corridors before carving new ones, and records every release.
+    struct ElasticDma {
+        dma: MockDma,
+        arena: std::sync::Mutex<ElasticArena>,
+    }
+
+    #[derive(Default)]
+    struct ElasticArena {
+        next_base: u64,
+        left: usize,
+        idle: Vec<KvFrameCorridor>,
+        released: Vec<KvFrameCorridor>,
+    }
+
+    impl ElasticDma {
+        fn new(left: usize) -> Self {
+            Self {
+                dma: MockDma::default(),
+                arena: std::sync::Mutex::new(ElasticArena {
+                    next_base: 0x2_0000_0000,
+                    left,
+                    idle: Vec::new(),
+                    released: Vec::new(),
+                }),
+            }
+        }
+    }
+
+    impl FrameDma for ElasticDma {
+        fn download_frame(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {
+            self.dma.download_frame(frame_addr, dst)
+        }
+        fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()> {
+            self.dma.upload_frame(frame_addr, src)
+        }
+        fn grow_frames(&self, frame_bytes: u64, count: usize) -> Result<Vec<KvFrameCorridor>> {
+            let mut arena = self.arena.lock().unwrap();
+            let mut out = Vec::new();
+            let mut want = count;
+            while want > 0 {
+                let Some(index) = arena.idle.iter().position(|c| c.frames <= want) else {
+                    break;
+                };
+                let corridor = arena.idle.remove(index);
+                want -= corridor.frames;
+                out.push(corridor);
+            }
+            if want > 0 && arena.left > 0 {
+                let granted = want.min(arena.left);
+                arena.left -= granted;
+                let base = arena.next_base;
+                arena.next_base += granted as u64 * frame_bytes;
+                out.push(KvFrameCorridor {
+                    base,
+                    frames: granted,
+                });
+            }
+            Ok(out)
+        }
+        fn release_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
+            let mut arena = self.arena.lock().unwrap();
+            arena.idle.extend_from_slice(corridors);
+            arena.released.extend_from_slice(corridors);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_elastic_corridor_grows_before_it_sinks_or_evicts() {
+        let mut kv = cache_ram(4, 8);
+        kv.set_elastic_corridor(16, 4);
+        let dma = ElasticDma::new(12);
+        let chain = grow_with(&mut kv, &dma, 12);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 12);
+        assert_eq!(kv.corridor_grows, 2);
+        assert_eq!(kv.tier_demotions, 0);
+        assert_eq!(kv.evictions, 0);
+        // Growth appends segments, so frame 4 is the first byte of the second corridor and frame 8
+        // of the third: a handle's address must follow the segment table, not a single base.
+        assert_eq!(kv.plane_addr(chain[0], 0), 0x1_0000_0000);
+        assert_eq!(kv.plane_addr(chain[4], 0), 0x2_0000_0000);
+        assert_eq!(kv.plane_addr(chain[8], 0), 0x2_0000_0000 + 4 * FB);
+        assert_eq!(kv.plane_addr(chain[8], 1), 0x2_0000_0000 + 4 * FB + FB / 2);
+    }
+
+    #[test]
+    fn growth_stops_at_the_ceiling_and_the_sink_ladder_takes_over() {
+        let mut kv = cache_ram(4, 8);
+        kv.set_elastic_corridor(8, 4);
+        let dma = ElasticDma::new(64);
+        let cold = grow_with(&mut kv, &dma, 4);
+        kv.publish((1..=16).collect(), cold.clone()).unwrap();
+        kv.session_release(&cold);
+        let _hot = grow_with(&mut kv, &dma, 5);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 8);
+        assert_eq!(kv.corridor_grows, 1);
+        assert_eq!(
+            kv.tier_demotions, 4,
+            "the cold chain sinks instead of growing"
+        );
+        // An empty arena grant latches: the tree must not re-plan it for every later page.
+        let mut kv = cache_ram(4, 0);
+        kv.set_elastic_corridor(64, 4);
+        let dry = ElasticDma::new(0);
+        let _ = grow_with(&mut kv, &dry, 4);
+        assert!(!kv.grow_stalled);
+        assert!(
+            kv.alloc_frame(&dry).is_none(),
+            "a dry arena leaves the corridor at its init size"
+        );
+        assert!(kv.grow_stalled);
+        assert_eq!(kv.corridor_grows, 0);
+    }
+
+    #[test]
+    fn idle_chunks_go_back_to_the_arena_and_a_live_frame_keeps_its_address() {
+        let mut kv = cache_ram(4, 0);
+        kv.set_elastic_corridor(16, 4);
+        let dma = ElasticDma::new(8);
+        let chain = grow_with(&mut kv, &dma, 12);
+        kv.publish((1..=16).collect(), chain[..4].to_vec()).unwrap();
+        // One session still owns a frame in the middle chunk: that segment must stay.
+        kv.session_release(&chain[..5]);
+        kv.session_release(&chain[6..]);
+        kv.release_idle_corridors(&dma);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 8);
+        assert_eq!(kv.corridor_shrinks, 1);
+        assert_eq!(
+            dma.arena.lock().unwrap().released,
+            vec![KvFrameCorridor {
+                base: 0x2_0000_0000 + 4 * FB,
+                frames: 4
+            }]
+        );
+        let addr_before = kv.plane_addr(chain[0], 0);
+        kv.session_release(&chain[5..6]);
+        kv.release_idle_corridors(&dma);
+        // The retained chunk is the floor even though its frames are tree-owned, not free.
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
+        assert_eq!(kv.corridor_shrinks, 2);
+        assert_eq!(kv.plane_addr(chain[0], 0), addr_before);
+        let (node, reusable) = kv.best_match(&(1..=16).collect::<Vec<_>>()).unwrap();
+        assert_eq!(reusable, 16);
+        assert_eq!(kv.entry_chain(node, reusable), chain[..4]);
+
+        // Regrowth reuses the returned bytes but never the retired slot indices, so the published
+        // chain cannot alias a frame the new session owns.
+        let fresh = grow_with(&mut kv, &dma, 4);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 8);
+        assert!(fresh.iter().all(|f| f.slot() >= 12));
+        assert_eq!(kv.plane_addr(fresh[0], 0), 0x2_0000_0000 + 4 * FB);
+        assert_eq!(kv.entry_chain(node, reusable), chain[..4]);
+    }
+
+    #[test]
+    fn a_fixed_corridor_never_grows_or_shrinks() {
+        let mut kv = cache_ram(4, 0);
+        let dma = ElasticDma::new(64);
+        let chain = grow_with(&mut kv, &dma, 4);
+        kv.publish((1..=16).collect(), chain.clone()).unwrap();
+        kv.session_release(&chain);
+        kv.release_idle_corridors(&dma);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
+        assert_eq!(kv.corridor_shrinks, 0);
+        assert!(dma.arena.lock().unwrap().released.is_empty());
+        // Exhaustion falls straight through to the Phase B eviction ladder, never to the arena.
+        assert!(kv.alloc_frame(&dma).is_some());
+        assert_eq!(kv.evictions, 1);
+        assert_eq!(kv.corridor_grows, 0);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
     }
 
     #[test]

@@ -3899,6 +3899,7 @@ $kvPagedCacheMax = [string](Get-SavedValue 'kv_paged_cache_max' '')
 # asked for a pool whenever it named one, so a saved size still implies the tree.
 $kvPagedTree = [bool](Get-SavedValue 'kv_paged_tree' ([bool]$kvPagedCacheMax))
 $kvPagedPageTokens = [string](Get-SavedValue 'kv_paged_page_tokens' '')
+$kvPagedElastic = [bool](Get-SavedValue 'kv_paged_elastic' $false)
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
@@ -4158,6 +4159,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedTree = $false
             $kvPagedCacheMax = ''
             $kvPagedPageTokens = ''
+            $kvPagedElastic = $false
         }
         if ($kvPagedTree) {
             # One prerequisite the wizard cannot test: the corridor is claimed from the unified VRAM
@@ -4187,8 +4189,25 @@ if (-not $reuseSavedSettings) {
             }
             if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
             $kvPagedPageTokens = Read-TextValue -Label '每帧 token 数（2 的幂，如 64；越小共享越细、重算尾巴越短）/ Tokens per frame (power of two, e.g. 64; smaller shares finer with shorter recompute tails)' -Default $kvPagedPageTokens -Required
-            Write-Host '试验性特性：分页走廊占用全部 KV 显存（会话与缓存树共用，不再为每个会话单独保留 KV）。' -ForegroundColor Yellow
-            Write-Host 'Experimental: the frame corridor claims the FULL KV VRAM space (resident sessions and the cache tree share it; no per-slot KV reserve).' -ForegroundColor DarkGray
+            # A fixed corridor leases `slots * ceil(ctx / page_tokens)` frames at boot and never
+            # returns them, so a short request on a long ctx squats the whole worst case. Elastic
+            # commits one chunk, claims the rest on demand and hands fully-free chunks back at a
+            # request boundary. The ceiling is the same worst case, so no other VRAM budget moves.
+            Write-Host '推荐开启弹性走廊：固定走廊开机就租下「会话数 × 整个 ctx」的显存并终身不退。实测 ctx 131072 跑 4345 token 的请求只用到 69/2048 帧（0.04GiB / 1.33GiB），白占的 1.16GiB 让专家少驻留，解码从 165.1 掉到 140.4 t/s。弹性走廊先只租 256 帧（0.17GiB），按需增长、请求边界把整段空闲的归还专家：同窗口实测解码回到 145.9 t/s（+3.9%），30K / 125K 长请求持平，复用率与生成文本逐字节不变。' -ForegroundColor Yellow
+            Write-Host 'Recommended: a fixed corridor leases slots x the whole ctx at boot and never returns it. Measured at ctx 131072 with a 4345-token request: only 69 of 2048 frames were used (0.04GiB of 1.33GiB), and the 1.16GiB of squatting cost decode 165.1 -> 140.4 t/s. The elastic corridor leases 256 frames (0.17GiB) first, grows on demand and returns fully-free chunks to the expert pager at a request boundary: same-window decode recovered to 145.9 t/s (+3.9%), 30K/125K requests unchanged, reuse and generated text byte-identical.' -ForegroundColor DarkGray
+            $elasticDefault = if ($null -eq $script:Saved) { $true } else { $kvPagedElastic }
+            $kvPagedElastic = Read-YesNo -Label '让分页显存走廊按需增长、并把整段空闲的走廊归还专家（推荐；上限仍是整个 ctx 的最坏情况，不改动其它显存预算）？/ Let the paged VRAM corridor grow on demand and return fully-free chunks to the expert pager (recommended; the ceiling is still the full-ctx worst case, so no other VRAM budget moves)?' -Default $elasticDefault
+            if ($kvPagedElastic) {
+                Write-Host '增长发生在 prefill 中，会先退掉 Prefill 对走廊未提交单元的临时借用（与分段 KV 增长同一条串行边界）。实测 125K token 的 prefill 连续增长 7 次到上限，冷启 TTFT 只多 0.3%；整段空闲的走廊在请求边界归还，配合 RAM 帧池时冷链先下沉再归还，命中再换回（实测 0.31GiB 链下沉后回访 TTFT 287ms，冷启是 13466ms）。' -ForegroundColor DarkGray
+                Write-Host 'Growth happens inside prefill and first retires Prefill transient loan on the corridor uncommitted cells (the same serial boundary segmented KV growth takes). Measured: a 125K-token prefill grew 7 times to the ceiling for +0.3% cold TTFT. Fully-free chunks go back at a request boundary; with a RAM pool a cold chain sinks first and promotes back on a hit (a 0.31GiB chain revisited in 287ms against 13466ms cold).' -ForegroundColor DarkGray
+            }
+            if ($kvPagedElastic) {
+                Write-Host '试验性特性：分页走廊与会话/缓存树共用 KV 显存（不再为每个会话单独保留 KV），开机只提交一个 chunk，其余按需增长到整个 ctx 的上限。' -ForegroundColor Yellow
+                Write-Host 'Experimental: the frame corridor shares the KV VRAM space with resident sessions and the cache tree (no per-slot KV reserve); it commits one chunk at boot and grows the rest on demand up to the full-ctx ceiling.' -ForegroundColor DarkGray
+            } else {
+                Write-Host '试验性特性：分页走廊占用全部 KV 显存（会话与缓存树共用，不再为每个会话单独保留 KV）。' -ForegroundColor Yellow
+                Write-Host 'Experimental: the frame corridor claims the FULL KV VRAM space (resident sessions and the cache tree share it; no per-slot KV reserve).' -ForegroundColor DarkGray
+            }
             Write-Host '命中只到帧边界，尾帧重算；多模态会话不入树；与 MTP 联用未验收（draft 状态在树恢复时丢弃，且 draft KV 在走廊之外另占显存），建议关闭 MTP。' -ForegroundColor Yellow
             Write-Host 'Hits are frame-aligned (tail frame recomputed); multimodal sessions never enter the tree; the MTP combination is unvalidated (draft state is dropped on tree restore and the draft KV costs VRAM outside the corridor) - keep MTP off.' -ForegroundColor DarkGray
             if ($kvRamCacheMax) {
@@ -4202,6 +4221,7 @@ if (-not $reuseSavedSettings) {
         } else {
             $kvPagedCacheMax = ''
             $kvPagedPageTokens = ''
+            $kvPagedElastic = $false
         }
         $kvRamCacheEnabled = $false
         if (-not $kvPagedTree) {
@@ -4448,6 +4468,7 @@ if ($launchMode -eq 'server') {
             Write-Host "The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout; $treeBlocker, so it was turned off instead of refusing at startup. Pick KV auto/Q8 and keep overflow off to use it." -ForegroundColor DarkGray
             $kvPagedTree = $false
             $kvPagedCacheMax = ''
+            $kvPagedElastic = $false
         }
         if ($kvPagedTree) {
             # `kv.paged` opens the tree; the host-RAM frame pool is a separate budget that only exists
@@ -4457,6 +4478,7 @@ if ($launchMode -eq 'server') {
             if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
             Add-SetArgument $nativeArgs 'kv.paged_page_tokens' $kvPagedPageTokens
             if ($kvPagedCacheMax) { Add-SetArgument $nativeArgs 'kv.paged_cache_max' $kvPagedCacheMax }
+            if ($kvPagedElastic) { Add-SetArgument $nativeArgs 'kv.paged_elastic' 'true' }
         }
         if ($kvRamCacheMax) {
             Add-SetArgument $nativeArgs 'kv.ram_cache_max' $kvRamCacheMax
@@ -4560,6 +4582,7 @@ $state = [ordered]@{
     session_cache_ttl_hours = $sessionCacheTtlHours; kv_ram_cache_max = $kvRamCacheMax
     kv_paged_cache_max = $kvPagedCacheMax; kv_paged_page_tokens = $kvPagedPageTokens
     kv_paged_tree = $kvPagedTree
+    kv_paged_elastic = $kvPagedElastic
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     image_url_allow_private = $imageUrlAllowPrivate
     server_llm_enabled = $serverLlmEnabled

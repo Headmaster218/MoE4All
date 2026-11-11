@@ -258,6 +258,14 @@ cfg_struct! {
         /// and cold chains evict instead of sinking. `kv.paged_cache_max` stays the pool budget and
         /// still turns the tree on by itself, so every existing configuration resolves unchanged.
         paged: bool = false,
+        /// `INFR_KV_PAGED_ELASTIC`: let the paged VRAM frame corridor grow and shrink with demand
+        /// instead of leasing `slots * ceil(max_ctx / page_tokens)` frames for the process's life.
+        /// Init commits one chunk, a dry free list claims another from the shared expert arena, and
+        /// every fully-free chunk above the retained one goes back at a request boundary — so the
+        /// experts keep the bytes an idle conversation was squatting on. The growth ceiling is the
+        /// same worst case the fixed corridor leases, so no other VRAM budget moves. Only meaningful
+        /// with the paged tree ([`KvCfg::paged`] or [`KvCfg::paged_cache_max`]).
+        paged_elastic: bool = false,
         /// `INFR_KV_PAGED_PAGE_TOKENS`: tokens per physical KV segment (page). The segmented
         /// machinery addresses planes through a runtime device table, so the page size is pure
         /// geometry — 32768 (default) reproduces the legacy 32K growth step byte-for-byte, while

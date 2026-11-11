@@ -8864,11 +8864,12 @@ impl Backend for VulkanBackend {
     ) -> Result<Option<Vec<KvFrameCorridor>>> {
         // One arena transaction per corridor, sliced into fixed-size frames by the caller's
         // FramePool bookkeeping. A single lease per segment is deliberate: per-frame arena claims
-        // would reintroduce exactly the external fragmentation the fixed-frame design removes, and
-        // the whole space is claimed at cache init (never lazily), so expert/KV reclaim pressure is
-        // paid once, not per page. The unified arena is built from ~2 GiB ReBAR shard pieces, so a
-        // space larger than one shard's largest free gap (ctx 262144 wants 4.31 GiB) is claimed as
-        // several corridors in one transaction, never as one impossible contiguous run.
+        // would reintroduce exactly the external fragmentation the fixed-frame design removes.
+        // Callers may claim once at cache init (a fixed corridor) or in chunks as demand grows
+        // (`kv.paged_elastic`); either way expert/KV reclaim pressure is paid per transaction, not
+        // per page. The unified arena is built from ~2 GiB ReBAR shard pieces, so a space larger
+        // than one shard's largest free gap (ctx 262144 wants 4.31 GiB) is claimed as several
+        // corridors in one transaction, never as one impossible contiguous run.
         let total = (frame_bytes as usize)
             .checked_mul(count)
             .ok_or_else(|| be("KV frame corridor size overflow"))?;
@@ -8885,6 +8886,23 @@ impl Backend for VulkanBackend {
                     .ok_or_else(|| be("KV frame corridor lost its unified VRAM arena"))?;
                 let mut corridors = Vec::new();
                 if pool.expert_layout().is_some() {
+                    // Prefill borrows the corridor's UNCOMMITTED cells, so a lazily grown frame
+                    // corridor has to retire that transient loan before claiming them — the same
+                    // serial-boundary step segmented KV growth takes. A corridor claimed outright
+                    // at init has no uncommitted cells to lend, so this is a no-op there.
+                    self.handoff_gpu_decode()?;
+                    let released = self
+                        .moe_pager
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .is_some_and(crate::pager::MoePagerSession::enter_decode);
+                    if released {
+                        tracing::debug!(
+                            requested_frames = count,
+                            "released Prefill KV loan before frame-corridor growth"
+                        );
+                    }
                     let protected = self.protected_unified_experts();
                     let owner =
                         self.unified_phases
@@ -8998,17 +9016,20 @@ impl Backend for VulkanBackend {
     }
 
     fn free_kv_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
-        let mut installed = self.kv_corridors.lock().unwrap();
-        for corridor in corridors {
-            let index = installed
-                .iter()
-                .position(|(addr, _)| *addr == corridor.base)
-                .ok_or_else(|| be("unknown KV frame corridor"))?;
-            // Dropping the corridor buffer releases its arena lease. Safe only when every frame's
-            // refcount reached zero — the engine tears the paged cache down before its slots.
-            installed.remove(index);
-        }
-        Ok(())
+        self.with_unified_exclusive_result(|| {
+            let mut installed = self.kv_corridors.lock().unwrap();
+            for corridor in corridors {
+                let index = installed
+                    .iter()
+                    .position(|(addr, _)| *addr == corridor.base)
+                    .ok_or_else(|| be("unknown KV frame corridor"))?;
+                // Dropping the corridor buffer releases its arena lease, which the expert pager can
+                // then re-claim. Safe only when every frame's refcount reached zero and no dispatch
+                // still names the segment — the caller holds the GPU baton at a request boundary.
+                installed.remove(index);
+            }
+            Ok(())
+        })
     }
 
     fn kv_frame_download(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {

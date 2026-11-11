@@ -268,21 +268,26 @@ try {
         Assert ($state.server_session_cache) 'Fresh API installs should enable SSD KV caching'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Default SSD KV cache path was not emitted'
     }
-    Test-Flow 'API paged tree with no RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', 'n', '', '', '') -Check {
+    Test-Flow 'API paged tree with no RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', 'n', '', 'n', '', '') -Check {
         Assert ('kv.paged=true' -in $nativeArgs) 'The corridor-only paged tree was not emitted'
         Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The corridor-only tree lost the frame page size'
         Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv\.paged_cache_max=' }).Count)) 'Declining the RAM pool must not emit a pool budget'
         Assert ($state.kv_paged_tree -and -not $state.kv_paged_cache_max) 'The corridor-only tree choice was not saved'
         Assert (-not $state.server_session_cache) 'The paged tree must turn off the mutually exclusive disk session cache'
+        Assert (-not ('kv.paged_elastic=true' -in $nativeArgs)) 'Declining the elastic corridor must keep the fixed lease'
+        Assert (-not $state.kv_paged_elastic) 'The declined elastic corridor was saved as on'
     }
     # A fresh install is RECOMMENDED the pool: accepting the default must emit a budget, because a
     # corridor-only tree evicts the very chain an alternating session would hit (cached_tokens=0).
-    Test-Flow 'fresh API paged tree takes the recommended RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', '') -Check {
+    Test-Flow 'fresh API paged tree takes the recommended RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', '', '') -Check {
         Assert ('kv.paged=true' -in $nativeArgs) 'The paged tree was not emitted'
         Assert ('kv.paged_cache_max=16GiB' -in $nativeArgs) 'Accepting the recommended default must emit the RAM frame-pool cap'
         Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The recommended tree lost the frame page size'
         Assert ($state.kv_paged_cache_max -eq '16GiB') 'The recommended pool cap was not saved'
         Assert (@($script:Output | Where-Object { $_ -match '98\.9%' }).Count) 'The recommendation did not explain the measured reuse consequence'
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'A fresh install must be recommended the elastic corridor'
+        Assert ($state.kv_paged_elastic) 'The recommended elastic corridor was not saved'
+        Assert (@($script:Output | Where-Object { $_ -match '145\.9' }).Count) 'The elastic recommendation did not explain the measured decode consequence'
     }
     # The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout, so a saved profile that
     # pairs it with another KV format must heal rather than emit a command line the engine refuses.
@@ -298,6 +303,15 @@ try {
     Test-Flow 'an explicit Q8_0/Q8_0 profile keeps its paged tree' -Saved $customQ8TreeSettings -Inputs @('') -Check {
         Assert ('kv.paged=true' -in $nativeArgs) 'A Q8_0/Q8_0 profile lost the corridor-only tree'
         Assert ($state.kv_paged_tree) 'The eligible profile must keep the tree saved'
+        Assert (-not ('kv.paged_elastic=true' -in $nativeArgs)) 'A state file from before the elastic corridor must keep the fixed lease'
+    }
+    # Reuse mode never re-asks, so a profile that DID choose the elastic corridor has to keep emitting
+    # it: the choice is saved separately from the tree and must survive a saved-settings launch.
+    $elasticTreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; kv_paged_elastic = $true; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'a saved elastic corridor stays elastic on reuse' -Saved $elasticTreeSettings -Inputs @('') -Check {
+        Assert ($reuseSavedSettings) 'Saved profile should not reconfigure'
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'A saved elastic corridor was dropped on reuse'
+        Assert ($state.kv_paged_elastic) 'The elastic corridor choice was not kept saved'
     }
     Test-Flow 'manual hardware and sampling' -Inputs @('',  $model,  '',  '3',  '3072',  '4',  '',  '',  'n',  '3',  '256',  'n',  'paging.expert_prefetch=false',  'n',  '2048',  'y',  '0.7',  '20',  '0.95',  '9',  'n',  '20k') -Check {
         foreach ($value in @('--ubatch', '3072', '--threads', '4', 'device.submit_dispatches=256', 'paging.expert_prefetch=false', '--temp', '0.7', '--seed', '9')) {

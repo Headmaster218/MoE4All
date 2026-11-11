@@ -789,8 +789,10 @@ pub trait Backend: Send + Sync {
             "segmented KV table writes are not supported by this backend",
         ))
     }
-    /// Release corridors previously returned by [`Self::alloc_kv_frames`]. Engine shutdown only;
-    /// every frame must already be free (refcount 0) or the drop order is a use-after-free.
+    /// Release corridors previously returned by [`Self::alloc_kv_frames`], returning their bytes to
+    /// the shared arena. Every frame must already be free (refcount 0) and no dispatch may still
+    /// name the segment, or the drop order is a use-after-free. Called at engine shutdown, and at
+    /// request boundaries by an elastic corridor handing idle chunks back to the expert pager.
     fn free_kv_frames(&self, _corridors: &[KvFrameCorridor]) -> Result<()> {
         Err(crate::error::Error::backend(
             "segmented KV frame corridors are not supported by this backend",

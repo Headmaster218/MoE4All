@@ -95,14 +95,21 @@ struct SlotState {
     /// Monotonic clock stamp of the last access; the LRU key for cold-leaf
     /// pruning (tip-first: the coldest leaf's tail page is picked first).
     lru: u64,
+    /// False once the slot's corridor segment was handed back to the arena. Slot indices are
+    /// never recycled across a shrink, so a retired slot stays in the array as a tombstone:
+    /// every live handle keeps its index, and `capacity` (not `slots.len()`) is the tier's size.
+    present: bool,
 }
 
-/// Fixed-capacity slot array + free list for one tier.
+/// Fixed-capacity slot array + free list for one tier. The VRAM tier's capacity moves at runtime
+/// (elastic corridor); RAM and disk are sized once.
 #[derive(Clone, Debug)]
 struct TierState {
     slots: Vec<SlotState>,
     free: VecDeque<usize>,
     held: usize,
+    /// Live slots: `slots.len()` minus retired tombstones.
+    capacity: usize,
 }
 
 impl TierState {
@@ -112,12 +119,14 @@ impl TierState {
                 SlotState {
                     refcount: 0,
                     active: false,
-                    lru: 0
+                    lru: 0,
+                    present: true
                 };
                 capacity
             ],
             free: (0..capacity).rev().collect(),
             held: 0,
+            capacity,
         }
     }
 }
@@ -192,6 +201,75 @@ impl FramePool {
         self.segments[Self::idx(tier)] = segments;
     }
 
+    /// Append freshly claimed VRAM corridors to the slot space (elastic corridor growth). New
+    /// slots continue at `slots.len()`, so every existing handle keeps its index and the segment
+    /// table stays sorted by `first_frame`. Returns the number of frames added.
+    pub(crate) fn grow_vram(&mut self, corridors: &[KvFrameCorridor]) -> usize {
+        let mut first_frame = self.tiers[Self::idx(Tier::Vram)].slots.len();
+        let mut added = 0usize;
+        for corridor in corridors {
+            assert!(corridor.frames > 0, "a KV frame corridor must hold frames");
+            self.segments[Self::idx(Tier::Vram)].push(FrameSegment {
+                base: corridor.base,
+                first_frame,
+                frames: corridor.frames,
+            });
+            let t = &mut self.tiers[Self::idx(Tier::Vram)];
+            for _ in 0..corridor.frames {
+                t.slots.push(SlotState {
+                    refcount: 0,
+                    active: false,
+                    lru: 0,
+                    present: true,
+                });
+                added += 1;
+            }
+            // Reverse push so `alloc`'s pop_back hands out the segment ascending, matching `new`.
+            t.free
+                .extend((first_frame..first_frame + corridor.frames).rev());
+            first_frame += corridor.frames;
+        }
+        self.tiers[Self::idx(Tier::Vram)].capacity += added;
+        added
+    }
+
+    pub(crate) fn vram_segment_count(&self) -> usize {
+        self.segments[Self::idx(Tier::Vram)].len()
+    }
+
+    /// Whether every slot of a VRAM segment is unowned, i.e. the whole corridor can go back to the
+    /// arena without stranding a chain or a live session's page table.
+    pub(crate) fn vram_segment_all_free(&self, index: usize) -> bool {
+        let Some(segment) = self.segments[Self::idx(Tier::Vram)].get(index) else {
+            return false;
+        };
+        let t = &self.tiers[Self::idx(Tier::Vram)];
+        (segment.first_frame..segment.first_frame + segment.frames)
+            .all(|slot| t.slots[slot].refcount == 0)
+    }
+
+    /// Retire one all-free VRAM segment and report its corridor so the caller can drop the arena
+    /// lease. The slots become tombstones: indices are never reused, so a later growth appends
+    /// above them and no live handle can alias a released address. `None` = segment still owned.
+    pub(crate) fn take_free_vram_segment(&mut self, index: usize) -> Option<KvFrameCorridor> {
+        if !self.vram_segment_all_free(index) {
+            return None;
+        }
+        let segment = self.segments[Self::idx(Tier::Vram)].remove(index);
+        let end = segment.first_frame + segment.frames;
+        let t = &mut self.tiers[Self::idx(Tier::Vram)];
+        t.free
+            .retain(|&slot| slot < segment.first_frame || slot >= end);
+        for slot in segment.first_frame..end {
+            t.slots[slot].present = false;
+        }
+        t.capacity -= segment.frames;
+        Some(KvFrameCorridor {
+            base: segment.base,
+            frames: segment.frames,
+        })
+    }
+
     /// Device address of a frame's first byte. Debug-asserts the tier has a corridor: a RAM-tier
     /// frame must never reach a page table (the caller writes 0 for RAM-tier entries instead).
     pub(crate) fn frame_addr(&self, id: FrameId) -> u64 {
@@ -235,7 +313,7 @@ impl FramePool {
     }
 
     pub(crate) fn capacity_frames(&self, tier: Tier) -> usize {
-        self.tiers[Self::idx(tier)].slots.len()
+        self.tiers[Self::idx(tier)].capacity
     }
 
     pub(crate) fn held_frames(&self, tier: Tier) -> usize {
@@ -259,12 +337,14 @@ impl FramePool {
     fn slot(&self, id: FrameId) -> &SlotState {
         let s = &self.tiers[Self::idx(id.tier())].slots[id.slot()];
         debug_assert!(s.refcount > 0, "handle {id:?} references a freed slot");
+        debug_assert!(s.present, "handle {id:?} references a retired slot");
         s
     }
 
     fn slot_mut(&mut self, id: FrameId) -> &mut SlotState {
         let s = &mut self.tiers[Self::idx(id.tier())].slots[id.slot()];
         debug_assert!(s.refcount > 0, "handle {id:?} references a freed slot");
+        debug_assert!(s.present, "handle {id:?} references a retired slot");
         s
     }
 
@@ -278,6 +358,7 @@ impl FramePool {
             refcount: 1,
             active: false,
             lru,
+            present: true,
         };
         t.held += 1;
         Some(FrameId::new(tier, slot))

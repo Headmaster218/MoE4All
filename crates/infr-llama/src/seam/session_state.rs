@@ -515,6 +515,10 @@ impl SeamKv {
         }
         let chain = std::mem::take(&mut self.segmented_kv.chain);
         kv.session_release(&chain);
+        // This conversation just left VRAM, so any elastic corridor chunk it was the last owner of
+        // goes back to the expert arena here — the baton still guarantees no dispatch names those
+        // frames, and the next checkout grows the corridor again if it needs the room.
+        kv.release_idle_corridors(be);
         Ok(full * page)
     }
 
