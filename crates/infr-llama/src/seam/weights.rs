@@ -1647,7 +1647,18 @@ impl SeamKv {
     /// key differs from the first pad token onward. The rolling recurrent checkpoints are real-token
     /// prefixes, so they stay out of this comparison; a multimodal session continues from its live
     /// frontier or from the tree, which is the same rule the resident path already applies.
-    pub(crate) fn continuation_prefix_len_keyed(&self, key_view: &[u32]) -> Option<usize> {
+    ///
+    /// `projection` is the setting the REQUEST resolves to. Rows computed under the other setting
+    /// are not a continuation of it at any depth, so a mismatch refuses the whole slot — the same
+    /// separation the tree gets from addressing a different root.
+    pub(crate) fn continuation_prefix_len_keyed(
+        &self,
+        key_view: &[u32],
+        projection: Option<bool>,
+    ) -> Option<usize> {
+        if self.paged_cache_projection() != projection {
+            return None;
+        }
         let view = self.paged_cache_view();
         let score = common_prefix_len(&view, key_view);
         (score > 0 && (score == view.len() || score == key_view.len())).then_some(score)
@@ -1704,15 +1715,19 @@ impl SeamKv {
     /// The token vector this slot's KV may be SHARED under: `cached`, with every image span's pad
     /// run replaced by that image's content block. Byte-identical to `cached` for a text
     /// conversation, so a slot that never saw an image keys and publishes exactly as before.
+    ///
+    /// The projection setting is NOT folded in here — it selects which tree the key addresses
+    /// ([`crate::paged_cache::PagedKv::best_match`]'s `projection`), because overwriting a key
+    /// position with a setting tag would erase the first token's identity.
     pub(crate) fn paged_cache_view(&self) -> Vec<u32> {
-        let mut view = crate::seam::image_cache_view(&self.cached, &self.image_cache_spans);
-        // The setting these rows were actually computed under. Without it, an ON chain and an OFF
-        // chain of the same prompt would be one entry, and a flip would be served activations the
-        // request did not ask for (see `infr_uncensor::KEY_TOKEN_BIT`).
-        if let Some(tag) = self.uncensor_key(self.uncensor.as_ref().and_then(|u| u.ran())) {
-            crate::seam::tag_uncensor_key(&mut view, tag);
-        }
-        view
+        crate::seam::image_cache_view(&self.cached, &self.image_cache_spans)
+    }
+
+    /// The projection setting this slot's own rows were materialized under, or `None` when the
+    /// session has no projection at all. This is the tree its [`Self::paged_cache_view`] belongs
+    /// to; a request resolves to its own setting through [`Self::uncensor_setting`].
+    pub(crate) fn paged_cache_projection(&self) -> Option<bool> {
+        self.uncensor_setting(None)
     }
 
     /// The tree key for a request about to run ON THIS SLOT: `tokens` tagged with the setting the
@@ -1735,30 +1750,6 @@ impl SeamKv {
         if let Some(u) = self.uncensor.as_mut() {
             u.ran = Some(on);
         }
-    }
-
-    pub(crate) fn paged_request_key(
-        &self,
-        tokens: &[u32],
-        requested: Option<bool>,
-    ) -> Option<Vec<u32>> {
-        let ran = self.uncensor.as_ref().and_then(|u| u.ran());
-        let tag = self.uncensor_key(Some(infr_uncensor::effective(requested, ran)))?;
-        let mut view = tokens.to_vec();
-        crate::seam::tag_uncensor_key(&mut view, tag);
-        Some(view)
-    }
-
-    /// The tree key this slot would use to run the projection setting `on` — `None` when the session
-    /// has no projection, which is the state where keys stay exactly as they were before.
-    ///
-    /// Callers pass the setting the REQUEST resolves to (`infr_uncensor::effective` of the request's
-    /// field and this slot's last real run), so a lookup addresses the chain the request will
-    /// actually compute under.
-    pub(crate) fn uncensor_key(&self, on: Option<bool>) -> Option<u32> {
-        self.uncensor
-            .as_ref()
-            .map(|_| infr_uncensor::key_token(on.unwrap_or(true)))
     }
 
     /// Record the image spans of the prompt this slot is about to materialize, so its chain is
@@ -2911,6 +2902,11 @@ mod tests {
         fn sync(&self) -> BackendResult<()> {
             self.inner.sync()
         }
+        // The CPU has no device page table to zero, so the paged detach's release is a no-op here
+        // instead of the trait's "unsupported by this backend" error.
+        fn release_segmented_kv(&self, _buffer: &dyn Buffer) -> BackendResult<()> {
+            Ok(())
+        }
     }
 
     fn rollback_pattern(
@@ -3764,5 +3760,78 @@ mod tests {
         assert!(checkpoint.tokens.is_empty());
         assert_eq!(checkpoint.copied, [false, false]);
         assert!(!checkpoint.ple_copied);
+    }
+
+    /// A publish can be REFUSED: a chain that does not cover the token prefix, or a recurrent
+    /// anchor that will not fit the aux budget. The slot has to survive that holding its frontier
+    /// — the one snapshot that can make a later publish resumable. Consuming it on the first
+    /// refusal would leave a conversation that re-prefills forever and still never enters the tree.
+    #[test]
+    fn a_refused_paged_publish_keeps_the_frontier_for_the_retry() {
+        let be = CountingRollbackBackend::new();
+        let (cfg, mut slot) = rollback_slot(&be, true, false, 31);
+        let page = 4;
+        let tokens: Vec<u32> = (1..=8).collect();
+        slot.segmented_kv = SegmentedKvState::enabled(page);
+        slot.cached = tokens.clone();
+        slot.paged_frontier = Some(Arc::new(crate::paged_cache::PagedCkpt {
+            boundary_tokens: tokens.len(),
+            layers: Vec::new(),
+            kbufs: vec![vec![7u8; 64]],
+            vbufs: Vec::new(),
+            ple: None,
+        }));
+        let tree = Arc::new(std::sync::Mutex::new(crate::paged_cache::PagedKv::new(
+            1 << 20,
+            page,
+            vec![0],
+            8,
+            0,
+            0,
+            None,
+            cfg.has_recurrent_state(),
+        )));
+        slot.set_paged(tree.clone());
+        let mut tree = tree.lock().unwrap();
+        tree.set_vram_segments(&[infr_core::backend::KvFrameCorridor {
+            base: 0x1_0000_0000,
+            frames: 8,
+        }]);
+        tree.set_aux_budget(1 << 20);
+        let chain: Vec<_> = (0..2).map(|_| tree.alloc_frame(&be).unwrap()).collect();
+
+        // A chain shorter than the ledger's complete pages must be a refusal, not a slice panic:
+        // paged growth stops mid-loop when a frame claim or a table write fails.
+        slot.segmented_kv.chain = chain[..1].to_vec();
+        assert!(slot.paged_publish_detach(&be, &cfg, &mut tree).is_err());
+        assert!(slot.paged_frontier.is_some());
+        slot.segmented_kv.chain = chain.clone();
+
+        // The refusal that matters: the chain is well formed, so the snapshots are collected
+        // FIRST and the tree rejects the anchor afterwards. This is the ordering that used to
+        // consume the frontier on a publish that never happened.
+        tree.set_aux_budget(32);
+        assert!(slot.paged_publish_detach(&be, &cfg, &mut tree).is_err());
+        assert!(
+            slot.paged_frontier.is_some(),
+            "a refused publish consumed the frontier"
+        );
+        assert_eq!(slot.cached, tokens, "a refused publish cleared the ledger");
+        assert_eq!(slot.segmented_kv.chain, chain);
+        assert!(
+            tree.best_match(&tokens, None).is_none(),
+            "a refused publish still entered the tree"
+        );
+
+        // The retry carries the SAME snapshot, publishes, and only then lets the frontier go.
+        tree.set_aux_budget(1 << 20);
+        assert_eq!(slot.paged_publish_detach(&be, &cfg, &mut tree).unwrap(), 8);
+        assert!(slot.paged_frontier.is_none());
+        assert!(slot.cached.is_empty());
+        let (node, reusable) = tree.best_match(&tokens, None).unwrap();
+        assert_eq!(reusable, 8);
+        let (depth, ckpt) = tree.hit_prefix(node, cfg.has_recurrent_state(), reusable);
+        assert_eq!(depth, 8);
+        assert!(ckpt.is_some(), "the retried publish lost the anchor");
     }
 }

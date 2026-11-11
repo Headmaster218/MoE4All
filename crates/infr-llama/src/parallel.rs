@@ -295,11 +295,6 @@ fn clamp_ram_frames_to_ram_room(
     ((room / frame_bytes.max(1)) as usize).min(declared)
 }
 
-fn tagged_key(kv: &SeamKv, key_view: &[u32], req: &RequestCtx) -> Vec<u32> {
-    kv.paged_request_key(key_view, req.sampling().uncensor)
-        .unwrap_or_else(|| key_view.to_vec())
-}
-
 fn pick_continuation(
     candidates: impl IntoIterator<Item = (usize, usize, usize)>,
     prompt_len: usize,
@@ -1937,6 +1932,7 @@ impl ParallelSeam {
                 ram_frames,
                 disk_frames,
                 disk_path,
+                cfg.has_recurrent_state(),
             );
             tree.set_vram_segments(&corridors);
             if elastic {
@@ -3042,7 +3038,7 @@ impl ParallelSeam {
             .expect("paged checkout requires a paged cache");
         let cfg: &Config = self.model.config();
         // Hybrid recurrent models pin reuse to snapshot boundaries; a dense model resumes anywhere.
-        let recurrent = cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3;
+        let recurrent = cfg.has_recurrent_state();
         let mut pool = self.pool.lock().expect("pool poisoned");
         loop {
             let free = (0..pool.slots.len())
@@ -3172,16 +3168,12 @@ impl ParallelSeam {
                 //    A resident continuation only loses to a STRICTLY deeper tree chain.
                 // The tree is addressed under the projection setting THIS request resolves to, so an
                 // ON chain is never handed to an OFF request — and a flip stops paying a wasted
-                // attach followed by a full re-prefill. No direction file loaded ⇒ plain tokens, and
-                // every chain that exists today keeps addressing exactly as it did.
-                let request_key = target_kv
-                    .as_ref()
-                    .and_then(|kv| kv.paged_request_key(prompt, req.sampling().uncensor));
-                let match_tokens: &[u32] = request_key.as_deref().unwrap_or(prompt);
+                // attach followed by a full re-prefill. No direction file loaded ⇒ the unprojected
+                // root, and every chain that exists today keeps addressing exactly as it did.
                 let attach_setting = target_kv
                     .as_ref()
                     .and_then(|kv| kv.uncensor_setting(req.sampling().uncensor));
-                if let Some((node, matched)) = tree.best_match(match_tokens) {
+                if let Some((node, matched)) = tree.best_match(prompt, attach_setting) {
                     // A dense model resumes wherever it matched; a hybrid recurrent model only at a
                     // boundary its entry carries a snapshot for (see `PagedKv::hit_prefix`).
                     let pages = tree.page_tokens();
@@ -3653,7 +3645,7 @@ impl ParallelSeam {
             .as_ref()
             .expect("paged multimodal checkout requires a paged cache");
         let cfg: &Config = self.model.config();
-        let recurrent = cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3;
+        let recurrent = cfg.has_recurrent_state();
         let mut pool = self.pool.lock().expect("pool poisoned");
         loop {
             let free = (0..pool.slots.len())
@@ -3672,8 +3664,11 @@ impl ParallelSeam {
                         .then_some(pool.slots[index].kv.as_ref())
                         .flatten()
                         .and_then(|kv| {
-                            kv.continuation_prefix_len_keyed(&tagged_key(kv, key_view, req))
-                                .map(|prefix| (index, prefix, prefix))
+                            kv.continuation_prefix_len_keyed(
+                                key_view,
+                                kv.uncensor_setting(req.sampling().uncensor),
+                            )
+                            .map(|prefix| (index, prefix, prefix))
                         })
                 }),
                 key_view.len(),
@@ -3681,7 +3676,10 @@ impl ParallelSeam {
             let continuation_prefix = continuation
                 .and_then(|index| {
                     pool.slots[index].kv.as_ref().and_then(|kv| {
-                        kv.continuation_prefix_len_keyed(&tagged_key(kv, key_view, req))
+                        kv.continuation_prefix_len_keyed(
+                            key_view,
+                            kv.uncensor_setting(req.sampling().uncensor),
+                        )
                     })
                 })
                 .unwrap_or(0);
@@ -3768,14 +3766,10 @@ impl ParallelSeam {
 
                 // 2. Deepest page-aligned chain the tree can serve for THIS key.
                 // Same setting-aware addressing on top of the image content key.
-                let request_key = target_kv
-                    .as_ref()
-                    .and_then(|kv| kv.paged_request_key(key_view, req.sampling().uncensor));
-                let match_key: &[u32] = request_key.as_deref().unwrap_or(key_view);
                 let attach_setting = target_kv
                     .as_ref()
                     .and_then(|kv| kv.uncensor_setting(req.sampling().uncensor));
-                if let Some((node, matched)) = tree.best_match(match_key) {
+                if let Some((node, matched)) = tree.best_match(key_view, attach_setting) {
                     let pages = tree.page_tokens();
                     let (mut reusable, mut ckpt) = tree.hit_prefix(node, recurrent, matched);
                     if reusable > continuation_prefix {
@@ -6154,13 +6148,16 @@ impl ParallelSeam {
                     .lock()
                     .expect("MTP heads poisoned")[work.slot]
                     .policy
-                    .record(rows, cycle_secs, committed);
+                    // `cycle_secs` paid for the full `choice.rows` draft; the confidence trim only
+                    // shortened VERIFY. Billing `rows` here would hand arm 2 the wide arm's cost.
+                    .record(choice.rows, cycle_secs, committed);
             }
             if first_cycle {
                 tracing::info!(
                     slot = work.slot,
                     context = old_len,
-                    rows,
+                    drafted = choice.rows - 1,
+                    verified = rows - 1,
                     accepted = accepted - 1,
                     published = emitted,
                     tail_kv_only = ec.spec.mtp_tail_kv_only,
@@ -6171,8 +6168,8 @@ impl ParallelSeam {
                 slot = work.slot,
                 lanes = indices.len(),
                 context = old_len,
-                rows,
-                drafted = predictions[lane_index].len(),
+                drafted = choice.rows - 1,
+                verified = rows - 1,
                 accepted = accepted - 1,
                 committed,
                 published = emitted,

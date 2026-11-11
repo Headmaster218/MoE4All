@@ -470,8 +470,9 @@ impl SeamKv {
     /// Publish the slot's conversation into the tree (complete pages only — the sub-page tail is
     /// dropped, matching the reuse rule) and detach the WHOLE chain: state zeroed, tables cleared,
     /// session owners dropped. Returns the published token count (0 detaches without publishing).
-    /// On publish `Err` the slot is untouched; a later table-write `Err` leaves the tree owning
-    /// what it published (the caller resets the slot). GPU baton held.
+    /// On publish `Err` the slot is untouched — including its `paged_frontier`, so a refused
+    /// publish can be retried with the same snapshot; a later table-write `Err` leaves the tree
+    /// owning what it published (the caller resets the slot). GPU baton held.
     pub(crate) fn paged_publish_detach(
         &mut self,
         be: &dyn Backend,
@@ -487,15 +488,24 @@ impl SeamKv {
         // chain holding image KV can only ever be handed back to the same pictures.
         let view = self.paged_cache_view();
         let full = view.len() / page;
+        // Paged growth stops mid-loop when a frame claim or a table write fails, so the ledger can
+        // name more complete pages than the chain backs. Publish refuses that mismatch; slicing
+        // first would panic instead of leaving the caller a slot it can reset and retry.
+        anyhow::ensure!(
+            self.segmented_kv.chain.len() >= full,
+            "paged detach: {full} complete pages but the slot chain carries {}",
+            self.segmented_kv.chain.len()
+        );
         if full > 0 {
             // Publish FIRST: until `publish` returns the frames are only session-owned, so a
             // failed publish leaves a consistent resident slot. After it, the tree holds its own
             // owners and the detach below can never strand the conversation.
-            let ckpts = self.take_paged_ckpts(be, full * page, page);
+            let ckpts = self.collect_paged_ckpts(be, full * page, page);
             kv.publish_with_ckpts(
                 view[..full * page].to_vec(),
                 self.segmented_kv.chain[..full].to_vec(),
                 ckpts,
+                self.paged_cache_projection(),
             )?;
         }
         be.sync()
@@ -528,8 +538,14 @@ impl SeamKv {
     /// a position the frame chain cannot address could never be attached. Two sources naming the
     /// same boundary describe the same state, so the second copy is dropped rather than counted
     /// twice against the tree's aux budget.
-    fn take_paged_ckpts(
-        &mut self,
+    ///
+    /// Nothing is consumed here. The publish can be REFUSED (a recurrent entry whose deepest
+    /// snapshot does not fit the aux budget, a misaligned chain), and the slot has to survive that
+    /// with its frontier intact — otherwise the one snapshot that could have made a later publish
+    /// resumable is gone and the conversation re-prefills forever. The caller clears the frontier
+    /// only once the tree owns the chain.
+    fn collect_paged_ckpts(
+        &self,
         be: &dyn Backend,
         published_tokens: usize,
         page: usize,
@@ -552,7 +568,7 @@ impl SeamKv {
                 ),
             }
         }
-        if let Some(frontier) = self.paged_frontier.take() {
+        if let Some(frontier) = self.paged_frontier.clone() {
             if usable(frontier.boundary_tokens)
                 && !out
                     .iter()

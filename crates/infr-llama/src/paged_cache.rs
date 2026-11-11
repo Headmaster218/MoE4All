@@ -27,9 +27,13 @@
 //! [`PagedCkpt`] snapshots keyed to a page-aligned token boundary; a recurrent session attaches
 //! ONLY at exactly such a boundary, uploads the snapshot into its live buffers, and resumes from
 //! there ([`PagedKv::entry_ckpt`]). Aux bytes live under their own budget — an eighth of the RAM
-//! tier — and snapshots NEVER evict frames: when the budget is exhausted the coldest entry's
-//! snapshot is dropped (its chain still serves as an attention prefix), because a snapshot is an
-//! accelerator and a frame is the cache itself.
+//! tier. What exhausting that budget costs depends on the model: a dense entry ignores its
+//! snapshots, so the coldest one is simply dropped and its chain still serves as an attention
+//! prefix. A recurrent entry resumes ONLY through them, so dropping its last snapshot would leave
+//! a chain that matches and then hands back zero tokens — dead cache holding frames. Such an entry
+//! is evicted whole instead, and a recurrent conversation that arrives with no usable snapshot is
+//! refused at publish time ([`PagedKv::publish_with_ckpts`], counted as `aux_refusals`) rather than
+//! cached unreachable.
 //!
 //! # Ownership and eviction
 //!
@@ -240,8 +244,16 @@ pub(crate) struct PagedKv {
     /// Host bytes currently held by every entry's `ckpts` (see [`PagedCkpt`]).
     aux_bytes: usize,
     /// Cap on `aux_bytes`: an eighth of the RAM-tier frame backing, 0 when that tier is off. Aux
-    /// is a restore accelerator, not a second KV copy — it never evicts frames, only itself.
+    /// is a restore accelerator, not a second KV copy: on a dense tree it only ever trims itself,
+    /// and on a recurrent tree it evicts the entry it can no longer make resumable (see
+    /// [`Self::recurrent`]) rather than keep an unreachable chain.
     aux_budget: usize,
+    /// Whether the model this tree serves summarizes its prefix into recurrent/PLE state
+    /// ([`crate::config::Config::has_recurrent_state`]). Decides what an entry's snapshots MEAN:
+    /// for a dense model they are an accelerator that may be trimmed freely, for a recurrent model
+    /// they are the only way back into the chain, so an entry that loses its last one is evicted
+    /// rather than left holding frames no hit can resume.
+    recurrent: bool,
     /// Elastic-corridor ceiling in frames; 0 keeps the corridor fixed at its init size.
     vram_ceiling: usize,
     /// Frames per growth transaction, and the floor below which idle segments are never handed
@@ -256,6 +268,10 @@ pub(crate) struct PagedKv {
     misses: u64,
     demotions: u64,
     evictions: u64,
+    /// Recurrent publishes refused for want of a resumable snapshot (none captured, a device
+    /// download failed, or the deepest one cannot fit the aux budget). A rising count means the
+    /// tree is caching nothing for this model and every request re-prefills.
+    aux_refusals: u64,
     tier_demotions: u64,
     tier_promotions: u64,
     disk_demotions: u64,
@@ -265,6 +281,10 @@ pub(crate) struct PagedKv {
 }
 
 impl PagedKv {
+    /// One root per projection setting: unprojected, OFF, ON (see [`Self::root`]).
+    const PROJECTION_ROOTS: usize = 3;
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         frame_bytes: u64,
         page_tokens: usize,
@@ -273,6 +293,7 @@ impl PagedKv {
         ram_frames: usize,
         disk_frames: usize,
         disk_path: Option<PathBuf>,
+        recurrent: bool,
     ) -> Self {
         assert!(
             page_tokens.is_power_of_two(),
@@ -320,7 +341,11 @@ impl PagedKv {
         };
         Self {
             pool: FramePool::new(frame_bytes, vram_frames, ram_frames, disk_frames),
-            nodes: vec![Node::new(None, Vec::new(), 0)],
+            // One root per projection setting — see [`Self::root`]. Root 0 is the unprojected
+            // tree, so a session with no direction file addresses exactly the keys it always did.
+            nodes: (0..Self::PROJECTION_ROOTS)
+                .map(|_| Node::new(None, Vec::new(), 0))
+                .collect(),
             free: Vec::new(),
             page_tokens,
             plane_offsets,
@@ -332,6 +357,7 @@ impl PagedKv {
             // corridor-only tree (`kv.paged` with no pool) has nothing to divide, so its caller
             // overrides this — see [`Self::set_aux_budget`].
             aux_budget: (ram_frames * frame_bytes as usize) / 8,
+            recurrent,
             vram_ceiling: 0,
             grow_chunk: 0,
             grow_stalled: false,
@@ -340,12 +366,29 @@ impl PagedKv {
             misses: 0,
             demotions: 0,
             evictions: 0,
+            aux_refusals: 0,
             tier_demotions: 0,
             tier_promotions: 0,
             disk_demotions: 0,
             disk_promotions: 0,
             corridor_grows: 0,
             corridor_shrinks: 0,
+        }
+    }
+
+    /// The root of the tree addressed under `projection`: `None` when the session loaded no
+    /// direction file, `Some(on)` for the setting its rows were actually computed under.
+    ///
+    /// One token prefix has two different bodies of activations, so the setting has to be part of
+    /// the address. Partitioning at the ROOT is what keeps the key injective: stamping a reserved
+    /// id into the first position instead would overwrite the first token — and a first image's
+    /// content id — so two prompts differing only there would be handed each other's KV rows.
+    /// Roots share the frame pool, the aux budget and the eviction clock; only the spine is split.
+    fn root(&self, projection: Option<bool>) -> usize {
+        match projection {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
         }
     }
 
@@ -375,9 +418,10 @@ impl PagedKv {
 
     /// Replace the aux (recurrent/PLE snapshot) budget implied by the RAM frame pool. Only the
     /// corridor-only tree needs it: `aux_budget` derives from a pool that is not there, and a zero
-    /// budget does not merely shrink reuse — [`Self::hit_prefix`] admits no recurrent resume point at
-    /// all, so every hybrid-recurrent hit silently re-prefills. Call once at init, before anything
-    /// publishes. Host bytes are still claimed per captured snapshot, never reserved here.
+    /// budget does not merely shrink reuse — a recurrent publish is refused outright (see
+    /// [`Self::publish_with_ckpts`]), so the tree caches nothing for a hybrid model. Call once at
+    /// init, before anything publishes. Host bytes are still claimed per captured snapshot, never
+    /// reserved here.
     pub(crate) fn set_aux_budget(&mut self, bytes: usize) {
         self.aux_budget = bytes;
     }
@@ -402,7 +446,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} sunk={} promoted={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} aux_refusals={} sunk={} promoted={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -426,6 +470,7 @@ impl PagedKv {
             self.misses,
             self.demotions,
             self.evictions,
+            self.aux_refusals,
             self.tier_demotions,
             self.tier_promotions,
             self.disk_demotions,
@@ -809,8 +854,12 @@ impl PagedKv {
     /// prompt diverges *inside* its edge — its chain still covers the shared prefix), the spine
     /// path nodes, and — when the prompt was fully consumed — entries deeper in the subtree (the
     /// superseded-ancestor case). Counts one hit/miss and stamps the chosen node + its frames.
-    pub(crate) fn best_match(&mut self, prompt: &[u32]) -> Option<(usize, usize)> {
-        let (path, consumed, partial) = self.walk(prompt);
+    pub(crate) fn best_match(
+        &mut self,
+        prompt: &[u32],
+        projection: Option<bool>,
+    ) -> Option<(usize, usize)> {
+        let (path, consumed, partial) = self.walk(self.root(projection), prompt);
         let pages = consumed / self.page_tokens;
         if pages == 0 {
             self.misses += 1;
@@ -991,18 +1040,26 @@ impl PagedKv {
     /// conversation the next request has to replay.
     #[cfg(test)]
     pub(crate) fn publish(&mut self, tokens: Vec<u32>, chain: Vec<FrameId>) -> Result<()> {
-        self.publish_with_ckpts(tokens, chain, Vec::new())
+        self.publish_with_ckpts(tokens, chain, Vec::new(), None)
     }
 
     /// [`Self::publish`] plus host snapshots of the conversation's recurrent state at
     /// page-aligned boundaries (hybrid recurrent models — see [`PagedCkpt`]). Every snapshot must
     /// describe a page-aligned prefix of the published tokens; anything else is a capture bug and
     /// is refused BEFORE any frame is pinned, so a rejected publish never leaks ownership.
+    ///
+    /// On a recurrent tree a snapshot is not an accelerator but the entry's only resume point, so
+    /// a conversation arriving without a usable one is refused on the same terms: publishing it
+    /// would pin a chain that every later hit resolves to zero reusable tokens.
+    ///
+    /// `projection` selects the tree the chain is published into (see [`Self::root`]); a lookup
+    /// under a different setting cannot reach it.
     pub(crate) fn publish_with_ckpts(
         &mut self,
         tokens: Vec<u32>,
         chain: Vec<FrameId>,
         ckpts: Vec<Arc<PagedCkpt>>,
+        projection: Option<bool>,
     ) -> Result<()> {
         let pages = tokens.len() / self.page_tokens;
         if chain.len() != pages {
@@ -1022,18 +1079,46 @@ impl PagedKv {
                 tokens.len()
             );
         }
+        if self.recurrent {
+            match ckpts.iter().max_by_key(|ckpt| ckpt.boundary_tokens) {
+                None => {
+                    self.aux_refusals += 1;
+                    return Err(anyhow!(
+                        "paged publish: a recurrent conversation is resumable only at a snapshot \
+                         boundary, and none was captured"
+                    ));
+                }
+                // Admission never trims the deepest snapshot, so it has to fit on its own.
+                Some(anchor) if anchor.bytes() > self.aux_budget => {
+                    self.aux_refusals += 1;
+                    return Err(anyhow!(
+                        "paged publish: the deepest recurrent snapshot needs {} B but the aux budget is {} B",
+                        anchor.bytes(),
+                        self.aux_budget
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         for &frame in &chain {
             self.pool.pin(frame);
         }
-        let node = self.descend_to(&tokens);
+        let node = self.descend_to(self.root(projection), &tokens);
         self.drop_superseded_ancestors(node);
         self.clock += 1;
-        let ckpts = self.admit_ckpts(ckpts);
-        // A newer entry at the same node replaces the old chain; the old frames' tree owners
-        // leave now (session owners keep any still in use alive).
-        let old = self.nodes[node].entry.replace(ChainEntry { chain, ckpts });
+        // The replaced entry leaves the aux budget NOW, before admission: its frames stay pinned
+        // by the new chain (or by their session owners), and counting its snapshots against the
+        // incoming ones would refuse a re-publish of the same conversation that trivially fits.
+        let old = self.nodes[node].entry.take();
+        if let Some(old) = &old {
+            self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&old.ckpts));
+        }
+        let ckpts = self.admit_ckpts(ckpts, node);
+        self.nodes[node].entry = Some(ChainEntry { chain, ckpts });
         if let Some(old) = old {
-            self.unpin_entry(old);
+            for frame in old.chain {
+                self.pool.unpin(frame);
+            }
         }
         self.nodes[node].last_access = self.clock;
         self.demotions += 1;
@@ -1049,42 +1134,65 @@ impl PagedKv {
         self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&entry.ckpts));
     }
 
-    /// Fit `ckpts` (sorted ascending by boundary) under the aux budget by dropping snapshots from
-    /// the coldest OTHER entries first, then the incoming ones shallowest-first. Returns the
-    /// snapshots that fit and adds their bytes to `aux_bytes`; entries keep their frames either
-    /// way — only an accelerator is ever trimmed here.
-    fn admit_ckpts(&mut self, mut ckpts: Vec<Arc<PagedCkpt>>) -> Vec<Arc<PagedCkpt>> {
+    /// Fit `ckpts` (sorted ascending by boundary) under the aux budget by yielding the coldest
+    /// OTHER entries first, then the incoming snapshots shallowest-first. Returns the snapshots
+    /// that fit and adds their bytes to `aux_bytes`. `incoming` is the node being published: never
+    /// a victim, because pruning it could free the index the caller still holds.
+    ///
+    /// What yielding costs depends on the model. A dense entry ignores its snapshots, so they leave
+    /// alone and its chain stays matchable. A recurrent entry resumes ONLY through them, so taking
+    /// its last one would leave a chain that matches and then hands back zero tokens — the whole
+    /// entry is evicted instead, returning its frames to the pool.
+    fn admit_ckpts(
+        &mut self,
+        mut ckpts: Vec<Arc<PagedCkpt>>,
+        incoming: usize,
+    ) -> Vec<Arc<PagedCkpt>> {
         ckpts.sort_by_key(|ckpt| ckpt.boundary_tokens);
         while !ckpts.is_empty() && self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget {
-            let Some(node) = self.coldest_ckpt_entry() else {
+            let Some(node) = self.coldest_ckpt_entry(incoming) else {
                 break;
             };
-            let dropped = std::mem::take(
-                &mut self.nodes[node]
+            if self.recurrent {
+                let entry = self.nodes[node]
                     .entry
-                    .as_mut()
-                    .expect("victim carries an entry")
-                    .ckpts,
-            );
-            self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&dropped));
+                    .take()
+                    .expect("victim carries an entry");
+                self.unpin_entry(entry);
+                self.evictions += 1;
+                self.prune_upward(node);
+            } else {
+                let dropped = std::mem::take(
+                    &mut self.nodes[node]
+                        .entry
+                        .as_mut()
+                        .expect("victim carries an entry")
+                        .ckpts,
+                );
+                self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&dropped));
+            }
         }
-        while self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget && !ckpts.is_empty() {
-            // Still over after every other entry yielded: the shallowest incoming snapshot goes.
-            // The deepest one is the one a same-conversation resume actually needs.
+        // Still over after every other entry yielded: the shallowest incoming snapshots go. The
+        // deepest one is what a same-conversation resume attaches, and on a recurrent tree it is
+        // the entry's only way in — the publish pre-flight proved it fits the budget alone.
+        let keep = usize::from(self.recurrent && !ckpts.is_empty());
+        while self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget && ckpts.len() > keep {
             ckpts.remove(0);
         }
         self.aux_bytes += ckpts_bytes(&ckpts);
         ckpts
     }
 
-    /// The coldest entry that still carries snapshots, in [`Self::evict_cold_one`]'s order.
-    fn coldest_ckpt_entry(&self) -> Option<usize> {
+    /// The coldest entry that still carries snapshots, in [`Self::evict_cold_one`]'s order,
+    /// ignoring `skip` (the node a publish is about to replace).
+    fn coldest_ckpt_entry(&self, skip: usize) -> Option<usize> {
         let mut best: Option<(bool, u64, usize)> = None;
         for (index, node) in self.nodes.iter().enumerate() {
-            if node
-                .entry
-                .as_ref()
-                .is_none_or(|entry| entry.ckpts.is_empty())
+            if index == skip
+                || node
+                    .entry
+                    .as_ref()
+                    .is_none_or(|entry| entry.ckpts.is_empty())
             {
                 continue;
             }
@@ -1175,9 +1283,9 @@ impl PagedKv {
     /// the number of leading `tokens` matched against the tree (`consumed`), and the child whose
     /// edge matched partially — the node where the query diverges *inside* an edge, whose entry
     /// chain still covers the shared prefix.
-    fn walk(&self, tokens: &[u32]) -> (Vec<usize>, usize, Option<usize>) {
-        let mut path = vec![0usize];
-        let mut node = 0usize;
+    fn walk(&self, root: usize, tokens: &[u32]) -> (Vec<usize>, usize, Option<usize>) {
+        let mut path = vec![root];
+        let mut node = root;
         let mut index = 0usize;
         while index < tokens.len() {
             let Some(&child) = self.nodes[node].children.get(&tokens[index]) else {
@@ -1233,8 +1341,8 @@ impl PagedKv {
         node.entry = None;
     }
 
-    fn descend_to(&mut self, tokens: &[u32]) -> usize {
-        let mut node = 0usize;
+    fn descend_to(&mut self, root: usize, tokens: &[u32]) -> usize {
+        let mut node = root;
         let mut index = 0usize;
         while index < tokens.len() {
             let first = tokens[index];
@@ -1365,11 +1473,28 @@ mod tests {
     }
 
     fn cache_ram(vram_frames: usize, ram_frames: usize) -> PagedKv {
-        let mut kv = PagedKv::new(FB, PAGE, vec![0, FB / 2], vram_frames, ram_frames, 0, None);
+        let mut kv = PagedKv::new(
+            FB,
+            PAGE,
+            vec![0, FB / 2],
+            vram_frames,
+            ram_frames,
+            0,
+            None,
+            false,
+        );
         kv.set_vram_segments(&[KvFrameCorridor {
             base: 0x1_0000_0000,
             frames: vram_frames,
         }]);
+        kv
+    }
+
+    /// A tree serving a hybrid recurrent model: an entry resumes ONLY at a snapshot boundary, so
+    /// its aux is a correctness constraint rather than a tuning knob.
+    fn cache_recurrent(vram_frames: usize, ram_frames: usize) -> PagedKv {
+        let mut kv = cache_ram(vram_frames, ram_frames);
+        kv.recurrent = true;
         kv
     }
 
@@ -1391,6 +1516,7 @@ mod tests {
             ram_frames,
             disk_frames,
             Some(path.clone()),
+            false,
         );
         kv.set_vram_segments(&[KvFrameCorridor {
             base: 0x1_0000_0000,
@@ -1595,7 +1721,7 @@ mod tests {
         assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
         assert_eq!(kv.corridor_shrinks, 2);
         assert_eq!(kv.plane_addr(chain[0], 0), addr_before);
-        let (node, reusable) = kv.best_match(&(1..=16).collect::<Vec<_>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=16).collect::<Vec<_>>(), None).unwrap();
         assert_eq!(reusable, 16);
         assert_eq!(kv.entry_chain(node, reusable), chain[..4]);
 
@@ -1632,11 +1758,11 @@ mod tests {
         let a = grow(&mut kv, 3); // 12 tokens, exactly 3 pages
         kv.publish((1..=12).collect(), a.clone()).unwrap();
         // Exact replay: full chain.
-        let (node, reusable) = kv.best_match(&(1..=12).collect::<Vec<_>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=12).collect::<Vec<_>>(), None).unwrap();
         assert_eq!(reusable, 12);
         assert_eq!(kv.entry_chain(node, reusable), a);
         // Longer prompt: truncated continuation at the entry length.
-        let (node, reusable) = kv.best_match(&(1..=20).collect::<Vec<_>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=20).collect::<Vec<_>>(), None).unwrap();
         assert_eq!(reusable, 12);
         assert_eq!(kv.entry_chain(node, reusable), a);
     }
@@ -1650,7 +1776,7 @@ mod tests {
                                 // Prompt shares 10 tokens with the entry: only 2 complete pages (8 tokens) are reusable.
         let mut prompt: Vec<u32> = (1..=10).collect();
         prompt.push(99);
-        let (node, reusable) = kv.best_match(&prompt).unwrap();
+        let (node, reusable) = kv.best_match(&prompt, None).unwrap();
         assert_eq!(reusable, 8);
         assert_eq!(kv.entry_chain(node, reusable), a[..2]);
     }
@@ -1662,7 +1788,9 @@ mod tests {
         kv.publish((1..=8).collect(), short.clone()).unwrap();
         kv.session_release(&short); // tree-only owners
                                     // Session B restores the prefix (pin), grows one divergence page, then demotes the chain.
-        let (node, reusable) = kv.best_match(&(1..=10).collect::<Vec<u32>>()).unwrap();
+        let (node, reusable) = kv
+            .best_match(&(1..=10).collect::<Vec<u32>>(), None)
+            .unwrap();
         assert_eq!(reusable, 8);
         let mut long = kv.entry_chain(node, reusable);
         kv.session_attach(&long);
@@ -1673,7 +1801,7 @@ mod tests {
         assert_eq!(kv.pool.refcount(long[0]), 1, "tree owns each frame once");
         assert_eq!(kv.pool.held_frames(Tier::Vram), 3, "two shared + one new");
         // The deeper entry truncates to continue the shorter prompt.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
         assert_eq!(reusable, 8);
         assert_eq!(kv.entry_chain(node, reusable), long[..2]);
     }
@@ -1685,7 +1813,7 @@ mod tests {
         kv.publish((1..=8).collect(), a.clone()).unwrap();
         kv.session_release(&a); // demotion complete: tree-only
         assert_eq!(kv.pool.refcount(a[0]), 1);
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<_>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<_>>(), None).unwrap();
         let chain = kv.entry_chain(node, reusable);
         kv.session_attach(&chain); // restoring session gains owners
         assert_eq!(kv.pool.refcount(a[0]), 2);
@@ -1724,7 +1852,7 @@ mod tests {
             .expect("eviction made room");
         assert_eq!(kv.evictions, 1);
         assert_eq!(
-            kv.best_match(&(1..=8).collect::<Vec<_>>()),
+            kv.best_match(&(1..=8).collect::<Vec<_>>(), None),
             None,
             "entry gone"
         );
@@ -1744,16 +1872,108 @@ mod tests {
             .unwrap();
         kv.session_release(&b_frames);
         // A's entry sits on one side of the split, B's on the other; both stay matchable.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<_>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<_>>(), None).unwrap();
         assert_eq!(reusable, 8);
         assert_eq!(kv.entry_chain(node, reusable), a);
-        let (node, reusable) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12]).unwrap();
+        let (node, reusable) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12], None).unwrap();
         assert_eq!(reusable, 8);
         assert_eq!(kv.entry_chain(node, reusable), b_frames);
         // A prompt diverging inside the split edge still shares the complete first page.
-        let (node, reusable) = kv.best_match(&[1, 2, 3, 4, 5, 99]).unwrap();
+        let (node, reusable) = kv.best_match(&[1, 2, 3, 4, 5, 99], None).unwrap();
         assert_eq!(reusable, 4);
         assert_eq!(kv.entry_chain(node, reusable), vec![a[0]]);
+    }
+
+    /// The projection setting partitions the tree at the ROOT, so the key's first position keeps
+    /// its own identity. Stamping a reserved setting id over it instead would make these two
+    /// prompts one chain, and the second reader would be handed the first one's activations.
+    #[test]
+    fn a_projected_key_still_addresses_its_own_first_token() {
+        let mut kv = cache(4);
+        let chain = grow(&mut kv, 1);
+        kv.publish_with_ckpts(vec![1, 2, 3, 4], chain, Vec::new(), Some(true))
+            .unwrap();
+        let (node, reusable) = kv.best_match(&[1, 2, 3, 4], Some(true)).unwrap();
+        assert_eq!(reusable, 4);
+        let (depth, ckpt) = kv.hit_prefix(node, false, reusable);
+        assert_eq!(depth, 4);
+        assert!(ckpt.is_none());
+        assert!(
+            kv.best_match(&[9, 2, 3, 4], Some(true)).is_none(),
+            "a different first token is a different conversation"
+        );
+    }
+
+    /// Same rule for a prompt that OPENS with an image: position 0 carries that picture's content
+    /// id, and a setting stamp would erase it — two different first pictures would share one chain.
+    #[test]
+    fn a_projected_key_still_addresses_its_own_first_image() {
+        use crate::seam::IMAGE_CACHE_TOKEN_BIT;
+        let mut kv = cache(4);
+        let picture_a = 0x1234_5678 | IMAGE_CACHE_TOKEN_BIT;
+        let picture_b = 0x8765_4321 | IMAGE_CACHE_TOKEN_BIT;
+        let chain = grow(&mut kv, 1);
+        kv.publish_with_ckpts(vec![picture_a, 2, 3, 4], chain, Vec::new(), Some(true))
+            .unwrap();
+        assert_eq!(
+            kv.best_match(&[picture_a, 2, 3, 4], Some(true)).unwrap().1,
+            4
+        );
+        assert!(
+            kv.best_match(&[picture_b, 2, 3, 4], Some(true)).is_none(),
+            "a different first picture is a different conversation"
+        );
+    }
+
+    /// One token prefix has three bodies of activations — unprojected, OFF and ON — so all three
+    /// chains coexist and each lookup reaches only its own. A session with no direction file keeps
+    /// addressing the unprojected root, exactly as it did before the setting existed.
+    #[test]
+    fn each_projection_setting_addresses_a_disjoint_chain() {
+        let mut kv = cache(8);
+        let tokens = vec![1, 2, 3, 4];
+        let mut nodes = Vec::new();
+        for projection in [None, Some(false), Some(true)] {
+            let chain = grow(&mut kv, 1);
+            kv.publish_with_ckpts(tokens.clone(), chain, Vec::new(), projection)
+                .unwrap();
+            let (node, reusable) = kv.best_match(&tokens, projection).unwrap();
+            assert_eq!(reusable, 4, "projection={projection:?}");
+            nodes.push(node);
+        }
+        assert_eq!(nodes.len(), 3);
+        assert!(
+            nodes
+                .iter()
+                .all(|&a| nodes.iter().filter(|&&b| a == b).count() == 1),
+            "three settings must be three entries, not one overwritten twice"
+        );
+        // Every chain is still reachable after all three publishes.
+        for (projection, &node) in [None, Some(false), Some(true)].into_iter().zip(&nodes) {
+            let (found, reusable) = kv.best_match(&tokens, projection).unwrap();
+            assert_eq!(found, node);
+            assert_eq!(reusable, 4);
+        }
+    }
+
+    /// Partitioning must not cost prefix reuse INSIDE one setting: a shared head still hits, and
+    /// only the divergent tail is replayed.
+    #[test]
+    fn a_shared_prefix_still_hits_inside_one_projection() {
+        let mut kv = cache(4);
+        let chain = grow(&mut kv, 2);
+        kv.publish_with_ckpts((1..=8).collect(), chain, Vec::new(), Some(false))
+            .unwrap();
+        let (node, reusable) = kv
+            .best_match(&[1, 2, 3, 4, 9, 10, 11, 12], Some(false))
+            .unwrap();
+        assert_eq!(reusable, 4);
+        let (depth, ckpt) = kv.hit_prefix(node, false, reusable);
+        assert_eq!(depth, 4);
+        assert!(ckpt.is_none());
+        assert!(kv
+            .best_match(&[1, 2, 3, 4, 9, 10, 11, 12], Some(true))
+            .is_none());
     }
 
     #[test]
@@ -1793,13 +2013,16 @@ mod tests {
             kv.session_release(&chain);
         }
         assert_eq!(kv.nodes.len(), steady, "churn grew the arena: {steady}");
-        assert!(steady <= 4, "steady arena should stay small, got {steady}");
+        assert!(
+            steady <= PagedKv::PROJECTION_ROOTS + 3,
+            "steady arena should stay small, got {steady}"
+        );
         let (_, reusable) = kv
-            .best_match(&[381, 382, 383, 384])
+            .best_match(&[381, 382, 383, 384], None)
             .expect("the second-newest conversation survived");
         assert_eq!(reusable, 4);
         assert!(
-            kv.best_match(&[1, 2, 3, 4]).is_none(),
+            kv.best_match(&[1, 2, 3, 4], None).is_none(),
             "evicted prompt is gone"
         );
     }
@@ -1810,6 +2033,7 @@ mod tests {
         let f1 = kv.alloc_frame(&MockDma::default()).unwrap();
         kv.publish(vec![1, 2, 3, 4], vec![f1]).unwrap();
         kv.session_release(&[f1]);
+        let spine = node_of(&kv, f1);
         let f2 = kv.alloc_frame(&MockDma::default()).unwrap();
         let f3 = kv.alloc_frame(&MockDma::default()).unwrap();
         kv.publish(vec![1, 2, 3, 4, 5, 6, 7, 8], vec![f2, f3])
@@ -1817,14 +2041,14 @@ mod tests {
         kv.session_release(&[f2, f3]);
         // The 4-token spine node lost its entry to the supersede and became a pass-through with
         // one child: it must merge into that child, not linger.
-        assert!(kv.free.contains(&1), "pass-through spine was not freed");
+        assert!(kv.free.contains(&spine), "pass-through spine was not freed");
         let (node, reusable) = kv
-            .best_match(&[1, 2, 3, 4])
+            .best_match(&[1, 2, 3, 4], None)
             .expect("the merged spine still matches");
         assert_eq!(reusable, 4);
         assert_eq!(kv.entry_chain(node, 4), vec![f2]);
         let (_, reusable) = kv
-            .best_match(&[1, 2, 3, 4, 5, 6, 7, 8])
+            .best_match(&[1, 2, 3, 4, 5, 6, 7, 8], None)
             .expect("the full conversation matches");
         assert_eq!(reusable, 8);
     }
@@ -1844,7 +2068,7 @@ mod tests {
         assert_eq!(kv.evictions, 0, "sinking precedes eviction");
         assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
         // A fully sunk chain still matches; the entry is not gone, only resting.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
         assert_eq!(reusable, 8);
         // Give the corridor its frame back so the whole chain can promote at once.
         kv.session_release(&[fresh]);
@@ -1915,18 +2139,20 @@ mod tests {
             .alloc_frame(&dma)
             .expect("sinking a leaf freed a VRAM frame");
         assert!(kv.tier_demotions >= 1);
-        assert!(kv.best_match(&(1..=8).collect::<Vec<u32>>()).is_some());
+        assert!(kv
+            .best_match(&(1..=8).collect::<Vec<u32>>(), None)
+            .is_some());
         assert!(
-            kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12]).is_some(),
+            kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12], None).is_some(),
             "sinking never deletes an entry"
         );
         kv.session_release(&[c]);
         // Promote branch A fully, then branch B: the shared frame must land on one id owned
         // by exactly two chains again.
-        let (node_a, reusable_a) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        let (node_a, reusable_a) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
         let back_a = kv.entry_chain_promoted(&dma, node_a, reusable_a);
         assert_eq!(back_a.len(), 2, "the corridor can host the whole chain");
-        let (node_b, reusable_b) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12]).unwrap();
+        let (node_b, reusable_b) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12], None).unwrap();
         let back_b = kv.entry_chain_promoted(&dma, node_b, reusable_b);
         assert_eq!(back_b.len(), 2);
         assert_eq!(back_a[0], back_b[0], "shared frame id agrees again");
@@ -1966,7 +2192,7 @@ mod tests {
         assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
         kv.session_release(&[c]); // give the corridor one frame back for the promotion
                                   // A is a Disk chain now: still matchable, still resting.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>()).unwrap();
+        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
         assert_eq!(reusable, 8);
         // Promotion walks A back up: disk->RAM (cascading B to disk for the RAM slot) then
         // RAM->VRAM. The mock's pattern check can only pass if the file round-trip was exact.
@@ -2064,6 +2290,7 @@ mod tests {
             (1..=16).collect(),
             a.clone(),
             vec![ckpt(12, 64), ckpt(4, 64)], // insertion order must not matter
+            None,
         )
         .unwrap();
         let node = node_of(&kv, a[0]);
@@ -2088,7 +2315,7 @@ mod tests {
         assert_eq!(kv.aux_budget, 0, "no RAM pool means no implied aux budget");
         kv.set_aux_budget(128);
         let a = grow(&mut kv, 4); // 16 tokens
-        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(12, 64)])
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(12, 64)], None)
             .unwrap();
         let node = node_of(&kv, a[0]);
         let (reusable, ckpt) = kv.hit_prefix(node, true, 16);
@@ -2109,6 +2336,7 @@ mod tests {
             (1..=16).collect(),
             a.clone(),
             vec![ckpt(12, 64), ckpt(4, 64)],
+            None,
         )
         .unwrap();
         let node = node_of(&kv, a[0]);
@@ -2131,23 +2359,24 @@ mod tests {
     fn aux_budget_trims_the_coldest_snapshots_before_any_frame() {
         let mut kv = cache_ram(8, 8); // aux budget = 8 MiB RAM backing / 8 = 1 MiB
         let a = grow(&mut kv, 2);
-        kv.publish_with_ckpts((1..=8).collect(), a.clone(), vec![ckpt(4, 400_000)])
+        kv.publish_with_ckpts((1..=8).collect(), a.clone(), vec![ckpt(4, 400_000)], None)
             .unwrap();
         let b = grow(&mut kv, 2);
-        kv.publish_with_ckpts((21..=28).collect(), b.clone(), vec![ckpt(8, 400_000)])
+        kv.publish_with_ckpts((21..=28).collect(), b.clone(), vec![ckpt(8, 400_000)], None)
             .unwrap();
         assert_eq!(kv.aux_bytes, 800_000, "both snapshots fit");
         // A third snapshot exceeds the budget: the COLDEST entry's aux leaves first...
         let c = grow(&mut kv, 2);
-        kv.publish_with_ckpts((41..=48).collect(), c.clone(), vec![ckpt(8, 400_000)])
+        kv.publish_with_ckpts((41..=48).collect(), c.clone(), vec![ckpt(8, 400_000)], None)
             .unwrap();
         assert_eq!(kv.aux_bytes, 800_000);
         assert!(
             kv.entry_ckpt(node_of(&kv, a[0]), 8).is_none(),
             "the coldest snapshot was trimmed"
         );
-        // ...while its FRAMES and its match stay intact: aux never evicts cache content.
-        assert!(kv.best_match(&(1..=8).collect::<Vec<_>>()).is_some());
+        // ...while its FRAMES and its match stay intact: on a DENSE tree aux is only an
+        // accelerator, so trimming it never evicts cache content.
+        assert!(kv.best_match(&(1..=8).collect::<Vec<_>>(), None).is_some());
         assert_eq!(kv.evictions, 0);
         // A single conversation may not monopolize the budget either.
         let d = grow(&mut kv, 2);
@@ -2155,6 +2384,7 @@ mod tests {
             (61..=68).collect(),
             d.clone(),
             vec![ckpt(8, 3 * FB as usize)],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2165,11 +2395,107 @@ mod tests {
     }
 
     #[test]
+    fn a_recurrent_publish_without_a_resumable_snapshot_is_refused() {
+        let mut kv = cache_recurrent(8, 8);
+        kv.set_aux_budget(0);
+        let a = grow(&mut kv, 2); // 8 tokens
+        let tokens = (1..=8).collect::<Vec<u32>>();
+        // No snapshot at all — the shape a failed device download leaves behind. The chain would
+        // match and then resume zero tokens, so it must never reach the tree.
+        assert!(
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), Vec::new(), None)
+                .is_err(),
+            "a recurrent entry without a snapshot is unreachable cache"
+        );
+        // A snapshot the budget cannot hold is the same dead end.
+        assert!(
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(4, 64)], None)
+                .is_err(),
+            "the anchor has to fit the aux budget on its own"
+        );
+        assert_eq!(kv.aux_refusals, 2);
+        assert_eq!(kv.aux_bytes, 0);
+        assert!(kv.best_match(&tokens, None).is_none());
+        assert!(kv.nodes.iter().all(|node| node.entry.is_none()));
+        // Refusal lands BEFORE any frame is pinned, so the session still owns them alone.
+        assert_eq!(kv.pool.held_frames(Tier::Vram), 2);
+        kv.session_release(&a);
+        assert_eq!(kv.pool.held_frames(Tier::Vram), 0, "no tree owner leaked");
+    }
+
+    #[test]
+    fn aux_pressure_evicts_a_recurrent_entry_instead_of_stranding_it() {
+        let mut kv = cache_recurrent(8, 8);
+        kv.set_aux_budget(400_000); // room for exactly one snapshot
+        let a = grow(&mut kv, 2);
+        kv.publish_with_ckpts((1..=8).collect(), a.clone(), vec![ckpt(4, 400_000)], None)
+            .unwrap();
+        kv.session_release(&a);
+        assert_eq!(kv.pool.refcount(a[0]), 1, "tree-only owner");
+        let b = grow(&mut kv, 2);
+        kv.publish_with_ckpts((21..=28).collect(), b.clone(), vec![ckpt(8, 400_000)], None)
+            .unwrap();
+        kv.session_release(&b);
+        // The colder entry left WHOLE: stripping its anchor would have kept a chain that matches
+        // and resumes nothing, holding frames the pool could otherwise hand out.
+        assert_eq!(kv.aux_bytes, 400_000);
+        assert_eq!(kv.evictions, 1);
+        assert!(kv.best_match(&(1..=8).collect::<Vec<_>>(), None).is_none());
+        assert_eq!(
+            kv.pool.held_frames(Tier::Vram),
+            2,
+            "the evicted entry's frames went back to the corridor"
+        );
+        let (node, matched) = kv.best_match(&(21..=28).collect::<Vec<_>>(), None).unwrap();
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!((reusable, ckpt.unwrap().boundary_tokens), (8, 8));
+        for entry in kv.nodes.iter().filter_map(|node| node.entry.as_ref()) {
+            assert!(!entry.ckpts.is_empty(), "every survivor is resumable");
+        }
+    }
+
+    #[test]
+    fn a_recurrent_republish_reuses_its_own_aux_and_keeps_the_anchor() {
+        let mut kv = cache_recurrent(8, 8);
+        kv.set_aux_budget(400_000);
+        let a = grow(&mut kv, 4); // 16 tokens
+        let tokens = (1..=16).collect::<Vec<u32>>();
+        kv.publish_with_ckpts(
+            tokens.clone(),
+            a.clone(),
+            vec![ckpt(4, 200_000), ckpt(12, 200_000)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(kv.aux_bytes, 400_000);
+        // The same conversation published again with one more boundary: the replaced entry's bytes
+        // must not count against the incoming ones, and the shallow snapshot may go but the
+        // deepest — the one a resume actually attaches — may not.
+        kv.publish_with_ckpts(
+            tokens.clone(),
+            a.clone(),
+            vec![ckpt(4, 200_000), ckpt(12, 200_000), ckpt(16, 200_000)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(kv.aux_bytes, 400_000, "the budget is not exceeded");
+        assert_eq!(kv.evictions, 0, "a conversation never evicts itself");
+        let node = node_of(&kv, a[0]);
+        let (reusable, ckpt) = kv.hit_prefix(node, true, 16);
+        assert_eq!((reusable, ckpt.unwrap().boundary_tokens), (16, 16));
+    }
+
+    #[test]
     fn eviction_and_supersession_release_aux_bytes() {
         let mut kv = cache_ram(8, 8);
         let short = grow(&mut kv, 2);
-        kv.publish_with_ckpts((1..=8).collect(), short.clone(), vec![ckpt(4, 300_000)])
-            .unwrap();
+        kv.publish_with_ckpts(
+            (1..=8).collect(),
+            short.clone(),
+            vec![ckpt(4, 300_000)],
+            None,
+        )
+        .unwrap();
         kv.session_release(&short);
         assert_eq!(kv.aux_bytes, 300_000);
         // Publishing a longer conversation supersedes the shared ancestor entry: its snapshot
@@ -2177,8 +2503,13 @@ mod tests {
         let mut long = kv.entry_chain(node_of(&kv, short[0]), 8);
         kv.session_attach(&long);
         long.push(grow(&mut kv, 1)[0]);
-        kv.publish_with_ckpts((1..=12).collect(), long.clone(), vec![ckpt(12, 500_000)])
-            .unwrap();
+        kv.publish_with_ckpts(
+            (1..=12).collect(),
+            long.clone(),
+            vec![ckpt(12, 500_000)],
+            None,
+        )
+        .unwrap();
         assert_eq!(kv.aux_bytes, 500_000, "the superseded snapshot left");
         kv.session_release(&long);
         assert!(kv.evict_cold_one());
@@ -2195,17 +2526,17 @@ mod tests {
         let a = grow(&mut kv, 2);
         let tokens = (1..=8).collect::<Vec<u32>>();
         assert!(
-            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(6, 64)])
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(6, 64)], None)
                 .is_err(),
             "boundary is not page aligned"
         );
         assert!(
-            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(0, 64)])
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(0, 64)], None)
                 .is_err(),
             "empty boundary"
         );
         assert!(
-            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(16, 64)])
+            kv.publish_with_ckpts(tokens.clone(), a.clone(), vec![ckpt(16, 64)], None)
                 .is_err(),
             "boundary lies beyond the chain"
         );

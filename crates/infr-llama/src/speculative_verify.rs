@@ -54,15 +54,21 @@ impl MtpCostPolicy {
         MtpChoice { rows, probe: false }
     }
 
-    pub(crate) fn record(&mut self, rows: usize, seconds: f64, committed: usize) {
-        if !(1..=MAX_VERIFY_ROWS).contains(&rows)
+    /// Bill one cycle to the arm that was DRAFTED, not the arm that survived the confidence trim.
+    ///
+    /// `drafted_rows` is the width [`Self::choose`] requested — the counterfactual this policy is
+    /// choosing between. `seconds` covers that full draft even when the trim shortened VERIFY, so
+    /// billing the trimmed width would credit arm 2 with arm 4's draft cost and make the wide arms
+    /// look free. `committed` is the rows actually retained, which is the payoff either way.
+    pub(crate) fn record(&mut self, drafted_rows: usize, seconds: f64, committed: usize) {
+        if !(1..=MAX_VERIFY_ROWS).contains(&drafted_rows)
             || !seconds.is_finite()
             || seconds <= 0.0
             || committed == 0
         {
             return;
         }
-        let index = rows - 1;
+        let index = drafted_rows - 1;
         if self.samples[index] == 0 {
             self.seconds[index] = seconds;
             self.committed[index] = committed as f64;
@@ -401,6 +407,63 @@ mod tests {
         let choice = policy.choose(MAX_VERIFY_ROWS, true);
         assert_eq!(choice.rows, 4);
         assert!(!choice.probe);
+    }
+
+    /// The confidence trim shortens VERIFY *after* the head already drafted at full width, so the
+    /// cycle's cost belongs to the DRAFTED arm — the width `choose()` will request next. Billing the
+    /// trimmed width instead would leave the wide arm frozen on its warm-up sample while arm 2
+    /// absorbs every expensive cycle. Both call sites pass the pre-trim width (`mtp/qwen4.rs`'s
+    /// `drafted_rows`, `parallel.rs`'s `choice.rows`); this locks the semantics they depend on.
+    #[test]
+    fn a_trimmed_cycle_bills_the_drafted_arm_and_never_falls_back_to_plain() {
+        let mut policy = MtpCostPolicy::default();
+        for _ in 0..2 {
+            policy.record(1, 0.040, 1);
+            policy.record(2, 0.050, 2);
+            policy.record(3, 0.060, 3);
+            policy.record(4, 0.070, 4);
+        }
+        let warm_seconds = policy.seconds;
+        let warm_committed = policy.committed;
+        assert_eq!(policy.choose(MAX_VERIFY_ROWS, true).rows, 4);
+
+        // A real trim: four drafted rows whose cumulative confidence only justifies two VERIFY rows.
+        let probabilities = [0.9f32, 0.01, 0.9];
+        let drafted_rows = MAX_VERIFY_ROWS;
+        let verified_rows = crate::mtp::confidence_verify_rows(&probabilities, drafted_rows, 0.5);
+        assert_eq!(verified_rows, 2);
+
+        for _ in 0..100 {
+            // Both retained rows were accepted, and the cycle still cost a full wide draft.
+            policy.record(drafted_rows, 0.064, verified_rows);
+        }
+        assert_eq!(
+            policy.seconds[1], warm_seconds[1],
+            "arm 2 was never drafted"
+        );
+        assert_eq!(policy.committed[1], warm_committed[1]);
+        assert_eq!(
+            policy.seconds[2], warm_seconds[2],
+            "arm 3 was never drafted"
+        );
+        assert_eq!(policy.committed[2], warm_committed[2]);
+        assert!(
+            (policy.seconds[3] - 0.064).abs() < 1e-6,
+            "arm 4 must absorb the trimmed cycles: {}",
+            policy.seconds[3]
+        );
+        assert!(
+            (policy.committed[3] - 2.0).abs() < 1e-4,
+            "arm 4 must bill the retained rows, not the drafted ones: {}",
+            policy.committed[3]
+        );
+        for _ in 0..128 {
+            let choice = policy.choose(MAX_VERIFY_ROWS, true);
+            assert!(
+                choice.probe || choice.rows >= 2,
+                "trimming must not push the policy to plain"
+            );
+        }
     }
 
     #[test]

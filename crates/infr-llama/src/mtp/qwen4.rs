@@ -3125,7 +3125,10 @@ impl Qwen4MtpRuntime {
             };
             let draft_secs = t_draft.elapsed().as_secs_f64();
             timing.draft_secs += draft_secs;
-            timing.total_drafted += verify_tokens - 1;
+            // The head already paid for this width; a trim below cannot refund it. `drafted_rows`
+            // is what the cost policy must bill, because it is the width `choose()` asks for next
+            // cycle — see `MtpCostPolicy::record`.
+            let drafted_rows = verify_tokens;
             if want_probs {
                 verify_tokens = confidence_verify_rows(
                     &draft.probabilities,
@@ -3133,6 +3136,8 @@ impl Qwen4MtpRuntime {
                     ec.spec.mtp_slot_min_accept,
                 );
             }
+            timing.total_drafted += verify_tokens - 1;
+            timing.total_trimmed += drafted_rows - verify_tokens;
             let candidates = draft.tokens;
 
             refill_verify_feed(
@@ -3248,7 +3253,7 @@ impl Qwen4MtpRuntime {
             timing.catchup_secs += catchup_secs;
             if ec.spec.mtp_adaptive_width {
                 self.cost_policy.record(
-                    verify_tokens,
+                    drafted_rows,
                     draft_secs + verify_secs + catchup_secs,
                     retained,
                 );
@@ -3256,7 +3261,8 @@ impl Qwen4MtpRuntime {
 
             if ec.prof.stages || infr_core::pager_profile::active() {
                 tracing::info!(
-                    "[qwen4 mtp cycle {cycle}] drafted={} accepted={accepted_spec} committed={retained} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
+                    "[qwen4 mtp cycle {cycle}] drafted={} verified={} accepted={accepted_spec} committed={retained} draft={:.1}ms verify={:.1}ms catchup={:.1}ms",
+                    drafted_rows - 1,
                     verify_tokens - 1,
                     draft_secs * 1e3,
                     verify_secs * 1e3,
@@ -3285,10 +3291,11 @@ impl Qwen4MtpRuntime {
         if ec.prof.stages || infr_core::pager_profile::active() {
             let (draft_pct, verify_pct, catchup_pct) = timing.phase_shares();
             tracing::info!(
-                "[qwen4 mtp summary] {cycle} cycles, {}/{} accepted (alpha={:.3}), {generated} tokens generated, phase share: draft {:.0}% verify {:.0}% catchup {:.0}%",
+                "[qwen4 mtp summary] {cycle} cycles, {}/{} verified accepted (alpha={:.3}), {} rows trimmed before verify, {generated} tokens generated, phase share: draft {:.0}% verify {:.0}% catchup {:.0}%",
                 timing.total_accepted,
                 timing.total_drafted,
                 timing.alpha(),
+                timing.total_trimmed,
                 draft_pct,
                 verify_pct,
                 catchup_pct,

@@ -160,7 +160,7 @@ fn paged_frontier_pos(
     above: usize,
     max_ctx: usize,
 ) -> Option<usize> {
-    if !paged || page_tokens == 0 || !(cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
+    if !paged || page_tokens == 0 || !cfg.has_recurrent_state() {
         return None;
     }
     let frontier = page_floor(prompt_len.saturating_sub(1), page_tokens);
