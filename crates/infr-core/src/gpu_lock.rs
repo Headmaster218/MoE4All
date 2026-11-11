@@ -195,7 +195,9 @@ pub enum Skipped {
     /// The port is busy and the holder did not answer as `infr` — a foreign service, an `infr`
     /// older than this code, or our own probe timing out.
     NotIdentifiable(String),
-    /// `bind()` failed with something other than "address in use".
+    /// The lock socket could not be established: `bind()` failed with something other than
+    /// "address in use", or the banner thread that owns the listener could not be spawned — which
+    /// drops the listener and frees the port again.
     BindFailed(std::io::Error),
 }
 
@@ -272,33 +274,42 @@ fn ask_holder(addr: SocketAddr) -> Option<Holder> {
 /// Answer the banner from a dedicated thread, on the socket that IS the lock.
 ///
 /// The listener lives (and dies) with this thread, which is what makes [`Lock`]'s release work.
-/// Errors are tolerated, not fatal: a banner thread that gives up only degrades a later contender
-/// from "refused" to "warned and started", because the bind — not the thread — is the lock.
-fn serve_banner(listener: TcpListener, banner: String, released: Arc<AtomicBool>) {
-    let _ = Builder::new().name("infr-gpu-lock".into()).spawn(move || {
-        let mut failures = 0usize;
-        for stream in listener.incoming() {
-            match stream {
-                Ok(mut stream) => {
-                    if released.load(Ordering::Relaxed) {
-                        // Our own wake-up connect (see `Lock::drop`): stop answering and let the
-                        // listener — and with it the port — go.
-                        return;
+/// A thread that gives up LATER only degrades a later contender from "refused" to "warned and
+/// started". A thread that never STARTS is different: `spawn` drops the closure, and the listener
+/// with it, so the port is free again — reporting `Held` then would advertise a lock nobody holds.
+/// That failure is handed back to the caller instead of being tolerated.
+fn serve_banner(
+    listener: TcpListener,
+    banner: String,
+    released: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    Builder::new()
+        .name("infr-gpu-lock".into())
+        .spawn(move || {
+            let mut failures = 0usize;
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        if released.load(Ordering::Relaxed) {
+                            // Our own wake-up connect (see `Lock::drop`): stop answering and let the
+                            // listener — and with it the port — go.
+                            return;
+                        }
+                        let _ = stream.write_all(banner.as_bytes());
+                        let _ = stream.shutdown(Shutdown::Write);
                     }
-                    let _ = stream.write_all(banner.as_bytes());
-                    let _ = stream.shutdown(Shutdown::Write);
-                }
-                // An accept that keeps failing would spin, so stop answering after a few.
-                Err(_) => {
-                    failures += 1;
-                    if failures > 16 || released.load(Ordering::Relaxed) {
-                        return;
+                    // An accept that keeps failing would spin, so stop answering after a few.
+                    Err(_) => {
+                        failures += 1;
+                        if failures > 16 || released.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
-        }
-    });
+        })
+        .map(|_| ())
 }
 
 /// Try to take the machine's GPU startup lock for `device`, advertising `label` (the invocation)
@@ -315,13 +326,19 @@ pub fn acquire_on(port: u16, device: &str, label: &str) -> Outcome {
     match TcpListener::bind(addr) {
         Ok(listener) => {
             let released = Arc::new(AtomicBool::new(false));
-            register(port, &released);
-            serve_banner(listener, Holder::banner(device, label), released.clone());
-            Outcome::Held(Lock {
-                device: device.to_string(),
-                port,
-                released,
-            })
+            match serve_banner(listener, Holder::banner(device, label), released.clone()) {
+                Ok(()) => {
+                    // Registered only once the thread owns the listener: a flag for a lock that
+                    // was never established would shadow the real one on the next acquire.
+                    register(port, &released);
+                    Outcome::Held(Lock {
+                        device: device.to_string(),
+                        port,
+                        released,
+                    })
+                }
+                Err(error) => Outcome::Skipped(Skipped::BindFailed(error)),
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => match ask_holder(addr) {
             // Our own banner: this process already holds the lock, so hand back the SAME release
@@ -454,6 +471,24 @@ mod tests {
             acquire_on(port, "metal", "run -m model.gguf"),
             Outcome::Held(_)
         ));
+    }
+
+    /// The premise of `acquire_on`'s spawn-failure arm: `Builder::spawn` consumes the closure, so a
+    /// listener moved into it is DROPPED when the OS refuses the thread — `bind` succeeded, yet the
+    /// port is free again and there is no lock to report holding. An impossible stack size is a
+    /// deterministic refusal.
+    #[test]
+    fn a_refused_spawn_drops_the_listener_and_frees_the_port() {
+        let listener = TcpListener::bind(lock_addr_on(0)).expect("ephemeral bind");
+        let port = listener.local_addr().unwrap().port();
+        let refused = Builder::new()
+            .stack_size(usize::MAX)
+            .spawn(move || drop(listener));
+        assert!(refused.is_err(), "the OS accepted an impossible stack size");
+        assert!(
+            TcpListener::bind(lock_addr_on(port)).is_ok(),
+            "the listener outlived the refused spawn, so the port would still be locked"
+        );
     }
 
     /// A live holder that answers for another device must NOT refuse us: multi-GPU users run one
