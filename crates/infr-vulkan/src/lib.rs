@@ -2333,6 +2333,9 @@ struct VkSegmentedKvBuffer {
     spec: SegmentedKvSpec,
     table: VkBuffer,
     segments: Mutex<Vec<VkBuffer>>,
+    /// High-water mark of pages written straight into the table by the paged tier, whose frames
+    /// are shared with the radix tree and so never appear in `segments`.
+    table_pages: AtomicUsize,
     reservation: Mutex<Option<SegmentedKvReservation>>,
 }
 
@@ -2342,8 +2345,14 @@ struct SegmentedKvReservation {
 }
 
 impl VkSegmentedKvBuffer {
+    /// Live pages, from whichever tier committed them. Decode command-ahead reads this to prove
+    /// the next token's KV rows already exist, so a paged plane reporting 0 disables it outright.
     fn committed(&self) -> usize {
-        self.segments.lock().unwrap().len()
+        self.segments
+            .lock()
+            .unwrap()
+            .len()
+            .max(self.table_pages.load(Ordering::Acquire))
     }
 
     pub(crate) fn table_buffer(&self) -> &VkBuffer {
@@ -7181,6 +7190,7 @@ impl VulkanBackend {
             spec,
             table,
             segments: Mutex::new(Vec::new()),
+            table_pages: AtomicUsize::new(0),
             reservation: Mutex::new(None),
         })
     }
@@ -8835,6 +8845,7 @@ impl Backend for VulkanBackend {
             }
             // Keep the reservation: future growth must reuse the same frozen coordinates.
             segments.truncate(keep);
+            segmented.table_pages.fetch_min(keep, Ordering::AcqRel);
             Ok(())
         })
     }
@@ -8852,6 +8863,7 @@ impl Backend for VulkanBackend {
                 std::ptr::write_bytes(table_ptr, 0, segmented.table.size);
             }
             segmented.segments.lock().unwrap().clear();
+            segmented.table_pages.store(0, Ordering::Release);
             *segmented.reservation.lock().unwrap() = None;
             Ok(())
         })
@@ -9012,6 +9024,7 @@ impl Backend for VulkanBackend {
                 std::mem::size_of::<u64>(),
             );
         }
+        segmented.table_pages.fetch_max(page + 1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -12562,6 +12575,53 @@ mod tests {
             restored, payload,
             "invalid copies must not partially execute"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn paged_table_writes_report_committed_depth() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        const MIB: usize = 1024 * 1024;
+        let _pool = be.init_unified_vram(8 * MIB).expect("init unified VRAM");
+        let kv = be
+            .alloc_segmented_kv(SegmentedKvSpec {
+                logical_bytes: 4 * MIB,
+                segment_bytes: MIB,
+                segment_elements: MIB / 2,
+                max_segments: 4,
+            })
+            .expect("allocate segmented KV")
+            .expect("Vulkan supports segmented KV");
+        let corridor = be
+            .alloc_kv_frames(MIB as u64, 4)
+            .expect("claim KV corridor")
+            .expect("Vulkan supports KV corridors");
+        let base = corridor[0].base;
+        let segmented = as_segmented_kv(kv.as_ref()).expect("segmented downcast");
+        assert_eq!(segmented.committed(), 0);
+
+        // The paged tier never fills `segments`, so depth must come from the table writes:
+        // decode command-ahead reads it to prove the next token's rows exist, and a 0 there
+        // silently drops every paged decode back to synchronous record+submit.
+        be.set_kv_table_entry(kv.as_ref(), 0, base).unwrap();
+        assert_eq!(segmented.committed(), 1);
+        be.set_kv_table_entry(kv.as_ref(), 2, base + 2 * MIB as u64)
+            .unwrap();
+        assert_eq!(segmented.committed(), 3);
+        assert_eq!(be.buffer_committed_bytes(kv.as_ref()).unwrap(), 3 * MIB);
+
+        be.trim_segmented_kv(kv.as_ref(), 0).unwrap();
+        assert_eq!(segmented.committed(), 0);
+        be.set_kv_table_entry(kv.as_ref(), 1, base + MIB as u64)
+            .unwrap();
+        be.release_segmented_kv(kv.as_ref()).unwrap();
+        assert_eq!(segmented.committed(), 0);
     }
 
     #[test]
