@@ -20,6 +20,7 @@ members = [
     "crates/infr-testkit",
     "crates/infr-uncensor",
     "crates/infr-vision",
+    "crates/infr-console",
 ]
 
 [workspace.package]

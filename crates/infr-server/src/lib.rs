@@ -16,6 +16,8 @@
 //!   POST /v1/responses/{id}/cancel      -> 400: nothing is queued to cancel            (auth)
 //!   POST /v1/embeddings         -> OpenAI-compatible normalized float embeddings         (auth)
 //!   POST /v1/audio/transcriptions -> native WAV transcription JSON/text or segment SSE (auth)
+//!   GET  /internal/stats        -> slot table + resource occupancy, for an external console (auth)
+//!   GET  /internal/config       -> knob schema + effective values (secrets redacted)       (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
@@ -273,6 +275,16 @@ pub trait ChatGenerator: Send + Sync {
         progress: Option<infr_core::GenerationProgressCallback>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
+
+    /// Point-in-time resource occupancy for `GET /internal/stats`. `None` on a backend with nothing
+    /// to report, which the endpoint renders as an ABSENT block rather than a zeroed one: a fake
+    /// "0 experts resident" reads as a measurement and is worse than no number.
+    ///
+    /// Must be cheap and must not take the GPU turn-taking baton — a monitoring poll that stalls
+    /// decode is worse than no monitoring.
+    fn resources(&self) -> Option<infr_core::telemetry::EngineReport> {
+        None
+    }
 }
 
 /// Embedding backend driven by `/v1/embeddings`. Like [`ChatGenerator`], the server knows
@@ -1529,6 +1541,37 @@ impl RequestProgress {
         }
     }
 
+    /// Non-consuming display read for the telemetry endpoint.
+    ///
+    /// [`Self::display_snapshot`] DRAINS `display_decode_tokens` to build the terminal table's
+    /// interval rate. A monitoring poll that did the same would steal that rate, so this derives
+    /// decode speed from the cumulative token count over the time since the Prefill boundary.
+    fn peek(&self) -> RequestDisplay {
+        let state = self.state.lock().expect("request progress poisoned");
+        let Some(progress) = state.latest else {
+            return RequestDisplay {
+                phase: "Starting",
+                speed: 0.0,
+                context_tokens: None,
+                context_limit: None,
+            };
+        };
+        let elapsed = self.started.elapsed();
+        let (phase, speed) = match progress.phase {
+            infr_core::GenerationPhase::Prefill => ("Prefill", state.prefill_rate.speed(elapsed)),
+            infr_core::GenerationPhase::Decode => {
+                let decode = elapsed.saturating_sub(state.prefill_elapsed.unwrap_or(elapsed));
+                ("Decode", per_second(progress.completion_tokens, decode))
+            }
+        };
+        RequestDisplay {
+            phase,
+            speed,
+            context_tokens: Some(progress.context_tokens),
+            context_limit: Some(progress.context_limit),
+        }
+    }
+
     /// Reconcile a final count if a backend returned between natural progress callbacks, then
     /// return the exact context snapshot and model-visible phase timings.
     fn finish(&self, outcome: ChatOutcome) -> Option<FinishedProgress> {
@@ -1701,6 +1744,97 @@ impl ActivityDashboard {
             window,
         )
     }
+
+    /// The same registry as JSON, for `GET /internal/stats`. Clones the slot vector (an `Arc` per
+    /// live request) so each request's progress mutex is taken OUTSIDE the dashboard lock.
+    fn snapshot(&self) -> Vec<SlotSnapshot> {
+        let slots = self
+            .slots
+            .lock()
+            .expect("activity dashboard poisoned")
+            .clone();
+        slots
+            .iter()
+            .map(|slot| SlotSnapshot {
+                kind: match slot.kind {
+                    DashboardSlotKind::Chat => "chat",
+                    DashboardSlotKind::Embedding => "embedding",
+                },
+                ordinal: slot.ordinal,
+                capacity: slot.capacity,
+                model: slot.model.to_string(),
+                request: slot.activity.as_ref().map(|activity| match activity {
+                    DashboardActivity::Chat { req_id, progress } => {
+                        let display = progress.peek();
+                        let latest = progress
+                            .state
+                            .lock()
+                            .expect("request progress poisoned")
+                            .latest;
+                        RequestSnapshot {
+                            req_id: *req_id,
+                            phase: display.phase,
+                            tokens_per_second: display.speed,
+                            elapsed_ms: progress.started.elapsed().as_millis() as u64,
+                            prompt_tokens: latest.map_or(0, |p| p.prompt_tokens),
+                            cached_prompt_tokens: latest.map_or(0, |p| p.cached_prompt_tokens),
+                            prefill_tokens: latest.map_or(0, |p| p.prefill_tokens),
+                            completion_tokens: latest.map_or(0, |p| p.completion_tokens),
+                            context_tokens: display.context_tokens,
+                            context_limit: display.context_limit,
+                        }
+                    }
+                    // An embedding call has no token progress: `prompt_tokens` carries the input
+                    // count and the rate stays zero rather than inventing a token speed.
+                    DashboardActivity::Embedding {
+                        req_id,
+                        inputs,
+                        started,
+                    } => RequestSnapshot {
+                        req_id: *req_id,
+                        phase: "Embedding",
+                        tokens_per_second: 0.0,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        prompt_tokens: *inputs as u64,
+                        cached_prompt_tokens: 0,
+                        prefill_tokens: 0,
+                        completion_tokens: 0,
+                        context_tokens: None,
+                        context_limit: None,
+                    },
+                }),
+            })
+            .collect()
+    }
+}
+
+/// One admission slot as the console renders it. `request` is absent when the slot is idle.
+#[derive(serde::Serialize)]
+struct SlotSnapshot {
+    kind: &'static str,
+    ordinal: usize,
+    capacity: usize,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<RequestSnapshot>,
+}
+
+#[derive(serde::Serialize)]
+struct RequestSnapshot {
+    req_id: u64,
+    /// `Starting` / `Prefill` / `Decode` / `Embedding`. The model-visible phase, NOT the wire
+    /// distinction between reasoning and answer text — both are `Decode` (see
+    /// [`infr_core::GenerationPhase`]); a console that wants thinking/tool-call/output splits them
+    /// from the stream it is already proxying.
+    phase: &'static str,
+    tokens_per_second: f64,
+    elapsed_ms: u64,
+    prompt_tokens: u64,
+    cached_prompt_tokens: u64,
+    prefill_tokens: u64,
+    completion_tokens: u64,
+    context_tokens: Option<u64>,
+    context_limit: Option<u64>,
 }
 
 struct DashboardActivityGuard {
@@ -2467,6 +2601,8 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health_handler))
+        .route("/internal/stats", get(internal_stats_handler))
+        .route("/internal/config", get(internal_config_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route(
@@ -2628,6 +2764,90 @@ async fn shutdown_latched() {
 /// [`auth_gate`].
 async fn health_handler() -> StatusCode {
     StatusCode::OK
+}
+
+/// Live occupancy for an external console: one entry per admission slot, the process gauges, and
+/// each hosted model's resource report. GATED — it discloses the model set and the machine's
+/// memory layout, which is exactly what [`models_handler`] gates.
+///
+/// Reads only. It does not drain [`ServeStats`] (that would steal the periodic reporter's interval)
+/// and does not call [`RequestProgress::display_snapshot`] (that would steal the terminal
+/// dashboard's decode rate); the non-consuming [`RequestProgress::peek`] is used instead.
+async fn internal_stats_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
+    let (busy_slots, total_slots) = state.slot_occupancy();
+    let models: Vec<serde_json::Value> = state
+        .models
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "id": model.id.as_ref(),
+                "capacity": model.capacity,
+                "resources": model.engine.as_ref().and_then(|engine| engine.resources()),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "slots": state.dashboard.snapshot(),
+        "totals": {
+            "active": state.stats.active.load(Ordering::Relaxed),
+            "queued": state.stats.queued.load(Ordering::Relaxed),
+            "busy_slots": busy_slots,
+            "total_slots": total_slots,
+        },
+        "models": models,
+        "uncensor": {
+            "vector_loaded": state.cfg.uncensor.vector.is_some(),
+            "first_layer": state.cfg.uncensor.first_layer,
+            "last_layer": state.cfg.uncensor.last_layer,
+        },
+        "spec": {
+            "mtp": state.cfg.spec.mtp,
+            "k": state.cfg.spec.k,
+            "draft": state.cfg.spec.draft.is_some(),
+        },
+    }))
+    .into_response()
+}
+
+/// The knob tree a graphical launcher renders: every config path with its type, shipped default
+/// and doc comment, plus this process's effective values. GATED.
+///
+/// The schema half is compile-time public information. The effective half is NOT: a secret's value
+/// is replaced by [`REDACTED`] so the console can show "configured" without ever holding the key.
+async fn internal_config_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, &headers) {
+        return denied;
+    }
+    let schema = Config::schema();
+    let effective: serde_json::Map<String, serde_json::Value> = schema
+        .iter()
+        .map(|field| {
+            let value = state.cfg.get_path(&field.path).unwrap_or_default();
+            let value = if is_secret_path(&field.path) {
+                if value.is_empty() || value == "none" {
+                    String::new()
+                } else {
+                    REDACTED.to_string()
+                }
+            } else {
+                value
+            };
+            (field.path.clone(), serde_json::Value::String(value))
+        })
+        .collect();
+    Json(serde_json::json!({ "schema": schema, "effective": effective })).into_response()
+}
+
+const REDACTED: &str = "<redacted>";
+
+/// Paths whose EFFECTIVE value must never leave the process. Matching on the leaf name rather than
+/// an exact list means a secret added to any section later is redacted by default.
+fn is_secret_path(path: &str) -> bool {
+    let leaf = path.rsplit('.').next().unwrap_or(path);
+    matches!(leaf, "api_key" | "token" | "secret" | "password")
 }
 
 /// The hosted model list — GATED by the same bearer check as `/v1/chat/completions`.
@@ -4083,6 +4303,91 @@ mod tests {
             "test-model",
             Arc::new(Config::default()),
         ))
+    }
+
+    async fn get_json(router: Router, path: &str, key: Option<&str>) -> (StatusCode, String) {
+        let mut request = Request::get(path);
+        if let Some(key) = key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let response = router
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// The launcher needs every knob, but the effective value of a secret must never leave the
+    /// process — an external console is one more place for a key to leak from.
+    #[tokio::test]
+    async fn internal_config_reports_the_whole_schema_with_secrets_redacted() {
+        let mut cfg = Config::default();
+        cfg.serve.api_key = Some("sk-do-not-leak".into());
+        let router = build_router(AppState::headless("test-model", Arc::new(cfg)));
+
+        let (status, _) = get_json(router.clone(), "/internal/config", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) =
+            get_json(router, "/internal/config", Some("sk-do-not-leak")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("sk-do-not-leak"), "the key escaped: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["schema"].as_array().unwrap().len(),
+            Config::all_paths().len()
+        );
+        assert_eq!(json["effective"]["serve.api_key"], REDACTED);
+    }
+
+    /// A monitoring poll must leave the terminal reporter's interval intact. Both counters it
+    /// could steal are checked: `ServeStats`' window (drained by `drain`) and the per-request
+    /// `display_decode_tokens` (drained by `display_snapshot`).
+    #[tokio::test]
+    async fn internal_stats_does_not_consume_the_terminal_reporters_window() {
+        let state = AppState::headless("test-model", Arc::new(Config::default()));
+        state.stats.active.store(1, Ordering::Relaxed);
+
+        let progress = Arc::new(RequestProgress::new(
+            7,
+            "test-model".into(),
+            None,
+            Arc::clone(&state.stats),
+        ));
+        progress.observe(infr_core::GenerationProgress {
+            phase: infr_core::GenerationPhase::Decode,
+            prompt_tokens: 120,
+            cached_prompt_tokens: 20,
+            prefill_tokens: 100,
+            completion_tokens: 40,
+            context_tokens: 160,
+            context_limit: 4096,
+        });
+        let _slot = state.dashboard.claim_chat("test-model", 7, Arc::clone(&progress));
+
+        let router = build_router(state.clone());
+        for _ in 0..3 {
+            let (status, body) = get_json(router.clone(), "/internal/stats", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let slot = &json["slots"][0];
+            assert_eq!(slot["request"]["req_id"], 7);
+            assert_eq!(slot["request"]["phase"], "Decode");
+            assert_eq!(slot["request"]["cached_prompt_tokens"], 20);
+            // No engine behind a headless state: absent, not a zeroed measurement.
+            assert!(json["models"][0]["resources"].is_null());
+        }
+
+        let window = state.stats.drain(Duration::from_secs(1));
+        assert_eq!(window.prompt_tokens, 100, "the poll drained the interval");
+        assert_eq!(window.gen_tokens, 40, "the poll drained the interval");
+        assert_eq!(
+            progress.display_snapshot(Duration::from_secs(1)).speed,
+            40.0,
+            "the poll drained the terminal dashboard's decode counter"
+        );
     }
 
     const BODY_LIMIT_REQUESTS: [(&str, &str); 3] = [

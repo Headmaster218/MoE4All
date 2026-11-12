@@ -479,6 +479,28 @@ impl PagedKv {
         self.pool.frame_addr(frame) + self.plane_offsets[plane]
     }
 
+    /// Structured twin of [`Self::stats_line`]'s corridor columns, for the telemetry endpoint.
+    /// `free` is what a growing request can still claim before eviction, so `free_vram_tokens()`
+    /// is the "how much context is left in the pool" number.
+    pub(crate) fn pool_report(&self) -> infr_core::telemetry::KvPoolReport {
+        use infr_core::telemetry::{KvPoolReport, KvTierReport};
+        let tier = |name: &'static str, t: Tier| KvTierReport {
+            tier: name,
+            capacity_frames: self.pool.capacity_frames(t) as u64,
+            held_frames: self.pool.held_frames(t) as u64,
+            free_frames: self.pool.free_frames(t) as u64,
+        };
+        KvPoolReport {
+            page_tokens: self.page_tokens as u64,
+            frame_bytes: self.pool.frame_bytes(),
+            tiers: vec![
+                tier("vram", Tier::Vram),
+                tier("ram", Tier::Ram),
+                tier("disk", Tier::Disk),
+            ],
+        }
+    }
+
     /// One-line console report. Besides the tree counters it spells the corridor in the units an
     /// operator reads on the serve console: frames (allocated/total/free), the token capacity they
     /// buy, and the GiB claimed — `held` counts every allocated frame (tree chains AND live

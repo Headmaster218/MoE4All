@@ -470,6 +470,10 @@ enum Cmd {
         #[command(flatten)]
         device: DeviceOpts,
     },
+    /// Print every configuration knob's path, type, shipped default and doc as JSON, without
+    /// touching a GPU or loading a model. A graphical launcher renders its whole knob tree from
+    /// this — including while no engine is running, which is exactly when launch parameters get set.
+    ConfigSchema,
     /// Capture or finish a compact diagnostic report. Run this in another terminal while a service
     /// remains active, or pass --source to add the user's description to an automatic fatal report.
     Report {
@@ -899,6 +903,7 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Pull { .. } => "pull",
         Cmd::Devices => "devices",
         Cmd::Resources { .. } => "resources",
+        Cmd::ConfigSchema => "config-schema",
         Cmd::Report { .. } => "report",
         Cmd::Submission { .. } => "submission",
         Cmd::TestPlanPrompt { .. } => "test-plan-prompt",
@@ -1700,6 +1705,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
         | Cmd::Transcribe { .. }
         | Cmd::Speak { .. }
         | Cmd::Devices
+        | Cmd::ConfigSchema
         | Cmd::Report { .. }
         | Cmd::Submission { .. }
         | Cmd::TestPlanPrompt { .. }
@@ -1714,6 +1720,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
         Cmd::Resources { .. } => cmd_resources(cfg),
+        Cmd::ConfigSchema => cmd_config_schema(),
         Cmd::TestPlanPrompt {
             model,
             messages,
@@ -2238,6 +2245,17 @@ fn cmd_resources(cfg: &Config) -> anyhow::Result<()> {
             "device": format!("Vulkan{}", selected.index),
             "device_name": selected.name,
         })
+    );
+    Ok(())
+}
+
+/// The knob tree a graphical launcher renders. No GPU, no model, no config file required: the
+/// defaults are the SHIPPED ones, so a launcher can show them before any engine exists.
+fn cmd_config_schema() -> anyhow::Result<()> {
+    // print-ok: machine-readable output of the launcher-facing schema command.
+    println!(
+        "{}",
+        serde_json::json!({ "schema": infr_core::config::Config::schema() })
     );
     Ok(())
 }
@@ -3398,6 +3416,10 @@ impl infr_server::ChatGenerator for ParallelGenerator {
             progress,
             on_delta,
         )
+    }
+
+    fn resources(&self) -> Option<infr_core::telemetry::EngineReport> {
+        Some(self.engine.resource_report())
     }
 }
 

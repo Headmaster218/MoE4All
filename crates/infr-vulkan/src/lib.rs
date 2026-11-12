@@ -6113,6 +6113,33 @@ impl VulkanBackend {
         }
     }
 
+    /// Resource occupancy for the telemetry endpoint (`GET /internal/stats`).
+    ///
+    /// Takes no GPU baton and forces no statistics handoff: the session mutex is held only for the
+    /// length of a counter read, so a monitoring poll cannot stall decode. `kv_pool` is filled in
+    /// by the seam, which owns the paged-KV corridor.
+    pub fn resource_report(&self) -> infr_core::telemetry::EngineReport {
+        let vram = self.vram();
+        infr_core::telemetry::EngineReport {
+            vram: Some(infr_core::telemetry::VramReport {
+                total: vram.total,
+                available: vram.available,
+                tracked_bytes: self.shared.budget_used(),
+                live_budget: vram.live,
+                uma: vram.uma,
+            }),
+            rss_bytes: infr_core::hostmem::process_resident_bytes(),
+            experts: self
+                .moe_pager
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|session| session.expert_report())
+                .unwrap_or_default(),
+            kv_pool: None,
+        }
+    }
+
     /// Locked access to the paged-MoE session for the adapter's `execute_static` — `pub(crate)`
     /// (only `adapter.rs` reaches into this); see `pager.rs`'s module doc for why this lives
     /// outside the `Graph`/`Bindings` seam instead of a per-op flag.

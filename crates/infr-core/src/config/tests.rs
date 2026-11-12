@@ -1467,6 +1467,40 @@ fn env_layer_reads_every_key() {
     }
 }
 
+/// The launcher's schema is the SAME table as `--set`'s path set, with a usable type, default and
+/// doc on every leaf. A graphical knob tree built from a schema that silently lost a field, or
+/// rendered every default as `none`, would be worse than no tree at all.
+#[test]
+fn schema_covers_every_path_with_a_real_default_and_doc() {
+    let schema = Config::schema();
+    let paths: Vec<&str> = schema.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, Config::all_paths(), "schema and path set drifted");
+    let defaults = Config::default();
+    let mut undocumented = Vec::new();
+    for field in &schema {
+        assert!(!field.ty.is_empty(), "{} has no type", field.path);
+        assert!(
+            !field.ty.contains(' '),
+            "{} type `{}` was not normalized",
+            field.path,
+            field.ty
+        );
+        assert_eq!(
+            field.default,
+            defaults.get_path(&field.path).expect("schema path resolves"),
+            "{} default is not the shipped default",
+            field.path
+        );
+        if field.doc.is_empty() {
+            undocumented.push(field.path.as_str());
+        }
+    }
+    assert!(
+        undocumented.is_empty(),
+        "no doc comment for the launcher to show: {undocumented:?}"
+    );
+}
+
 /// Every manifest path is a REAL config path, so `--set`, the TOML schema and the manifest cannot
 /// drift apart. (The reverse does not hold: `device.threads` and `kernels.cpu.reference` are
 /// fields with no env key, by design.)

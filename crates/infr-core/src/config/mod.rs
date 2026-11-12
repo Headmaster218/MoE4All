@@ -44,7 +44,7 @@ pub use reasoning::ReasoningEffort;
 mod tests;
 
 pub use cli::ConfigOverrides;
-pub use partial::{ConfigValue, SetPathError};
+pub use partial::{ConfigField, ConfigValue, SetPathError};
 
 use partial::cfg_struct;
 
@@ -1166,9 +1166,15 @@ cfg_struct! {
         timeline_host_select: Option<String> = None,
         /// Optional one-shot CPU-miss weight/input fixture for local kernel diagnostics.
         cpu_miss_fixture_dir: Option<PathBuf> = None,
+        /// Decode steps discarded before the first captured window, so warm-up (clock ramp,
+        /// cold expert residency) stays out of the trace.
         timeline_skip_steps: usize = 64,
+        /// Consecutive decode steps captured per window. Must not exceed `timeline_stride`, or
+        /// the trace is disabled outright.
         timeline_steps: usize = 16,
+        /// Decode steps between the start of one window and the next — the sampled period.
         timeline_stride: usize = 128,
+        /// How many windows to capture before the trace stops. Zero disables the trace.
         timeline_windows: usize = 12,
         /// Zero captures any cohort size; otherwise capture exactly this many Decode lanes.
         timeline_lanes: usize = 0,
@@ -1514,6 +1520,14 @@ impl Config {
     pub fn all_paths() -> Vec<String> {
         let mut out = Vec::new();
         Config::collect_paths("", &mut out);
+        out
+    }
+
+    /// Every leaf's path, type, shipped default and doc comment, in declaration order. The
+    /// graphical launcher renders its whole knob tree from this rather than from a copied list.
+    pub fn schema() -> Vec<ConfigField> {
+        let mut out = Vec::new();
+        Config::collect_schema("", &mut out);
         out
     }
 }

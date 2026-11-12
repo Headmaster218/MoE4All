@@ -437,6 +437,12 @@ impl GpuPager {
         self.pager.n_slots()
     }
 
+    /// Expert slots currently holding a resident block. A telemetry read of the host LRU: when
+    /// residency authority is GPU-owned this is the last handed-off state, not live.
+    pub fn resident_count(&self) -> usize {
+        self.pager.resident_count()
+    }
+
     pub fn enabled_slots(&self) -> usize {
         self.pager.enabled_slots()
     }
@@ -4682,6 +4688,49 @@ impl MoePagerSession {
     /// `paging.stats` (`INFR_PAGER_STATS=1`): print each pool's hit/miss/eviction counters. Called
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
+    /// Point-in-time expert residency for the telemetry endpoint.
+    ///
+    /// Deliberately reads only host-side state: no GPU baton, no `owned_statistics` handoff, no
+    /// trace flush. A monitoring poll must not stall decode or force a layout handoff, so when
+    /// residency authority is GPU-owned the host LRU counters are reported as-is with
+    /// `gpu_owned` set rather than being refreshed.
+    pub fn expert_report(&self) -> infr_core::telemetry::ExpertReport {
+        let mut report = infr_core::telemetry::ExpertReport {
+            paged: true,
+            gpu_owned: self
+                .gpu_decode_owner
+                .as_ref()
+                .is_some_and(|owner| owner.owned_active()),
+            ..Default::default()
+        };
+        for pool in &self.pools {
+            let stats = pool.pager.stats();
+            report.vram_resident += pool.pager.resident_count() as u64;
+            report.vram_slots += pool.pager.enabled_slots() as u64;
+            report.hits += stats.hits;
+            report.misses += stats.misses;
+            report.evictions += stats.evictions;
+            if let Some(host) = &pool.host {
+                report.ram_resident += host.stats().shadow_resident as u64;
+                report.ram_slots += host.n_slots() as u64;
+            }
+        }
+        report.full_host_store = !self.host_store.is_empty();
+        report.host_store_bytes = self
+            .host_store
+            .iter()
+            .map(HostStoreChunk::len)
+            .sum::<usize>() as u64;
+        report.host_store_experts = self
+            .sources
+            .values()
+            .map(|(_, _, source)| source)
+            .filter(|source| source.host_chunk.is_some() && source.stride_bytes > 0)
+            .map(|source| (source.bank_bytes / source.stride_bytes) as u64)
+            .sum();
+        report
+    }
+
     pub fn print_stats_if_enabled(&self) {
         self.print_stats_with_snapshot(None);
     }

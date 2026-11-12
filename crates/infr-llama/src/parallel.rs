@@ -1476,6 +1476,17 @@ pub struct ParallelSeam {
 }
 
 impl ParallelSeam {
+    /// Resource occupancy for the server's telemetry endpoint. Reads counters only: no GPU baton,
+    /// no statistics handoff, no drained statistics window.
+    pub fn resource_report(&self) -> infr_core::telemetry::EngineReport {
+        let mut report = self.vk.resource_report();
+        report.kv_pool = self
+            .paged_cache
+            .as_ref()
+            .map(|cache| cache.lock().expect("paged cache poisoned").pool_report());
+        report
+    }
+
     fn batch_decode_progress(
         &self,
         prompt_tokens: usize,

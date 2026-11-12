@@ -40,6 +40,7 @@ pub mod resource;
 pub mod shutdown;
 pub mod step_pipeline;
 pub mod tensor;
+pub mod telemetry;
 pub mod test_resource;
 pub mod tier;
 pub mod timeline;
