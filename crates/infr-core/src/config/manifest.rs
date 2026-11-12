@@ -368,6 +368,7 @@ knobs! {
     "INFR_MOE_COUNTS_DUMP"     => "debug.moe_counts_dump", Presence, Ignored, "1", migrated;
     "INFR_QSA_INDEX_DUMP"      => "debug.qsa_index_dump",  Presence, Ignored, "1", migrated;
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;
+    "INFR_PAGED_FRONTIER_CUT"  => "debug.paged_frontier_cut", Presence, Ignored, "1", migrated;
     "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", migrated;
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", migrated;
 

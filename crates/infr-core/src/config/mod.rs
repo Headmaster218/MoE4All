@@ -1263,6 +1263,10 @@ cfg_struct! {
         qsa_index_dump: bool = false,
         /// `INFR_POISON_UNINIT`.
         poison_uninit: bool = false,
+        /// `INFR_PAGED_FRONTIER_CUT`: force the paged frontier to CUT a prefill chunk instead of
+        /// exporting the recurrent state inside the chunk that contains it. A/B poison for the
+        /// export path — both arms then run the same binary, so the chunk grid is the only difference.
+        paged_frontier_cut: bool = false,
         /// `INFR_NOBARRIER`.
         no_barrier: bool = false,
         /// `INFR_FULLBARRIER`.

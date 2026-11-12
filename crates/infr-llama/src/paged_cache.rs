@@ -98,7 +98,7 @@
 
 use crate::seam::kv_frame_pool::{FrameId, FramePool, Tier};
 use anyhow::{anyhow, Result};
-use infr_core::backend::{Backend, KvFrameCorridor};
+use infr_core::backend::{Backend, Buffer, KvFrameCorridor};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -187,16 +187,21 @@ struct ChainEntry {
 /// frames: the page table resumes attention, this snapshot resumes everything the page table does
 /// not cover. Snapshots are captured at publish time and restored into the live buffers BEFORE the
 /// attaching session's page table is written, so a tree hit never replays the prefill.
+///
+/// The storage is a backend `Readback` buffer, not a `Vec<u8>`: that class is host-visible system
+/// RAM outside the device-local budget, so the aux costs exactly the host bytes `bytes()` reports
+/// and no VRAM. It also lets the prefill graph WRITE the snapshot directly (see
+/// `seam::runner::StateExport`) instead of downloading device state after the fact.
 pub(crate) struct PagedCkpt {
     /// Token boundary (a multiple of `page_tokens`) this snapshot describes: a session attaching
     /// it may reuse exactly this many tokens, never more (the state stops here).
     pub(crate) boundary_tokens: usize,
     /// Recurrent layer indices; `layers[i]` owns `kbufs[i]`/`vbufs[i]`.
     pub(crate) layers: Vec<usize>,
-    pub(crate) kbufs: Vec<Vec<u8>>,
-    pub(crate) vbufs: Vec<Vec<u8>>,
+    pub(crate) kbufs: Vec<Box<dyn Buffer>>,
+    pub(crate) vbufs: Vec<Box<dyn Buffer>>,
     /// Qwen3.8's model-level PLE convolution history, when the model has one.
-    pub(crate) ple: Option<Vec<u8>>,
+    pub(crate) ple: Option<Box<dyn Buffer>>,
 }
 
 impl PagedCkpt {
@@ -204,9 +209,9 @@ impl PagedCkpt {
         self.kbufs
             .iter()
             .chain(self.vbufs.iter())
-            .map(Vec::len)
+            .map(|buffer| buffer.len_bytes())
             .sum::<usize>()
-            + self.ple.as_ref().map_or(0, Vec::len)
+            + self.ple.as_ref().map_or(0, |buffer| buffer.len_bytes())
     }
 }
 
@@ -2979,11 +2984,19 @@ mod tests {
     }
 
     /// A snapshot-shaped aux whose byte size is deterministic (the tree never inspects content).
+    /// The storage is a real backend buffer, so the tree's byte accounting is exercised against the
+    /// same `len_bytes()` the production capture path reports.
     fn ckpt(boundary: usize, bytes: usize) -> Arc<PagedCkpt> {
+        static BE: std::sync::OnceLock<infr_cpu::CpuBackend> = std::sync::OnceLock::new();
+        let be = BE.get_or_init(|| {
+            infr_cpu::CpuBackend::new_with(Arc::new(crate::EngineConfig::default()))
+        });
         Arc::new(PagedCkpt {
             boundary_tokens: boundary,
             layers: vec![0],
-            kbufs: vec![vec![7; bytes]],
+            kbufs: vec![be
+                .alloc(bytes, infr_core::backend::BufferUsage::Readback)
+                .unwrap()],
             vbufs: Vec::new(),
             ple: None,
         })

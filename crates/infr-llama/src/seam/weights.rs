@@ -1303,18 +1303,32 @@ impl TurnRecurrentCkpt {
 /// chunk, every earlier layer has already swept the chunks AFTER it, so its live buffer holds the
 /// prompt-END state. Each layer's bytes must therefore be taken the moment its own span finishes the
 /// frontier chunk — the same rule [`TurnRecurrentCkpt::snapshot_layer`] applies in VRAM. Either way,
-/// capturing mid-chunk is wrong: the device state is the pre-chunk or post-chunk value, never the
-/// boundary's.
+/// reading the LIVE buffers mid-chunk is wrong: they hold the pre-chunk or post-chunk value, never
+/// the boundary's. A mid-chunk boundary is only reachable through the graph-export path, where the
+/// prefill ops themselves write the snapshot at the exact row (see `runner`'s `StateExport`).
 pub(crate) struct PagedFrontierCapture {
     ckpt: crate::paged_cache::PagedCkpt,
     copied: Vec<bool>,
     ple_copied: bool,
 }
 
+/// One aux storage buffer: host-visible system RAM (`Readback`), so the snapshot costs the host
+/// bytes the tree's aux budget counts and never touches the device-local VRAM plan.
+pub(crate) fn aux_alloc(
+    be: &dyn Backend,
+    bytes: usize,
+    layer: usize,
+    what: &str,
+) -> AResult<Box<dyn Buffer>> {
+    be.alloc(bytes, BufferUsage::Readback)
+        .map_err(|e| anyhow!("allocate paged aux {what} state for layer {layer}: {e}"))
+}
+
 impl PagedFrontierCapture {
     /// Size the snapshot against one slot's live buffers. Nothing is transferred yet.
     pub(crate) fn new(
         cfg: &Config,
+        be: &dyn Backend,
         kbufs: &[Box<dyn Buffer>],
         vbufs: &[Box<dyn Buffer>],
         ple_state_buf: Option<&dyn Buffer>,
@@ -1338,8 +1352,8 @@ impl PagedFrontierCapture {
             let v = vbufs
                 .get(layer)
                 .ok_or_else(|| anyhow!("recurrent layer {layer} has no state buffer"))?;
-            ck.push(vec![0u8; k.len_bytes()]);
-            cv.push(vec![0u8; v.len_bytes()]);
+            ck.push(aux_alloc(be, k.len_bytes(), layer, "conv")?);
+            cv.push(aux_alloc(be, v.len_bytes(), layer, "matrix")?);
         }
         let copied = vec![false; ck.len()];
         Ok(Self {
@@ -1348,14 +1362,16 @@ impl PagedFrontierCapture {
                 layers,
                 kbufs: ck,
                 vbufs: cv,
-                ple: ple_state_buf.map(|buffer| vec![0u8; buffer.len_bytes()]),
+                ple: ple_state_buf
+                    .map(|buffer| aux_alloc(be, buffer.len_bytes(), usize::MAX, "PLE"))
+                    .transpose()?,
             },
             copied,
             ple_copied: false,
         })
     }
 
-    /// Download one recurrent layer's live conv/`S` buffers into the snapshot. A no-op for a layer
+    /// Copy one recurrent layer's live conv/`S` buffers into the snapshot. A no-op for a layer
     /// the model does not checkpoint, so a layer-major sweep calls it for every span.
     pub(crate) fn snapshot_layer(
         &mut self,
@@ -1376,20 +1392,21 @@ impl PagedFrontierCapture {
         let v = vbufs
             .get(layer)
             .ok_or_else(|| anyhow!("recurrent layer {layer} has no state buffer"))?;
-        if k.len_bytes() != self.ckpt.kbufs[index].len()
-            || v.len_bytes() != self.ckpt.vbufs[index].len()
+        if k.len_bytes() != self.ckpt.kbufs[index].len_bytes()
+            || v.len_bytes() != self.ckpt.vbufs[index].len_bytes()
         {
             return Err(anyhow!("recurrent layer {layer} changed size mid-prefill"));
         }
-        be.download(k.as_ref(), &mut self.ckpt.kbufs[index])
-            .map_err(|e| anyhow!("download recurrent conv state at layer {layer}: {e}"))?;
-        be.download(v.as_ref(), &mut self.ckpt.vbufs[index])
-            .map_err(|e| anyhow!("download recurrent matrix state at layer {layer}: {e}"))?;
+        be.copy_buffers(&[
+            (k.as_ref(), self.ckpt.kbufs[index].as_ref(), k.len_bytes()),
+            (v.as_ref(), self.ckpt.vbufs[index].as_ref(), v.len_bytes()),
+        ])
+        .map_err(|e| anyhow!("copy recurrent state at layer {layer} into the snapshot: {e}"))?;
         self.copied[index] = true;
         Ok(())
     }
 
-    /// Download the model-level PLE history, once.
+    /// Copy the model-level PLE history, once.
     pub(crate) fn snapshot_ple(
         &mut self,
         be: &dyn Backend,
@@ -1398,13 +1415,13 @@ impl PagedFrontierCapture {
         if self.ple_copied {
             return Ok(());
         }
-        match (ple_state_buf, self.ckpt.ple.as_mut()) {
-            (Some(buffer), Some(bytes)) => {
-                if buffer.len_bytes() != bytes.len() {
+        match (ple_state_buf, self.ckpt.ple.as_deref()) {
+            (Some(buffer), Some(dst)) => {
+                if buffer.len_bytes() != dst.len_bytes() {
                     return Err(anyhow!("PLE state buffer changed size mid-prefill"));
                 }
-                be.download(buffer, bytes)
-                    .map_err(|e| anyhow!("download PLE state: {e}"))?;
+                be.copy_buffer(buffer, dst, buffer.len_bytes())
+                    .map_err(|e| anyhow!("copy PLE state into the snapshot: {e}"))?;
                 self.ple_copied = true;
                 Ok(())
             }
@@ -1463,7 +1480,8 @@ pub(crate) fn capture_paged_ckpt(
     ple_state_buf: Option<&dyn Buffer>,
     boundary_tokens: usize,
 ) -> AResult<std::sync::Arc<crate::paged_cache::PagedCkpt>> {
-    let mut capture = PagedFrontierCapture::new(cfg, kbufs, vbufs, ple_state_buf, boundary_tokens)?;
+    let mut capture =
+        PagedFrontierCapture::new(cfg, be, kbufs, vbufs, ple_state_buf, boundary_tokens)?;
     capture.snapshot_all(be, kbufs, vbufs, ple_state_buf)?;
     capture.finish()
 }
@@ -1498,25 +1516,32 @@ pub(crate) fn paged_ckpt_from_device(
     let mut kbufs = Vec::with_capacity(ck.kbufs.len());
     let mut vbufs = Vec::with_capacity(ck.vbufs.len());
     for (index, &layer) in ck.layers.iter().enumerate() {
-        let mut k = vec![0u8; ck.kbufs[index].len_bytes()];
-        be.download(ck.kbufs[index].as_ref(), &mut k)
-            .map_err(|e| anyhow!("download turn checkpoint conv state at layer {layer}: {e}"))?;
-        let mut v = vec![0u8; ck.vbufs[index].len_bytes()];
-        be.download(ck.vbufs[index].as_ref(), &mut v)
-            .map_err(|e| anyhow!("download turn checkpoint matrix state at layer {layer}: {e}"))?;
-        kbufs.push(k);
-        vbufs.push(v);
+        kbufs.push(aux_alloc(be, ck.kbufs[index].len_bytes(), layer, "conv")?);
+        vbufs.push(aux_alloc(be, ck.vbufs[index].len_bytes(), layer, "matrix")?);
     }
     let ple = ck
         .ple_state
         .as_deref()
-        .map(|buffer| {
-            let mut bytes = vec![0u8; buffer.len_bytes()];
-            be.download(buffer, &mut bytes)
-                .map_err(|e| anyhow!("download turn checkpoint PLE state: {e}"))?;
-            Ok::<_, anyhow::Error>(bytes)
-        })
+        .map(|buffer| aux_alloc(be, buffer.len_bytes(), usize::MAX, "PLE"))
         .transpose()?;
+    let mut copies = Vec::with_capacity(ck.kbufs.len() * 2 + usize::from(ple.is_some()));
+    for index in 0..ck.layers.len() {
+        copies.push((
+            ck.kbufs[index].as_ref(),
+            kbufs[index].as_ref(),
+            ck.kbufs[index].len_bytes(),
+        ));
+        copies.push((
+            ck.vbufs[index].as_ref(),
+            vbufs[index].as_ref(),
+            ck.vbufs[index].len_bytes(),
+        ));
+    }
+    if let (Some(src), Some(dst)) = (ck.ple_state.as_deref(), ple.as_deref()) {
+        copies.push((src, dst, src.len_bytes()));
+    }
+    be.copy_buffers(&copies)
+        .map_err(|e| anyhow!("copy turn checkpoint into host aux: {e}"))?;
     Ok(std::sync::Arc::new(PagedCkpt {
         boundary_tokens: ck.tokens.len(),
         layers: ck.layers.clone(),
@@ -1526,7 +1551,7 @@ pub(crate) fn paged_ckpt_from_device(
     }))
 }
 
-/// Upload a host [`PagedCkpt`](crate::paged_cache::PagedCkpt) into a slot's live recurrent/PLE
+/// Copy a host [`PagedCkpt`](crate::paged_cache::PagedCkpt) into a slot's live recurrent/PLE
 /// buffers — the restore half of [`PagedFrontierCapture`]. Device-side addressing of the state lives
 /// entirely in the ordinary single-buffer path, so no KV table work is involved here.
 pub(crate) fn restore_paged_ckpt(
@@ -1536,6 +1561,7 @@ pub(crate) fn restore_paged_ckpt(
     ple_state_buf: Option<&dyn Buffer>,
     ckpt: &crate::paged_cache::PagedCkpt,
 ) -> AResult<()> {
+    let mut copies = Vec::with_capacity(ckpt.layers.len() * 2 + usize::from(ckpt.ple.is_some()));
     for (index, &layer) in ckpt.layers.iter().enumerate() {
         let k = kbufs
             .get(layer)
@@ -1543,31 +1569,29 @@ pub(crate) fn restore_paged_ckpt(
         let v = vbufs
             .get(layer)
             .ok_or_else(|| anyhow!("paged snapshot names layer {layer} the slot does not have"))?;
-        if k.len_bytes() != ckpt.kbufs[index].len() || v.len_bytes() != ckpt.vbufs[index].len() {
+        let (ck, cv) = (&ckpt.kbufs[index], &ckpt.vbufs[index]);
+        if k.len_bytes() != ck.len_bytes() || v.len_bytes() != cv.len_bytes() {
             return Err(anyhow!(
                 "paged snapshot geometry differs from the resident slot at layer {layer} ({}+{} vs {}+{})",
-                ckpt.kbufs[index].len(),
-                ckpt.vbufs[index].len(),
+                ck.len_bytes(),
+                cv.len_bytes(),
                 k.len_bytes(),
                 v.len_bytes(),
             ));
         }
-        be.upload(k.as_ref(), &ckpt.kbufs[index])
-            .map_err(|e| anyhow!("upload recurrent conv state at layer {layer}: {e}"))?;
-        be.upload(v.as_ref(), &ckpt.vbufs[index])
-            .map_err(|e| anyhow!("upload recurrent matrix state at layer {layer}: {e}"))?;
+        copies.push((ck.as_ref(), k.as_ref(), ck.len_bytes()));
+        copies.push((cv.as_ref(), v.as_ref(), cv.len_bytes()));
     }
     match (ple_state_buf, ckpt.ple.as_deref()) {
-        (Some(buffer), Some(bytes)) => {
-            if buffer.len_bytes() != bytes.len() {
+        (Some(buffer), Some(src)) => {
+            if buffer.len_bytes() != src.len_bytes() {
                 return Err(anyhow!(
                     "paged snapshot PLE size {} differs from the resident slot's {}",
-                    bytes.len(),
+                    src.len_bytes(),
                     buffer.len_bytes()
                 ));
             }
-            be.upload(buffer, bytes)
-                .map_err(|e| anyhow!("upload PLE state: {e}"))?;
+            copies.push((src, buffer, src.len_bytes()));
         }
         (None, None) => {}
         _ => {
@@ -1576,6 +1600,8 @@ pub(crate) fn restore_paged_ckpt(
             ));
         }
     }
+    be.copy_buffers(&copies)
+        .map_err(|e| anyhow!("restore paged recurrent snapshot: {e}"))?;
     Ok(())
 }
 
@@ -3802,7 +3828,7 @@ mod tests {
         slot.paged_frontier = Some(Arc::new(crate::paged_cache::PagedCkpt {
             boundary_tokens: tokens.len(),
             layers: Vec::new(),
-            kbufs: vec![vec![7u8; 64]],
+            kbufs: vec![be.inner.alloc(64, BufferUsage::Readback).unwrap()],
             vbufs: Vec::new(),
             ple: None,
         }));
@@ -3876,7 +3902,7 @@ mod tests {
             Arc::new(crate::paged_cache::PagedCkpt {
                 boundary_tokens: boundary,
                 layers: Vec::new(),
-                kbufs: vec![vec![boundary as u8; 64]],
+                kbufs: vec![be.inner.alloc(64, BufferUsage::Readback).unwrap()],
                 vbufs: Vec::new(),
                 ple: None,
             })

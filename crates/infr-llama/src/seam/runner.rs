@@ -8,9 +8,9 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::token_delivery::ParallelTokenCallback;
 use super::weights::{
-    alloc_segmented_plane, capture_paged_ckpt, set_paged_frontier, AttnW, DeltaW, Dsv4CompressedW,
-    Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW,
-    LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW,
+    alloc_segmented_plane, aux_alloc, capture_paged_ckpt, set_paged_frontier, AttnW, DeltaW,
+    Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW,
+    LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW,
     QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState,
     SessionStable, TurnRecurrentCkpt, UncensorState,
 };
@@ -162,6 +162,97 @@ fn paged_capture_boundary(chunks: &[(usize, usize)], frontier: Option<usize>) ->
         .map(|&(_, end)| end)
         .filter(|&end| end <= frontier)
         .max()
+}
+
+/// The chunk a frontier falls STRICTLY inside, and the row it lands on. `None` when the frontier is
+/// already a chunk end: the live buffers hold the boundary's state and there is nothing to export.
+fn paged_frontier_chunk(chunks: &[(usize, usize)], frontier: usize) -> Option<(usize, usize)> {
+    chunks
+        .iter()
+        .enumerate()
+        .find(|(_, &(start, end))| start < frontier && frontier < end)
+        .map(|(index, &(start, _))| (index, frontier - start))
+}
+
+/// Whether the recurrent ops can be split `row` rows into their chunk to export the state there.
+///
+/// Two bounds, both load-bearing:
+/// * `row % 32 == 0` — the chunked DeltaNet kernel walks the prompt in C=32 blocks
+///   (`shaders/deltanet_chunked.comp`), so a split off that grid changes the arithmetic. The
+///   register-resident seq scan is exact at any row; this keeps the two interchangeable.
+/// * `row >= window - 1` — `conv1d_shift` rebuilds the conv history from the last `window-1` INPUT
+///   rows, so the export is a plain slice of the conv input only once that many rows precede the
+///   boundary. Below it the state straddles the pre-chunk history.
+fn exportable_frontier_row(c: &Config, row: usize) -> bool {
+    let ple_window = if c.qwen4exp {
+        (c.ple_conv_kernel - 1) * c.ple_ngram_size + 1
+    } else {
+        0
+    };
+    let window = c.ssm_d_conv.max(ple_window);
+    row.is_multiple_of(32) && row >= window.saturating_sub(1)
+}
+
+/// The aux buffers a prefill chunk WRITES its recurrent state into at a mid-chunk row.
+///
+/// A paged radix entry needs the state at the page-aligned frontier, but that frontier is
+/// `page_floor(prompt_len - 1, page)` — almost never a chunk end. Cutting a chunk there pays a whole
+/// extra GPU expert sweep (~570-940 ms) for a tail of at most `page - 1` rows. Instead the chunk runs
+/// whole and the graph exports the boundary itself: the conv history is a slice of the conv INPUT
+/// (`conv1d_shift` rebuilds it from the last `window-1` rows), and the DeltaNet matrix is read between
+/// the two halves of a split recurrence. The same bytes a post-hoc download produced, no extra chunk.
+///
+/// Host-visible (`Readback`) storage, so the snapshot costs the host bytes the tree's aux budget
+/// already counts and no VRAM — see [`crate::paged_cache::PagedCkpt`].
+pub(super) struct StateExport {
+    /// Chunk rows the snapshot covers; `batch - row` is the sub-page tail.
+    row: usize,
+    layers: Vec<usize>,
+    k: Vec<Box<dyn Buffer>>,
+    v: Vec<Box<dyn Buffer>>,
+    ple: Option<Box<dyn Buffer>>,
+}
+
+impl StateExport {
+    fn new(
+        c: &Config,
+        be: &dyn Backend,
+        row: usize,
+        kbufs: &[Box<dyn Buffer>],
+        vbufs: &[Box<dyn Buffer>],
+        ple_state_buf: Option<&dyn Buffer>,
+    ) -> AResult<Self> {
+        let layers: Vec<usize> = (0..c.n_layer)
+            .filter(|&layer| c.is_recurrent_layer(layer))
+            .collect();
+        let mut k = Vec::with_capacity(layers.len());
+        let mut v = Vec::with_capacity(layers.len());
+        for &layer in &layers {
+            k.push(aux_alloc(be, kbufs[layer].len_bytes(), layer, "conv")?);
+            v.push(aux_alloc(be, vbufs[layer].len_bytes(), layer, "matrix")?);
+        }
+        Ok(Self {
+            row,
+            layers,
+            k,
+            v,
+            ple: ple_state_buf
+                .map(|buffer| aux_alloc(be, buffer.len_bytes(), usize::MAX, "PLE"))
+                .transpose()?,
+        })
+    }
+
+    /// The graph has run, so every buffer holds the boundary's state by construction — there is no
+    /// completeness flag to check, unlike [`PagedFrontierCapture`] reading live buffers after the fact.
+    fn into_ckpt(self, boundary_tokens: usize) -> std::sync::Arc<crate::paged_cache::PagedCkpt> {
+        std::sync::Arc::new(crate::paged_cache::PagedCkpt {
+            boundary_tokens,
+            layers: self.layers,
+            kbufs: self.k,
+            vbufs: self.v,
+            ple: self.ple,
+        })
+    }
 }
 
 /// The page-aligned position a chunked prefill of `prompt_len` tokens stops at: every prefill path
@@ -1561,6 +1652,12 @@ pub(super) struct DecodeHandles {
     mtp_ple_trace: Option<TensorId>,
     qsa_k_cache: Vec<Option<TensorId>>,
     qsa_block_cache: Vec<Option<TensorId>>,
+    // Mid-chunk frontier export (`StateExport`): the Outputs the recurrent ops write the boundary's
+    // conv history / DeltaNet matrix / PLE history into. Indexed by LAYER, `None` for every layer
+    // this build does not export — which is all of them unless `state_export` was passed.
+    state_export_k: Vec<Option<TensorId>>,
+    state_export_v: Vec<Option<TensorId>>,
+    state_export_ple: Option<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
@@ -4749,7 +4846,13 @@ fn generate_dense_backend_inner(
                  // what makes that chaining real; the seam's layer-major prefill is the caller).
                  // `None` = the whole model with `hidden` as scratch — every other call site, and
                  // byte-identical to what they built before the parameter existed.
-                 span: Option<std::ops::Range<usize>>|
+                 span: Option<std::ops::Range<usize>>,
+                 // MID-CHUNK FRONTIER EXPORT: write the recurrent state at `state_export.row` into
+                 // the caller's aux buffers instead of leaving it only in the live state at the
+                 // chunk end. `Some` from ONLY the one batched-prefill chunk that contains the
+                 // paged frontier; `None` everywhere else, which builds byte-identically to what
+                 // those call sites built before the parameter existed.
+                 state_export: Option<&StateExport>|
      -> (Graph, DecodeHandles) {
         let (l_first, l_end) = match &span {
             Some(r) => (r.start, r.end),
@@ -4979,12 +5082,26 @@ fn generate_dense_backend_inner(
         let mut mtp_v_trace = Vec::new();
         let mut qsa_k_cache = Vec::new();
         let mut qsa_block_cache = Vec::new();
+        // Mid-chunk frontier export (`StateExport`): one Output per exported recurrent layer, bound
+        // by the caller to its aux buffer. Declared beside the state Inputs they mirror so the two
+        // element counts cannot drift apart.
+        let mut state_export_k = vec![None; c.n_layer];
+        let mut state_export_v = vec![None; c.n_layer];
+        let mut state_export_ple = None;
+        let exports = |l: usize| {
+            state_export.is_some_and(|export| export.layers.contains(&l))
+                && (l_first..l_end).contains(&l)
+        };
         for l in 0..c.n_layer {
             if c.is_recurrent_layer(l) {
                 let conv_elems = (c.ssm_d_conv - 1) * c.recurrent_conv_channels();
                 let s_elems = c.recurrent_state_elems();
                 k_cache.push(g.input(f32d(conv_elems)));
                 v_cache.push(g.input(f32d(s_elems)));
+                if exports(l) {
+                    state_export_k[l] = Some(g.output(f32d(conv_elems)));
+                    state_export_v[l] = Some(g.output(f32d(s_elems)));
+                }
                 mtp_k_trace
                     .push(trace_recurrent.then(|| g.input(f32d(mtp_trace_rows * conv_elems))));
                 mtp_v_trace.push(trace_recurrent.then(|| g.input(f32d(mtp_trace_rows * s_elems))));
@@ -5830,6 +5947,22 @@ fn generate_dense_backend_inner(
         let dn_bbuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_abuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_out = g.internal(f32d(batch * q35_vdim.max(1)));
+        // The sub-page tail of an exported chunk. `Op::DeltaNet` carries no source/destination
+        // offset, so the second half of the split recurrence reads a packed copy of the tail rows
+        // and writes its own output, which one Copy moves into `dn_out` at the boundary row.
+        // Declared once and reused across layers like the packed buffers above; no scratch at all
+        // when nothing is exported.
+        let dn_tail = state_export.map(|export| {
+            let tail = batch - export.row;
+            (
+                g.internal(f32d(tail * q35_keydim.max(1))),
+                g.internal(f32d(tail * q35_keydim.max(1))),
+                g.internal(f32d(tail * q35_vdim.max(1))),
+                g.internal(f32d(tail * q35_nv.max(1))),
+                g.internal(f32d(tail * q35_nv.max(1))),
+                g.internal(f32d(tail * q35_vdim.max(1))),
+            )
+        });
         // Ling KDA adds a vector forget projection, while its MLA layers add one gate scalar per
         // head. Both are shared scratch across mutually-exclusive layer mixer arms.
         let kda_forget = if c.bailingmoe3 {
@@ -6317,6 +6450,20 @@ fn generate_dense_backend_inner(
                     n_embd: ne as u32,
                     eps,
                 });
+                if let Some(export) = state_export.filter(|export| export.ple.is_some()) {
+                    let hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
+                    let dst = *state_export_ple.get_or_insert_with(|| g.output(f32d(hist * hcw)));
+                    // `conv1d_shift` rebuilds the history from the last `hist` INPUT rows, so the
+                    // boundary's state is a contiguous slice of the conv input. Read it here: the
+                    // conv below overwrites the live history with the CHUNK-END one.
+                    g.push(Op::Copy {
+                        src: ple_key,
+                        src_off: ((export.row - hist) * hcw) as u32,
+                        dst,
+                        dst_off: 0,
+                        n: (hist * hcw) as u32,
+                    });
+                }
                 g.push(Op::Conv1dSilu {
                     x: ple_key,
                     weight: pw.conv,
@@ -6443,6 +6590,19 @@ fn generate_dense_backend_inner(
                     out_f: q35_di as u32,
                     w_off: 0,
                 });
+                let export_row = state_export.filter(|_| exports(l)).map(|export| export.row);
+                if let (Some(row), Some(dst)) = (export_row, state_export_k[l]) {
+                    let hist = c.ssm_d_conv - 1;
+                    // Same argument as the PLE history: `conv1d_shift` leaves the last `hist` INPUT
+                    // rows in the state, so the boundary's conv history is this slice of `dn_qkvbuf`.
+                    g.push(Op::Copy {
+                        src: dn_qkvbuf,
+                        src_off: ((row - hist) * q35_cc) as u32,
+                        dst,
+                        dst_off: 0,
+                        n: (hist * q35_cc) as u32,
+                    });
+                }
                 g.push(Op::Conv1dSilu {
                     x: dn_qkvbuf,
                     weight: dw.conv1d,
@@ -6527,25 +6687,85 @@ fn generate_dense_backend_inner(
                 } else {
                     (dn_qbuf, dn_kbuf, dn_vbuf)
                 };
-                g.push(Op::DeltaNet {
-                    q: q_src,
-                    k: k_src,
-                    v: v_src,
-                    b: dn_bbuf,
-                    a: dn_abuf,
-                    a_coef: dw.ssm_a,
-                    dt_bias: dw.dt_bias,
-                    state: v_cache[l],
-                    state_trace: mtp_v_trace[l],
-                    dst: dn_out,
-                    rows: batch as u32,
-                    n_vhead: q35_nv as u32,
-                    n_khead: q35_nk as u32,
-                    head_k: q35_kd as u32,
-                    head_v: q35_vd as u32,
-                    eps: 1e-6,
-                    src_stride: 0,
-                });
+                let delta = |g: &mut Graph,
+                             q: TensorId,
+                             k: TensorId,
+                             v: TensorId,
+                             b: TensorId,
+                             a: TensorId,
+                             dst: TensorId,
+                             rows: usize| {
+                    g.push(Op::DeltaNet {
+                        q,
+                        k,
+                        v,
+                        b,
+                        a,
+                        a_coef: dw.ssm_a,
+                        dt_bias: dw.dt_bias,
+                        state: v_cache[l],
+                        state_trace: mtp_v_trace[l],
+                        dst,
+                        rows: rows as u32,
+                        n_vhead: q35_nv as u32,
+                        n_khead: q35_nk as u32,
+                        head_k: q35_kd as u32,
+                        head_v: q35_vd as u32,
+                        eps: 1e-6,
+                        src_stride: 0,
+                    });
+                };
+                match export_row {
+                    None => delta(&mut g, q_src, k_src, v_src, dn_bbuf, dn_abuf, dn_out, batch),
+                    Some(row) => {
+                        // Split the recurrence at the frontier so the matrix can be read between the
+                        // halves. The seq scan carries its state in registers and the chunked scan
+                        // walks C=32 blocks (`exportable_frontier_row` keeps `row` on that grid), so
+                        // both produce the same bytes they would have without the split: an f32
+                        // round-trip through memory is exact and the per-token arithmetic order is
+                        // unchanged.
+                        let tail = batch - row;
+                        let (tq, tk, tv, tb, ta, tout) =
+                            dn_tail.expect("an exported chunk declares its tail scratch");
+                        delta(&mut g, q_src, k_src, v_src, dn_bbuf, dn_abuf, dn_out, row);
+                        g.push(Op::Copy {
+                            src: v_cache[l],
+                            src_off: 0,
+                            dst: state_export_v[l]
+                                .expect("an exported layer declares its matrix Output"),
+                            dst_off: 0,
+                            n: c.recurrent_state_elems() as u32,
+                        });
+                        // `Op::DeltaNet` carries no source offset, so the tail rows are packed into
+                        // their own scratch. The packed buffers are contiguous, making each a plain
+                        // slice copy rather than a strided one.
+                        for (src, dst, width) in [
+                            (dn_qbuf, tq, q35_keydim),
+                            (dn_kbuf, tk, q35_keydim),
+                            (dn_vbuf, tv, q35_vdim),
+                            (dn_bbuf, tb, q35_nv),
+                            (dn_abuf, ta, q35_nv),
+                        ] {
+                            g.push(Op::Copy {
+                                src,
+                                src_off: (row * width) as u32,
+                                dst,
+                                dst_off: 0,
+                                n: (tail * width) as u32,
+                            });
+                        }
+                        delta(&mut g, tq, tk, tv, tb, ta, tout, tail);
+                        // ...and no destination offset either: the tail's output lands below the
+                        // boundary rows the first half already wrote.
+                        g.push(Op::Copy {
+                            src: tout,
+                            src_off: 0,
+                            dst: dn_out,
+                            dst_off: (row * q35_vdim) as u32,
+                            n: (tail * q35_vdim) as u32,
+                        });
+                    }
+                }
                 // Gated RMSNorm per v-head: qwen35 uses SiLU and qwen4exp uses Sigmoid. Fuse the
                 // norm and gate into one dispatch when supported, removing the split form's
                 // read-after-write hazard on `dn_out`.
@@ -9012,6 +9232,9 @@ fn generate_dense_backend_inner(
                 mtp_ple_trace,
                 qsa_k_cache,
                 qsa_block_cache,
+                state_export_k,
+                state_export_v,
+                state_export_ple,
                 weights,
             },
         )
@@ -9251,6 +9474,7 @@ fn generate_dense_backend_inner(
                 independent_rows,
                 independent_rows.then_some(spans.as_slice()),
                 Some(0..1),
+                None, // state export
             );
             g0.prefill_target_tokens = Some(prefill_target);
             g0.prefill_runtime_reserve_bytes = prefill_runtime_reserve;
@@ -9331,6 +9555,7 @@ fn generate_dense_backend_inner(
                 independent_rows,
                 independent_rows.then_some(spans.as_slice()),
                 Some(1..c.n_layer),
+                None, // state export
             );
             g1.prefill_next_chunk = prefill_next_chunk;
             g1.prefill_target_tokens = Some(prefill_target);
@@ -9680,6 +9905,7 @@ fn generate_dense_backend_inner(
                 false, // independent_rows: one session with several sequence rows
                 None,  // independent spans
                 None,  // span: the whole model in one graph
+                None,  // state export
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
@@ -10047,6 +10273,7 @@ fn generate_dense_backend_inner(
                 independent,
                 spans,
                 Some(0..1),
+                None, // state export
             );
             let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
             let mut bindings0 = Bindings::new();
@@ -10113,6 +10340,7 @@ fn generate_dense_backend_inner(
             independent,
             spans,
             if has_ple { Some(1..c.n_layer) } else { None },
+            None, // state export
         );
         let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
         let mut bindings1 = Bindings::new();
@@ -10447,6 +10675,7 @@ fn generate_dense_backend_inner(
                     false,
                     None,
                     Some(0..1),
+                    None, // state export
                 );
                 let vplan0 = be.compile(&vg0).map_err(|e| anyhow!("{e}"))?;
                 let mut vb0 = Bindings::new();
@@ -10514,6 +10743,7 @@ fn generate_dense_backend_inner(
                 false,
                 None,
                 overlap_ple.then_some(1..c.n_layer),
+                None, // state export
             );
             let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
             let mut vb = Bindings::new();
@@ -10690,6 +10920,7 @@ fn generate_dense_backend_inner(
             false, // independent_rows: one speculative sequence
             None,  // independent spans
             None,  // span: the whole model in one graph
+            None,  // state export
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
@@ -11094,6 +11325,7 @@ fn generate_dense_backend_inner(
                     independent_rows,
                     plan_spans.as_deref(),
                     Some(0..1),
+                    None, // state export
                 );
                 let plan0 = be.compile(&g0).map_err(|e| anyhow!("{e}"))?;
                 if prepare_ahead {
@@ -11116,6 +11348,7 @@ fn generate_dense_backend_inner(
                 independent_rows,
                 plan_spans.as_deref(),
                 Some(usize::from(!plan_full_graph)..c.n_layer),
+                None, // state export
             );
             let plan1 = be.compile(&g1).map_err(|e| anyhow!("{e}"))?;
             if prepare_ahead {
@@ -12428,7 +12661,7 @@ fn generate_dense_backend_inner(
         } else {
             std::iter::once(0..c.n_layer).collect()
         };
-        let chunks: Vec<(usize, usize)> = {
+        let chunk_grid = |frontier: Option<usize>| -> Vec<(usize, usize)> {
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
@@ -12437,13 +12670,44 @@ fn generate_dense_backend_inner(
                     pf_end,
                     ubatch,
                     &turn_checkpoint_boundaries,
-                    paged_frontier_at,
+                    frontier,
                     ring_floor,
                 );
                 v.push((cs, ce));
                 cs = ce;
             }
             v
+        };
+        // Cutting a chunk AT the frontier costs a whole extra GPU expert sweep for a tail of at most
+        // `page - 1` rows. Where the recurrent ops can be split at the frontier row instead, the
+        // chunk runs whole and the graph exports the boundary's state itself (`StateExport`) — same
+        // snapshot, one fewer chunk. The natural grid is laid out first so the decision is made
+        // against the grid that will actually run: a frontier the split cannot serve keeps the cut,
+        // rather than silently degrading to `paged_capture_boundary`'s shallower fallback.
+        // Layer-major is excluded: its per-layer spans reach the frontier at different times, so
+        // there is no single chunk whose graph could carry the export.
+        let exportable = (c.qwen35 || c.qwen4exp) && !layer_major && !ec.debug.paged_frontier_cut;
+        let natural = if exportable {
+            chunk_grid(None)
+        } else {
+            Vec::new()
+        };
+        let cut_grid = chunk_grid(paged_frontier_at);
+        let frontier_export = paged_frontier_at
+            .filter(|_| exportable)
+            // The export is paid for by the chunk it REMOVES, and it is not free: splitting the
+            // recurrence and copying each layer's state out mid-graph measured +664 ms on a 112-row
+            // tail at 14.4k. When `ring_floor` already rejects the frontier cut the two grids are
+            // identical, so there is no chunk to remove and the split would be pure cost — leave
+            // that case to the post-chunk capture, which moves the same bytes after the last
+            // dispatch instead of between them.
+            .filter(|_| cut_grid.len() > natural.len())
+            .and_then(|frontier| paged_frontier_chunk(&natural, frontier))
+            .filter(|&(_, row)| exportable_frontier_row(c, row));
+        let chunks = if frontier_export.is_some() {
+            natural
+        } else {
+            cut_grid
         };
         // A chunk's uploaded inputs and its residual stream, materialized on first use and
         // dropped after the chunk's LAST span. Chunk-major (one span) therefore holds exactly one
@@ -12488,9 +12752,26 @@ fn generate_dense_backend_inner(
         // Assembled at the frontier chunk and published with this request's frames at detach. Held
         // across the whole sweep because a layer-major prefill fills it one span at a time.
         let mut frontier_capture: Option<PagedFrontierCapture> = None;
-        // The chunk the snapshot is taken at: the frontier itself when a chunk lands on it, else the
-        // deepest chunk end below it (see `paged_capture_boundary`).
-        let paged_capture_at = paged_capture_boundary(&chunks, paged_frontier_at);
+        // The export path's aux buffers, written by the frontier chunk's own graph. Allocated up
+        // front so the chunk can bind them; consumed into the snapshot once that chunk has run.
+        let mut state_export = match frontier_export {
+            Some((_, row)) => Some(StateExport::new(
+                c,
+                be,
+                row,
+                &kbufs[..],
+                &vbufs[..],
+                ple_state_buf.as_deref(),
+            )?),
+            None => None,
+        };
+        // The chunk the snapshot is taken at: the export chunk's END (its graph wrote the frontier
+        // row mid-chunk), else the frontier itself when a chunk lands on it, else the deepest chunk
+        // end below it (see `paged_capture_boundary`).
+        let paged_capture_at = match frontier_export {
+            Some((index, _)) => Some(chunks[index].1),
+            None => paged_capture_boundary(&chunks, paged_frontier_at),
+        };
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -12752,6 +13033,11 @@ fn generate_dense_backend_inner(
                             .expect("the chunk's buffers were just materialized");
                         let pf_t0 = std::time::Instant::now();
                         let timeline_build = infr_core::timeline::span("prefill_build");
+                        // Only the chunk containing the frontier exports; every other chunk builds
+                        // exactly the graph it always did.
+                        let chunk_export = state_export
+                            .as_ref()
+                            .filter(|_| frontier_export.is_some_and(|(index, _)| index == ci));
                         // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
                         // chunk's logits — the decode loop below feeds the LAST prompt token itself and
                         // samples from its own fresh logits — so the LM-head tail (whole-chunk
@@ -12779,6 +13065,7 @@ fn generate_dense_backend_inner(
                             false, // independent_rows: one contiguous prompt chunk
                             None,  // independent spans
                             Some(span.clone()),
+                            chunk_export,
                         );
                         pf_g.prefill_next_chunk =
                             ec.paging.prefill_cross_chunk && !layer_major && ci + 1 < chunks.len();
@@ -12835,6 +13122,25 @@ fn generate_dense_backend_inner(
                             uncensor_dirs_buf,
                             uncensor_scale_buf,
                         );
+                        if let Some(export) = chunk_export {
+                            for (index, &layer) in export.layers.iter().enumerate() {
+                                pf_b.bind(
+                                    pf_h.state_export_k[layer]
+                                        .expect("an exported layer declares its conv Output"),
+                                    export.k[index].as_ref(),
+                                );
+                                pf_b.bind(
+                                    pf_h.state_export_v[layer]
+                                        .expect("an exported layer declares its matrix Output"),
+                                    export.v[index].as_ref(),
+                                );
+                            }
+                            if let (Some(id), Some(buffer)) =
+                                (pf_h.state_export_ple, export.ple.as_deref())
+                            {
+                                pf_b.bind(id, buffer);
+                            }
+                        }
                         debug_assert!(
                             pf_h.logits.is_none(),
                             "headless prefill build has no logits"
@@ -12918,39 +13224,74 @@ fn generate_dense_backend_inner(
                         // depth. Layer-major fills it span by span (see `PagedFrontierCapture`);
                         // chunk-major reads the whole model once.
                         if Some(cend) == paged_capture_at {
-                            let capture = match frontier_capture.as_mut() {
-                                Some(capture) => capture,
-                                None => frontier_capture.insert(PagedFrontierCapture::new(
-                                    c,
-                                    &kbufs[..],
-                                    &vbufs[..],
-                                    ple_state_buf.as_deref(),
-                                    cend,
-                                )?),
-                            };
-                            if layer_major {
-                                capture.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
-                                if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer)) {
-                                    capture.snapshot_ple(be, ple_state_buf.as_deref())?;
+                            if state_export.is_some() {
+                                // The chunk's own graph wrote the frontier row into the aux buffers,
+                                // so there is nothing to read back and no completeness to verify.
+                                if si + 1 == spans.len() {
+                                    let finished =
+                                        state_export.take().expect("the export chunk").into_ckpt(
+                                            paged_frontier_at.expect("an exported frontier"),
+                                        );
+                                    tracing::debug!(
+                                        boundary = finished.boundary_tokens,
+                                        replaced = paged_frontier
+                                            .as_ref()
+                                            .map(|prev| prev.boundary_tokens),
+                                        "paged frontier exported in-chunk"
+                                    );
+                                    set_paged_frontier(
+                                        paged_frontier,
+                                        paged_frontier_prev,
+                                        finished,
+                                    );
                                 }
                             } else {
-                                capture.snapshot_all(
-                                    be,
-                                    &kbufs[..],
-                                    &vbufs[..],
-                                    ple_state_buf.as_deref(),
-                                )?;
-                            }
-                            if si + 1 == spans.len() {
-                                let finished =
-                                    frontier_capture.take().expect("just created").finish()?;
-                                tracing::debug!(
-                                    boundary = finished.boundary_tokens,
-                                    replaced =
-                                        paged_frontier.as_ref().map(|prev| prev.boundary_tokens),
-                                    "paged frontier captured"
-                                );
-                                set_paged_frontier(paged_frontier, paged_frontier_prev, finished);
+                                let capture = match frontier_capture.as_mut() {
+                                    Some(capture) => capture,
+                                    None => frontier_capture.insert(PagedFrontierCapture::new(
+                                        c,
+                                        be,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        ple_state_buf.as_deref(),
+                                        cend,
+                                    )?),
+                                };
+                                if layer_major {
+                                    capture.snapshot_layer(
+                                        be,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        span.start,
+                                    )?;
+                                    if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer))
+                                    {
+                                        capture.snapshot_ple(be, ple_state_buf.as_deref())?;
+                                    }
+                                } else {
+                                    capture.snapshot_all(
+                                        be,
+                                        &kbufs[..],
+                                        &vbufs[..],
+                                        ple_state_buf.as_deref(),
+                                    )?;
+                                }
+                                if si + 1 == spans.len() {
+                                    let finished =
+                                        frontier_capture.take().expect("just created").finish()?;
+                                    tracing::debug!(
+                                        boundary = finished.boundary_tokens,
+                                        replaced = paged_frontier
+                                            .as_ref()
+                                            .map(|prev| prev.boundary_tokens),
+                                        "paged frontier captured"
+                                    );
+                                    set_paged_frontier(
+                                        paged_frontier,
+                                        paged_frontier_prev,
+                                        finished,
+                                    );
+                                }
                             }
                         }
                         // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
@@ -13073,6 +13414,7 @@ fn generate_dense_backend_inner(
             false, // independent_rows: ordinary single-session decode
             None,  // independent spans
             None,  // span: the whole model in one graph
+            None,  // state export
         );
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
@@ -13191,6 +13533,7 @@ fn generate_dense_backend_inner(
                 false, // independent_rows: ordinary single-session decode
                 None,
                 span,
+                None, // state export
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             if prepare_ahead {
@@ -15239,11 +15582,11 @@ mod tests {
 
     use super::{
         allocate_parallel_prefill_rows, command_ahead_cohort_ready, dense_request_exceeds_capacity,
-        full_mrope_positions, mrope_rows_are_plain_rope, mrope_token_position, page_floor,
-        paged_capture_boundary, paged_frontier_pos, parallel_decode_should_stop,
-        parallel_prefill_group, parallel_prefill_progress, prefill_chunk_end,
-        qsa_prepare_pair_supported, recurrent_extension_start, resident_after_gen,
-        sampling_suffix_start, validate_token_ids,
+        exportable_frontier_row, full_mrope_positions, mrope_rows_are_plain_rope,
+        mrope_token_position, page_floor, paged_capture_boundary, paged_frontier_chunk,
+        paged_frontier_pos, parallel_decode_should_stop, parallel_prefill_group,
+        parallel_prefill_progress, prefill_chunk_end, qsa_prepare_pair_supported,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
     use infr_core::DType;
 
@@ -15780,6 +16123,89 @@ mod tests {
             paged_capture_boundary(&[(0, 64), (64, 128), (128, 200)], Some(192)),
             Some(128)
         );
+    }
+
+    /// The export's whole point: the frontier stops being a chunk boundary. Same prompt, same
+    /// ubatch, one fewer chunk — and each chunk pays a near-full GPU expert sweep regardless of its
+    /// row count, so the 61-row tail the cut used to create is the entire saving.
+    #[test]
+    fn exporting_the_frontier_removes_the_chunk_the_cut_used_to_create() {
+        let none = [None, None];
+        let grid = |frontier: Option<usize>| -> Vec<(usize, usize)> {
+            let mut v = Vec::new();
+            let mut cs = 0;
+            while cs < 4348 {
+                let ce = prefill_chunk_end(cs, 4348, 2048, &none, frontier, 0);
+                v.push((cs, ce));
+                cs = ce;
+            }
+            v
+        };
+        let cut = grid(Some(4288));
+        assert_eq!(cut, [(0, 2048), (2048, 4096), (4096, 4288), (4288, 4348)]);
+        let whole = grid(None);
+        assert_eq!(whole, [(0, 2048), (2048, 4096), (4096, 4348)]);
+        assert_eq!(whole.len() + 1, cut.len());
+        // The frontier lands 192 rows into the last chunk, leaving a 60-row tail.
+        assert_eq!(paged_frontier_chunk(&whole, 4288), Some((2, 192)));
+        // A frontier that IS a chunk end needs no export: the live buffers already hold it.
+        assert_eq!(paged_frontier_chunk(&cut, 4288), None);
+        assert_eq!(paged_frontier_chunk(&whole, 4096), None);
+        assert_eq!(paged_frontier_chunk(&whole, 4348), None);
+    }
+
+    /// The export is only worth its split when the cut it replaces actually added a chunk. Both
+    /// grids below are the real ub-2048 / ring-154 chunking of the A/B prompts; the ring floor is
+    /// what decides, and it decides differently at 14449 and 14545 tokens.
+    #[test]
+    fn a_cut_the_ring_floor_already_rejected_buys_the_export_nothing() {
+        let none = [None, None];
+        let grid = |end: usize, frontier: Option<usize>| -> Vec<(usize, usize)> {
+            let mut v = Vec::new();
+            let mut cs = 0;
+            while cs < end {
+                let ce = prefill_chunk_end(cs, end, 2048, &none, frontier, 154);
+                v.push((cs, ce));
+                cs = ce;
+            }
+            v
+        };
+        // 14449 tokens: the frontier 14400 would leave 64 rows, under the floor, so the chunker
+        // already refuses it. Splitting the recurrence here would be pure cost.
+        let cut = grid(14_448, Some(14_400));
+        let whole = grid(14_448, None);
+        assert_eq!(cut, whole);
+        assert_eq!(cut.len(), 8);
+        // 14545 tokens: 192 rows clears the floor, so the cut adds a 16-row chunk the export removes.
+        let cut = grid(14_544, Some(14_528));
+        let whole = grid(14_544, None);
+        assert_eq!(cut.len(), whole.len() + 1);
+        assert_eq!(paged_frontier_chunk(&whole, 14_528), Some((7, 192)));
+    }
+
+    #[test]
+    fn a_frontier_row_the_split_cannot_serve_keeps_the_cut() {
+        let cfg = crate::Config {
+            qwen4exp: true,
+            ssm_d_conv: 4,
+            ple_conv_kernel: 4,
+            ple_ngram_size: 4,
+            ..crate::Config::default()
+        };
+        // On the chunked kernel's C=32 grid and past both conv windows (DeltaNet 3, PLE 12).
+        assert!(exportable_frontier_row(&cfg, 192));
+        assert!(exportable_frontier_row(&cfg, 32));
+        // Off the block grid: the chunked scan would partition differently and the bytes would drift.
+        assert!(!exportable_frontier_row(&cfg, 48));
+        // Inside the PLE history: the state straddles the pre-chunk rows, so it is not a slice.
+        assert!(!exportable_frontier_row(&cfg, 0));
+        // A qwen35 model has no PLE window to clear, only the DeltaNet conv's 3 rows.
+        let q35 = crate::Config {
+            qwen35: true,
+            ssm_d_conv: 4,
+            ..crate::Config::default()
+        };
+        assert!(exportable_frontier_row(&q35, 32));
     }
 
     #[test]

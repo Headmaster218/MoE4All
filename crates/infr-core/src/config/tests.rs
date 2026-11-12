@@ -2007,7 +2007,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
 
     /// S4 — `infr-llama`'s seam: the whole `kv`, `spec` and `multi` sections, `device.ubatch*`,
     /// `paging.cache` (read ONLY in the seam's placement
-    /// binders), the two graph-shape gates, and the seam's own `prof.*` diagnostics.
+    /// binders), the two graph-shape gates, and the seam's own `prof.*` diagnostics plus the
+    /// `debug.paged_frontier_cut` A/B poison.
     ///
     /// NOT here, deliberately: `sampling.*` — the SEAM reads it from `Config` now
     /// (`Sampler::from_cfg`), but `infr-cli`'s model-recommendation bridge
@@ -2058,6 +2059,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_VRAM_BUDGET",
         "INFR_VRAM_RESERVE",
         "INFR_UBATCH_PARALLEL",
+        "INFR_PAGED_FRONTIER_CUT",
     ];
 
     /// S5a — `infr-vulkan`'s CONSTRUCTION-time tier: everything `VulkanBackend::new_with` resolves

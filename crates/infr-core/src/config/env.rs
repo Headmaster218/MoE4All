@@ -461,6 +461,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.debug.moe_counts_dump = presence(get, "INFR_MOE_COUNTS_DUMP");
     p.debug.qsa_index_dump = presence(get, "INFR_QSA_INDEX_DUMP");
     p.debug.poison_uninit = presence(get, "INFR_POISON_UNINIT");
+    p.debug.paged_frontier_cut = presence(get, "INFR_PAGED_FRONTIER_CUT");
     p.debug.no_barrier = presence(get, "INFR_NOBARRIER");
     p.debug.full_barrier = presence(get, "INFR_FULLBARRIER");
 
