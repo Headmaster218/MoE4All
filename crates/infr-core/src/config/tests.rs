@@ -438,6 +438,7 @@ fn default_config_matches_documented_defaults() {
     // §6.3: the paged tree is opt-in and its RAM tier is a SEPARATE opt-in on top of it.
     assert!(!d.kv.paged);
     assert!(!d.kv.paged_elastic);
+    assert!(!d.kv.paged_yield_under_pressure);
     assert_eq!(d.kv.paged_cache_max, None);
     assert_eq!(d.kv.paged_page_tokens, 32 * 1024);
     assert!(!d.kv.force_q8);
@@ -726,6 +727,19 @@ fn paged_elastic_corridor_defaults_off_and_roundtrips() {
         for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
             let cfg = Config::load_from_layers(&[layer]);
             assert_eq!(cfg.kv.paged_elastic, enabled);
+        }
+    }
+}
+
+#[test]
+fn paged_pressure_yield_defaults_off_and_roundtrips() {
+    assert!(!Config::default().kv.paged_yield_under_pressure);
+    for enabled in [false, true] {
+        let setting = format!("kv.paged_yield_under_pressure={enabled}");
+        let toml = format!("[kv]\npaged_yield_under_pressure={enabled}\n");
+        for layer in [cli_layer(&[setting.as_str()]), file_layer(&toml)] {
+            let cfg = Config::load_from_layers(&[layer]);
+            assert_eq!(cfg.kv.paged_yield_under_pressure, enabled);
         }
     }
 }
@@ -2276,6 +2290,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_KV_RAM_CACHE_MAX",
         "INFR_KV_PAGED",
         "INFR_KV_PAGED_ELASTIC",
+        "INFR_KV_PAGED_YIELD_UNDER_PRESSURE",
         "INFR_KV_PAGED_PAGE_TOKENS",
         "INFR_KV_PAGED_CACHE_MAX",
         "INFR_KV_DISK_CACHE_MAX",

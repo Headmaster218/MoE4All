@@ -163,6 +163,7 @@ knobs! {
     "INFR_NO_DYNAMIC_KV"        => "kv.dynamic",             PresenceInv, Ignored, "1",    migrated;
     "INFR_KV_PAGED"             => "kv.paged",               Flag,        Ignored, "1",    migrated;
     "INFR_KV_PAGED_ELASTIC"     => "kv.paged_elastic",       Flag,        Ignored, "1",    migrated;
+    "INFR_KV_PAGED_YIELD_UNDER_PRESSURE" => "kv.paged_yield_under_pressure", Flag, Ignored, "1", migrated;
     "INFR_KV_PAGED_PAGE_TOKENS" => "kv.paged_page_tokens",    Int,         Ignored, "64",   migrated;
     "INFR_KV_PAGED_CACHE_MAX"   => "kv.paged_cache_max",      Size,        Ignored, "16GiB", migrated;
     "INFR_KV_DISK_CACHE_MAX"    => "kv.disk_cache_max",       Size,        Ignored, "64GiB", migrated;

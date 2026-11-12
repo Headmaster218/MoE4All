@@ -266,6 +266,15 @@ cfg_struct! {
         /// same worst case the fixed corridor leases, so no other VRAM budget moves. Only meaningful
         /// with the paged tree ([`KvCfg::paged`] or [`KvCfg::paged_cache_max`]).
         paged_elastic: bool = false,
+        /// `INFR_KV_PAGED_YIELD_UNDER_PRESSURE`: let the paged tree sink cold conversation tails to
+        /// the RAM tier when the EXPERT cache sharing the same arena is starving for device bytes,
+        /// then return the emptied corridor segments. Without it each owner only sees its own
+        /// ceiling, so a conversation below the VRAM frame limit keeps every page in device memory
+        /// while the expert pager evicts on every admission and the host tier sits empty. The last
+        /// attach's reuse depth is a hard floor, so a conversation that reuses its whole prefix every
+        /// turn yields nothing. Requires [`KvCfg::paged_elastic`] plus a RAM tier
+        /// ([`KvCfg::paged_cache_max`]).
+        paged_yield_under_pressure: bool = false,
         /// `INFR_KV_PAGED_PAGE_TOKENS`: tokens per physical KV segment (page). The segmented
         /// machinery addresses planes through a runtime device table, so the page size is pure
         /// geometry — 32768 (default) reproduces the legacy 32K growth step byte-for-byte, while

@@ -3900,6 +3900,7 @@ $kvPagedCacheMax = [string](Get-SavedValue 'kv_paged_cache_max' '')
 $kvPagedTree = [bool](Get-SavedValue 'kv_paged_tree' ([bool]$kvPagedCacheMax))
 $kvPagedPageTokens = [string](Get-SavedValue 'kv_paged_page_tokens' '')
 $kvPagedElastic = [bool](Get-SavedValue 'kv_paged_elastic' $false)
+$kvPagedYieldPressure = [bool](Get-SavedValue 'kv_paged_yield_under_pressure' $false)
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
@@ -4160,6 +4161,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedCacheMax = ''
             $kvPagedPageTokens = ''
             $kvPagedElastic = $false
+            $kvPagedYieldPressure = $false
         }
         if ($kvPagedTree) {
             # One prerequisite the wizard cannot test: the corridor is claimed from the unified VRAM
@@ -4201,6 +4203,18 @@ if (-not $reuseSavedSettings) {
                 Write-Host '增长发生在 prefill 中，会先退掉 Prefill 对走廊未提交单元的临时借用（与分段 KV 增长同一条串行边界）。实测 125K token 的 prefill 连续增长 7 次到上限，冷启 TTFT 只多 0.3%；整段空闲的走廊在请求边界归还，配合 RAM 帧池时冷链先下沉再归还，命中再换回（实测 0.31GiB 链下沉后回访 TTFT 287ms，冷启是 13466ms）。' -ForegroundColor DarkGray
                 Write-Host 'Growth happens inside prefill and first retires Prefill transient loan on the corridor uncommitted cells (the same serial boundary segmented KV growth takes). Measured: a 125K-token prefill grew 7 times to the ceiling for +0.3% cold TTFT. Fully-free chunks go back at a request boundary; with a RAM pool a cold chain sinks first and promotes back on a hit (a 0.31GiB chain revisited in 287ms against 13466ms cold).' -ForegroundColor DarkGray
             }
+            # Both owners sub-allocate ONE arena but only see their own ceiling, so a tree below its
+            # frame limit squats cold pages the expert pager is evicting to get. The yield needs the
+            # elastic corridor (segments must be returnable) and a RAM pool (somewhere to sink to).
+            if ($kvPagedElastic -and $kvPagedCacheMax) {
+                Write-Host '试验性、默认关闭：专家缓存和分页 KV 共用同一个显存池，但两边各自只看自己的上限——KV 没到自己的帧上限就把冷页全留在显存里，专家那边每次准入都在驱逐、RAM 帧池却空着。开启后，专家最近一个窗口的未命中率超过 3% 时，树把冷会话的尾巴下沉到 RAM 帧池，再把腾空的整段走廊还给专家。上次续接用到的复用深度是硬底线：每轮都整段复用前缀的会话一帧也不会让。' -ForegroundColor Yellow
+                Write-Host 'Experimental, off by default: the expert cache and the paged KV tree sub-allocate ONE VRAM pool, but each owner only sees its own ceiling - a tree below its frame limit keeps every cold page in device memory while the expert pager evicts on every admission and the RAM frame pool sits empty. With this on, once the expert miss rate over the window since the last request boundary exceeds 3%, the tree sinks cold conversation tails to the RAM frame pool and hands the emptied corridor segments back to the experts. The last attach reuse depth is a hard floor: a conversation that reuses its whole prefix every turn yields nothing.' -ForegroundColor DarkGray
+                Write-Host '代价：每个请求边界多一次设备 LRU 读回（只有开启时才付），下沉的帧一次 DMA 出去、命中再一次 DMA 回来。实测（同一 release 二进制、同窗口、35B、ctx 65536、page 64、把 paging.cache 压到 4GiB 造压力）：0.46GiB 走廊回到专家手里，专家驻留槽 +8%、驱逐 −12%，两条 1024 token 的长解码 +4.0%/+3.9% t/s，复用率与文本 sha 不变。出货默认的专家缓存下未命中率热完就掉到 0%，这一项不会动作；收益只在解码腿上，短问答序列反而略慢。' -ForegroundColor DarkGray
+                Write-Host 'Cost: one device-LRU readback per request boundary (paid only when this is on), a DMA out for each sunk frame and a DMA back on a hit. Measured (same release binary, same window, 35B, ctx 65536, page 64, paging.cache squeezed to 4GiB to manufacture pressure): 0.46GiB of corridor returned to the experts, expert resident slots +8% and evictions -12%, two 1024-token decodes +4.0%/+3.9% t/s, reuse and text sha unchanged. At the shipping expert cache size the miss rate falls to 0% once warm and this never fires; the gain lives in the decode leg, and a short-answer sequence is slightly slower.' -ForegroundColor DarkGray
+                $kvPagedYieldPressure = Read-YesNo -Label '专家显存吃紧时，让分页树把冷会话尾巴下沉到 RAM、把腾空的走廊还给专家（试验性，默认关闭）？/ When the expert cache is starving for VRAM, let the paged tree sink cold conversation tails to RAM and hand the emptied corridor back to the experts (experimental, off by default)?' -Default $kvPagedYieldPressure
+            } else {
+                $kvPagedYieldPressure = $false
+            }
             if ($kvPagedElastic) {
                 Write-Host '试验性特性：分页走廊与会话/缓存树共用 KV 显存（不再为每个会话单独保留 KV），开机只提交一个 chunk，其余按需增长到整个 ctx 的上限。' -ForegroundColor Yellow
                 Write-Host 'Experimental: the frame corridor shares the KV VRAM space with resident sessions and the cache tree (no per-slot KV reserve); it commits one chunk at boot and grows the rest on demand up to the full-ctx ceiling.' -ForegroundColor DarkGray
@@ -4222,6 +4236,7 @@ if (-not $reuseSavedSettings) {
             $kvPagedCacheMax = ''
             $kvPagedPageTokens = ''
             $kvPagedElastic = $false
+            $kvPagedYieldPressure = $false
         }
         $kvRamCacheEnabled = $false
         if (-not $kvPagedTree) {
@@ -4469,6 +4484,7 @@ if ($launchMode -eq 'server') {
             $kvPagedTree = $false
             $kvPagedCacheMax = ''
             $kvPagedElastic = $false
+            $kvPagedYieldPressure = $false
         }
         if ($kvPagedTree) {
             # `kv.paged` opens the tree; the host-RAM frame pool is a separate budget that only exists
@@ -4479,6 +4495,9 @@ if ($launchMode -eq 'server') {
             Add-SetArgument $nativeArgs 'kv.paged_page_tokens' $kvPagedPageTokens
             if ($kvPagedCacheMax) { Add-SetArgument $nativeArgs 'kv.paged_cache_max' $kvPagedCacheMax }
             if ($kvPagedElastic) { Add-SetArgument $nativeArgs 'kv.paged_elastic' 'true' }
+            # Reuse mode never re-asks, so a profile saved with the yield on and later stripped of
+            # its corridor or RAM pool must not emit a knob the engine would ignore.
+            if ($kvPagedElastic -and $kvPagedCacheMax -and $kvPagedYieldPressure) { Add-SetArgument $nativeArgs 'kv.paged_yield_under_pressure' 'true' }
         }
         if ($kvRamCacheMax) {
             Add-SetArgument $nativeArgs 'kv.ram_cache_max' $kvRamCacheMax
@@ -4583,6 +4602,7 @@ $state = [ordered]@{
     kv_paged_cache_max = $kvPagedCacheMax; kv_paged_page_tokens = $kvPagedPageTokens
     kv_paged_tree = $kvPagedTree
     kv_paged_elastic = $kvPagedElastic
+    kv_paged_yield_under_pressure = $kvPagedYieldPressure
     server_vision = $serverVision; vision_projector = $visionProjectorPath
     image_url_allow_private = $imageUrlAllowPrivate
     server_llm_enabled = $serverLlmEnabled

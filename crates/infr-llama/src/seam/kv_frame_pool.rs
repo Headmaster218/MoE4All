@@ -237,6 +237,13 @@ impl FramePool {
         self.segments[Self::idx(Tier::Vram)].len()
     }
 
+    /// Slot range `[first, first + frames)` of one VRAM segment, so a caller can ask which entries
+    /// own the frames a release would have to empty. `None` = no such segment.
+    pub(crate) fn vram_segment_range(&self, index: usize) -> Option<(usize, usize)> {
+        let segment = self.segments[Self::idx(Tier::Vram)].get(index)?;
+        Some((segment.first_frame, segment.frames))
+    }
+
     /// Whether every slot of a VRAM segment is unowned, i.e. the whole corridor can go back to the
     /// arena without stranding a chain or a live session's page table.
     pub(crate) fn vram_segment_all_free(&self, index: usize) -> bool {

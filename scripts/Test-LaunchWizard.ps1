@@ -276,10 +276,11 @@ try {
         Assert (-not $state.server_session_cache) 'The paged tree must turn off the mutually exclusive disk session cache'
         Assert (-not ('kv.paged_elastic=true' -in $nativeArgs)) 'Declining the elastic corridor must keep the fixed lease'
         Assert (-not $state.kv_paged_elastic) 'The declined elastic corridor was saved as on'
+        Assert (-not ('kv.paged_yield_under_pressure=true' -in $nativeArgs)) 'A corridor-only tree has nowhere to sink, so the yield must not be offered or emitted'
     }
     # A fresh install is RECOMMENDED the pool: accepting the default must emit a budget, because a
     # corridor-only tree evicts the very chain an alternating session would hit (cached_tokens=0).
-    Test-Flow 'fresh API paged tree takes the recommended RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh API paged tree takes the recommended RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', 'n', '', '') -Check {
         Assert ('kv.paged=true' -in $nativeArgs) 'The paged tree was not emitted'
         Assert ('kv.paged_cache_max=16GiB' -in $nativeArgs) 'Accepting the recommended default must emit the RAM frame-pool cap'
         Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The recommended tree lost the frame page size'
@@ -288,6 +289,16 @@ try {
         Assert ('kv.paged_elastic=true' -in $nativeArgs) 'A fresh install must be recommended the elastic corridor'
         Assert ($state.kv_paged_elastic) 'The recommended elastic corridor was not saved'
         Assert (@($script:Output | Where-Object { $_ -match '145\.9' }).Count) 'The elastic recommendation did not explain the measured decode consequence'
+        Assert (-not ('kv.paged_yield_under_pressure=true' -in $nativeArgs)) 'The pressure yield must stay opt-in on a fresh install'
+        Assert (-not $state.kv_paged_yield_under_pressure) 'The declined pressure yield was saved as on'
+    }
+    # The yield is the only knob that needs BOTH the elastic corridor and a RAM pool, so accepting it
+    # is a separate leg: the recommended-pool leg above declines it and must not emit it.
+    Test-Flow 'API paged tree accepts the expert-pressure yield' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', 'y', '', '') -Check {
+        Assert ('kv.paged_yield_under_pressure=true' -in $nativeArgs) 'The accepted pressure yield was not emitted'
+        Assert ($state.kv_paged_yield_under_pressure) 'The accepted pressure yield was not saved'
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'The yield leg lost its elastic corridor prerequisite'
+        Assert ('kv.paged_cache_max=16GiB' -in $nativeArgs) 'The yield leg lost its RAM pool prerequisite'
     }
     # The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout, so a saved profile that
     # pairs it with another KV format must heal rather than emit a command line the engine refuses.
@@ -307,11 +318,20 @@ try {
     }
     # Reuse mode never re-asks, so a profile that DID choose the elastic corridor has to keep emitting
     # it: the choice is saved separately from the tree and must survive a saved-settings launch.
-    $elasticTreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; kv_paged_elastic = $true; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    $elasticTreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; kv_paged_elastic = $true; kv_paged_yield_under_pressure = $true; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
     Test-Flow 'a saved elastic corridor stays elastic on reuse' -Saved $elasticTreeSettings -Inputs @('') -Check {
         Assert ($reuseSavedSettings) 'Saved profile should not reconfigure'
         Assert ('kv.paged_elastic=true' -in $nativeArgs) 'A saved elastic corridor was dropped on reuse'
         Assert ($state.kv_paged_elastic) 'The elastic corridor choice was not kept saved'
+        Assert ('kv.paged_yield_under_pressure=true' -in $nativeArgs) 'A saved pressure yield was dropped on reuse'
+        Assert ($state.kv_paged_yield_under_pressure) 'The pressure yield choice was not kept saved'
+    }
+    # Reuse mode never re-asks, so a profile that kept the yield but lost its RAM pool must heal:
+    # the engine only wires the knob inside the elastic branch, and a sink needs a host tier.
+    $yieldNoPoolSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = ''; kv_paged_page_tokens = '64'; kv_paged_elastic = $true; kv_paged_yield_under_pressure = $true; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'a saved pressure yield without a RAM pool is not emitted' -Saved $yieldNoPoolSettings -Inputs @('') -Check {
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'The corridor-only profile lost its elastic corridor'
+        Assert (-not ('kv.paged_yield_under_pressure=true' -in $nativeArgs)) 'A yield with nowhere to sink was still emitted'
     }
     Test-Flow 'manual hardware and sampling' -Inputs @('',  $model,  '',  '3',  '3072',  '4',  '',  '',  'n',  '3',  '256',  'n',  'paging.expert_prefetch=false',  'n',  '2048',  'y',  '0.7',  '20',  '0.95',  '9',  'n',  '20k') -Check {
         foreach ($value in @('--ubatch', '3072', '--threads', '4', 'device.submit_dispatches=256', 'paging.expert_prefetch=false', '--temp', '0.7', '--seed', '9')) {

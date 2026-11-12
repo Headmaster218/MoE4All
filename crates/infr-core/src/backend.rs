@@ -798,6 +798,16 @@ pub trait Backend: Send + Sync {
             "segmented KV frame corridors are not supported by this backend",
         ))
     }
+    /// Whether the paged expert cache is starving for device bytes right now, measured over the
+    /// window since the last call. The KV corridor and the expert arena sub-allocate ONE physical
+    /// pool, but each owner only sees its own ceiling: a tree that has not reached its frame limit
+    /// keeps every cold page in VRAM while the expert pager evicts on every admission. This is the
+    /// signal that lets the tree yield room it does not currently need. Default `false` — a backend
+    /// without a paged expert cache never asks for room, and an unmeasurable window must not move
+    /// bytes. Callers hold the GPU baton at a drained request boundary.
+    fn expert_vram_pressure(&self) -> bool {
+        false
+    }
     /// Copy one paged-KV frame out of its device corridor into host memory (Phase C RAM-tier
     /// demotion). `frame_addr` is the frame's first-byte corridor address
     /// (`FramePool::frame_addr`); `dst.len()` must equal `frame_bytes`. The caller holds the GPU

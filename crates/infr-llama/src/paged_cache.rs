@@ -125,6 +125,12 @@ pub(crate) trait FrameDma {
         let _ = corridors;
         Ok(())
     }
+    /// Whether the expert cache sharing this arena is starving for VRAM (see
+    /// [`Backend::expert_vram_pressure`]). Default `false`: host stand-ins and backends without a
+    /// paged expert cache never ask the tree to yield.
+    fn expert_vram_pressure(&self) -> bool {
+        false
+    }
 }
 
 impl<T: Backend + ?Sized> FrameDma for T {
@@ -144,6 +150,9 @@ impl<T: Backend + ?Sized> FrameDma for T {
     fn release_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
         self.free_kv_frames(corridors)
             .map_err(|error| anyhow!("{error}"))
+    }
+    fn expert_vram_pressure(&self) -> bool {
+        Backend::expert_vram_pressure(self)
     }
 }
 
@@ -269,6 +278,11 @@ pub(crate) struct PagedKv {
     /// more than the sink ladder it replaces, so the tree stops asking until a request boundary
     /// ([`Self::release_idle_corridors`]) clears this.
     grow_stalled: bool,
+    /// Whether a starving expert cache may ask this tree to sink cold tails and return the emptied
+    /// segments (`kv.paged_yield_under_pressure`). Off by default: yielding costs a DMA out now and
+    /// a DMA back on the next hit, so it is only worth paying when the other owner of the arena is
+    /// actually evicting.
+    yield_under_pressure: bool,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -375,6 +389,7 @@ impl PagedKv {
             vram_ceiling: 0,
             grow_chunk: 0,
             grow_stalled: false,
+            yield_under_pressure: false,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -430,6 +445,13 @@ impl PagedKv {
         );
         self.vram_ceiling = ceiling_frames.max(self.pool.capacity_frames(Tier::Vram));
         self.grow_chunk = chunk_frames.min(self.vram_ceiling);
+    }
+
+    /// Let a starving expert cache reclaim this tree's cold tails (see
+    /// [`Self::yield_vram_under_expert_pressure`]). Call once at init; meaningless without an
+    /// elastic corridor and a RAM tier, both of which the yield path checks itself.
+    pub(crate) fn set_yield_under_pressure(&mut self, enabled: bool) {
+        self.yield_under_pressure = enabled;
     }
 
     /// Replace the aux (recurrent/PLE snapshot) budget implied by the RAM frame pool. Only the
@@ -637,6 +659,98 @@ impl PagedKv {
         }
     }
 
+    /// Sink cold tails until the segments above the retained base chunk are empty, so
+    /// [`Self::release_idle_corridors`] can hand them to an expert cache that is starving. Returns
+    /// how many frames left VRAM.
+    ///
+    /// The tree and the expert arena sub-allocate ONE physical pool, but each only sees its own
+    /// ceiling: a conversation below `vram_ceiling` keeps every page in VRAM while the expert pager
+    /// evicts on every admission, and the host tier sits empty. [`FrameDma::expert_vram_pressure`]
+    /// is the cross-owner signal that closes that gap.
+    ///
+    /// Two limits keep this from being a pure loss. The last attach's reuse depth is a HARD floor
+    /// here (unlike the exhaustion ladder, which offers a fully warm run rather than let the evictor
+    /// delete it): nothing is about to be evicted, so sinking bytes a next hit would DMA straight
+    /// back buys nothing. And only the highest segments are emptied — the base chunk always stays,
+    /// and a hot conversation that reuses its whole prefix every turn pins itself and yields zero.
+    pub(crate) fn yield_vram_under_expert_pressure<M: FrameDma + ?Sized>(
+        &mut self,
+        be: &M,
+    ) -> usize {
+        if self.grow_chunk == 0
+            || !self.yield_under_pressure
+            || self.pool.capacity_frames(Tier::Ram) == 0
+            || self.pool.vram_segment_count() < 2
+            || !be.expert_vram_pressure()
+        {
+            return 0;
+        }
+        let mut sunk = 0usize;
+        while let Some(index) = (1..self.pool.vram_segment_count())
+            .rev()
+            .find(|&index| !self.pool.vram_segment_all_free(index))
+        {
+            let Some((first, frames)) = self.pool.vram_segment_range(index) else {
+                break;
+            };
+            let reach = first..first + frames;
+            let mut best: Option<(usize, usize, usize)> = None;
+            let mut best_key: Option<(bool, u64, usize)> = None;
+            for (node, item) in self.nodes.iter().enumerate() {
+                let Some(entry) = item.entry.as_ref() else {
+                    continue;
+                };
+                let (keep, end) = self.sink_region(entry, Tier::Vram, &[]);
+                // Floor at the entry's first frame inside the target segment. `first` is a POOL
+                // slot while `keep` indexes this entry's own chain, so the two only coincide for a
+                // single conversation that owns the corridor from slot 0; comparing them directly
+                // skips every shorter chain and the yield silently does nothing. Sinking below the
+                // segment is wasted DMA anyway: the take runs to the end of the whole VRAM run, and
+                // bytes in the retained base chunk are never handed back to the arena.
+                let keep = entry
+                    .chain
+                    .iter()
+                    .position(|frame| frame.slot() >= first)
+                    .unwrap_or(entry.chain.len())
+                    .max(entry.warm_frames)
+                    .max(keep);
+                if keep >= end
+                    || !entry.chain[keep..end]
+                        .iter()
+                        .any(|frame| frame.tier() == Tier::Vram && reach.contains(&frame.slot()))
+                {
+                    continue;
+                }
+                let key = (self.has_entry_below(node), item.last_access, node);
+                if best_key.is_none_or(|current| key < current) {
+                    best_key = Some(key);
+                    best = Some((node, keep, end));
+                }
+            }
+            // No entry can yield a frame in that segment (all active, all warm, or already sunk):
+            // stop rather than spin. Every iteration below moves at least one frame out of VRAM.
+            let Some((node, keep, end)) = best else {
+                break;
+            };
+            let moved = self.sink_entry_tail(be, node, keep, end);
+            if moved == 0 {
+                break;
+            }
+            if keep > 0 {
+                self.tail_sinks += 1;
+            }
+            sunk += moved;
+        }
+        if sunk > 0 {
+            tracing::debug!(
+                sunk_frames = sunk,
+                capacity_frames = self.pool.capacity_frames(Tier::Vram),
+                "paged KV yielded cold tails to the expert arena under device pressure"
+            );
+        }
+        sunk
+    }
+
     /// Rewrite every entry-chain occurrence of `source` to `fresh` after a tier migration.
     /// Entries share positional frames: an ancestor's chain and a descendant's chain carry the
     /// SAME id at the SAME index (attach reuses the matched chain, publish pins it), and the
@@ -733,8 +847,29 @@ impl PagedKv {
         let Some((node, keep, end)) = best else {
             return false;
         };
-        // Take from the TAIL: sinking from `keep` forward would move the hot end of the run and
-        // leave device frames behind host ones, and promotion truncates at the first host frame.
+        let moved = self.sink_entry_tail(be, node, keep, end);
+        if moved > 0 && keep > 0 {
+            self.tail_sinks += 1;
+        }
+        moved > 0
+    }
+
+    /// Move the tail of one entry's VRAM run `[keep, end)` into the RAM tier, highest frame first.
+    /// Returns how many frames left VRAM.
+    ///
+    /// Taking from the TAIL is what keeps the chain a gradient: sinking from `keep` forward would
+    /// move the hot end and leave device frames behind host ones, and promotion truncates at the
+    /// first host frame. The take is bounded by free RAM, not by the run length, so a conversation
+    /// longer than the host tier keeps a mixed chain instead of being skipped and then deleted. A
+    /// DMA failure rolls back frame by frame — whatever already sank stays sunk (its bytes are safe
+    /// in the backing), the rest stay in VRAM.
+    fn sink_entry_tail<M: FrameDma + ?Sized>(
+        &mut self,
+        be: &M,
+        node: usize,
+        keep: usize,
+        end: usize,
+    ) -> usize {
         let take = (end - keep).min(self.pool.free_frames(Tier::Ram));
         let frame_bytes = self.pool.frame_bytes() as usize;
         let mut moved = 0usize;
@@ -763,10 +898,7 @@ impl PagedKv {
             self.tier_demotions += 1;
             moved += 1;
         }
-        if moved > 0 && keep > 0 {
-            self.tail_sinks += 1;
-        }
-        moved > 0
+        moved
     }
 
     /// Phase D: write one frame's bytes to its disk slot, growing the sparse file to cover it.
@@ -1859,6 +1991,40 @@ mod tests {
         }
     }
 
+    /// The cross-owner signal on top of the elastic stand-in: a test flips whether the expert cache
+    /// sharing the arena is starving without changing the arena itself.
+    struct PressureDma {
+        inner: ElasticDma,
+        pressure: std::cell::Cell<bool>,
+    }
+
+    impl PressureDma {
+        fn new(left: usize, pressure: bool) -> Self {
+            Self {
+                inner: ElasticDma::new(left),
+                pressure: std::cell::Cell::new(pressure),
+            }
+        }
+    }
+
+    impl FrameDma for PressureDma {
+        fn download_frame(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {
+            self.inner.download_frame(frame_addr, dst)
+        }
+        fn upload_frame(&self, frame_addr: u64, src: &[u8]) -> Result<()> {
+            self.inner.upload_frame(frame_addr, src)
+        }
+        fn grow_frames(&self, frame_bytes: u64, count: usize) -> Result<Vec<KvFrameCorridor>> {
+            self.inner.grow_frames(frame_bytes, count)
+        }
+        fn release_frames(&self, corridors: &[KvFrameCorridor]) -> Result<()> {
+            self.inner.release_frames(corridors)
+        }
+        fn expert_vram_pressure(&self) -> bool {
+            self.pressure.get()
+        }
+    }
+
     #[test]
     fn an_elastic_corridor_grows_before_it_sinks_or_evicts() {
         let mut kv = cache_ram(4, 8);
@@ -1962,6 +2128,152 @@ mod tests {
         assert_eq!(kv.evictions, 1);
         assert_eq!(kv.corridor_grows, 0);
         assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
+    }
+
+    #[test]
+    fn expert_pressure_sinks_cold_tails_and_the_corridor_goes_back() {
+        // The host tier is deliberately roomier than the 8 frames that should sink: sized to exactly
+        // 8 it fills up, and a base chunk the yield wrongly tried to empty would be refused by the
+        // take bound instead of by the segment floor — the `== 8` assertion could not tell them apart.
+        let mut kv = cache_ram(4, 16);
+        kv.set_elastic_corridor(16, 4);
+        kv.set_yield_under_pressure(true);
+        let dma = PressureDma::new(8, false);
+        let chain = grow_with(&mut kv, &dma, 12);
+        kv.publish((1..=48).collect(), chain.clone()).unwrap();
+        kv.session_release(&chain);
+        // No pressure: every page stays in VRAM even though the host tier sits empty.
+        assert_eq!(kv.yield_vram_under_expert_pressure(&dma), 0);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 12);
+
+        dma.pressure.set(true);
+        assert_eq!(kv.yield_vram_under_expert_pressure(&dma), 8);
+        assert_gradient(&kv);
+        // The sink rewrites the TREE's chain; the caller's FrameId copies still name the old slots.
+        let sunk_chain = kv.entry_chain(node_of(&kv, chain[0]), 48);
+        assert!(sunk_chain[..4]
+            .iter()
+            .all(|frame| frame.tier() == Tier::Vram));
+        assert!(sunk_chain[4..]
+            .iter()
+            .all(|frame| frame.tier() == Tier::Ram));
+        assert_eq!(
+            kv.evictions, 0,
+            "bytes move down a tier, they are not deleted"
+        );
+        // Only the two emptied segments go back; the base chunk is the floor.
+        kv.release_idle_corridors(&dma);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
+        assert_eq!(kv.corridor_shrinks, 2);
+        assert_eq!(
+            dma.inner.arena.lock().unwrap().released,
+            vec![
+                KvFrameCorridor {
+                    base: 0x2_0000_0000 + 4 * FB,
+                    frames: 4
+                },
+                KvFrameCorridor {
+                    base: 0x2_0000_0000,
+                    frames: 4
+                },
+            ]
+        );
+        // The prefix is still addressable, and the sunk tail comes back through the host backing:
+        // MockDma refuses an upload whose bytes match no frame it ever downloaded.
+        let (node, reusable) = kv.best_match(&(1..=48).collect::<Vec<_>>(), None).unwrap();
+        assert_eq!(reusable, 48);
+        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(back.len(), 12);
+        assert!(back.iter().all(|frame| frame.tier() == Tier::Vram));
+        assert_eq!(kv.tier_demotions, 8);
+        assert_eq!(kv.tier_promotions, 8);
+    }
+
+    #[test]
+    fn expert_pressure_yields_for_short_chains_that_do_not_start_at_slot_zero() {
+        // Two conversations side by side, neither as long as the corridor. The segment floor is a
+        // POOL slot but `keep` indexes an entry's OWN chain, so a floor compared against the raw
+        // slot number skips both of these (keep >= end) and the yield returns 0 — the feature is a
+        // no-op for exactly the multi-session case it exists to serve.
+        let mut kv = cache_ram(4, 16);
+        kv.set_elastic_corridor(16, 4);
+        kv.set_yield_under_pressure(true);
+        let dma = PressureDma::new(8, true);
+        let a = grow_with(&mut kv, &dma, 6); // pool slots 0..5
+        kv.publish((1..=24).collect(), a.clone()).unwrap();
+        let b = grow_with(&mut kv, &dma, 6); // pool slots 6..11
+        kv.publish((101..=124).collect(), b.clone()).unwrap();
+        assert_eq!(a[0].slot(), 0);
+        assert_eq!(b[0].slot(), 6);
+        // Resolve the nodes BEFORE the sink: it rewrites the tree's FrameIds, so the caller's
+        // copies no longer name the same frames afterwards.
+        let na = node_of(&kv, a[0]);
+        let nb = node_of(&kv, b[0]);
+        kv.session_release(&a);
+        kv.session_release(&b);
+
+        assert_eq!(kv.yield_vram_under_expert_pressure(&dma), 8);
+        assert_gradient(&kv);
+        let ca = kv.entry_chain(na, 24);
+        let cb = kv.entry_chain(nb, 24);
+        // A keeps the base chunk it lives in; B owns no base-chunk frame, so all of it goes.
+        assert!(ca[..4].iter().all(|f| f.tier() == Tier::Vram));
+        assert!(ca[4..].iter().all(|f| f.tier() == Tier::Ram));
+        assert!(cb.iter().all(|f| f.tier() == Tier::Ram));
+        assert_eq!(kv.evictions, 0);
+        kv.release_idle_corridors(&dma);
+        assert_eq!(kv.pool.capacity_frames(Tier::Vram), 4);
+        assert_eq!(kv.corridor_shrinks, 2);
+        // Both prefixes are still addressable and round-trip through the host backing.
+        for (tokens, node) in [
+            ((1..=24).collect::<Vec<_>>(), na),
+            ((101..=124).collect(), nb),
+        ] {
+            let (found, reusable) = kv.best_match(&tokens, None).unwrap();
+            assert_eq!(found, node);
+            assert_eq!(reusable, 24);
+            let back = kv.entry_chain_promoted(&dma, found, reusable);
+            assert!(back.iter().all(|f| f.tier() == Tier::Vram));
+        }
+    }
+
+    #[test]
+    fn a_warm_prefix_a_dry_host_tier_or_the_off_knob_never_yields() {
+        let dma = PressureDma::new(64, true);
+        // Opt-in: an existing deployment keeps its VRAM residency until the knob is set.
+        let mut kv = cache_ram(4, 8);
+        kv.set_elastic_corridor(16, 4);
+        let chain = grow_with(&mut kv, &dma, 12);
+        kv.publish((1..=48).collect(), chain.clone()).unwrap();
+        kv.session_release(&chain);
+        assert_eq!(kv.yield_vram_under_expert_pressure(&dma), 0);
+
+        // The last attach's reuse depth is a HARD floor here, unlike the exhaustion ladder (which
+        // offers a fully warm run rather than let the evictor delete it): nothing is about to be
+        // evicted, so sinking bytes the next hit would DMA straight back buys nothing.
+        kv.set_yield_under_pressure(true);
+        let (node, reusable) = kv.best_match(&(1..=48).collect::<Vec<_>>(), None).unwrap();
+        let _ = kv.entry_chain_promoted(&dma, node, reusable);
+        assert_eq!(kv.yield_vram_under_expert_pressure(&dma), 0);
+        assert_eq!(kv.tier_demotions, 0);
+
+        // No host tier: yielding would mean deleting the prefix, so the ladder keeps it instead.
+        let mut dry = cache_ram(4, 0);
+        dry.set_elastic_corridor(16, 4);
+        dry.set_yield_under_pressure(true);
+        let cold = grow_with(&mut dry, &dma, 12);
+        dry.publish((1..=48).collect(), cold.clone()).unwrap();
+        dry.session_release(&cold);
+        assert_eq!(dry.yield_vram_under_expert_pressure(&dma), 0);
+        assert_eq!(dry.evictions, 0);
+
+        // A fixed corridor is one segment: there is nothing above the base chunk to empty.
+        let mut fixed = cache_ram(12, 8);
+        fixed.set_yield_under_pressure(true);
+        let one = grow_with(&mut fixed, &dma, 12);
+        fixed.publish((1..=48).collect(), one.clone()).unwrap();
+        fixed.session_release(&one);
+        assert_eq!(fixed.yield_vram_under_expert_pressure(&dma), 0);
     }
 
     #[test]

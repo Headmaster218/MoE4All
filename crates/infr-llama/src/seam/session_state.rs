@@ -525,6 +525,9 @@ impl SeamKv {
         }
         let chain = std::mem::take(&mut self.segmented_kv.chain);
         kv.session_release(&chain);
+        // Cold tails the expert arena can use leave before the corridor is measured for release,
+        // so the segments they empty go back in this same boundary. The tree owns the opt-in.
+        kv.yield_vram_under_expert_pressure(be);
         // This conversation just left VRAM, so any elastic corridor chunk it was the last owner of
         // goes back to the expert arena here — the baton still guarantees no dispatch names those
         // frames, and the next checkout grows the corridor again if it needs the room.

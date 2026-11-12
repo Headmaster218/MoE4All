@@ -1937,6 +1937,7 @@ impl ParallelSeam {
             tree.set_vram_segments(&corridors);
             if elastic {
                 tree.set_elastic_corridor(budget_frames, grow_chunk);
+                tree.set_yield_under_pressure(ec.kv.paged_yield_under_pressure);
             }
             if ram_frames == 0 {
                 // The `RAM tier / 8` derivation has no tier to divide. A zero aux cap is not a

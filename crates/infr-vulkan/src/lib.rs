@@ -9045,6 +9045,32 @@ impl Backend for VulkanBackend {
         })
     }
 
+    fn expert_vram_pressure(&self) -> bool {
+        // The device-LRU readback takes the same exclusive gate `free_kv_frames` takes at this
+        // boundary, and the caller holds the GPU baton on a drained request, so `in_forward` is
+        // clear. Only the opt-in tree asks, so a default configuration never pays for the readback.
+        self.with_unified_gate(|| {
+            let pager = self.moe_pager.lock().unwrap();
+            let Some(session) = pager.as_ref() else {
+                return false;
+            };
+            let gpu_stats = match session
+                .gpu_decode_owner
+                .as_ref()
+                .filter(|owner| owner.owned_active())
+                .map(|owner| owner.owned_statistics(self, session))
+            {
+                None => None,
+                Some(Ok(stats)) => stats,
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "GPU-owned expert pressure unavailable; the KV tree keeps its corridors");
+                    return false;
+                }
+            };
+            session.expert_vram_pressure(gpu_stats.as_deref())
+        })
+    }
+
     fn kv_frame_download(&self, frame_addr: u64, dst: &mut [u8]) -> Result<()> {
         // Phase C demotion: locate the installed corridor holding this frame and range-copy its
         // bytes to host memory. The caller holds the GPU baton (no dispatch may read the corridor
