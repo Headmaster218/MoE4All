@@ -107,12 +107,16 @@ pub(crate) trait MtpPrefillHiddenSink {
 ///
 /// `min_rows` is the layer-ring threshold (see [`prefill_uses_layer_ring`]): while a round PAID the
 /// ring reserve, a boundary that would starve the chunk below the threshold is skipped (the
-/// 2026-10-19 memory-bomb fix). Skipping is functionally free — recurrent checkpoints publish only
-/// when a chunk ends exactly on the boundary (`Some(cend) == boundary` at the snapshot sites), so a
-/// starved boundary simply degrades to "no reuse checkpoint this turn" instead of misaligning.
-/// Without it, a 160-token prompt was cut into 45+115-row chunks below every ring decision, the
-/// reserve was paid without the ring ever being used, and the gray chunks storm-missed hundreds of
-/// experts per layer through the emptied corridor into unbounded staging (~23 GiB/s of commit).
+/// 2026-10-19 memory-bomb fix). Skipping a TURN boundary is functionally free — recurrent
+/// checkpoints publish only when a chunk ends exactly on the boundary (`Some(cend) == boundary` at
+/// the snapshot sites), so a starved turn boundary simply degrades to "no reuse checkpoint this
+/// turn". Skipping the PAGED FRONTIER is not free: a single-sequence request has no turn boundaries,
+/// so an exact-match-only capture would leave it with no snapshot at all and the recurrent entry is
+/// refused outright. [`paged_capture_boundary`] is what keeps that case publishable by falling back
+/// to the previous chunk end. Without the threshold, a 160-token prompt was cut into 45+115-row
+/// chunks below every ring decision, the reserve was paid without the ring ever being used, and the
+/// gray chunks storm-missed hundreds of experts per layer through the emptied corridor into unbounded
+/// staging (~23 GiB/s of commit).
 fn prefill_chunk_end(
     start: usize,
     end: usize,
@@ -141,6 +145,23 @@ fn page_floor(value: usize, page: usize) -> usize {
     } else {
         value - value % page
     }
+}
+
+/// The deepest chunk end at or below `frontier` — the position the paged snapshot is actually taken
+/// at. [`prefill_chunk_end`] skips a frontier that would starve the chunk below the ring threshold,
+/// so no chunk need end exactly on it; capturing only on an exact match then leaves a single-sequence
+/// request with NO snapshot at all, and a recurrent entry without one is refused outright (the whole
+/// conversation replays every turn). Falling back to the previous chunk end keeps a publishable
+/// prefix: it is page-aligned like the frontier, so its frames and its state still describe the same
+/// tokens, just fewer of them. `None` when even the first chunk overshoots (a prompt shorter than one
+/// ubatch), where there is nothing to capture.
+fn paged_capture_boundary(chunks: &[(usize, usize)], frontier: Option<usize>) -> Option<usize> {
+    let frontier = frontier?;
+    chunks
+        .iter()
+        .map(|&(_, end)| end)
+        .filter(|&end| end <= frontier)
+        .max()
 }
 
 /// The page-aligned position a chunked prefill of `prompt_len` tokens stops at: every prefill path
@@ -12407,6 +12428,9 @@ fn generate_dense_backend_inner(
         // Assembled at the frontier chunk and published with this request's frames at detach. Held
         // across the whole sweep because a layer-major prefill fills it one span at a time.
         let mut frontier_capture: Option<PagedFrontierCapture> = None;
+        // The chunk the snapshot is taken at: the frontier itself when a chunk lands on it, else the
+        // deepest chunk end below it (see `paged_capture_boundary`).
+        let paged_capture_at = paged_capture_boundary(&chunks, paged_frontier_at);
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -12830,9 +12854,10 @@ fn generate_dense_backend_inner(
                             }
                         }
                         // Paged tier: the host snapshot this request's radix entry publishes, taken at
-                        // exactly the position the frame chain reaches. Layer-major fills it span by
-                        // span (see `PagedFrontierCapture`); chunk-major reads the whole model once.
-                        if Some(cend) == paged_frontier_at {
+                        // the deepest chunk end at or below the frontier — the frame chain's page-aligned
+                        // depth. Layer-major fills it span by span (see `PagedFrontierCapture`);
+                        // chunk-major reads the whole model once.
+                        if Some(cend) == paged_capture_at {
                             let capture = match frontier_capture.as_mut() {
                                 Some(capture) => capture,
                                 None => frontier_capture.insert(PagedFrontierCapture::new(
@@ -15121,9 +15146,10 @@ mod tests {
     use super::{
         allocate_parallel_prefill_rows, command_ahead_cohort_ready, dense_request_exceeds_capacity,
         full_mrope_positions, mrope_rows_are_plain_rope, mrope_token_position, page_floor,
-        paged_frontier_pos, parallel_decode_should_stop, parallel_prefill_group,
-        parallel_prefill_progress, prefill_chunk_end, qsa_prepare_pair_supported,
-        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
+        paged_capture_boundary, paged_frontier_pos, parallel_decode_should_stop,
+        parallel_prefill_group, parallel_prefill_progress, prefill_chunk_end,
+        qsa_prepare_pair_supported, recurrent_extension_start, resident_after_gen,
+        sampling_suffix_start, validate_token_ids,
     };
     use infr_core::DType;
 
@@ -15629,11 +15655,36 @@ mod tests {
             prefill_chunk_end(29_952, 29_999, 32_768, &none, Some(29_952), 0),
             29_999
         );
-        // A frontier the ring reserve would starve is skipped exactly like a checkpoint: the
-        // request loses its snapshot and the next one replays, which is a perf loss, not a hazard.
+        // A frontier the ring reserve would starve is skipped exactly like a checkpoint: no chunk
+        // ends on it. For a single-sequence request that is NOT merely a perf loss — with no turn
+        // boundary either, an exact-match capture yields no snapshot and the whole entry is refused.
+        // `paged_capture_boundary` recovers the previous chunk end so the conversation still publishes.
         assert_eq!(
             prefill_chunk_end(29_900, 29_999, 32_768, &none, Some(29_952), 154),
             29_999
+        );
+    }
+
+    #[test]
+    fn paged_capture_falls_back_to_the_deepest_chunk_end_below_the_frontier() {
+        // Both vectors are the tail of the real ub-2048 chunking of the A/B prompts, whose last
+        // prefill row is prompt_len - 1. The live case (604 segments, 14545 tokens): the frontier
+        // 14528 leaves a 192-row chunk, above the ring floor, so a chunk lands on it exactly.
+        let landed = [(12_288, 14_336), (14_336, 14_528), (14_528, 14_544)];
+        assert_eq!(paged_capture_boundary(&landed, Some(14_528)), Some(14_528));
+        // The dead case (600 segments, 14449 tokens): the frontier 14400 would leave 64 rows, below
+        // the ring floor, so the chunker skips it and the last chunk overshoots to 14448. The
+        // previous chunk end is still page-aligned and publishable — 14336 tokens instead of none.
+        let starved = [(12_288, 14_336), (14_336, 14_448)];
+        assert_eq!(paged_capture_boundary(&starved, Some(14_400)), Some(14_336));
+        // A prompt shorter than one ubatch has a single chunk that overshoots: nothing to capture.
+        assert_eq!(paged_capture_boundary(&[(0, 40)], Some(0)), None);
+        // No frontier (non-paged or non-recurrent) captures nothing.
+        assert_eq!(paged_capture_boundary(&landed, None), None);
+        // The deepest end wins even when several chunks sit below the frontier.
+        assert_eq!(
+            paged_capture_boundary(&[(0, 64), (64, 128), (128, 200)], Some(192)),
+            Some(128)
         );
     }
 
