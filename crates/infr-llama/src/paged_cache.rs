@@ -278,6 +278,10 @@ pub(crate) struct PagedKv {
     /// download failed, or the deepest one cannot fit the aux budget). A rising count means the
     /// tree is caching nothing for this model and every request re-prefills.
     aux_refusals: u64,
+    /// Snapshots a deeper publish inherited from the ancestor entries it superseded. Zero on a
+    /// workload whose every request continues the same conversation at its own frontier; a rising
+    /// count is the branch-point reuse that supersession used to delete.
+    ckpts_inherited: u64,
     tier_demotions: u64,
     tier_promotions: u64,
     /// Sinks that left a warm prefix in VRAM and moved only the tail behind it. Zero means every
@@ -377,6 +381,7 @@ impl PagedKv {
             demotions: 0,
             evictions: 0,
             aux_refusals: 0,
+            ckpts_inherited: 0,
             tier_demotions: 0,
             tier_promotions: 0,
             tail_sinks: 0,
@@ -457,7 +462,7 @@ impl PagedKv {
         let held = self.pool.held_frames(Tier::Vram);
         let total = self.pool.capacity_frames(Tier::Vram);
         format!(
-            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} aux_refusals={} sunk={} promoted={} tail_sinks={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
+            "entries={} frames_held={}/{} free={} tokens_held={}/{} bytes={:.2}GiB/{:.2}GiB ram={}/{} ram_bytes={:.2}GiB disk={}/{} disk_bytes={:.2}GiB aux_bytes={:.2}MiB/{:.2}MiB hits={} misses={} demotions={} evictions={} aux_refusals={} ckpts_inherited={} sunk={} promoted={} tail_sinks={} disk_sunk={} disk_promoted={} corridor_grows={} corridor_shrinks={} corridor_ceiling={}",
             self.nodes
                 .iter()
                 .filter(|node| node.entry.is_some())
@@ -482,6 +487,7 @@ impl PagedKv {
             self.demotions,
             self.evictions,
             self.aux_refusals,
+            self.ckpts_inherited,
             self.tier_demotions,
             self.tier_promotions,
             self.tail_sinks,
@@ -928,26 +934,81 @@ impl PagedKv {
         let mut candidates: Vec<usize> = Vec::new();
         candidates.extend(partial);
         candidates.extend(path.iter().rev().copied());
-        if consumed == prompt.len() {
-            // Fully consumed prompt at a node boundary: every subtree entry continues it.
-            if let Some(&root) = path.last() {
-                let mut stack = vec![root];
-                while let Some(index) = stack.pop() {
-                    if self.nodes[index].entry.is_some() {
-                        candidates.push(index);
-                    }
-                    stack.extend(self.nodes[index].children.values().copied());
+        // Every entry at or below the walk's frontier shares the query's first `consumed` tokens, so
+        // its first `pages` frames cover a prefix of the query — including when the query diverges
+        // INSIDE an edge, or stops at a node with no matching child. Scanning only the fully
+        // consumed case left a fork that edits history matching nothing while the frames it needed
+        // sat one node deeper, behind the entry-less node the split created.
+        if let Some(base) = partial.or_else(|| path.last().copied()) {
+            let mut stack = vec![base];
+            while let Some(index) = stack.pop() {
+                if self.nodes[index].entry.is_some() {
+                    candidates.push(index);
+                }
+                stack.extend(self.nodes[index].children.values().copied());
+            }
+        }
+        let depth = pages * self.page_tokens;
+        let n_candidates = candidates.len();
+        let detail = candidates
+            .iter()
+            .map(|&node| {
+                let entry = self.nodes[node].entry.as_ref();
+                (
+                    node,
+                    self.nodes[node].path_len,
+                    entry.map(|entry| entry.chain.len()),
+                    entry.map(|entry| {
+                        entry
+                            .ckpts
+                            .iter()
+                            .map(|ckpt| ckpt.boundary_tokens)
+                            .collect::<Vec<_>>()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        // A recurrent entry resumes only at a snapshot boundary, so the longest chain is not the
+        // best candidate: one whose snapshots all sit above `depth` matches and then hands back
+        // zero tokens. Rank by the depth actually resumable, first-wins on ties, stop at a full one.
+        let mut chosen = None;
+        let mut best_resumable = 0usize;
+        for node in candidates {
+            let Some(entry) = self.nodes[node].entry.as_ref() else {
+                continue;
+            };
+            if entry.chain.len() < pages {
+                continue;
+            }
+            let resumable = if self.recurrent {
+                entry
+                    .ckpts
+                    .iter()
+                    .map(|ckpt| ckpt.boundary_tokens)
+                    .filter(|&boundary| boundary <= depth)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                depth
+            };
+            if chosen.is_none() || resumable > best_resumable {
+                chosen = Some(node);
+                best_resumable = resumable;
+                if resumable == depth {
+                    break;
                 }
             }
         }
-        let chosen = candidates.into_iter().find(|&node| {
-            self.nodes[node]
-                .entry
-                .as_ref()
-                .is_some_and(|entry| entry.chain.len() >= pages)
-        });
         let Some(node) = chosen else {
             self.misses += 1;
+            tracing::debug!(
+                query = prompt.len(),
+                consumed,
+                pages,
+                candidates = n_candidates,
+                detail = ?detail,
+                "paged KV match miss"
+            );
             return None;
         };
         self.hits += 1;
@@ -957,7 +1018,7 @@ impl PagedKv {
         for &frame in &entry.chain[..pages] {
             self.pool.touch(frame);
         }
-        Some((node, pages * self.page_tokens))
+        Some((node, depth))
     }
 
     /// Read-only form of the chain accessor below: the entry node's frames covering `reusable`
@@ -1124,11 +1185,16 @@ impl PagedKv {
     ///
     /// `projection` selects the tree the chain is published into (see [`Self::root`]); a lookup
     /// under a different setting cannot reach it.
+    ///
+    /// A publish that lands DEEPER than an existing entry supersedes it, and inherits the snapshot
+    /// that entry resumed at: the branch point is still a prefix of these tokens, so a later request
+    /// forking there attaches instead of re-prefilling. Inheritance moves aux bytes between entries
+    /// rather than adding them — the ancestor's bytes leave the budget before admission re-adds them.
     pub(crate) fn publish_with_ckpts(
         &mut self,
         tokens: Vec<u32>,
         chain: Vec<FrameId>,
-        ckpts: Vec<Arc<PagedCkpt>>,
+        mut ckpts: Vec<Arc<PagedCkpt>>,
         projection: Option<bool>,
     ) -> Result<()> {
         let pages = tokens.len() / self.page_tokens;
@@ -1174,7 +1240,19 @@ impl PagedKv {
             self.pool.pin(frame);
         }
         let node = self.descend_to(self.root(projection), &tokens);
-        self.drop_superseded_ancestors(node);
+        let mut inherited = self.drop_superseded_ancestors(node);
+        inherited.sort_by_key(|ckpt| ckpt.boundary_tokens);
+        inherited.dedup_by_key(|ckpt| ckpt.boundary_tokens);
+        // A boundary this publish captured itself wins: its state belongs to the chain being
+        // published, and counting it twice would charge the aux budget for one snapshot twice.
+        inherited.retain(|ckpt| {
+            !ckpts
+                .iter()
+                .any(|own| own.boundary_tokens == ckpt.boundary_tokens)
+        });
+        self.ckpts_inherited += inherited.len() as u64;
+        let inherited_now = inherited.len();
+        ckpts.extend(inherited);
         self.clock += 1;
         // The replaced entry leaves the aux budget NOW, before admission: its frames stay pinned
         // by the new chain (or by their session owners), and counting its snapshots against the
@@ -1184,6 +1262,14 @@ impl PagedKv {
             self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&old.ckpts));
         }
         let ckpts = self.admit_ckpts(ckpts, node);
+        tracing::debug!(
+            node,
+            depth = tokens.len(),
+            pages = chain.len(),
+            inherited = inherited_now,
+            snapshots = ?ckpts.iter().map(|ckpt| ckpt.boundary_tokens).collect::<Vec<_>>(),
+            "paged KV publish"
+        );
         self.nodes[node].entry = Some(ChainEntry {
             chain,
             ckpts,
@@ -1248,7 +1334,8 @@ impl PagedKv {
         }
         // Still over after every other entry yielded: the shallowest incoming snapshots go. The
         // deepest one is what a same-conversation resume attaches, and on a recurrent tree it is
-        // the entry's only way in — the publish pre-flight proved it fits the budget alone.
+        // the entry's only way in — it fits the budget alone, either because the publish pre-flight
+        // proved it or because an inherited snapshot was admitted under this same budget.
         let keep = usize::from(self.recurrent && !ckpts.is_empty());
         while self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget && ckpts.len() > keep {
             ckpts.remove(0);
@@ -1313,7 +1400,19 @@ impl PagedKv {
     ) -> (usize, Option<Arc<PagedCkpt>>) {
         if recurrent {
             let ckpt = self.entry_ckpt(node, depth);
-            (ckpt.as_ref().map_or(0, |ckpt| ckpt.boundary_tokens), ckpt)
+            let out = (ckpt.as_ref().map_or(0, |ckpt| ckpt.boundary_tokens), ckpt);
+            tracing::debug!(
+                node,
+                matched = depth,
+                resumable = out.0,
+                entry_depth = self.nodes[node].path_len,
+                chain = ?self.nodes[node].entry.as_ref().map(|entry| entry.chain.len()),
+                snapshots = ?self.nodes[node].entry.as_ref().map(|entry| {
+                    entry.ckpts.iter().map(|ckpt| ckpt.boundary_tokens).collect::<Vec<_>>()
+                }),
+                "paged KV hit"
+            );
+            out
         } else {
             (depth, None)
         }
@@ -1461,11 +1560,15 @@ impl PagedKv {
         node
     }
 
-    /// Unpin ancestor entry chains superseded by the chain just published at `node`. The new
-    /// entry already holds owners on those frames, so the ancestors' owners leaving cannot free
-    /// anything the new chain still references. Cleared ancestors are swept AFTER the walk:
-    /// pruning mid-walk could free a node whose index the walk still has to visit.
-    fn drop_superseded_ancestors(&mut self, node: usize) {
+    /// Unpin ancestor entry chains superseded by the chain just published at `node`, and hand back
+    /// the snapshot each of them resumes at. The new entry already holds owners on those frames, so
+    /// the ancestors' owners leaving cannot free anything the new chain still references. Their
+    /// deepest snapshot describes a prefix of `node`'s tokens — the radix path guarantees it — so it
+    /// is still resumable, and it is the ONLY state that can resume a fork branching at that depth:
+    /// deleting it left a chain that matches and then hands back zero tokens. Cleared ancestors are
+    /// swept AFTER the walk: pruning mid-walk could free a node whose index the walk still has to
+    /// visit.
+    fn drop_superseded_ancestors(&mut self, node: usize) -> Vec<Arc<PagedCkpt>> {
         let mut cleared = Vec::new();
         let mut parent = self.nodes[node].parent;
         while let Some(index) = parent {
@@ -1474,12 +1577,21 @@ impl PagedKv {
             }
             parent = self.nodes[index].parent;
         }
+        let mut inherited = Vec::new();
         for index in cleared {
             if let Some(entry) = self.nodes[index].entry.take() {
+                // The DEEPEST snapshot only. Shallower ones are either re-captured by this publish
+                // (the shared instruction prefix) or describe a branch point two turns back, and
+                // inheriting whole sets would grow every entry by its ancestry until the aux budget
+                // started evicting entire conversations to pay for it.
+                if let Some(anchor) = entry.ckpts.iter().max_by_key(|ckpt| ckpt.boundary_tokens) {
+                    inherited.push(anchor.clone());
+                }
                 self.unpin_entry(entry);
             }
             self.prune_upward(index);
         }
+        inherited
     }
 
     /// Detach entry-less, child-less nodes upward and merge pass-through nodes into their only
@@ -2610,6 +2722,264 @@ mod tests {
     }
 
     #[test]
+    fn a_recurrent_branch_shallower_than_its_only_snapshot_reuses_nothing() {
+        // The sub-agent shape: several requests share a long prefix and diverge early. The tree
+        // holds that prefix in VRAM and counts a HIT, but a recurrent entry resumes only at a
+        // snapshot boundary and the publish captured one at the conversation's own frontier.
+        let mut kv = cache_recurrent(16, 8);
+        let a = grow(&mut kv, 4); // 16 tokens
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        let branch: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 900, 901];
+        let (node, matched) = kv
+            .best_match(&branch, None)
+            .expect("the shared prefix is a hit");
+        assert_eq!(matched, 8);
+        assert_eq!(
+            kv.entry_chain(node, 8).len(),
+            2,
+            "two VRAM pages already cover the branch point"
+        );
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!(
+            (reusable, ckpt.is_some()),
+            (0, false),
+            "a hit that hands back zero tokens: the whole prompt re-prefills"
+        );
+        // Same tree, same prompt, dense attention: the pages alone are the resume point.
+        assert_eq!(kv.hit_prefix(node, false, matched).0, 8);
+    }
+
+    #[test]
+    fn a_deeper_continuation_publish_inherits_the_branch_point_it_supersedes() {
+        // t1 -> t2 -> t3 of the measured conversation probe: t2 continues t1 and publishes deeper,
+        // t3 branches off at exactly t1's frontier. A continuation captures no new snapshot AT its
+        // start (the runner's `boundary > start` filter), so the deeper entry carries only its own
+        // frontier — and supersession deletes the shallower entry that held the branch point. The
+        // frames survive either way; inheriting the deleted entry's anchor is what keeps the STATE
+        // that can resume them, instead of a hit that hands back zero tokens.
+        let mut kv = cache_recurrent(16, 8);
+        let t1 = grow(&mut kv, 4); // 16 tokens
+        kv.publish_with_ckpts(
+            (1..=16).collect(),
+            t1.clone(),
+            vec![ckpt(8, 64), ckpt(16, 64)],
+            None,
+        )
+        .unwrap();
+        kv.session_release(&t1);
+        let branch: Vec<u32> = (1..=16).chain([900, 901]).collect();
+        let (node, matched) = kv.best_match(&branch, None).unwrap();
+        assert_eq!(
+            kv.hit_prefix(node, true, matched).0,
+            16,
+            "t1 resumes the branch"
+        );
+
+        // t2 continues t1 to 24 tokens and publishes; its only snapshot is its own frontier.
+        let t2 = grow(&mut kv, 6);
+        kv.publish_with_ckpts((1..=24).collect(), t2.clone(), vec![ckpt(24, 64)], None)
+            .unwrap();
+        kv.session_release(&t2);
+        // The pass-through node merges into its only child, so the deeper entry stays matchable and
+        // its chain physically covers all 16 branch tokens. The superseded entry's deepest snapshot
+        // moved onto it, so the branch resumes there rather than re-prefilling.
+        let (node, matched) = kv
+            .best_match(&branch, None)
+            .expect("the merged chain still matches");
+        assert_eq!(matched, 16);
+        assert_eq!(
+            kv.entry_chain(node, 16).len(),
+            4,
+            "four VRAM pages still cover the branch point"
+        );
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!(
+            (reusable, ckpt.unwrap().boundary_tokens),
+            (16, 16),
+            "the fork attaches at the frontier it branched from"
+        );
+        assert_eq!(kv.ckpts_inherited, 1);
+        // The shallow 8-token snapshot was NOT inherited: only the branch point was. Aux moved
+        // between entries instead of growing — 64 B left with the ancestor, 128 B sit on t2.
+        assert_eq!(kv.aux_bytes, 128);
+        assert_eq!(
+            kv.evictions, 0,
+            "inheritance must not cost another conversation"
+        );
+        assert_gradient(&kv);
+    }
+
+    /// Two conversations sharing a 12-token prefix and diverging there, so the split leaves an
+    /// entry-less node at 12 above two entries at 16. The left one can resume at 8 and 16, the
+    /// right one only at 16 — chain length alone cannot tell them apart.
+    fn split_recurrent_tree() -> (PagedKv, usize, usize) {
+        let mut kv = cache_recurrent(16, 8);
+        let a = grow(&mut kv, 4);
+        kv.publish_with_ckpts(
+            (1..=16).collect(),
+            a.clone(),
+            vec![ckpt(8, 64), ckpt(16, 64)],
+            None,
+        )
+        .unwrap();
+        kv.session_release(&a);
+        let b = grow(&mut kv, 4);
+        kv.publish_with_ckpts(
+            (1..=12).chain([900, 901, 902, 903]).collect(),
+            b.clone(),
+            vec![ckpt(16, 64)],
+            None,
+        )
+        .unwrap();
+        kv.session_release(&b);
+        let (left, right) = (node_of(&kv, a[0]), node_of(&kv, b[0]));
+        assert_ne!(left, right, "the divergence split the edge");
+        (kv, left, right)
+    }
+
+    #[test]
+    fn a_fork_diverging_inside_a_split_edge_reuses_the_deeper_entry() {
+        // The measured sub-agent shape: a third request diverges EARLIER than the split, inside the
+        // entry-less node's own edge. The walk's partial candidate carries no entry, and the frames
+        // it needs sit one node deeper.
+        let (mut kv, left, right) = split_recurrent_tree();
+        let fork: Vec<u32> = (1..=10).chain([800, 801]).collect();
+        let (node, matched) = kv
+            .best_match(&fork, None)
+            .expect("the split node's subtree holds the frames");
+        assert_eq!(matched, 8);
+        assert_eq!(node, left, "the entry whose snapshot is usable wins");
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!((reusable, ckpt.unwrap().boundary_tokens), (8, 8));
+        assert!(
+            kv.entry_ckpt(right, matched).is_none(),
+            "the sibling's only snapshot sits above the branch point"
+        );
+        assert_eq!(kv.hit_prefix(node, false, matched).0, 8);
+    }
+
+    #[test]
+    fn a_fork_stopping_at_a_node_with_no_matching_child_reuses_the_subtree() {
+        let (mut kv, left, _right) = split_recurrent_tree();
+        // The shared prefix ends exactly ON the split node: no child matches the next token, so
+        // there is no partial candidate either.
+        let fork: Vec<u32> = (1..=12).chain([800, 801]).collect();
+        let (node, matched) = kv.best_match(&fork, None).expect("the subtree continues it");
+        assert_eq!((matched, node), (12, left));
+        assert_eq!(kv.hit_prefix(node, true, matched).0, 8);
+        // Fully consumed at the split node: the subtree was already scanned here, but the first
+        // entry with a long enough chain won, which could be the one that resumes at zero.
+        let (node, matched) = kv.best_match(&(1..=12).collect::<Vec<u32>>(), None).unwrap();
+        assert_eq!((matched, node), (12, left));
+        assert_eq!(kv.hit_prefix(node, true, matched).0, 8);
+    }
+
+    #[test]
+    fn a_dense_fork_inside_a_split_edge_reuses_the_pages_it_matches() {
+        let mut kv = cache(16);
+        let a = grow(&mut kv, 4);
+        kv.publish((1..=16).collect(), a.clone()).unwrap();
+        kv.session_release(&a);
+        let b = grow(&mut kv, 4);
+        kv.publish((1..=12).chain([900, 901, 902, 903]).collect(), b.clone())
+            .unwrap();
+        kv.session_release(&b);
+        let fork: Vec<u32> = (1..=10).chain([800, 801]).collect();
+        let (node, matched) = kv
+            .best_match(&fork, None)
+            .expect("dense pages are their own resume point");
+        assert_eq!(matched, 8);
+        assert_eq!(kv.hit_prefix(node, false, matched).0, 8);
+        assert_eq!(kv.entry_chain(node, 8).len(), 2);
+    }
+
+    #[test]
+    fn a_usable_snapshot_outranks_a_longer_chain_on_the_matched_path() {
+        // A shallow publish splits the deep entry off and leaves an entry ON the walk's path. That
+        // entry's chain covers the branch point but its only snapshot sits above it, so taking the
+        // first long-enough chain — the old rule — matches and then hands back zero tokens.
+        let mut kv = cache_recurrent(16, 8);
+        let deep = grow(&mut kv, 4);
+        kv.publish_with_ckpts(
+            (1..=16).collect(),
+            deep.clone(),
+            vec![ckpt(8, 64), ckpt(16, 64)],
+            None,
+        )
+        .unwrap();
+        kv.session_release(&deep);
+        let shallow = grow(&mut kv, 3);
+        kv.publish_with_ckpts((1..=12).collect(), shallow.clone(), vec![ckpt(12, 64)], None)
+            .unwrap();
+        kv.session_release(&shallow);
+        let fork: Vec<u32> = (1..=10).chain([800, 801]).collect();
+        let (node, matched) = kv.best_match(&fork, None).unwrap();
+        assert_eq!(matched, 8);
+        assert_eq!(node, node_of(&kv, deep[0]));
+        assert_eq!(kv.hit_prefix(node, true, matched).0, 8);
+        assert_eq!(
+            kv.hit_prefix(node_of(&kv, shallow[0]), true, matched).0,
+            0,
+            "the path entry is the one that would have resumed at zero"
+        );
+    }
+
+    #[test]
+    fn inheritance_keeps_an_entrys_snapshot_count_bounded_across_turns() {
+        // Ten continuations of one conversation. Inheriting whole ancestor sets would accumulate
+        // every turn's frontier on the newest entry until the aux budget started evicting OTHER
+        // conversations to pay for it; inheriting the deepest keeps the count flat.
+        let mut kv = cache_recurrent(64, 8);
+        let mut tokens = 0usize;
+        for turn in 0..10 {
+            let mut chain = if tokens == 0 {
+                Vec::new()
+            } else {
+                let published: Vec<u32> = (1..=tokens as u32).collect();
+                kv.entry_chain(node_at(&kv, &published), tokens)
+            };
+            kv.session_attach(&chain);
+            chain.extend(grow(&mut kv, 2)); // 8 more tokens per turn
+            tokens += 8;
+            kv.publish_with_ckpts(
+                (1..=tokens as u32).collect(),
+                chain.clone(),
+                vec![ckpt(tokens - 4, 64), ckpt(tokens, 64)],
+                None,
+            )
+            .unwrap();
+            kv.session_release(&chain);
+            let snapshots = kv
+                .nodes
+                .iter()
+                .filter_map(|node| node.entry.as_ref())
+                .map(|entry| entry.ckpts.len())
+                .max()
+                .expect("the conversation is in the tree");
+            assert!(
+                snapshots <= 3,
+                "turn {turn} accumulated {snapshots} snapshots"
+            );
+            // Every turn's own frontier still resumes, and so does the previous one — the depth a
+            // request editing the last user message branches at.
+            let (node, matched) = kv
+                .best_match(&(1..=tokens as u32).collect::<Vec<_>>(), None)
+                .unwrap();
+            assert_eq!(kv.hit_prefix(node, true, matched).0, tokens);
+            if turn > 0 {
+                let (node, matched) = kv
+                    .best_match(&(1..=(tokens - 8) as u32).collect::<Vec<_>>(), None)
+                    .unwrap();
+                assert_eq!(kv.hit_prefix(node, true, matched).0, tokens - 8);
+            }
+        }
+        assert_eq!(kv.aux_bytes, 3 * 64, "three snapshots, not one per turn");
+        assert_eq!(kv.evictions, 0);
+        assert_gradient(&kv);
+    }
+
+    #[test]
     fn a_corridor_only_tree_resumes_from_the_aux_cap_its_caller_sets() {
         // The shape of `kv.paged` without `kv.paged_cache_max`: zero host RAM frames, so the /8
         // derivation is zero and the init caller installs a standing cap. Without it a hybrid
@@ -2801,8 +3171,9 @@ mod tests {
         .unwrap();
         kv.session_release(&short);
         assert_eq!(kv.aux_bytes, 300_000);
-        // Publishing a longer conversation supersedes the shared ancestor entry: its snapshot
-        // bytes must leave the budget together with its chain owners.
+        // Publishing a longer conversation supersedes the shared ancestor entry: its chain owners
+        // leave, and its snapshot MOVES to the deeper entry rather than vanishing — the branch point
+        // it describes is still a prefix of the new conversation. Eviction releases all of it.
         let mut long = kv.entry_chain(node_of(&kv, short[0]), 8);
         kv.session_attach(&long);
         long.push(grow(&mut kv, 1)[0]);
@@ -2813,7 +3184,17 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(kv.aux_bytes, 500_000, "the superseded snapshot left");
+        assert_eq!(
+            kv.aux_bytes, 800_000,
+            "the ancestor's snapshot was inherited, not deleted"
+        );
+        assert_eq!(kv.ckpts_inherited, 1);
+        assert_eq!(
+            kv.nodes.iter().filter(|node| node.entry.is_some()).count(),
+            1,
+            "the superseded ancestor no longer holds an entry"
+        );
+        assert!(kv.entry_ckpt(node_of(&kv, long[0]), 4).is_some());
         kv.session_release(&long);
         assert!(kv.evict_cold_one());
         assert_eq!(kv.aux_bytes, 0, "eviction released the last snapshot");
