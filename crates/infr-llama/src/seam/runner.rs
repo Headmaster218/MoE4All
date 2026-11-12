@@ -1097,6 +1097,13 @@ fn bind_layer_io<'a>(
     }
 }
 
+/// `debug.qsa_index_dump`: bind the per-layer selection readback when this build declared one.
+fn bind_qsa_dump<'a>(b: &mut Bindings<'a>, h: &DecodeHandles, buf: &'a Option<Box<dyn Buffer>>) {
+    if let (Some(id), Some(buf)) = (h.qsa_dump, buf) {
+        b.bind(id, buf.as_ref());
+    }
+}
+
 fn bind_mtp_recurrent_traces<'a>(
     b: &mut Bindings<'a>,
     h: &DecodeHandles,
@@ -1517,6 +1524,9 @@ pub(super) struct DecodeHandles {
     // `None` for headless builds (`logits_rows == 0` — the batched-prefill chunks, whose logits
     // nothing consumes); `Some` everywhere else.
     logits: Option<TensorId>,
+    // `debug.qsa_index_dump`: the `[n_layer, top_k/ratio]` i32 readback every attention layer's
+    // selected blocks are copied into, so one download carries all layers instead of only the last.
+    qsa_dump: Option<TensorId>,
     // MTP target hidden output. This normally covers the rows projected by the LM head; Qwen3.8
     // prompt prime deliberately taps every four-stream residual row while projecting only the
     // frontier. `Some` only when `build` was called with `h_tap: true`.
@@ -4694,6 +4704,19 @@ fn generate_dense_backend_inner(
             ));
         }
     }
+    // `debug.qsa_index_dump`: `[n_layer, top_k/ratio]` i32, one row per attention layer. A per-call
+    // local rather than session state — the decode loop downloads it in place and appends to disk.
+    let qsa_dump_stride =
+        (c.indexer_top_k / c.compress_ratios.iter().copied().max().unwrap_or(4).max(1)).max(1);
+    let qsa_dump_buf = if ec.debug.qsa_index_dump && c.qwen4exp {
+        Some(
+            be.alloc(c.n_layer * qsa_dump_stride * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
+    let mut qsa_dump_file = None::<std::fs::File>;
     let parallel_mtp_rows = parallel_mtp_verify
         .as_ref()
         .map(|request| request.rows_per_lane);
@@ -5575,6 +5598,18 @@ fn generate_dense_backend_inner(
             // graph entirely preserves every pre-QSA graph's tensor and allocation layout.
             (k, q, q16, positions, k16, k16)
         };
+        // `debug.qsa_index_dump`: `qsa_indices` is one shared scratch for every attention layer, so a
+        // post-step readback only ever holds the last layer. Copy each layer's selection into its own
+        // row of a bound Output instead, which makes the cross-layer union measurable. Single-row
+        // decode only: a batched build would need `batch` rows per layer and its rows select
+        // independently, which is not the hotness question being asked.
+        let qsa_dump = (ec.debug.qsa_index_dump && c.qwen4exp && logits_rows > 0 && batch == 1)
+            .then(|| {
+                g.output(TensorDesc::new(
+                    vec![c.n_layer * qsa_dump_stride],
+                    DType::I32,
+                ))
+            });
         // DeepSeek2 MLA scratch: mla_q (f32 query with [nope|rope] per head, roped by the kernel),
         // mla_k16 (f32 K row staging; cast to f16 only at WriteKv — raw wkv_a_mqa outputs exceed f16 max before RMSNorm), mla_kv_cmpr (f32 latent for norm), mla_rope (f32 k_pe).
         let mla_q = if mla_qrow > 0 {
@@ -8055,6 +8090,15 @@ fn generate_dense_backend_inner(
                                 scale: 1.0 / (c.indexer_head_size as f32).sqrt(),
                                 sections: c.rope_sections,
                             });
+                            if let Some(dump) = qsa_dump {
+                                g.push(Op::Copy {
+                                    src: qsa_indices,
+                                    src_off: 0,
+                                    dst: dump,
+                                    dst_off: (l * qsa_dump_stride) as u32,
+                                    n: selected as u32,
+                                });
+                            }
                             g.push(Op::QsaGather {
                                 k_cache: k_cache[kv_src],
                                 v_cache: v_cache[kv_src],
@@ -8950,6 +8994,7 @@ fn generate_dense_backend_inner(
                 sc_embt: sc_embt_id,
                 temp_inv: temp_inv_id,
                 logits,
+                qsa_dump,
                 h_out,
                 tok_ids,
                 u_in,
@@ -9779,6 +9824,7 @@ fn generate_dense_backend_inner(
             dcache.dh.logits.expect("denoise build has logits"),
             logits_out_buf,
         );
+        bind_qsa_dump(&mut db, &dcache.dh, &qsa_dump_buf);
         let t_exec0 = std::time::Instant::now();
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
@@ -10104,6 +10150,7 @@ fn generate_dense_backend_inner(
         );
         bind_parallel_mtp_traces(&mut bindings1, &h1, mtp_delta_ckpt, parallel.peers);
         bindings1.bind(h1.logits.expect("MTP VERIFY logits"), fixed.logits.as_ref());
+        bind_qsa_dump(&mut bindings1, &h1, &qsa_dump_buf);
         if let Some(id) = h1.h_out {
             bindings1.bind(id, fixed.h_out.as_ref());
         }
@@ -10507,6 +10554,7 @@ fn generate_dense_backend_inner(
             vb.bind(vh.ple_embd.expect("Qwen VERIFY has PLE input"), ple_buf);
             bind_mtp_recurrent_traces(&mut vb, &vh, mtp_delta_ckpt);
             vb.bind(vh.logits.expect("verify build has logits"), logits_buf);
+            bind_qsa_dump(&mut vb, &vh, &qsa_dump_buf);
             if let (Some(id), Some(buf)) = (vh.tok_id, out_ids_buf) {
                 vb.bind(id, buf);
             }
@@ -10680,6 +10728,7 @@ fn generate_dense_backend_inner(
             vh.logits.expect("verify build has logits"),
             vf_logits_buf.as_ref(),
         );
+        bind_qsa_dump(&mut vb, &vh, &qsa_dump_buf);
         // The m-slot id output (gpu_verify_ids builds only) — 4 bytes/row readback.
         let vf_ids_buf = if gpu_verify_ids {
             Some(
@@ -11331,6 +11380,7 @@ fn generate_dense_backend_inner(
                             logits_batch.as_ref(),
                         );
                     }
+                    bind_qsa_dump(&mut b1, &h1, &qsa_dump_buf);
                     if let Some(buffers) = gpu_penalty_buffers
                         .as_ref()
                         .filter(|_| h1.penalty_io.is_some())
@@ -13059,6 +13109,7 @@ fn generate_dense_backend_inner(
             h.logits.expect("decode build has logits"),
             logits_buf.as_ref(),
         );
+        bind_qsa_dump(&mut b, &h, &qsa_dump_buf);
         if let Some(tid) = h.tok_id {
             b.bind(tid, id_out);
         }
@@ -13728,6 +13779,7 @@ fn generate_dense_backend_inner(
                         h1.logits.expect("qwen4exp tail build has logits"),
                         logits_buf.as_ref(),
                     );
+                    bind_qsa_dump(&mut b1, &h1, &qsa_dump_buf);
                     if let Some(tid) = h1.tok_id {
                         b1.bind(tid, id_out);
                     }
@@ -13835,6 +13887,7 @@ fn generate_dense_backend_inner(
                         h.logits.expect("decode build has logits"),
                         logits_buf.as_ref(),
                     );
+                    bind_qsa_dump(&mut b, &h, &qsa_dump_buf);
                     if let Some(tid) = h.tok_id {
                         b.bind(tid, id_out);
                     }
@@ -13937,6 +13990,30 @@ fn generate_dense_backend_inner(
                         be.download(hb.as_ref(), bytemuck::cast_slice_mut(&mut hrow))
                             .map_err(|e| anyhow!("{e}"))?;
                         *out = hrow;
+                    }
+                    // `debug.qsa_index_dump`: one record per frontier decode step —
+                    // `[pos, cur.len()]` then `[n_layer, top_k/ratio]` i32 block indices. Only the
+                    // single-row decode build declares the output, so a batched frontier would
+                    // append the previous step's rows; this knob is for single-stream analysis.
+                    if let Some(buf) = qsa_dump_buf.as_ref() {
+                        let mut rows = vec![0i32; c.n_layer * qsa_dump_stride];
+                        be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut rows))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        let file = match qsa_dump_file.as_mut() {
+                            Some(f) => f,
+                            None => qsa_dump_file.insert(
+                                std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("qsa-index-dump.bin")
+                                    .map_err(|e| anyhow!("qsa index dump: {e}"))?,
+                            ),
+                        };
+                        use std::io::Write;
+                        let meta = [pos as i32, cur.len() as i32];
+                        file.write_all(bytemuck::cast_slice(&meta))
+                            .and_then(|()| file.write_all(bytemuck::cast_slice(&rows)))
+                            .map_err(|e| anyhow!("qsa index dump: {e}"))?;
                     }
                     if let Some(cst) = constraint.as_deref_mut() {
                         if !ignore_eos {

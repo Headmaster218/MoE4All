@@ -1256,6 +1256,11 @@ cfg_struct! {
         moe_counts: bool = false,
         /// `INFR_MOE_COUNTS_DUMP`.
         moe_counts_dump: bool = false,
+        /// `INFR_QSA_INDEX_DUMP`: append one record per frontier decode step to `qsa-index-dump.bin`
+        /// in the working directory — i32 `[pos, n_fed]` then `[n_layer, top_k/ratio]` selected QSA
+        /// block indices. One shared scratch tensor feeds every attention layer, so without the
+        /// per-layer copy a post-step readback only ever shows the last layer. Single-stream only.
+        qsa_index_dump: bool = false,
         /// `INFR_POISON_UNINIT`.
         poison_uninit: bool = false,
         /// `INFR_NOBARRIER`.

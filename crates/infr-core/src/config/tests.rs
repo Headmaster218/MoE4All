@@ -2272,6 +2272,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
         "INFR_AMDVLK_HD256_FLASH",
+        "INFR_QSA_INDEX_DUMP",
         "INFR_NO_Q8_DECODE_CHUNK1024",
         "INFR_Q8_DECODE_REPLAY_CHUNK1024",
         "INFR_NO_Q8_QK_I8",

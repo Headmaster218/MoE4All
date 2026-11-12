@@ -274,7 +274,9 @@ Responses API 只接受 plain text 与默认 `text.verbosity="medium"`；`low`/`
 
 范围下载需要服务器支持；不支持的服务器（没有 `Accept-Ranges`，或请求 `206` 却返回 `200`）会回退为单一流，64 MiB 或更小的文件绝不切分。`0` 和 `1` 都严格表示一条连接，适用于计费链路，或反对来自同一客户端多连接的代理。
 
-**`[debug]`** — 填毒/屏障/转储开关：`coopmat`（输出枚举到和选定的 coopmat 形状，对 Intel Arc 很有用）、`bda_chunk`、`wide_dispatch`、`chat`、`moe_counts`、`moe_counts_dump`、`poison_uninit`、`no_barrier`、`full_barrier`。
+**`[debug]`** — 填毒/屏障/转储开关：`coopmat`（输出枚举到和选定的 coopmat 形状，对 Intel Arc 很有用）、`bda_chunk`、`wide_dispatch`、`chat`、`moe_counts`、`moe_counts_dump`、`qsa_index_dump`、`poison_uninit`、`no_barrier`、`full_barrier`。
+
+`qsa_index_dump`（`INFR_QSA_INDEX_DUMP`，默认关）只用于 Qwen3.8 的 QSA 分析：每个前沿解码步往工作目录的 `qsa-index-dump.bin` 追加一条记录，i32 `[pos, n_fed]` 之后是 `[n_layer, top_k/ratio]` 的选中块下标。所有注意力层共用一块 scratch，不逐层拷贝的话回读只看得到最后一层，所以这里给每层单独留一行。仅单流有效，且每步多一次 96 KiB 回读，别在测速时打开。
 
 ## GPU 启动锁 / GPU startup lock
 
