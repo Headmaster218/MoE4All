@@ -2865,12 +2865,16 @@ mod tests {
         // The shared prefix ends exactly ON the split node: no child matches the next token, so
         // there is no partial candidate either.
         let fork: Vec<u32> = (1..=12).chain([800, 801]).collect();
-        let (node, matched) = kv.best_match(&fork, None).expect("the subtree continues it");
+        let (node, matched) = kv
+            .best_match(&fork, None)
+            .expect("the subtree continues it");
         assert_eq!((matched, node), (12, left));
         assert_eq!(kv.hit_prefix(node, true, matched).0, 8);
         // Fully consumed at the split node: the subtree was already scanned here, but the first
         // entry with a long enough chain won, which could be the one that resumes at zero.
-        let (node, matched) = kv.best_match(&(1..=12).collect::<Vec<u32>>(), None).unwrap();
+        let (node, matched) = kv
+            .best_match(&(1..=12).collect::<Vec<u32>>(), None)
+            .unwrap();
         assert_eq!((matched, node), (12, left));
         assert_eq!(kv.hit_prefix(node, true, matched).0, 8);
     }
@@ -2910,8 +2914,13 @@ mod tests {
         .unwrap();
         kv.session_release(&deep);
         let shallow = grow(&mut kv, 3);
-        kv.publish_with_ckpts((1..=12).collect(), shallow.clone(), vec![ckpt(12, 64)], None)
-            .unwrap();
+        kv.publish_with_ckpts(
+            (1..=12).collect(),
+            shallow.clone(),
+            vec![ckpt(12, 64)],
+            None,
+        )
+        .unwrap();
         kv.session_release(&shallow);
         let fork: Vec<u32> = (1..=10).chain([800, 801]).collect();
         let (node, matched) = kv.best_match(&fork, None).unwrap();
