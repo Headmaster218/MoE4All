@@ -8,11 +8,11 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::token_delivery::ParallelTokenCallback;
 use super::weights::{
-    alloc_segmented_plane, capture_paged_ckpt, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW,
-    Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
-    MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW, QwenLayerHcW,
-    QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
-    TurnRecurrentCkpt, UncensorState,
+    alloc_segmented_plane, capture_paged_ckpt, set_paged_frontier, AttnW, DeltaW, Dsv4CompressedW,
+    Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW,
+    LayerW, MixerW, MlaW, MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW,
+    QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState,
+    SessionStable, TurnRecurrentCkpt, UncensorState,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
@@ -939,6 +939,7 @@ fn prepare_parallel_prompt_state(
             }
             // A divergent prompt may not publish last turn's host snapshot against this token spine.
             kv.paged_frontier = None;
+            kv.paged_frontier_prev = None;
             kv.cached.clear();
             0
         }
@@ -1922,6 +1923,7 @@ fn finish_pending_seam_slot(
         mtp_delta_ckpt: pending.mtp_delta_ckpt,
         turn_recurrent_ckpts: pending.turn_recurrent_ckpts,
         paged_frontier: None,
+        paged_frontier_prev: None,
         preallocated_siblings: Vec::new(),
     })
 }
@@ -4033,6 +4035,7 @@ fn generate_dense_backend_inner(
             mtp_delta_ckpt,
             turn_recurrent_ckpts,
             paged_frontier: None,
+            paged_frontier_prev: None,
             preallocated_siblings,
         });
     }
@@ -4196,6 +4199,7 @@ fn generate_dense_backend_inner(
         mtp_delta_ckpt,
         turn_recurrent_ckpts,
         paged_frontier,
+        paged_frontier_prev,
         preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
@@ -9357,24 +9361,30 @@ fn generate_dense_backend_inner(
                 // the slot and the RAM tier already pays for the frames beside it.
                 if Some(range.end) == prepared[lane].paged_frontier {
                     if lane == 0 {
-                        *paged_frontier = Some(capture_paged_ckpt(
+                        let captured = capture_paged_ckpt(
                             be,
                             c,
                             &kbufs[..],
                             &vbufs[..],
                             ple_state_buf.as_deref(),
                             range.end,
-                        )?);
+                        )?;
+                        set_paged_frontier(paged_frontier, paged_frontier_prev, captured);
                     } else {
                         let slot = &mut parallel.peers[lane - 1];
-                        slot.paged_frontier = Some(capture_paged_ckpt(
+                        let captured = capture_paged_ckpt(
                             be,
                             c,
                             &slot.kbufs,
                             &slot.vbufs,
                             slot.ple_state_buf.as_deref(),
                             range.end,
-                        )?);
+                        )?;
+                        set_paged_frontier(
+                            &mut slot.paged_frontier,
+                            &mut slot.paged_frontier_prev,
+                            captured,
+                        );
                     }
                 }
             }
@@ -12882,8 +12892,15 @@ fn generate_dense_backend_inner(
                                 )?;
                             }
                             if si + 1 == spans.len() {
-                                *paged_frontier =
-                                    Some(frontier_capture.take().expect("just created").finish()?);
+                                let finished =
+                                    frontier_capture.take().expect("just created").finish()?;
+                                tracing::debug!(
+                                    boundary = finished.boundary_tokens,
+                                    replaced =
+                                        paged_frontier.as_ref().map(|prev| prev.boundary_tokens),
+                                    "paged frontier captured"
+                                );
+                                set_paged_frontier(paged_frontier, paged_frontier_prev, finished);
                             }
                         }
                         // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph

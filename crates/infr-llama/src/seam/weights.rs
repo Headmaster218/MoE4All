@@ -580,6 +580,12 @@ pub(crate) struct SeamKv {
     /// Costs no VRAM-plan space, unlike a third device checkpoint; invalidated with the token
     /// stream it describes.
     pub(super) paged_frontier: Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
+    /// The frontier the last capture replaced, kept for the same reason the turn checkpoints come
+    /// in pairs: a continuation never detaches, so overwriting the frontier destroys the exact
+    /// boundary a fork branches at. Both describe this slot's token spine and leave together.
+    /// Bounded at one extra snapshot — on a 48-layer hybrid that is ~112 MiB of the tree's aux
+    /// budget per conversation, which `admit_ckpts` trims shallowest-first under pressure.
+    pub(super) paged_frontier_prev: Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
     /// Additional serve slots whose persistent device allocations were materialized beside slot
     /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
     /// immediately; ordinary one-shot/session paths always keep it empty.
@@ -1462,6 +1468,22 @@ pub(crate) fn capture_paged_ckpt(
     capture.finish()
 }
 
+/// Install a freshly captured frontier and keep the one it replaces as the slot's second snapshot.
+/// A re-capture at the SAME boundary keeps the older `prev` rather than duplicating a state the
+/// tree would dedup anyway, so a short turn costs no extra aux bytes.
+pub(super) fn set_paged_frontier(
+    frontier: &mut Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
+    prev: &mut Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
+    captured: std::sync::Arc<crate::paged_cache::PagedCkpt>,
+) {
+    let boundary = captured.boundary_tokens;
+    if let Some(replaced) = frontier.replace(captured) {
+        if replaced.boundary_tokens != boundary {
+            *prev = Some(replaced);
+        }
+    }
+}
+
 /// Copy an already-valid device checkpoint out of VRAM into a host
 /// [`PagedCkpt`](crate::paged_cache::PagedCkpt) — the publish path for a rolling turn checkpoint,
 /// which a radix entry can carry exactly as well as the frontier snapshot. The bytes come from the
@@ -1909,8 +1931,9 @@ impl SeamKv {
         for ck in self.turn_recurrent_ckpts.iter_mut().flatten() {
             ck.invalidate();
         }
-        // The host frontier snapshot describes a token stream this slot no longer owns.
+        // The host frontier snapshots describe a token stream this slot no longer owns.
         self.paged_frontier = None;
+        self.paged_frontier_prev = None;
     }
 
     /// Restore a rolling recurrent checkpoint when `prompt` strictly extends it. A mismatch is
@@ -2492,6 +2515,7 @@ impl SeamKv {
             turn_recurrent_ckpts,
             // The fork's token stream starts empty: no host snapshot describes it yet.
             paged_frontier: None,
+            paged_frontier_prev: None,
             preallocated_siblings: Vec::new(),
         })
     }
@@ -2794,8 +2818,8 @@ impl SeamKv {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_extension_start, FfnW, MoeSharedW, MtpDeltaCkpt, SeamKv, SeamWeights,
-        SegmentedKvState, SessionStable, TurnRecurrentCkpt,
+        checkpoint_extension_start, set_paged_frontier, FfnW, MoeSharedW, MtpDeltaCkpt, SeamKv,
+        SeamWeights, SegmentedKvState, SessionStable, TurnRecurrentCkpt,
     };
     use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
     use infr_core::error::{Error as BackendError, Result as BackendResult};
@@ -3073,6 +3097,7 @@ mod tests {
             mtp_delta_ckpt: checkpoint,
             turn_recurrent_ckpts: std::array::from_fn(|_| None),
             paged_frontier: None,
+            paged_frontier_prev: None,
             preallocated_siblings: Vec::new(),
         };
         (cfg, slot)
@@ -3833,5 +3858,89 @@ mod tests {
         let (depth, ckpt) = tree.hit_prefix(node, cfg.has_recurrent_state(), reusable);
         assert_eq!(depth, 8);
         assert!(ckpt.is_some(), "the retried publish lost the anchor");
+    }
+
+    /// A continuation never detaches, so capturing its own frontier used to destroy the boundary
+    /// the previous turn ended at — the exact depth a fork of that turn branches from. The slot
+    /// keeps the replaced snapshot, the publish carries both, and the fork resumes instead of
+    /// replaying.
+    #[test]
+    fn a_continuation_keeps_the_frontier_a_fork_branches_at() {
+        let be = CountingRollbackBackend::new();
+        let (cfg, mut slot) = rollback_slot(&be, true, false, 37);
+        let page = 4;
+        let tokens: Vec<u32> = (1..=8).collect();
+        slot.segmented_kv = SegmentedKvState::enabled(page);
+        slot.cached = tokens.clone();
+        let ckpt = |boundary: usize| {
+            Arc::new(crate::paged_cache::PagedCkpt {
+                boundary_tokens: boundary,
+                layers: Vec::new(),
+                kbufs: vec![vec![boundary as u8; 64]],
+                vbufs: Vec::new(),
+                ple: None,
+            })
+        };
+        let capture = |slot: &mut SeamKv, boundary: usize| {
+            set_paged_frontier(
+                &mut slot.paged_frontier,
+                &mut slot.paged_frontier_prev,
+                ckpt(boundary),
+            );
+        };
+        capture(&mut slot, 4);
+        assert!(
+            slot.paged_frontier_prev.is_none(),
+            "the first capture has nothing to keep"
+        );
+        capture(&mut slot, 8);
+        assert_eq!(
+            slot.paged_frontier_prev.as_ref().unwrap().boundary_tokens,
+            4,
+            "the continuation overwrote the fork's boundary"
+        );
+        // A turn too short to cross a page re-captures the same boundary: keep the older snapshot
+        // rather than pay aux bytes for a state the tree would dedup anyway.
+        capture(&mut slot, 8);
+        assert_eq!(
+            slot.paged_frontier_prev.as_ref().unwrap().boundary_tokens,
+            4
+        );
+
+        let tree = Arc::new(std::sync::Mutex::new(crate::paged_cache::PagedKv::new(
+            1 << 20,
+            page,
+            vec![0],
+            8,
+            0,
+            0,
+            None,
+            cfg.has_recurrent_state(),
+        )));
+        slot.set_paged(tree.clone());
+        let mut tree = tree.lock().unwrap();
+        tree.set_vram_segments(&[infr_core::backend::KvFrameCorridor {
+            base: 0x1_0000_0000,
+            frames: 8,
+        }]);
+        tree.set_aux_budget(1 << 20);
+        slot.segmented_kv.chain = (0..2).map(|_| tree.alloc_frame(&be).unwrap()).collect();
+        assert_eq!(slot.paged_publish_detach(&be, &cfg, &mut tree).unwrap(), 8);
+        assert!(slot.paged_frontier.is_none());
+        assert!(
+            slot.paged_frontier_prev.is_none(),
+            "the detach kept a snapshot it handed over"
+        );
+
+        // The fork shares only the first page. Its entry is the deeper one, so the shallow boundary
+        // has to come from the snapshot the continuation would otherwise have destroyed.
+        let (node, reusable) = tree.best_match(&tokens[..4], None).unwrap();
+        assert_eq!(reusable, 4);
+        let (depth, ckpt) = tree.hit_prefix(node, cfg.has_recurrent_state(), reusable);
+        assert_eq!(
+            depth, 4,
+            "the fork could not resume at the boundary it branched from"
+        );
+        assert_eq!(ckpt.unwrap().boundary_tokens, 4);
     }
 }

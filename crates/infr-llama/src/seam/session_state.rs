@@ -464,6 +464,9 @@ impl SeamKv {
         // so the next publish has to carry it or the entry degenerates into a chain nobody can
         // resume. The slot's own device checkpoints describe the previous conversation and are gone.
         self.paged_frontier = ckpt;
+        // The second snapshot belonged to the conversation that just left; this one begins at the
+        // inherited boundary and has no shallower state of its own yet.
+        self.paged_frontier_prev = None;
         Ok(())
     }
 
@@ -515,6 +518,7 @@ impl SeamKv {
         self.ledger_matches_kv = false;
         self.image_cache_spans.clear();
         self.paged_frontier = None;
+        self.paged_frontier_prev = None;
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
@@ -536,9 +540,10 @@ impl SeamKv {
     }
 
     /// The recurrent snapshots this slot can hand the tree for a `published_tokens`-long chain:
-    /// every still-valid device turn checkpoint plus the frontier captured during this request's
-    /// prefill. Only page-aligned boundaries at or below the chain's reach qualify — a snapshot of
-    /// a position the frame chain cannot address could never be attached. Two sources naming the
+    /// every still-valid device turn checkpoint plus both host frontiers — the one this request's
+    /// prefill captured and the one it replaced, which is the boundary a fork of the previous turn
+    /// branches at. Only page-aligned boundaries at or below the chain's reach qualify — a snapshot
+    /// of a position the frame chain cannot address could never be attached. Two sources naming the
     /// same boundary describe the same state, so the second copy is dropped rather than counted
     /// twice against the tree's aux budget.
     ///
@@ -571,15 +576,29 @@ impl SeamKv {
                 ),
             }
         }
-        if let Some(frontier) = self.paged_frontier.clone() {
+        for frontier in self
+            .paged_frontier_prev
+            .iter()
+            .chain(self.paged_frontier.iter())
+        {
             if usable(frontier.boundary_tokens)
                 && !out
                     .iter()
                     .any(|ckpt| ckpt.boundary_tokens == frontier.boundary_tokens)
             {
-                out.push(frontier);
+                out.push(frontier.clone());
             }
         }
+        tracing::debug!(
+            published_tokens,
+            collected = ?out.iter().map(|ckpt| ckpt.boundary_tokens).collect::<Vec<_>>(),
+            turn_valid = ?self
+                .turn_recurrent_ckpts
+                .iter()
+                .map(|slot| slot.as_ref().map(|ckpt| (ckpt.valid, ckpt.tokens.len())))
+                .collect::<Vec<_>>(),
+            "paged detach collected snapshots"
+        );
         out
     }
 
