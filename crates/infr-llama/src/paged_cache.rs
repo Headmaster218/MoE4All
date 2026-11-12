@@ -1171,6 +1171,29 @@ impl PagedKv {
         entry.chain[..reusable / self.page_tokens].to_vec()
     }
 
+    /// Whether the first `tokens.len()` tokens of the root path down to `node` spell `tokens`. The
+    /// path may be longer (a hit inside an edge, or an ancestor of the query), so each edge is
+    /// compared only over the part the query reaches. Node indices are recycled
+    /// (`free_node`/`alloc_node`), so an index handed out by an earlier lookup can name a different
+    /// conversation by the time it is read again.
+    fn node_spells(&self, node: usize, tokens: &[u32]) -> bool {
+        let mut edges = Vec::new();
+        let mut cursor = node;
+        while let Some(parent) = self.nodes[cursor].parent {
+            edges.push(&self.nodes[cursor].edge);
+            cursor = parent;
+        }
+        let mut at = 0usize;
+        for edge in edges.iter().rev() {
+            let take = edge.len().min(tokens.len() - at);
+            if edge[..take] != tokens[at..at + take] {
+                return false;
+            }
+            at += take;
+        }
+        at == tokens.len()
+    }
+
     /// The production chain accessor: every RAM frame in the matched prefix is DMA'd
     /// back into a freshly claimed VRAM slot BEFORE returning, so the caller only ever handles
     /// device-addressable frames (the page table never sees a RAM address). VRAM claims go
@@ -1180,13 +1203,37 @@ impl PagedKv {
     /// the caller recomputes the reuse length from the returned length (`len * page_tokens()`),
     /// and the un-promoted tail stays sunk in RAM for a later hit. A mid-chain DMA failure
     /// truncates the same way; already-promoted frames are committed to the tree chain.
+    ///
+    /// `prefix` is the query the caller matched (the KEY view for an image conversation). A publish
+    /// can land between [`Self::best_match`] and here — the slot switch that hands the previous
+    /// conversation to the tree — and aux pressure may evict the matched entry, whose index
+    /// `descend_to` then recycles onto a different path. The index alone no longer identifies the
+    /// conversation, so the path is re-spelled against `prefix` and a mismatch returns an empty
+    /// chain: both callers recompute reuse from its length and fall back to a re-prefill.
     pub(crate) fn entry_chain_promoted<M: FrameDma + ?Sized>(
         &mut self,
         be: &M,
         node: usize,
         reusable: usize,
+        prefix: &[u32],
     ) -> Vec<FrameId> {
-        let pages = reusable / self.page_tokens;
+        // Only the first `reusable` tokens are shared with the query: a candidate may sit deeper
+        // than the walk's divergence point, inside an edge the query only partly matched.
+        let shared = self.nodes[node].path_len.min(reusable).min(prefix.len());
+        let chain_len = self.nodes[node]
+            .entry
+            .as_ref()
+            .map(|entry| entry.chain.len());
+        let Some(chain_len) = chain_len.filter(|_| self.node_spells(node, &prefix[..shared]))
+        else {
+            tracing::debug!(
+                node,
+                reusable,
+                "paged KV attach lost the prefix it matched; re-prefilling"
+            );
+            return Vec::new();
+        };
+        let pages = (reusable / self.page_tokens).min(chain_len);
         // Stamp the depth the caller will actually attach, which is NOT the depth `best_match`
         // matched: a recurrent entry only resumes at a snapshot boundary, so `hit_prefix` can cut
         // a 200-page token match down to nothing. Keeping the matched depth would pin a prefix no
@@ -1194,16 +1241,17 @@ impl PagedKv {
         self.nodes[node]
             .entry
             .as_mut()
-            .expect("matched node carries an entry")
+            .expect("entry presence checked above")
             .warm_frames = pages;
         let frame_bytes = self.pool.frame_bytes() as usize;
         let mut out = Vec::with_capacity(pages);
         for i in 0..pages {
-            let frame = self.nodes[node]
-                .entry
-                .as_ref()
-                .expect("matched node carries an entry")
-                .chain[i];
+            // A cascading sink can evict this very entry mid-promotion; the frames already handed
+            // out stay valid, the rest of the reuse is dropped.
+            let Some(entry) = self.nodes[node].entry.as_ref() else {
+                break;
+            };
+            let frame = entry.chain[i];
             if matches!(frame.tier(), Tier::Vram) {
                 out.push(frame);
                 continue;
@@ -2215,9 +2263,10 @@ mod tests {
         );
         // The prefix is still addressable, and the sunk tail comes back through the host backing:
         // MockDma refuses an upload whose bytes match no frame it ever downloaded.
-        let (node, reusable) = kv.best_match(&(1..=48).collect::<Vec<_>>(), None).unwrap();
+        let query = (1..=48).collect::<Vec<_>>();
+        let (node, reusable) = kv.best_match(&query, None).unwrap();
         assert_eq!(reusable, 48);
-        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        let back = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(back.len(), 12);
         assert!(back.iter().all(|frame| frame.tier() == Tier::Vram));
         assert_eq!(kv.tier_demotions, 8);
@@ -2267,7 +2316,7 @@ mod tests {
             let (found, reusable) = kv.best_match(&tokens, None).unwrap();
             assert_eq!(found, node);
             assert_eq!(reusable, 24);
-            let back = kv.entry_chain_promoted(&dma, found, reusable);
+            let back = kv.entry_chain_promoted(&dma, found, reusable, &tokens);
             assert!(back.iter().all(|f| f.tier() == Tier::Vram));
         }
     }
@@ -2287,8 +2336,9 @@ mod tests {
         // offers a fully warm run rather than let the evictor delete it): nothing is about to be
         // evicted, so sinking bytes the next hit would DMA straight back buys nothing.
         kv.set_yield_under_pressure(true);
-        let (node, reusable) = kv.best_match(&(1..=48).collect::<Vec<_>>(), None).unwrap();
-        let _ = kv.entry_chain_promoted(&dma, node, reusable);
+        let query = (1..=48).collect::<Vec<_>>();
+        let (node, reusable) = kv.best_match(&query, None).unwrap();
+        let _ = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(kv.yield_vram_under_expert_pressure(&dma), 0);
         assert_eq!(kv.tier_demotions, 0);
 
@@ -2627,13 +2677,14 @@ mod tests {
         assert_eq!(kv.evictions, 0, "sinking precedes eviction");
         assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
         // A fully sunk chain still matches; the entry is not gone, only resting.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
+        let query = (1..=8).collect::<Vec<u32>>();
+        let (node, reusable) = kv.best_match(&query, None).unwrap();
         assert_eq!(reusable, 8);
         // Give the corridor its frame back so the whole chain can promote at once.
         kv.session_release(&[fresh]);
         // Promotion hands out device-addressable frames only (the page table never sees a RAM
         // id) and the mock's pattern check proves the bytes came back through the backing.
-        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        let back = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(back.len(), 2);
         assert!(
             back.iter().all(|f| matches!(f.tier(), Tier::Vram)),
@@ -2643,7 +2694,7 @@ mod tests {
         assert_eq!(kv.pool.held_frames(Tier::Ram), 0, "backing slots recycled");
         assert_eq!(kv.pool.held_frames(Tier::Vram), 2);
         // The entry chain was rewritten in place: a second pass promotes nothing.
-        let again = kv.entry_chain_promoted(&dma, node, reusable);
+        let again = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(again, back);
         assert_eq!(kv.tier_promotions, 2, "VRAM frames pass straight through");
     }
@@ -2708,11 +2759,13 @@ mod tests {
         kv.session_release(&[c]);
         // Promote branch A fully, then branch B: the shared frame must land on one id owned
         // by exactly two chains again.
-        let (node_a, reusable_a) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
-        let back_a = kv.entry_chain_promoted(&dma, node_a, reusable_a);
+        let query_a = (1..=8).collect::<Vec<u32>>();
+        let (node_a, reusable_a) = kv.best_match(&query_a, None).unwrap();
+        let back_a = kv.entry_chain_promoted(&dma, node_a, reusable_a, &query_a);
         assert_eq!(back_a.len(), 2, "the corridor can host the whole chain");
-        let (node_b, reusable_b) = kv.best_match(&[1, 2, 3, 4, 9, 10, 11, 12], None).unwrap();
-        let back_b = kv.entry_chain_promoted(&dma, node_b, reusable_b);
+        let query_b = vec![1, 2, 3, 4, 9, 10, 11, 12];
+        let (node_b, reusable_b) = kv.best_match(&query_b, None).unwrap();
+        let back_b = kv.entry_chain_promoted(&dma, node_b, reusable_b, &query_b);
         assert_eq!(back_b.len(), 2);
         assert_eq!(back_a[0], back_b[0], "shared frame id agrees again");
         assert_eq!(
@@ -2751,11 +2804,12 @@ mod tests {
         assert_eq!(kv.pool.held_frames(Tier::Ram), 2);
         kv.session_release(&[c]); // give the corridor one frame back for the promotion
                                   // A is a Disk chain now: still matchable, still resting.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
+        let query = (1..=8).collect::<Vec<u32>>();
+        let (node, reusable) = kv.best_match(&query, None).unwrap();
         assert_eq!(reusable, 8);
         // Promotion walks A back up: disk->RAM (cascading B to disk for the RAM slot) then
         // RAM->VRAM. The mock's pattern check can only pass if the file round-trip was exact.
-        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        let back = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(back.len(), 2, "the whole chain came back");
         assert!(
             back.iter().all(|f| matches!(f.tier(), Tier::Vram)),
@@ -2862,9 +2916,10 @@ mod tests {
         kv.session_release(&a);
 
         // A hit that consumes two of the four pages, through the production accessor.
-        let (node, reusable) = kv.best_match(&(1..=8).collect::<Vec<u32>>(), None).unwrap();
+        let head_query = (1..=8).collect::<Vec<u32>>();
+        let (node, reusable) = kv.best_match(&head_query, None).unwrap();
         assert_eq!(reusable, 8);
-        let head = kv.entry_chain_promoted(&dma, node, reusable);
+        let head = kv.entry_chain_promoted(&dma, node, reusable, &head_query);
         assert_eq!(head.len(), 2);
         assert_eq!(kv.nodes[node].entry.as_ref().unwrap().warm_frames, 2);
 
@@ -2891,11 +2946,10 @@ mod tests {
         kv.session_release(&[c1, c2]);
 
         // The full hit now promotes the tail alone, and MockDma checks every byte round-tripped.
-        let (node, reusable) = kv
-            .best_match(&(1..=16).collect::<Vec<u32>>(), None)
-            .unwrap();
+        let query = (1..=16).collect::<Vec<u32>>();
+        let (node, reusable) = kv.best_match(&query, None).unwrap();
         assert_eq!(reusable, 16);
-        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        let back = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(back.len(), 4);
         assert!(back.iter().all(|f| matches!(f.tier(), Tier::Vram)));
         assert_eq!(
@@ -2942,11 +2996,10 @@ mod tests {
         );
 
         // The resident prefix still serves a hit with no DMA at all.
-        let (node, reusable) = kv
-            .best_match(&(1..=16).collect::<Vec<u32>>(), None)
-            .unwrap();
+        let query = (1..=16).collect::<Vec<u32>>();
+        let (node, reusable) = kv.best_match(&query, None).unwrap();
         assert_eq!(reusable, 16);
-        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        let back = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(back.len(), 4);
         assert_eq!(
             kv.tier_promotions, 0,
@@ -2989,12 +3042,11 @@ mod tests {
         kv.session_release(&[c1, c2]);
 
         // A snapshot-backed attach DOES stamp its depth, and the next sink keeps that head.
-        let (node, matched) = kv
-            .best_match(&(1..=16).collect::<Vec<u32>>(), None)
-            .unwrap();
+        let query = (1..=16).collect::<Vec<u32>>();
+        let (node, matched) = kv.best_match(&query, None).unwrap();
         let (reusable, _) = kv.hit_prefix(node, true, matched);
         assert_eq!(reusable, 16);
-        let back = kv.entry_chain_promoted(&dma, node, reusable);
+        let back = kv.entry_chain_promoted(&dma, node, reusable, &query);
         assert_eq!(back.len(), 4);
         assert_eq!(kv.nodes[node].entry.as_ref().unwrap().warm_frames, 4);
     }
@@ -3249,6 +3301,96 @@ mod tests {
         assert_eq!(kv.hit_prefix(node, true, matched).0, 24);
         assert_eq!(kv.aux_bytes, 128);
         assert_eq!(kv.evictions, 0);
+        assert_gradient(&kv);
+    }
+
+    /// `best_match` hands out a node index, then the slot switch publishes the PREVIOUS conversation
+    /// before the attach runs. Under aux pressure that publish evicts the very entry just matched
+    /// (`admit_ckpts` shields only the node it is publishing), and the accessor used to assert the
+    /// entry was still there — a panic inside the scheduler, which took the whole server down with
+    /// the request. An empty chain is the degradation both callers already understand.
+    #[test]
+    fn a_publish_between_match_and_attach_cannot_pull_the_matched_entry_out() {
+        let mut kv = cache_recurrent(16, 8);
+        kv.set_aux_budget(64); // room for exactly one snapshot
+        let dma = MockDma::default();
+        let a = grow_with(&mut kv, &dma, 4); // 16 tokens
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&a);
+
+        let query: Vec<u32> = (1..=16).collect();
+        let (node, matched) = kv.best_match(&query, None).unwrap();
+        assert_eq!(kv.hit_prefix(node, true, matched).0, 16);
+
+        // A different conversation arrives and its snapshot does not fit alongside the matched one.
+        let b = grow_with(&mut kv, &dma, 4);
+        kv.publish_with_ckpts((101..=116).collect(), b.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&b);
+        assert_eq!(kv.evictions, 1);
+        assert!(
+            kv.nodes[node].entry.is_none(),
+            "the matched entry is the one that yielded"
+        );
+
+        assert!(
+            kv.entry_chain_promoted(&dma, node, 16, &query).is_empty(),
+            "a vanished entry attaches nothing instead of panicking"
+        );
+        // The caller's own fallback: re-pick against the zero frames that arrived.
+        assert_eq!(kv.hit_prefix(node, true, 0).0, 0);
+        assert_gradient(&kv);
+    }
+
+    /// The worse half of the same race: eviction frees the node index and the NEXT publish's
+    /// `descend_to` runs before its own admission, so it recycles that index onto a different path.
+    /// The stale index then names a live entry belonging to another conversation — attaching it
+    /// would hand the request KV for tokens it never sent, with no panic and no validation error.
+    #[test]
+    fn a_recycled_node_index_cannot_attach_another_conversations_chain() {
+        let mut kv = cache_recurrent(16, 8);
+        kv.set_aux_budget(64);
+        let dma = MockDma::default();
+        let a = grow_with(&mut kv, &dma, 4);
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&a);
+        let query_a: Vec<u32> = (1..=16).collect();
+        let (node, matched) = kv.best_match(&query_a, None).unwrap();
+        assert_eq!(matched, 16);
+
+        // B evicts A and frees its index; C's descend then reuses that index before B is evicted.
+        let b = grow_with(&mut kv, &dma, 4);
+        kv.publish_with_ckpts((101..=116).collect(), b.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&b);
+        let c = grow_with(&mut kv, &dma, 4);
+        let query_c: Vec<u32> = (201..=216).collect();
+        kv.publish_with_ckpts(query_c.clone(), c.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&c);
+        assert_eq!(kv.evictions, 2);
+        assert_eq!(
+            node_at(&kv, &query_c),
+            node,
+            "the third publish recycled the matched index"
+        );
+
+        assert!(
+            kv.entry_chain_promoted(&dma, node, 16, &query_a).is_empty(),
+            "the index now spells another conversation; none of its frames may be attached"
+        );
+        // The conversation that actually owns the index still attaches normally.
+        let (owner, matched) = kv.best_match(&query_c, None).unwrap();
+        assert_eq!(owner, node);
+        let (reusable, _) = kv.hit_prefix(owner, true, matched);
+        assert_eq!(reusable, 16);
+        assert_eq!(
+            kv.entry_chain_promoted(&dma, owner, reusable, &query_c)
+                .len(),
+            4
+        );
         assert_gradient(&kv);
     }
 

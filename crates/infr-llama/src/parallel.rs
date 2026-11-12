@@ -3211,7 +3211,7 @@ impl ParallelSeam {
                             // cannot host the whole chain attaches at its deepest promotable
                             // prefix; the un-promoted tail stays sunk and the rest re-prefills.
                             let mut chain =
-                                tree.entry_chain_promoted(self.vk.as_ref(), node, reusable);
+                                tree.entry_chain_promoted(self.vk.as_ref(), node, reusable, prompt);
                             // Promotion may fall short of the request. Re-pick against what
                             // actually arrived, then cut the chain back to the reuse point: a
                             // snapshot must never describe MORE tokens than the attached chain
@@ -3796,8 +3796,12 @@ impl ParallelSeam {
                             }
                         }
                         if ready {
-                            let mut chain =
-                                tree.entry_chain_promoted(self.vk.as_ref(), node, reusable);
+                            let mut chain = tree.entry_chain_promoted(
+                                self.vk.as_ref(),
+                                node,
+                                reusable,
+                                key_view,
+                            );
                             let promoted = chain.len() * pages;
                             if promoted < reusable {
                                 (reusable, ckpt) = tree.hit_prefix(node, recurrent, promoted);
