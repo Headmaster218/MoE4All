@@ -584,7 +584,8 @@ pub(crate) struct SeamKv {
     /// in pairs: a continuation never detaches, so overwriting the frontier destroys the exact
     /// boundary a fork branches at. Both describe this slot's token spine and leave together.
     /// Bounded at one extra snapshot — on a 48-layer hybrid that is ~112 MiB of the tree's aux
-    /// budget per conversation, which `admit_ckpts` trims shallowest-first under pressure.
+    /// budget per conversation, which `admit_ckpts` yields before any inherited anchor under
+    /// pressure.
     pub(super) paged_frontier_prev: Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
     /// Additional serve slots whose persistent device allocations were materialized beside slot
     /// 0 before the unified arena consumed the measured remainder. Startup drains this vector

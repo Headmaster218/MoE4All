@@ -1389,21 +1389,42 @@ impl PagedKv {
         });
         self.ckpts_inherited += inherited.len() as u64;
         let inherited_now = inherited.len();
+        // Boundaries this publish did not capture itself. They are the branch points some OTHER
+        // conversation resumes at, so admission yields them last (see `admit_ckpts`).
+        let mut anchors: Vec<usize> = inherited.iter().map(|ckpt| ckpt.boundary_tokens).collect();
         ckpts.extend(inherited);
         self.clock += 1;
         // The replaced entry leaves the aux budget NOW, before admission: its frames stay pinned
         // by the new chain (or by their session owners), and counting its snapshots against the
         // incoming ones would refuse a re-publish of the same conversation that trivially fits.
         let old = self.nodes[node].entry.take();
+        let mut retained = 0usize;
         if let Some(old) = &old {
             self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&old.ckpts));
+            // Inheritance covers ANCESTORS. A re-publish at this very node replaces the entry
+            // wholesale, so a boundary the old entry held and this publish did not re-capture was
+            // deleted outright — a parent revisit landing on the same node took its children's
+            // branch point with it. Same rule as above: own capture wins, everything else stays.
+            for ckpt in &old.ckpts {
+                if ckpt.boundary_tokens <= tokens.len()
+                    && !ckpts
+                        .iter()
+                        .any(|own| own.boundary_tokens == ckpt.boundary_tokens)
+                {
+                    anchors.push(ckpt.boundary_tokens);
+                    ckpts.push(ckpt.clone());
+                    retained += 1;
+                }
+            }
+            self.ckpts_inherited += retained as u64;
         }
-        let ckpts = self.admit_ckpts(ckpts, node);
+        let ckpts = self.admit_ckpts(ckpts, node, &anchors);
         tracing::debug!(
             node,
             depth = tokens.len(),
             pages = chain.len(),
             inherited = inherited_now,
+            retained,
             snapshots = ?ckpts.iter().map(|ckpt| ckpt.boundary_tokens).collect::<Vec<_>>(),
             "paged KV publish"
         );
@@ -1432,9 +1453,10 @@ impl PagedKv {
     }
 
     /// Fit `ckpts` (sorted ascending by boundary) under the aux budget by yielding the coldest
-    /// OTHER entries first, then the incoming snapshots shallowest-first. Returns the snapshots
-    /// that fit and adds their bytes to `aux_bytes`. `incoming` is the node being published: never
-    /// a victim, because pruning it could free the index the caller still holds.
+    /// OTHER entries first, then the incoming snapshots — shallowest first, inherited `anchors`
+    /// last. Returns the snapshots that fit and adds their bytes to `aux_bytes`. `incoming` is the
+    /// node being published: never a victim, because pruning it could free the index the caller
+    /// still holds.
     ///
     /// What yielding costs depends on the model. A dense entry ignores its snapshots, so they leave
     /// alone and its chain stays matchable. A recurrent entry resumes ONLY through them, so taking
@@ -1444,6 +1466,7 @@ impl PagedKv {
         &mut self,
         mut ckpts: Vec<Arc<PagedCkpt>>,
         incoming: usize,
+        anchors: &[usize],
     ) -> Vec<Arc<PagedCkpt>> {
         ckpts.sort_by_key(|ckpt| ckpt.boundary_tokens);
         while !ckpts.is_empty() && self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget {
@@ -1469,13 +1492,20 @@ impl PagedKv {
                 self.aux_bytes = self.aux_bytes.saturating_sub(ckpts_bytes(&dropped));
             }
         }
-        // Still over after every other entry yielded: the shallowest incoming snapshots go. The
-        // deepest one is what a same-conversation resume attaches, and on a recurrent tree it is
-        // the entry's only way in — it fits the budget alone, either because the publish pre-flight
-        // proved it or because an inherited snapshot was admitted under this same budget.
+        // Still over after every other entry yielded: the incoming snapshots go, shallowest first,
+        // but an inherited anchor goes only once every capture of this publish's own has gone. The
+        // anchor is the shallowest boundary here by construction and the ONLY state that can resume
+        // a fork branching at that depth, so yielding it first handed back exactly what inheritance
+        // had just preserved. The deepest one is what a same-conversation resume attaches, and on a
+        // recurrent tree it is the entry's only way in — it fits the budget alone, either because
+        // the publish pre-flight proved it or because an inherited snapshot was admitted under this
+        // same budget.
         let keep = usize::from(self.recurrent && !ckpts.is_empty());
         while self.aux_bytes + ckpts_bytes(&ckpts) > self.aux_budget && ckpts.len() > keep {
-            ckpts.remove(0);
+            let victim = (0..ckpts.len() - 1)
+                .find(|&index| !anchors.contains(&ckpts[index].boundary_tokens))
+                .unwrap_or(0);
+            ckpts.remove(victim);
         }
         self.aux_bytes += ckpts_bytes(&ckpts);
         ckpts
@@ -3132,6 +3162,93 @@ mod tests {
             kv.evictions, 0,
             "inheritance must not cost another conversation"
         );
+        assert_gradient(&kv);
+    }
+
+    /// A re-publish at the SAME node replaces the entry wholesale, and inheritance only covers
+    /// ANCESTORS — so a boundary the replaced entry held and this publish did not re-capture was
+    /// deleted outright. The measured shape: a parent revisit lands on the same node again and
+    /// swaps [3840, 4288] for its own single frontier, taking the fork's branch point with it.
+    #[test]
+    fn a_revisit_republishing_the_same_node_keeps_the_branch_point_it_did_not_recapture() {
+        let mut kv = cache_recurrent(16, 8);
+        let a = grow(&mut kv, 4); // 16 tokens
+        let tokens: Vec<u32> = (1..=16).collect();
+        kv.publish_with_ckpts(
+            tokens.clone(),
+            a.clone(),
+            vec![ckpt(8, 64), ckpt(16, 64)],
+            None,
+        )
+        .unwrap();
+        kv.session_release(&a);
+        let fork: Vec<u32> = (1..=8).chain([900, 901]).collect();
+        let (node, matched) = kv.best_match(&fork, None).unwrap();
+        assert_eq!(kv.hit_prefix(node, true, matched).0, 8);
+
+        // The revisit re-prefills the identical conversation and captures only its own frontier.
+        let b = grow(&mut kv, 4);
+        kv.publish_with_ckpts(tokens, b.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&b);
+        let (node, matched) = kv.best_match(&fork, None).expect("the chain still matches");
+        assert_eq!(matched, 8);
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!(
+            (reusable, ckpt.unwrap().boundary_tokens),
+            (8, 8),
+            "the fork still attaches at the branch point the revisit did not re-capture"
+        );
+        assert_eq!(
+            kv.aux_bytes, 128,
+            "both boundaries are charged exactly once"
+        );
+        assert_eq!(kv.evictions, 0);
+        assert_gradient(&kv);
+    }
+
+    /// Under aux pressure the incoming snapshots were yielded shallowest-first, and the inherited
+    /// anchor is exactly the shallowest — so a tight budget undid the inheritance performed a few
+    /// lines above it. The anchor is the only state that can resume a fork branching there; the
+    /// publish's own intermediate capture is not.
+    #[test]
+    fn aux_pressure_yields_the_publishs_own_capture_before_the_inherited_anchor() {
+        let mut kv = cache_recurrent(16, 8);
+        kv.set_aux_budget(128); // room for two of the three snapshots below
+        let a = grow(&mut kv, 4); // 16 tokens
+        kv.publish_with_ckpts((1..=16).collect(), a.clone(), vec![ckpt(16, 64)], None)
+            .unwrap();
+        kv.session_release(&a);
+        // A continuation to 24 tokens captures two of its own and inherits the branch point at 16.
+        let published: Vec<u32> = (1..=16).collect();
+        let mut chain = kv.entry_chain(node_at(&kv, &published), 16);
+        kv.session_attach(&chain);
+        chain.extend(grow(&mut kv, 2));
+        kv.publish_with_ckpts(
+            (1..=24).collect(),
+            chain.clone(),
+            vec![ckpt(20, 64), ckpt(24, 64)],
+            None,
+        )
+        .unwrap();
+        kv.session_release(&chain);
+        assert_eq!(kv.ckpts_inherited, 1);
+        let fork: Vec<u32> = (1..=16).chain([900, 901]).collect();
+        let (node, matched) = kv
+            .best_match(&fork, None)
+            .expect("the merged chain matches");
+        assert_eq!(matched, 16);
+        let (reusable, ckpt) = kv.hit_prefix(node, true, matched);
+        assert_eq!(
+            (reusable, ckpt.unwrap().boundary_tokens),
+            (16, 16),
+            "the inherited anchor outlived the aux pressure"
+        );
+        // The conversation's own resume point is still the deepest, and the budget still binds.
+        let (node, matched) = kv.best_match(&(1..=24).collect::<Vec<_>>(), None).unwrap();
+        assert_eq!(kv.hit_prefix(node, true, matched).0, 24);
+        assert_eq!(kv.aux_bytes, 128);
+        assert_eq!(kv.evictions, 0);
         assert_gradient(&kv);
     }
 
