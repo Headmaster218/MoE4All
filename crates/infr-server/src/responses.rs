@@ -133,6 +133,12 @@ pub(super) struct ResponseStore {
     /// Merged into at most one write per [`RECENCY_FLUSH_INTERVAL`]; every `save` clears it.
     recency_dirty: bool,
     last_write: Instant,
+    /// Process-lifetime lifecycle counters for the console's introspection panel. Not mirrored to
+    /// disk: they describe this run, while the mirror's job is the entries themselves.
+    created: u64,
+    evicted: u64,
+    chain_hits: u64,
+    chain_misses: u64,
 }
 
 /// How long recency-only touches are merged before the mirror is rewritten. The order they restore
@@ -210,6 +216,10 @@ impl ResponseStore {
                 .map(std::path::Path::to_path_buf),
             recency_dirty: false,
             last_write: Instant::now(),
+            created: 0,
+            evicted: 0,
+            chain_hits: 0,
+            chain_misses: 0,
         };
         let Some(path) = store.path.clone() else {
             return Ok(store);
@@ -334,17 +344,19 @@ impl ResponseStore {
     ) -> Result<Option<Arc<Vec<ChatMessageDto>>>, ParamError> {
         self.clock += 1;
         if let Some(id) = previous {
-            let entry = self.entries.get_mut(id).ok_or_else(|| {
-                invalid(
+            let Some(entry) = self.entries.get_mut(id) else {
+                self.chain_misses += 1;
+                return Err(invalid(
                     "previous_response_id",
                     format!(
                         "no stored response {id:?} (state is LRU-bounded; without \
                          serve.response_store_path a restart loses it)"
                     ),
-                )
-            })?;
+                ));
+            };
             entry.last_used = self.clock;
             let history = entry.history.clone();
+            self.chain_hits += 1;
             self.touch_recency();
             return Ok(Some(history));
         }
@@ -352,14 +364,16 @@ impl ResponseStore {
             if let Some(id) = self.conversations.get(name) {
                 // The cursor may point at an evicted entry: fail loudly (see `put`'s note on
                 // why cursors survive eviction) instead of restarting the conversation blank.
-                let entry = self.entries.get_mut(id).ok_or_else(|| {
-                    invalid(
+                let Some(entry) = self.entries.get_mut(id) else {
+                    self.chain_misses += 1;
+                    return Err(invalid(
                         "conversation",
                         format!("conversation {name:?} points at evicted response {id:?}"),
-                    )
-                })?;
+                    ));
+                };
                 entry.last_used = self.clock;
                 let history = entry.history.clone();
+                self.chain_hits += 1;
                 self.touch_recency();
                 return Ok(Some(history));
             }
@@ -377,6 +391,7 @@ impl ResponseStore {
         conversation: Option<&str>,
     ) {
         self.clock += 1;
+        self.created += 1;
         for item in item_ids(&response["output"]) {
             self.items.insert(item, id.to_owned());
         }
@@ -400,6 +415,7 @@ impl ResponseStore {
                 break;
             };
             self.forget(&victim);
+            self.evicted += 1;
         }
         self.save();
     }
@@ -476,6 +492,68 @@ impl ResponseStore {
     /// Stored responses, for `has_more` on a page.
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Read-only lifecycle introspection for the console's `/internal/stats` panel: store sizing,
+    /// mirror state, process-lifetime counters, and every stored context with its chain links and
+    /// LRU position. Metadata only — no history or response bodies leave the store.
+    pub(super) fn snapshot(&self) -> Value {
+        let mut entries: Vec<(&String, &StoredResponse)> = self.entries.iter().collect();
+        entries.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.last_used));
+        let entry_rows: Vec<Value> = entries
+            .iter()
+            .enumerate()
+            .map(|(rank, (id, entry))| {
+                let conversations: Vec<&str> = self
+                    .conversations
+                    .iter()
+                    .filter(|(_, cursor)| *cursor == *id)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                json!({
+                    "id": id,
+                    "created": entry.response["created_at"],
+                    "status": entry.response["status"],
+                    "model": entry.response["model"],
+                    "turns": entry.history.len(),
+                    "input_items": entry.input_items.len(),
+                    "output_items": entry.response["output"].as_array().map(Vec::len).unwrap_or(0),
+                    "last_used": entry.last_used,
+                    "lru_rank": rank + 1,
+                    "conversations": conversations,
+                })
+            })
+            .collect();
+        let mut conv_rows: Vec<Value> = self
+            .conversations
+            .iter()
+            .map(|(name, cursor)| {
+                json!({
+                    "name": name,
+                    "cursor": cursor,
+                    "alive": self.entries.contains_key(cursor),
+                })
+            })
+            .collect();
+        conv_rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        json!({
+            "enabled": self.capacity > 0,
+            "capacity": self.capacity,
+            "len": self.entries.len(),
+            "conversation_count": self.conversations.len(),
+            "item_count": self.items.len(),
+            "clock": self.clock,
+            "mirror": self.path.as_ref().map(|p| p.display().to_string()),
+            "recency_dirty": self.recency_dirty,
+            "counters": {
+                "created": self.created,
+                "evicted": self.evicted,
+                "chain_hits": self.chain_hits,
+                "chain_misses": self.chain_misses,
+            },
+            "entries": entry_rows,
+            "conversations": conv_rows,
+        })
     }
 }
 

@@ -13,6 +13,7 @@
   <nav class="tabs" role="tablist">
     <button class="tab" role="tab" data-view="overview" aria-selected="true">总览</button>
     <button class="tab" role="tab" data-view="history" aria-selected="false">历史</button>
+    <button class="tab" role="tab" data-view="context" aria-selected="false">上下文</button>
     <button class="tab" role="tab" data-view="keys" aria-selected="false">API Keys</button>
     <button class="tab" role="tab" data-view="launch" aria-selected="false">启动参数</button>
     <button class="tab" role="tab" data-view="logs" aria-selected="false">日志</button>
@@ -96,6 +97,36 @@
       </div>
     </section>
 
+    <!-- ── 上下文（Responses API 生命周期） ─────────────────────────── -->
+    <section data-pane="context" hidden>
+      <div class="card">
+        <h2>Responses 上下文存储<span class="spacer"></span><span class="frame-seq" id="ctx-note"></span></h2>
+        <div class="tiles" id="ctx-tiles"></div>
+      </div>
+
+      <div class="card">
+        <h2>响应条目（LRU）<span class="spacer"></span><span class="frame-seq">最近使用在前 · 末位高亮为下一个被驱逐</span></h2>
+        <table>
+          <thead><tr>
+            <th class="num">LRU</th><th>Response ID</th><th>模型</th><th>状态</th>
+            <th class="num">轮数</th><th class="num">输入项</th><th class="num">输出项</th>
+            <th>创建时间</th><th class="num">闲置 tick</th><th>会话</th>
+          </tr></thead>
+          <tbody id="ctx-entries"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>会话游标<span class="spacer"></span><span class="frame-seq">conversation → 最新响应 · 驱逐后游标悬空</span></h2>
+        <table>
+          <thead><tr>
+            <th>会话名</th><th>游标指向</th><th>状态</th>
+          </tr></thead>
+          <tbody id="ctx-conversations"></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- ── API Keys ─────────────────────────────────────────────────── -->
     <section data-pane="keys" hidden>
       <div class="card">
@@ -147,20 +178,13 @@
       </div>
 
       <div class="card">
-        <h2>常用（启动脚本等价项）</h2>
-        <div class="knob-grid" id="knobs-basic"></div>
-      </div>
-
-      <div class="card" id="manual-card" hidden>
-        <h2>全手动 · 下一级</h2>
-        <div id="knobs-manual"></div>
-      </div>
-
-      <div class="card">
-        <h2>高级选项<span class="spacer"></span>
+        <h2>参数设置<span class="spacer"></span>
           <input type="text" id="knob-search" class="icon-btn" placeholder="搜索配置项…" style="min-width:200px">
         </h2>
-        <div id="knobs-advanced"></div>
+        <div class="settings-browser">
+          <nav class="settings-nav" id="settings-nav" aria-label="参数分类"></nav>
+          <div class="settings-detail" id="settings-detail"></div>
+        </div>
       </div>
 
       <div class="card">

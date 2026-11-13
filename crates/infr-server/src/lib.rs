@@ -2808,6 +2808,7 @@ async fn internal_stats_handler(State(state): State<AppState>, headers: HeaderMa
             "k": state.cfg.spec.k,
             "draft": state.cfg.spec.draft.is_some(),
         },
+        "response_store": state.response_store.lock().unwrap().snapshot(),
     }))
     .into_response()
 }
