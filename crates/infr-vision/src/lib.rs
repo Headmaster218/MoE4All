@@ -14,9 +14,11 @@
 //! * **Projector**: `clip.projector_type == "qwen3vl_merger"` only.
 //! * **Deepstack**: `clip.is_deepstack_layers` must be ALL ZERO. Any nonzero entry bails at load
 //!   because deepstack multi-layer feature injection into the trunk is not implemented.
-//! * **Image inputs**: `data:` base64 URIs and bare base64 strings only
-//!   ([`decode_image_input`]). Plain `http(s)://` URLs are NOT fetched — they bail with a clear
-//!   error (a fetcher would add network and SSRF surface to the server).
+//! * **Image inputs**: `data:` base64 URIs, bare base64 strings, and `http(s)://` URLs
+//!   ([`decode_image_input`]). A URL fetch is the one place the engine goes out on a caller's
+//!   behalf, so it is bounded by size, by wall clock, and by an address rule that refuses
+//!   loopback / link-local / private ranges (`vision.image_url_allow_private` lifts it for a NAS or
+//!   a LAN camera). Any other scheme — `file://` included — bails with a clear error.
 //! * **Execution**: Vulkan only. The tower derives a client from the running LLM backend, admits
 //!   native GGUF weights from SSD for one image batch, and returns all temporary VRAM afterwards.
 

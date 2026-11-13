@@ -49,6 +49,13 @@ ubatch_parallel = 256
 # Default: unset = vendor-derived.
 # subgroup_pref = 32
 
+# Refuse to start when another live infr already holds this device (see
+# documentation/reference/configuration.md, "GPU startup lock"). The lock is a
+# loopback bind, so a killed or crashed holder releases it; only an infr that
+# says it holds THIS device blocks a start — any other case warns and runs.
+# Default: true. Same as INFR_NO_GPU_LOCK=1 (which prints INFR-W1001).
+# gpu_lock = false
+
 # ── sampling ─────────────────────────────────────────────────────────────────
 #
 # CAUTION: temp / top_k / top_p / max_new are PROVENANCE-sensitive. `infr run`
@@ -104,6 +111,13 @@ dynamic = true
 session_idle_secs = 120
 session_cache_max = "5GiB" # absolute size only; 0 disables the store
 session_cache_ttl_hours = 24 # 0 disables age expiry
+
+# Host-RAM prefix cache for idle conversations (SGLang-style radix tree over the VRAM slots):
+# a free slot's KV is demoted to RAM snapshots after `session_idle_secs` idle (or immediately
+# when a different-prefix request needs the slot) and restored on the next prefix hit. Never
+# written to disk; when set, it takes precedence over session_cache_dir. Percentages resolve
+# against total physical RAM. Requires the same dynamic Q8_0/Q8_0 Qwen KV as the disk store.
+# ram_cache_max = "16GiB" # e.g. "16GiB" or "25%"; unset/0 disables
 
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
@@ -301,3 +315,27 @@ endpoint = "https://huggingface.co"
 # number for both, because a bound per axis would multiply — some repos ship 236
 # shards. 0 and 1 both mean strictly one connection, never split.
 pull_jobs = 8
+
+[uncensor]
+# Refusal-direction projection (`crates/infr-uncensor`): projects one direction out of each
+# covered layer's residual, which REMOVES A TRAINED REFUSAL. Off unless `vector` names a file.
+#
+# Support is ONE model family: Qwen3.8-Flash-Next (`general.architecture = qwen4exp`), whose wide
+# multi-stream residual is what gets projected. Naming a file for any other model is a startup
+# ERROR, never a silent ignore — as is an unreadable or truncated file, or a layer range this
+# model has no layers for.
+#
+# Safety, compliance and legal responsibility for what the server then answers stay with the
+# operator, and the model licence's usage terms still apply; enabling the feature is treated as
+# consent. The launch wizard states this before it accepts a yes, and its prompt default AND its
+# 30 s timeout are both "no".
+#
+# llama.cpp-compatible `controlvector` GGUF: one `[n_embd]` f32 direction per layer
+# (`direction.1` …). Empty/absent = the feature does not exist for this session, and generation is
+# bit-for-bit the published model.
+# vector = "D:\models\qwen38-cvec.gguf"
+# Inclusive layer range. Below the first layer the model works out what was asked (projecting there
+# damages comprehension); above the last it has committed to an answer (removing a direction that
+# late reads as rambling). `last_layer` is clipped to the model's depth.
+first_layer = 4
+last_layer = 44

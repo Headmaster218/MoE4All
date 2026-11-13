@@ -45,7 +45,7 @@ backend-neutral Graph
         +--> Metal
 ```
 
-HTTP DTO、鉴权、SSE 和错误映射属于 `infr-server`；0.9.0 同时提供 Chat Completions 与无状态 Responses API。模板、工具和 reasoning/content 分流属于 `infr-chat`。
+HTTP DTO、鉴权、SSE 和错误映射属于 `infr-server`；它同时提供 Chat Completions 与 Responses API，后者默认无状态，由 `serve.response_store_entries` 开启进程内的响应存储。模板、工具和 reasoning/content 分流属于 `infr-chat`。
 模型、session、scheduler 与 MTP 主要仍在 `infr-llama`。CLI 负责把这些模块装配成实际命令。Vulkan `serve` 通常由
 `ParallelSeam` 统一调度；仅单 slot、纯文本且没有 Vision/Embedding 的 Qwen3.8 MTP serve 保留传统单请求路径。
 并发 token group 的 lane 顺序优先多模态 lane，再优先剩余 Prefill 较长的 lane，最后以 slot 稳定排序；这是共享图形状
