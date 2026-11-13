@@ -2,11 +2,12 @@
 //! the operator's browser, are never forwarded upstream, and are NOT gated by the client API keys
 //! (those authenticate inference callers, not the person sitting at the console).
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -15,7 +16,7 @@ use axum::Json;
 use futures_util::Stream;
 use serde::Deserialize;
 
-use crate::state::{new_token, ApiKey, Console, KeyView};
+use crate::state::{new_token, ApiKey, Console, KeyView, Settings};
 use crate::launch;
 
 pub struct UiError(anyhow::Error);
@@ -48,6 +49,9 @@ pub fn router(console: Arc<Console>) -> axum::Router {
         .route("/ui/keys/:id", delete(delete_key))
         .route("/ui/uncensor", post(set_uncensor))
         .route("/ui/schema", get(schema))
+        .route("/ui/settings", get(get_settings).post(save_settings))
+        .route("/ui/vector/download", post(download_vector))
+        .route("/ui/vector/status", get(vector_status))
         .route("/ui/launch", post(start_engine))
         .route("/ui/stop", post(stop_engine))
         .fallback(crate::proxy::handle)
@@ -281,4 +285,71 @@ pub async fn start_engine(
 pub async fn stop_engine(State(console): State<Arc<Console>>) -> UiResult<Json<serde_json::Value>> {
     launch::stop(&console).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The operator's saved launch form. Read on page load so a reload — or a console restart — restores
+/// the preset and touched knobs exactly as they were left, instead of falling back to schema defaults.
+pub async fn get_settings(State(console): State<Arc<Console>>) -> Json<Settings> {
+    Json(console.load_settings())
+}
+
+/// Persist the form. Values are not validated here: an unknown path is a HARD error at launch (see
+/// `build_args`), which is the right place to refuse it — saving must not silently drop a knob the
+/// operator typed, and the browser already filters restored keys against the live schema.
+pub async fn save_settings(
+    State(console): State<Arc<Console>>,
+    Json(settings): Json<Settings>,
+) -> UiResult<Json<serde_json::Value>> {
+    console.save_settings(&settings)?;
+    console.log("启动设置已保存");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct VectorDownloadRequest {
+    /// Full destination file path. Empty/absent = the wizard's default `models/control-vectors/…`.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub consent: bool,
+}
+
+/// Fetch the pinned refusal-direction vector. Consent is enforced here as well as in the browser, so
+/// the download cannot be triggered by a skipped dialog. The URLs are the wizard's real HF origin and
+/// mirror — never a proxy.
+pub async fn download_vector(
+    State(console): State<Arc<Console>>,
+    Json(req): Json<VectorDownloadRequest>,
+) -> UiResult<Json<serde_json::Value>> {
+    if !req.consent {
+        return Err(ui_err("下载去审查向量需要先勾选风险同意"));
+    }
+    let dest = req
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let path = crate::vector::download(&console, dest).await?;
+    Ok(Json(serde_json::json!({ "path": path.display().to_string() })))
+}
+
+#[derive(Deserialize)]
+pub struct VectorStatusQuery {
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Read-only vector status: present? hash matches the canonical direction? where would it default to?
+pub async fn vector_status(
+    State(console): State<Arc<Console>>,
+    Query(q): Query<VectorStatusQuery>,
+) -> Json<serde_json::Value> {
+    let path = q
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    Json(crate::vector::status(&console, path).await)
 }

@@ -12,6 +12,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 mod ui;
+mod vector;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

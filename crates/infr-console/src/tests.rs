@@ -37,8 +37,20 @@ fn console() -> Arc<Console> {
     })
 }
 
-fn known(paths: &[&str]) -> std::collections::HashSet<String> {
-    paths.iter().map(|p| p.to_string()).collect()
+/// A config field as the engine schema advertises it: `path` + shipped `default`. An unset Option
+/// defaults to `none`, which `build_args` emits verbatim so the engine parses it back to `None`.
+fn cfg(path: &str, default: &str) -> serde_json::Value {
+    serde_json::json!({ "path": path, "default": default })
+}
+
+/// A CLI-only field: it carries a `flag` spelling (empty = the positional model) instead of a `--set`
+/// path. `default` is what the engine uses when the operator leaves it blank.
+fn cli(path: &str, flag: &str, default: &str) -> serde_json::Value {
+    serde_json::json!({ "path": path, "flag": flag, "default": default })
+}
+
+fn fields(paths: &[&str]) -> Vec<serde_json::Value> {
+    paths.iter().map(|p| cfg(p, "none")).collect()
 }
 
 fn request(preset: &str, set: &[(&str, &str)]) -> LaunchRequest {
@@ -52,27 +64,27 @@ fn request(preset: &str, set: &[(&str, &str)]) -> LaunchRequest {
 #[test]
 fn presets_map_to_the_wizards_auto_profile() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
-    let conservative = launch::build_args(&request("conservative", &[]), shutdown, &known(&[])).unwrap();
+    let conservative = launch::build_args(&request("conservative", &[]), &fields(&[]), shutdown).unwrap();
     assert!(conservative.windows(2).any(|w| w == ["--set", "device.auto_profile=conservative"]));
-    let aggressive = launch::build_args(&request("aggressive", &[]), shutdown, &known(&[])).unwrap();
+    let aggressive = launch::build_args(&request("aggressive", &[]), &fields(&[]), shutdown).unwrap();
     assert!(aggressive.windows(2).any(|w| w == ["--set", "device.auto_profile=aggressive"]));
     // 全手动 means the operator owns every value; an auto profile would silently override them.
-    let manual = launch::build_args(&request("manual", &[]), shutdown, &known(&[])).unwrap();
+    let manual = launch::build_args(&request("manual", &[]), &fields(&[]), shutdown).unwrap();
     assert!(!manual.iter().any(|a| a.starts_with("device.auto_profile=")));
-    assert!(launch::build_args(&request("turbo", &[]), shutdown, &known(&[])).is_err());
+    assert!(launch::build_args(&request("turbo", &[]), &fields(&[]), shutdown).is_err());
 }
 
 #[test]
 fn every_launch_carries_the_graceful_shutdown_file() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
-    let args = launch::build_args(&request("manual", &[]), shutdown, &known(&[])).unwrap();
+    let args = launch::build_args(&request("manual", &[]), &fields(&[]), shutdown).unwrap();
     assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
     assert!(args.iter().any(|a| a == "serve.shutdown_file=/tmp/engine.shutdown"));
     // The console owns this knob; a form value must not replace the path it knows how to write.
     let overridden = launch::build_args(
         &request("manual", &[("serve.shutdown_file", "/somewhere/else")]),
+        &fields(&["serve.shutdown_file"]),
         shutdown,
-        &known(&["serve.shutdown_file"]),
     )
     .unwrap();
     assert!(!overridden.iter().any(|a| a.contains("/somewhere/else")));
@@ -81,6 +93,13 @@ fn every_launch_carries_the_graceful_shutdown_file() {
 #[test]
 fn cli_only_options_become_flags_not_set_paths() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
+    let schema = vec![
+        cli("cli:model", "", ""),
+        cli("cli:addr", "--addr", "127.0.0.1:8080"),
+        cli("cli:parallel", "--parallel", ""),
+        cli("cli:mmproj", "--mmproj", ""),
+        cfg("device.ctx", "none"),
+    ];
     let args = launch::build_args(
         &request(
             "conservative",
@@ -92,8 +111,8 @@ fn cli_only_options_become_flags_not_set_paths() {
                 ("device.ctx", "262144"),
             ],
         ),
+        &schema,
         shutdown,
-        &known(&["device.ctx"]),
     )
     .unwrap();
     assert!(args.windows(2).any(|w| w == ["--addr", "127.0.0.1:9000"]));
@@ -102,21 +121,82 @@ fn cli_only_options_become_flags_not_set_paths() {
     assert!(args.iter().any(|a| a == "C:/models/ad.gguf"));
     assert!(args.windows(2).any(|w| w == ["--set", "device.ctx=262144"]));
     assert!(!args.iter().any(|a| a.starts_with("cli:")));
-    // A flag left at its default is not emitted, so the engine's own default stays in force.
+    // FULL DUMP: a non-empty CLI flag is explicit even when it equals the default; an empty one has
+    // no flag spelling and is omitted, so the engine's own default stays in force for that knob.
     let defaults = launch::build_args(
         &request("conservative", &[("cli:addr", "127.0.0.1:8080"), ("cli:parallel", "")]),
+        &schema,
         shutdown,
-        &known(&[]),
     )
     .unwrap();
-    assert!(!defaults.iter().any(|a| a == "--addr" || a == "--parallel"));
+    assert!(defaults.windows(2).any(|w| w == ["--addr", "127.0.0.1:8080"]));
+    assert!(!defaults.iter().any(|a| a == "--parallel"));
 }
 
 #[test]
 fn unknown_paths_and_control_characters_are_refused_before_spawn() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
-    assert!(launch::build_args(&request("manual", &[("kv.not_a_knob", "1")]), shutdown, &known(&["kv.paged"])).is_err());
-    assert!(launch::build_args(&request("manual", &[("device.ctx", "8192\n--dev")]), shutdown, &known(&["device.ctx"])).is_err());
+    assert!(launch::build_args(&request("manual", &[("kv.not_a_knob", "1")]), &fields(&["kv.paged"]), shutdown).is_err());
+    assert!(launch::build_args(&request("manual", &[("device.ctx", "8192\n--dev")]), &fields(&["device.ctx"]), shutdown).is_err());
+}
+
+/// The operator asked for EVERY setting written explicitly into the launch command. An untouched
+/// Option must still appear as `=none` (so the engine keeps auto-filling it under the profile), the
+/// engine-derived `*_specified` presence markers must NOT appear (the wizard's `--set` path never
+/// sets them either), and the console-owned shutdown file is appended exactly once, last.
+#[test]
+fn full_dump_writes_every_field_and_skips_presence_markers() {
+    let shutdown = std::path::Path::new("/tmp/engine.shutdown");
+    let schema = vec![
+        cfg("device.ctx", "none"),
+        cfg("device.auto_profile", "conservative"),
+        cfg("device.ubatch_specified", "false"),
+        cfg("kv.type_k", "none"),
+        cfg("kv.type_k_specified", "false"),
+        cfg("kv.paged", "false"),
+        cfg("kernels.vulkan.gemv.variant", "none"),
+        cfg("serve.shutdown_file", "none"),
+    ];
+    // Touch only ctx and the KV dtype; everything else must still be emitted at its default.
+    let args = launch::build_args(
+        &request("conservative", &[("device.ctx", "262144"), ("kv.type_k", "q8_0")]),
+        &schema,
+        shutdown,
+    )
+    .unwrap();
+    assert!(args.windows(2).any(|w| w == ["--set", "device.ctx=262144"]));
+    assert!(args.windows(2).any(|w| w == ["--set", "kv.type_k=q8_0"]));
+    // Untouched fields are present at their shipped default, not silently omitted.
+    assert!(args.windows(2).any(|w| w == ["--set", "kv.paged=false"]));
+    assert!(args.windows(2).any(|w| w == ["--set", "kernels.vulkan.gemv.variant=none"]));
+    // auto_profile comes from the preset, exactly once.
+    assert_eq!(args.iter().filter(|a| a.starts_with("device.auto_profile=")).count(), 1);
+    assert!(args.windows(2).any(|w| w == ["--set", "device.auto_profile=conservative"]));
+    // Presence markers are engine-derived and must never be pinned by the dump.
+    assert!(!args.iter().any(|a| a.contains("_specified=")));
+    // The shutdown file is the console's, appended once and last.
+    assert_eq!(args.iter().filter(|a| a.starts_with("serve.shutdown_file=")).count(), 1);
+    assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
+}
+
+/// Settings survive a save/load round-trip beside the keys file, so a console restart restores the
+/// form. Only the preset and touched knobs are kept; defaults are re-derived from the schema.
+#[test]
+fn settings_persist_and_restore() {
+    let console = console();
+    let mut settings = crate::state::Settings::default();
+    assert_eq!(settings.preset, "conservative");
+    assert!(settings.set.is_empty());
+    settings.preset = "manual".into();
+    settings.set.insert("device.ctx".into(), "262144".into());
+    settings.set.insert("kv.type_k".into(), "q8_0".into());
+    console.save_settings(&settings).unwrap();
+    let restored = console.load_settings();
+    assert_eq!(restored.preset, "manual");
+    assert_eq!(restored.set.get("device.ctx").map(String::as_str), Some("262144"));
+    assert_eq!(restored.set.get("kv.type_k").map(String::as_str), Some("q8_0"));
+    let _ = std::fs::remove_file(console.settings_path());
+    let _ = std::fs::remove_file(&console.state_path);
 }
 
 #[tokio::test]

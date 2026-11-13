@@ -188,11 +188,29 @@
       </div>
 
       <div class="card">
+        <h2>去审查向量<span class="spacer"></span><span class="frame-seq">仅支持 Qwen3.8-Flash-Next（qwen4exp）</span></h2>
+        <div class="row">
+          <div class="field" style="flex:1;min-width:280px;margin:0">
+            <label for="vector-path">保存路径（留空 = 默认 models/control-vectors/）</label>
+            <input type="text" id="vector-path" placeholder="默认路径加载中…">
+          </div>
+          <button class="btn" id="vector-download" style="align-self:flex-end">自动下载</button>
+          <button class="btn ghost" id="vector-check" style="align-self:flex-end">检查状态</button>
+        </div>
+        <p class="doc" id="vector-status" style="color:var(--text-faint);font-size:12px;margin:10px 0 0">未检查</p>
+        <p class="doc" style="color:var(--text-faint);font-size:12px;margin:6px 0 0">
+          从 HuggingFace 官方仓库下载，连不上自动转 hf-mirror；按 sha256 校验，不符即弃。下载与启用均需勾选风险同意。
+        </p>
+      </div>
+
+      <div class="card">
         <h2>启动命令</h2>
         <div class="cmdline" id="cmdline"></div>
         <div class="row" style="margin-top:12px">
           <button class="btn" id="launch-start">启动引擎</button>
           <button class="btn danger" id="launch-stop">停止引擎</button>
+          <button class="btn ghost" id="launch-recommend">推荐配置</button>
+          <button class="btn ghost" id="launch-save">保存设置</button>
           <button class="btn ghost" id="launch-reset">恢复默认</button>
           <button class="btn ghost" id="launch-copy">复制命令</button>
           <span class="spacer"></span>

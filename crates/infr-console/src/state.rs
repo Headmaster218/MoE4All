@@ -4,7 +4,7 @@
 //! `/internal/stats` poll. Nothing is inferred from engine internals, so the console keeps working
 //! against any OpenAI-compatible upstream — the resource tiles simply go absent.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -261,6 +261,28 @@ pub struct UncensorState {
     pub vector_loaded: bool,
 }
 
+/// The operator's saved launch settings: the preset and the knob values they touched. Persisted
+/// beside the keys file so a console restart — or a browser reload — restores the form exactly as
+/// it was left, instead of silently falling back to schema defaults. Only touched values are kept;
+/// everything else is re-derived from the engine's own schema at launch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default = "default_settings_preset")]
+    pub preset: String,
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+}
+
+fn default_settings_preset() -> String {
+    "conservative".into()
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { preset: default_settings_preset(), set: BTreeMap::new() }
+    }
+}
+
 /// What the console knows about the engine process. `managed` distinguishes "we started it" from
 /// "we attached to one somebody else started" — only the former may be stopped from the UI.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -405,6 +427,33 @@ impl Console {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&self.state_path, json)?;
+        Ok(())
+    }
+
+    /// Launch settings live beside the keys file, in the same console state directory. A separate
+    /// file keeps the keys payload (which the proxy rewrites on every counter fold) from carrying
+    /// the whole knob tree, and lets settings survive even when no key has been created yet.
+    pub fn settings_path(&self) -> std::path::PathBuf {
+        self.state_path
+            .parent()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("settings.json")
+    }
+
+    pub fn load_settings(&self) -> Settings {
+        std::fs::read_to_string(self.settings_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_settings(&self, settings: &Settings) -> anyhow::Result<()> {
+        let path = self.settings_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(settings)?)?;
         Ok(())
     }
 

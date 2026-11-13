@@ -309,77 +309,86 @@ fn default_preset() -> String {
 }
 
 /// Turn the form into an argv. Split out from the spawn so the command line the UI previews is the
-/// one that actually runs, and so it can be tested without a GPU. `known` is every path the engine
-/// advertised — the curated lists are a subset of it, not the whole legal set.
+/// one that actually runs, and so it can be tested without a GPU.
+///
+/// FULL DUMP: every field the engine advertised is written explicitly, in schema order — untouched
+/// ones at their shipped default. An unset `Option` is spelled `none`, which the engine parses back
+/// to `None`, so an auto-filled memory/kernel knob stays auto-filled under the chosen profile rather
+/// than being pinned to a guess. The only fields NOT emitted are the engine-derived `*_specified`
+/// presence markers (the engine sets those from env/flag presence, exactly as the wizard's `--set`
+/// path does) and `serve.shutdown_file`, which the console owns and appends last. `fields` is the
+/// engine schema plus the CLI-only flags, each carrying `path`, `default` and (for CLI) `flag`.
 pub fn build_args(
     req: &LaunchRequest,
+    fields: &[serde_json::Value],
     shutdown_file: &std::path::Path,
-    known: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
     if !matches!(req.preset.as_str(), "conservative" | "aggressive" | "manual") {
         anyhow::bail!("未知的配置方式：{}", req.preset);
     }
-    let mut args = vec!["serve".to_string()];
-    let mut model: Option<String> = None;
-    let mut sets: Vec<(String, String)> = Vec::new();
+    let known: std::collections::HashSet<&str> = fields
+        .iter()
+        .filter_map(|f| f.get("path").and_then(|p| p.as_str()))
+        .collect();
+    // Validate the touched values first: an unknown path is a HARD error in the engine (saying so
+    // here keeps the message in the operator's language), and a control character would split one
+    // argument into two before the engine ever saw it.
     for (path, value) in &req.set {
         if value.chars().any(|c| c.is_control()) {
             anyhow::bail!("{path} 的值里有控制字符");
         }
-        if path == "serve.shutdown_file" {
-            // The console owns this one: it is how "停止引擎" asks for a graceful exit.
-            continue;
-        }
-        if let Some(flag) = CLI_FLAGS.iter().find(|f| f.path == path) {
-            if value.is_empty() || value == flag.default {
-                continue;
-            }
-            if flag.flag.is_empty() {
-                model = Some(value.clone());
-            } else {
-                args.push(flag.flag.to_string());
-                args.push(value.clone());
-            }
-            continue;
-        }
-        // An unknown path is a HARD error in the engine; saying so here keeps the message in the
-        // operator's language instead of a clap usage dump in the log view.
-        if !known.contains(path) {
+        if !known.contains(path.as_str()) {
             anyhow::bail!("未知配置项：{path}");
         }
-        sets.push((path.clone(), value.clone()));
+    }
+    let effective = |path: &str, default: &str| -> String {
+        req.set.get(path).cloned().unwrap_or_else(|| default.to_string())
+    };
+
+    let mut args = vec!["serve".to_string()];
+    let mut model: Option<String> = None;
+    // CLI-only flags first, in schema order. An empty value is "unset" and has no flag spelling, so
+    // it is omitted; a non-empty one is explicit even when it equals the default.
+    for f in fields {
+        let path = f["path"].as_str().unwrap_or("");
+        if !path.starts_with("cli:") {
+            continue;
+        }
+        let value = effective(path, f["default"].as_str().unwrap_or(""));
+        if value.is_empty() {
+            continue;
+        }
+        let flag = f["flag"].as_str().unwrap_or("");
+        if flag.is_empty() {
+            model = Some(value);
+        } else {
+            args.push(flag.to_string());
+            args.push(value);
+        }
     }
     if let Some(model) = model {
         args.push(model);
     }
+    // The preset owns auto_profile unless the operator chose 全手动, where it is an ordinary field.
     if req.preset != "manual" {
         args.push("--set".into());
         args.push(format!("device.auto_profile={}", req.preset));
     }
-    for (path, value) in sets {
+    for f in fields {
+        let path = f["path"].as_str().unwrap_or("");
+        if path.starts_with("cli:") || path == "serve.shutdown_file" || path.ends_with("_specified") {
+            continue;
+        }
         if path == "device.auto_profile" && req.preset != "manual" {
             continue;
         }
+        let value = effective(path, f["default"].as_str().unwrap_or("none"));
         args.push("--set".into());
         args.push(format!("{path}={value}"));
     }
     args.push("--set".into());
     args.push(format!("serve.shutdown_file={}", shutdown_file.display()));
     Ok(args)
-}
-
-/// Every path the engine advertised, for argv validation.
-pub fn schema_paths(payload: &serde_json::Value) -> std::collections::HashSet<String> {
-    payload
-        .get("schema")
-        .and_then(|v| v.as_array())
-        .map(|fields| {
-            fields
-                .iter()
-                .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result<serde_json::Value> {
@@ -390,7 +399,11 @@ pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result
         anyhow::bail!("开启去审查投影需要先勾选风险同意");
     }
     let payload = schema(console).await?;
-    let known = schema_paths(&payload);
+    let fields = payload
+        .get("schema")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let dir = console
         .state_path
         .parent()
@@ -399,7 +412,7 @@ pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result
     std::fs::create_dir_all(&dir)?;
     let shutdown_file = shutdown_path(console);
     let _ = std::fs::remove_file(&shutdown_file);
-    let args = build_args(&req, &shutdown_file, &known)?;
+    let args = build_args(&req, &fields, &shutdown_file)?;
 
     let mut command = tokio::process::Command::new(&console.binary);
     command
@@ -432,8 +445,10 @@ pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result
     *console.child.lock().unwrap() = Some(child);
     if req.consent {
         // The operator just acknowledged the risk for this launch; the hot toggle must not ask again
-        // for the same decision.
-        console.uncensor.lock().unwrap().consented = true;
+        // for the same decision, and the projection defaults ON for every round from here on.
+        let mut uncensor = console.uncensor.lock().unwrap();
+        uncensor.consented = true;
+        uncensor.default_on = true;
     }
     {
         let mut engine = console.engine.lock().unwrap();

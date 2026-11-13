@@ -696,8 +696,19 @@ async function ensureSchema() {
   if (SCHEMA) return;
   try {
     SCHEMA = await api("ui/schema");
+    // Restore the operator's saved form (preset + touched knobs) so a reload or a console restart
+    // picks up where they left off. Keys no longer in the live schema are dropped, so a stale
+    // settings.json from an older engine cannot hard-error the next launch.
+    let saved = null;
+    try { saved = await api("ui/settings"); } catch { /* nothing saved yet */ }
     FORM = {};
+    if (saved && saved.set) {
+      const known = new Set((SCHEMA.schema || []).map((f) => f.path));
+      for (const [k, v] of Object.entries(saved.set)) if (known.has(k)) FORM[k] = v;
+    }
+    if (saved && ["conservative", "aggressive", "manual"].includes(saved.preset)) PRESET = saved.preset;
     renderLaunch();
+    refreshVectorStatus();
   } catch (e) { $("#launch-note").textContent = `读取配置表失败：${e.message}`; }
 }
 
@@ -1271,21 +1282,31 @@ $$("#presets .preset").forEach((b) => b.addEventListener("click", () => {
   if (SCHEMA) renderLaunch();
 }));
 
-// Mirrors launch.rs::build_args, so the previewed command is the one that runs.
+// Mirrors launch.rs::build_args (FULL DUMP), so the previewed command is the one that runs: every
+// schema field is written explicitly in schema order, untouched Options as `none`, the engine-derived
+// `*_specified` markers and the console-owned shutdown file excluded. The engine API key is hidden in
+// the preview only — the real value is still injected at launch, never printed or copied.
 function renderCmdline() {
   if (!SCHEMA) return;
+  const fields = SCHEMA.schema || [];
+  const eff = (f) => (FORM[f.path] !== undefined ? FORM[f.path] : (f.default !== undefined ? f.default : "none"));
   const args = [SCHEMA.binary || "infr.exe", "serve"];
-  for (const f of SCHEMA.schema || []) {
+  let model = null;
+  for (const f of fields) {
     if (!f.path.startsWith("cli:")) continue;
-    const v = FORM[f.path];
-    if (v === undefined || v === "" || v === f.default) continue;
-    if (f.flag) args.push(f.flag, v); else args.push(v);
+    const v = eff(f);
+    if (v === "") continue;
+    if (f.flag) args.push(f.flag, v); else model = v;
   }
+  if (model !== null) args.push(model);
   if (PRESET !== "manual") args.push("--set", `device.auto_profile=${PRESET}`);
-  for (const [k, v] of Object.entries(FORM)) {
-    if (k.startsWith("cli:") || k === "serve.shutdown_file") continue;
-    if (k === "device.auto_profile" && PRESET !== "manual") continue;
-    args.push("--set", `${k}=${v}`);
+  for (const f of fields) {
+    const p = f.path;
+    if (p.startsWith("cli:") || p === "serve.shutdown_file" || p.endsWith("_specified")) continue;
+    if (p === "device.auto_profile" && PRESET !== "manual") continue;
+    let v = eff(f);
+    if (p === "serve.api_key" && v !== "" && v !== "none") v = "<已设置·预览隐藏>";
+    args.push("--set", `${p}=${v}`);
   }
   args.push("--set", `serve.shutdown_file=${SCHEMA.shutdown_file || "<控制台目录>/engine.shutdown"}`);
   $("#cmdline").textContent = args.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(" ");
@@ -1315,6 +1336,90 @@ $("#launch-stop").addEventListener("click", async () => {
   if (!confirm("停止引擎？进行中的请求会被中断。")) return;
   try { await api("ui/stop", { method: "POST" }); toast("已请求停止", "ok"); }
   catch (e) { toast(e.message, "bad"); }
+});
+
+// 推荐配置：本机（RX 7900 XTX 24GiB 独显 + 95GiB RAM）实测最优的可移植部分。模型 / 视觉 / 向量的
+// 具体路径因人而异，不写死在共享前端里——套用后操作者再补 cli:model / cli:mmproj / uncensor.vector
+// 与 serve.response_store_path 并保存。其余未列出的项仍按 schema 默认全量写出（见 renderCmdline）。
+const RECOMMENDED = {
+  "device.ctx": "262144",
+  "kv.type_k": "q8_0",
+  "kv.type_v": "q8_0",
+  "sampling.temp": "1",
+  "sampling.top_k": "20",
+  "sampling.top_p": "0.95",
+  "cli:parallel": "1",
+  "spec.mtp": "false",
+  "serve.response_store_entries": "256",
+  "vision.image_url_allow_private": "false",
+  // 分页树：page≥256 解码零税（本机实测），弹性走廊 + 专家压力让位，8GiB 内存帧池。
+  "kv.paged": "true",
+  "kv.paged_page_tokens": "256",
+  "kv.paged_cache_max": "8GiB",
+  "kv.paged_elastic": "true",
+  "kv.paged_yield_under_pressure": "true",
+};
+
+function applyRecommended() {
+  const byPath = new Map((SCHEMA.schema || []).map((f) => [f.path, f]));
+  let n = 0;
+  for (const [k, v] of Object.entries(RECOMMENDED)) {
+    const f = byPath.get(k);
+    if (!f) continue;
+    // Only genuinely-non-default values enter FORM; the rest are still emitted at default by the
+    // full dump, so the launch is identical either way and the form stays honest about what changed.
+    if (v === f.default || (v === "" && f.default === "none")) delete FORM[k];
+    else { FORM[k] = v; n++; }
+  }
+  PRESET = "conservative";
+  renderLaunch();
+  toast(`已套用推荐配置：${n} 项显式覆盖，其余按默认全量写出。请再补模型 / 视觉 / 向量路径后保存。`, "ok");
+}
+
+$("#launch-recommend").addEventListener("click", () => { if (SCHEMA) applyRecommended(); });
+$("#launch-save").addEventListener("click", async () => {
+  try {
+    await api("ui/settings", { method: "POST", body: { preset: PRESET, set: FORM } });
+    toast("设置已保存，刷新页面或重启控制台会自动恢复", "ok");
+  } catch (e) { toast(e.message, "bad"); }
+});
+
+// ── 去审查向量下载 ───────────────────────────────────────────────────────────
+// The URLs live in the backend (vector.rs), pinned to the wizard's real HF repo + mirror. The browser
+// only asks for status / triggers the download; it never constructs or substitutes a download URL.
+async function refreshVectorStatus() {
+  const pathInput = $("#vector-path");
+  const node = $("#vector-status");
+  if (!pathInput || !node) return;
+  const custom = pathInput.value.trim();
+  try {
+    const st = await api("ui/vector/status" + (custom ? `?path=${encodeURIComponent(custom)}` : ""));
+    if (st.default_path) pathInput.placeholder = st.default_path;
+    if (st.valid) { node.textContent = `✓ 已就绪，sha256 校验通过：${st.path}`; node.style.color = "var(--ok, #3fb950)"; }
+    else if (st.exists) { node.textContent = `✗ 文件存在但校验不符（不是规范方向）：${st.path}`; node.style.color = "var(--bad, #f85149)"; }
+    else { node.textContent = `未下载。默认路径：${st.default_path}`; node.style.color = ""; }
+  } catch (e) { node.textContent = `状态读取失败：${e.message}`; node.style.color = ""; }
+}
+
+$("#vector-check").addEventListener("click", refreshVectorStatus);
+$("#vector-path").addEventListener("change", refreshVectorStatus);
+$("#vector-download").addEventListener("click", () => {
+  const custom = $("#vector-path").value.trim();
+  riskModal(async () => {
+    const btn = $("#vector-download");
+    btn.disabled = true;
+    $("#vector-status").textContent = "下载中…（HuggingFace 优先，连不上自动转 hf-mirror）";
+    try {
+      const r = await api("ui/vector/download", { method: "POST", body: { path: custom || null, consent: true } });
+      // Point the launch form at the downloaded file so 启动引擎 picks it up (consent asked again there).
+      FORM["uncensor.vector"] = r.path;
+      renderLaunch();
+      toast("去审查向量已下载并校验通过", "ok");
+    } finally {
+      btn.disabled = false;
+      refreshVectorStatus();
+    }
+  });
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────
