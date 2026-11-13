@@ -15,7 +15,8 @@ verified_commit: ed62393068679573afe94a1472454efe7eae0f15
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
-- `POST /v1/responses`：无状态 Responses API，支持 JSON 与 typed SSE。
+- `POST /v1/responses`：Responses API，支持 JSON 与 typed SSE。
+- `GET /v1/responses`、`GET|DELETE /v1/responses/{response_id}`、`GET /v1/responses/{response_id}/input_items`、`POST /v1/responses/{response_id}/cancel`：仅在 `serve.response_store_entries` 非零时可用，否则返回指明该配置的 400。
 - `POST /v1/embeddings`
 
 HTTP 层负责 DTO、鉴权、参数校验、SSE、可选 request deadline 和错误映射。`serve.request_timeout_secs` 默认是 0（不设 deadline）；
@@ -23,8 +24,8 @@ HTTP 层负责 DTO、鉴权、参数校验、SSE、可选 request deadline 和�
 客户端断开后，排队中的请求会取消等待，不会之后再占用 slot。模型执行通过 generator contract 进入 runtime；
 server 不直接操作 Vulkan buffer。
 
-Responses API 将无状态 input 映射到内部 Chat Completions 路径，并以 Responses 事件类型输出流；请求输入不会在服务端形成
-持久对话事实源。流式 keep-alive 只维持连接，不代表模型在该时间窗内已产生 token。
+Responses API 把请求映射到内部 Chat Completions 路径，并以 Responses 事件类型输出流。默认（`serve.response_store_entries=0`）输入完全无状态，对话历史由客户端重放。开启后 `ResponseStore` 保存的是可重放的 DTO、响应信封和提示条目，
+它是进程内、LRU 有界、重启即失的对话事实源，不是持久事实源；链式请求重建出同一 token 前缀，由分页 KV 的 radix tree 自行命中，存储本身不引用也不固定任何 KV 页。流式 keep-alive 只维持连接，不代表模型在该时间窗内已产生 token。
 
 ## 请求生命周期
 
@@ -33,7 +34,10 @@ Responses API 将无状态 input 映射到内部 Chat Completions 路径，并�
 3. 渲染稳定 prompt，尝试复用 prefix/session state。
 4. Prefill 和 Decode/MTP。
 5. 将 reasoning/content/tool delta 编码为 SSE 或一次性响应。
-6. 客户端断开时设置 cancel latch，runtime 在安全边界停止并释放 slot。
+6. 客户端断开时设置 cancel latch，runtime 在安全边界停止并释放 slot。停在 prefill 的两个 chunk 之间时，
+   每一层都已写到那条 spine，账本因此保留：重试从那里续算，而不是从 token 0 重跑整段 prompt。
+7. 流式响应的 `response.created`/`response.in_progress` 由 Responses 层在建流时自己出具 id 与时间戳，不等第一个 token；
+   长 prefill 期间唯一外发的字节是 keep-alive 注释，客户端不该为了看到开场事件而等待预填充完成。
 
 llama.cpp compatibility embedding runner 仅对进程 readiness probe 保留启动超时，不再对整个 Embedding 请求施加固定 600 秒 deadline；
 不要将此行为与 `serve.request_timeout_secs` 混为一谈。

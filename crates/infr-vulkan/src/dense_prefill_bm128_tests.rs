@@ -2,18 +2,25 @@
 
 //! Extends the original Q8 Graph/Recorder contract to large Q8 and Q6_K projections.
 //! Mounted under the existing contract module to share its guard/offset fixtures.
+//!
+//! The gate under test is the merged `dense_bm128_applies`: PR #122 generalized BM128 from the
+//! original Q8_0/Q6_K tuple list to every native-dense format that has a `_n128_ag_bm128` build,
+//! behind m>=1024 / k>=2048 / n>=1024 and whole 128-row tiles. The narrow tuple policy this file
+//! was written against is a strict subset of it, so the assertions below state the generalized
+//! contract while keeping the Q8/Q6_K shapes and the Q6_K byte fixture that motivated it.
 use super::*;
 
 #[test]
 fn dense_prefill_policy_preserves_unqualified_routes() {
-    use crate::recorder::dense_prefill_bm128_applies as applies;
+    use crate::recorder::dense_bm128_applies as applies;
     for dtype in [DType::Q8_0, DType::Q6K] {
         for (k, n) in [(2048, 4096), (2048, 8192)] {
-            let min_rows: usize = if dtype == DType::Q8_0 { 1024 } else { 2048 };
             for m in [
-                1, 8, 16, 512, 1024, 1536, 2047, 2048, 2049, 4096, 8192, 12288, 12416,
+                1usize, 8, 16, 512, 1024, 1536, 2047, 2048, 2049, 4096, 8192, 12288, 12416,
             ] {
-                let expected = (min_rows..=12288).contains(&m) && m.is_multiple_of(128);
+                // k=2048 and n>=4096 already satisfy the wide-k/n floor, so only the
+                // 1024-row floor and whole-128-row-tile requirements remain.
+                let expected = m >= 1024 && m.is_multiple_of(128);
                 assert_eq!(applies(true, true, true, dtype, m, k, n), expected);
                 assert!(!applies(false, true, true, dtype, m, k, n));
                 assert!(!applies(true, false, true, dtype, m, k, n));
@@ -21,16 +28,15 @@ fn dense_prefill_policy_preserves_unqualified_routes() {
             }
         }
     }
-    for dtype in [
-        DType::F16,
-        DType::Bf16,
-        DType::Q4K,
-        DType::Q5K,
-        DType::Iq4Nl,
-    ] {
-        assert!(!applies(true, true, true, dtype, 4096, 2048, 8192));
+    // Generalized coverage: every format with a bm128 build qualifies on a wide shape;
+    // F16 has no such build and stays on the BM64 route.
+    for dtype in [DType::Bf16, DType::Q4K, DType::Q5K, DType::Iq4Nl] {
+        assert!(applies(true, true, true, dtype, 4096, 2048, 8192));
     }
-    for (k, n) in [(2048, 2048), (2048, 4097), (512, 2048), (2560, 640)] {
+    assert!(!applies(true, true, true, DType::F16, 4096, 2048, 8192));
+    // n must be a whole 128 column tile; k must reach the wide-k floor; n the wide-n floor.
+    assert!(applies(true, true, true, DType::Q8_0, 4096, 2048, 2048));
+    for (k, n) in [(2048, 4097), (512, 2048), (2560, 640)] {
         assert!(!applies(true, true, true, DType::Q8_0, 4096, k, n));
     }
     for (k, n, m) in QUALIFIED {
@@ -41,10 +47,10 @@ fn dense_prefill_policy_preserves_unqualified_routes() {
     }
     for n in [10240, 12288] {
         assert!(applies(true, true, true, DType::Q8_0, 4096, 2560, n));
-        assert!(!applies(true, true, true, DType::Q6K, 4096, 2560, n));
+        assert!(applies(true, true, true, DType::Q6K, 4096, 2560, n));
         assert!(!applies(true, true, true, DType::Q8_0, 4097, 2560, n));
     }
-    assert!(crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(DType::Bf16).is_none());
+    assert!(crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(DType::Bf16).is_some());
 }
 
 fn q6_raw(k: usize, n: usize) -> Vec<u8> {
@@ -80,8 +86,7 @@ fn dense_prefill_bm128_graph_exact_and_ragged_fallback() {
         } else {
             raw(k, n)
         };
-        let qualified =
-            crate::recorder::dense_prefill_bm128_applies(true, true, true, dtype, m, k, n);
+        let qualified = crate::recorder::dense_bm128_applies(true, true, true, dtype, m, k, n);
         assert_eq!(split_k_plan(m, k, n), 1);
         for internal in [false, true] {
             let a = Case::new_typed(&off, k, n, m, internal, &bytes, dtype);

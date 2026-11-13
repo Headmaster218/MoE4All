@@ -2370,8 +2370,15 @@ pub struct MtpTiming {
     pub draft_secs: f64,
     pub verify_secs: f64,
     pub catchup_secs: f64,
+    /// Draft rows that were actually VERIFIED. A confidence trim drops rows the head was not sure
+    /// about after it already drafted them, so this can be smaller than what `draft_secs` paid for;
+    /// [`Self::total_trimmed`] carries the difference. `alpha()` is measured against this, not
+    /// against the drafted width, so a trim cannot make the acceptance rate look worse than it is.
     pub total_drafted: usize,
     pub total_accepted: usize,
+    /// Draft rows paid for but dropped by the confidence trim before VERIFY. Visibility only —
+    /// never subtracted from `total_drafted`, which already counts verified rows.
+    pub total_trimmed: usize,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2384,6 +2391,7 @@ impl MtpTiming {
         self.catchup_secs += other.catchup_secs;
         self.total_drafted += other.total_drafted;
         self.total_accepted += other.total_accepted;
+        self.total_trimmed += other.total_trimmed;
     }
 
     /// Draft acceptance rate (`accepted / drafted`) — llama.cpp's `alpha`.
@@ -2924,6 +2932,8 @@ fn generate_mtp_spec_core(
         catchup_secs: sum_catchup_secs,
         total_drafted,
         total_accepted,
+        // This proposer has no confidence trim: every drafted row goes to VERIFY.
+        total_trimmed: 0,
     };
     if time_mtp {
         let (dp, vp, cp) = timing.phase_shares();
@@ -2948,10 +2958,31 @@ fn generate_mtp_spec_core(
 
 #[cfg(test)]
 mod tests {
-    use super::nonleading_base;
+    use super::{nonleading_base, MtpTiming};
 
     /// AUDIT #4: the non-leading `base = m - (cand.len()+1)` subtraction must return an `Err` (not
     /// wrap `usize` and panic on the subsequent slice) when the trunk hands back too few rows.
+    #[test]
+    fn alpha_counts_verified_rows_and_trimmed_rows_are_visibility_only() {
+        // One cycle: the head drafted 4 rows (3 candidates), confidence kept 2 VERIFY rows
+        // (1 candidate), and that candidate was accepted.
+        let cycle = MtpTiming {
+            total_drafted: 1,
+            total_accepted: 1,
+            total_trimmed: 2,
+            ..MtpTiming::default()
+        };
+        assert_eq!(cycle.alpha(), 1.0);
+        let mut run = MtpTiming::default();
+        for _ in 0..10 {
+            run.add(&cycle);
+        }
+        assert_eq!(run.total_drafted, 10);
+        assert_eq!(run.total_accepted, 10);
+        assert_eq!(run.total_trimmed, 20);
+        assert_eq!(run.alpha(), 1.0);
+    }
+
     #[test]
     fn nonleading_base_guards_underflow() {
         // Normal cycle-2+ shape: m = cand.len() + 1 (leading row + the drafted rows).

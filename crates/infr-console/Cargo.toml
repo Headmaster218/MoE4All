@@ -1,0 +1,31 @@
+[package]
+name = "infr-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately depends on NO engine crate: the console talks to a running `infr serve` over HTTP
+# only, so it builds and runs on a machine with no GPU, no Vulkan SDK and no model.
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+dirs.workspace = true
+sha2.workspace = true
+futures-util = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "infr-console"
+path = "src/main.rs"

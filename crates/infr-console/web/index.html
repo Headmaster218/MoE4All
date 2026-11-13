@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INFR Console</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">INFR<span>·</span>Console</div>
+  <nav class="tabs" role="tablist">
+    <button class="tab" role="tab" data-view="overview" aria-selected="true">总览</button>
+    <button class="tab" role="tab" data-view="history" aria-selected="false">历史</button>
+    <button class="tab" role="tab" data-view="context" aria-selected="false">上下文</button>
+    <button class="tab" role="tab" data-view="keys" aria-selected="false">API Keys</button>
+    <button class="tab" role="tab" data-view="launch" aria-selected="false">启动参数</button>
+    <button class="tab" role="tab" data-view="logs" aria-selected="false">日志</button>
+  </nav>
+  <div class="spacer"></div>
+  <span class="pill" id="engine-pill"><i class="dot"></i><span>连接中…</span></span>
+  <button class="icon-btn" id="uncensor-toggle" title="逐请求注入去审查投影">去审查：关</button>
+  <button class="icon-btn" id="theme-toggle" title="深色 / 浅色">◐</button>
+</header>
+
+<div class="layout">
+  <main class="main">
+
+    <!-- ── 总览 ─────────────────────────────────────────────────────── -->
+    <section data-pane="overview">
+      <div class="card">
+        <h2>进程占用<span class="spacer"></span><span id="res-note" class="frame-seq"></span></h2>
+        <div class="tiles" id="tiles"></div>
+      </div>
+
+      <div class="card">
+        <h2>速度<span class="spacer"></span><span class="frame-seq" id="chart-window"></span></h2>
+        <div class="chart-wrap"><svg class="chart" id="speed-chart" viewBox="0 0 600 150" preserveAspectRatio="none"></svg></div>
+        <div class="legend">
+          <span><i style="background:var(--decode)"></i>decode t/s</span>
+          <span><i style="background:var(--prefill)"></i>prefill t/s</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>对话窗口<span class="spacer"></span><span class="frame-seq">点击一行查看流式 JSON</span></h2>
+        <table>
+          <thead><tr>
+            <th>时间</th><th>Key</th><th>状态</th><th>工具</th><th class="num">t/s</th>
+            <th class="num">已生成</th><th class="num">复用</th><th class="num">首字 ms</th>
+          </tr></thead>
+          <tbody id="live-rounds"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>引擎槽位<span class="spacer"></span><span class="frame-seq" id="slot-note"></span></h2>
+        <table>
+          <thead><tr>
+            <th>槽位</th><th>阶段</th><th class="num">t/s</th><th class="num">输入</th>
+            <th class="num">命中</th><th class="num">已生成</th><th>上下文</th>
+          </tr></thead>
+          <tbody id="slots"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>最近请求<span class="spacer"></span><button class="icon-btn" data-goto="history">全部</button></h2>
+        <table>
+          <thead><tr>
+            <th>时间</th><th>Key</th><th>状态</th><th>去审查</th>
+            <th class="num">输入</th><th class="num">复用</th><th class="num">输出</th>
+            <th class="num">首字 ms</th><th class="num">prefill</th><th class="num">decode</th>
+          </tr></thead>
+          <tbody id="recent"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── 历史 ─────────────────────────────────────────────────────── -->
+    <section data-pane="history" hidden>
+      <div class="card">
+        <h2>每轮请求<span class="spacer"></span>
+          <select id="history-key" class="icon-btn"><option value="">全部 Key</option></select>
+          <button class="icon-btn" id="history-clear">清空</button>
+        </h2>
+        <table>
+          <thead><tr>
+            <th>#</th><th>时间</th><th>Key</th><th>状态</th><th>工具</th><th>去审查</th>
+            <th class="num">输入</th><th class="num">命中</th><th class="num">未命中</th><th class="num">命中率</th>
+            <th class="num">前缀估计</th><th class="num">输出</th>
+            <th class="num">首字 ms</th><th class="num">prefill t/s</th><th class="num">decode t/s</th><th class="num">耗时</th>
+          </tr></thead>
+          <tbody id="history"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── 上下文（Responses API 生命周期） ─────────────────────────── -->
+    <section data-pane="context" hidden>
+      <div class="card">
+        <h2>Responses 上下文存储<span class="spacer"></span><span class="frame-seq" id="ctx-note"></span></h2>
+        <div class="tiles" id="ctx-tiles"></div>
+      </div>
+
+      <div class="card">
+        <h2>响应条目（LRU）<span class="spacer"></span><span class="frame-seq">最近使用在前 · 末位高亮为下一个被驱逐</span></h2>
+        <table>
+          <thead><tr>
+            <th class="num">LRU</th><th>Response ID</th><th>模型</th><th>状态</th>
+            <th class="num">轮数</th><th class="num">输入项</th><th class="num">输出项</th>
+            <th>创建时间</th><th class="num">闲置 tick</th><th>会话</th>
+          </tr></thead>
+          <tbody id="ctx-entries"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>会话游标<span class="spacer"></span><span class="frame-seq">conversation → 最新响应 · 驱逐后游标悬空</span></h2>
+        <table>
+          <thead><tr>
+            <th>会话名</th><th>游标指向</th><th>状态</th>
+          </tr></thead>
+          <tbody id="ctx-conversations"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── API Keys ─────────────────────────────────────────────────── -->
+    <section data-pane="keys" hidden>
+      <div class="card">
+        <h2>新增 Key</h2>
+        <div class="row">
+          <div class="field" style="flex:1;min-width:180px;margin:0">
+            <label for="new-key-label">名称</label>
+            <input type="text" id="new-key-label" placeholder="android-ui-agent">
+          </div>
+          <div class="field" style="flex:2;min-width:240px;margin:0">
+            <label for="new-key-token">客户端令牌（留空自动生成）</label>
+            <input type="text" id="new-key-token" placeholder="sk-console-…">
+          </div>
+          <button class="btn" id="new-key-add" style="align-self:flex-end">添加</button>
+        </div>
+        <p class="doc" style="color:var(--text-faint);font-size:12px;margin:10px 0 0">
+          客户端把请求发到本控制台，用这里的令牌鉴权；控制台再用上游引擎的 Key 转发。每个令牌独立计数。
+        </p>
+      </div>
+      <div class="card">
+        <h2>每 Key 统计</h2>
+        <table>
+          <thead><tr>
+            <th>名称</th><th>令牌</th><th class="num">请求</th>
+            <th class="num">输入 tok</th><th class="num">输出 tok</th>
+            <th class="num">命中 tok</th><th class="num">未命中 tok</th><th class="num">命中率</th>
+            <th class="num">平均首字 ms</th><th class="num">平均 prefill</th><th class="num">平均 decode</th><th></th>
+          </tr></thead>
+          <tbody id="keys"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── 启动参数 ─────────────────────────────────────────────────── -->
+    <section data-pane="launch" hidden>
+      <div class="card">
+        <h2>配置方式</h2>
+        <div class="preset-picker" id="presets">
+          <button class="preset" data-preset="conservative" aria-pressed="true">
+            <strong>默认保守</strong><small>留足显存余量，优先稳定。适合长上下文与多路并发。</small>
+          </button>
+          <button class="preset" data-preset="aggressive" aria-pressed="false">
+            <strong>默认激进</strong><small>把显存吃满换吞吐。余量小，OOM 风险高。</small>
+          </button>
+          <button class="preset" data-preset="manual" aria-pressed="false">
+            <strong>全手动</strong><small>逐项指定显存 / 内存 / 分页 / 诊断，展开下一级菜单。</small>
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>参数设置<span class="spacer"></span>
+          <input type="text" id="knob-search" class="icon-btn" placeholder="搜索配置项…" style="min-width:200px">
+        </h2>
+        <div class="settings-browser">
+          <nav class="settings-nav" id="settings-nav" aria-label="参数分类"></nav>
+          <div class="settings-detail" id="settings-detail"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>去审查向量<span class="spacer"></span><span class="frame-seq">仅支持 Qwen3.8-Flash-Next（qwen4exp）</span></h2>
+        <div class="row">
+          <div class="field" style="flex:1;min-width:280px;margin:0">
+            <label for="vector-path">保存路径（留空 = 默认 models/control-vectors/）</label>
+            <input type="text" id="vector-path" placeholder="默认路径加载中…">
+          </div>
+          <button class="btn" id="vector-download" style="align-self:flex-end">自动下载</button>
+          <button class="btn ghost" id="vector-check" style="align-self:flex-end">检查状态</button>
+        </div>
+        <p class="doc" id="vector-status" style="color:var(--text-faint);font-size:12px;margin:10px 0 0">未检查</p>
+        <p class="doc" style="color:var(--text-faint);font-size:12px;margin:6px 0 0">
+          从 HuggingFace 官方仓库下载，连不上自动转 hf-mirror；按 sha256 校验，不符即弃。下载与启用均需勾选风险同意。
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>启动命令</h2>
+        <div class="cmdline" id="cmdline"></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn" id="launch-start">启动引擎</button>
+          <button class="btn danger" id="launch-stop">停止引擎</button>
+          <button class="btn ghost" id="launch-recommend">推荐配置</button>
+          <button class="btn ghost" id="launch-save">保存设置</button>
+          <button class="btn ghost" id="launch-reset">恢复默认</button>
+          <button class="btn ghost" id="launch-copy">复制命令</button>
+          <span class="spacer"></span>
+          <span class="frame-seq" id="launch-note"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 日志 ─────────────────────────────────────────────────────── -->
+    <section data-pane="logs" hidden>
+      <div class="card">
+        <h2>引擎输出<span class="spacer"></span><span class="frame-seq" id="log-note"></span></h2>
+        <div class="log" id="engine-log"></div>
+      </div>
+      <div class="card">
+        <h2>控制台</h2>
+        <div class="log" id="console-log"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── 右侧流式 JSON 侧边栏 ───────────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-inner">
+      <div class="sidebar-head">
+        <strong id="sb-title">—</strong>
+        <span class="badge" id="sb-phase"></span>
+        <span class="spacer"></span>
+        <button class="icon-btn" id="sb-follow" aria-pressed="true" title="自动滚到最新">跟随</button>
+        <button class="icon-btn" id="sb-close">✕</button>
+      </div>
+      <div class="sidebar-tabs" id="sb-tabs">
+        <button class="tab" data-sb="frames" aria-selected="true">流式 JSON</button>
+        <button class="tab" data-sb="output" aria-selected="false">输出</button>
+        <button class="tab" data-sb="thinking" aria-selected="false">思考</button>
+        <button class="tab" data-sb="tools" aria-selected="false">工具</button>
+        <button class="tab" data-sb="request" aria-selected="false">请求</button>
+      </div>
+      <div class="sidebar-body" id="sb-body"></div>
+    </div>
+  </aside>
+</div>
+
+<div id="modal-host"></div>
+<div id="toast-host"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

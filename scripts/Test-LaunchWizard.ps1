@@ -14,6 +14,9 @@ $realStartModelReasoningProbe = ${function:Start-ModelReasoningProbe}
 $realInvokeRecommendedModelDownload = ${function:Invoke-RecommendedModelDownload}
 $realOfferBenchmarkUpload = ${function:Offer-BenchmarkUpload}
 $realInvokeNativeCommandResult = ${function:Invoke-NativeCommandResult}
+$realGetUncensorVectorSpec = ${function:Get-UncensorVectorSpec}
+$realInvokeModelFileDownload = ${function:Invoke-ModelFileDownload}
+$realTestEndpointReachable = ${function:Test-EndpointReachable}
 $source = Get-Content -LiteralPath $wizardPath -Raw -Encoding UTF8
 if ($source -notmatch 'AI/automation: report the benchmark result') {
     throw 'Windows manual benchmark path is missing the automation guidance'
@@ -90,8 +93,57 @@ function New-ModelFixture {
         Write-GgufString $writer $Template
     } finally { $writer.Dispose() }
 }
+# The pinned direction-vector hash belongs to a file nobody ships in this repository (models/ is
+# gitignored), so the uncensor legs below re-pin the spec to fixture bytes and script the download
+# per origin. That proves the origin→mirror fallback and the consent→command-line wiring with no
+# network and no real 470 KiB vector.
+$script:UncensorFixtureBytes = [System.Text.Encoding]::UTF8.GetBytes('GGUF fixture refusal direction')
+$script:UncensorFixtureSha = ([System.BitConverter]::ToString(
+    ([System.Security.Cryptography.SHA256]::Create()).ComputeHash($script:UncensorFixtureBytes))).Replace('-', '')
+$script:UncensorFixture = $null
+
+function Get-UncensorVectorSpec {
+    if ($null -eq $script:UncensorFixture) { return & $realGetUncensorVectorSpec }
+    $wizardSpec = & $realGetUncensorVectorSpec
+    return @{ Repo = $wizardSpec.Repo; File = $wizardSpec.File; Sha256 = $script:UncensorFixtureSha }
+}
+
+# The wizard's reachability probe is a real TCP connect; a test suite that must touch no network
+# cannot run it, so the legs declare which endpoints answer and the stub reads that list.
+function Test-EndpointReachable {
+    param([string]$BaseUrl, [int]$TimeoutMs = 1500)
+    if ($null -eq $script:UncensorFixture) { return & $realTestEndpointReachable -BaseUrl $BaseUrl -TimeoutMs $TimeoutMs }
+    foreach ($blocked in $script:UncensorFixture.Unreachable) {
+        if ($BaseUrl.StartsWith($blocked, [System.StringComparison]::Ordinal)) { return $false }
+    }
+    return $true
+}
+
+function Invoke-ModelFileDownload {
+    param([string]$Url, [string]$Destination, [string]$Label, [int]$MaximumAttempts = 3, [int]$AttemptTimeoutMs = 30000)
+    if ($null -eq $script:UncensorFixture) { return & $realInvokeModelFileDownload @PSBoundParameters }
+    $script:UncensorFixture.Urls.Add($Url)
+    foreach ($prefix in $script:UncensorFixture.FailFor) {
+        if ($Url.StartsWith($prefix, [System.StringComparison]::Ordinal)) { throw "fixture endpoint refuses $Url" }
+    }
+    [System.IO.File]::WriteAllBytes($Destination, $script:UncensorFixtureBytes)
+}
+
+function Use-UncensorFixture {
+    param([string[]]$FailFor = @(), [string[]]$Unreachable = @(), [switch]$Cached)
+    # Every leg starts from its own vector state: the fixture directory is shared across legs, so a
+    # vector left by one run would satisfy the next run's cache check and hide the fetch being tested.
+    $path = Get-UncensorVectorPath
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if ($Cached) { [System.IO.File]::WriteAllBytes($path, $script:UncensorFixtureBytes) }
+    $script:UncensorFixture = @{
+        FailFor = @($FailFor); Unreachable = @($Unreachable)
+        Urls = [System.Collections.Generic.List[string]]::new()
+    }
+}
+
 function Test-Flow {
-    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Check, [switch]$Dashboard, [string]$DashboardKey = '')
+    param([string]$Name, $Saved, [string[]]$Inputs, [string]$InitialPath = '', [scriptblock]$Setup, [scriptblock]$Check, [switch]$Dashboard, [string]$DashboardKey = '')
     $script:Saved = $Saved
     $script:DashboardAccepted = [bool]$Dashboard
     $script:DashboardApiKey = $DashboardKey
@@ -100,7 +152,11 @@ function Test-Flow {
     foreach ($value in $Inputs) { $script:Answers.Enqueue($value) }
     $script:Events = [System.Collections.Generic.List[string]]::new()
     $script:Output = [System.Collections.Generic.List[string]]::new()
+    # The download stub below intercepts the real fetcher only for legs that ask for it; a leg that
+    # forgot to reset it would silently swallow another leg's download.
+    $script:UncensorFixture = $null
     $repoRoot = $testRoot
+    if ($Setup) { . $Setup }
     $dataDir = Join-Path $testRoot 'gui-data'
     $statePath = Join-Path $dataDir 'wizard-state.json'
     $DryRun = $true
@@ -175,7 +231,7 @@ try {
     function Open-EngineReleaseNotes { param($Release) [void]$script:Events.Add('release notes') }
     Test-UpdateAction 'release notes then skip' @('R', '') 'skip'
 
-    Test-Flow 'fresh chat defaults' -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh chat defaults' -Inputs @('',  $model,  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert ($nativeArgs[0] -eq 'run') 'Expected chat'
         Assert ('65536' -in $nativeArgs -and $state.kv_preset -eq 'auto') 'Fresh defaults changed'
         Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv.type_[kv]=' }).Count)) 'Automatic defaults must defer KV format to the engine'
@@ -183,45 +239,115 @@ try {
         Assert (@($script:Events | Where-Object { $_ -match 'Compute device' }).Count -eq 1) 'One GPU still needs manual selection'
         Assert (($script:Output -join "`n") -notmatch 'CPU: Fixture CPU') 'CPU must not be a compute-device option'
     }
-    Test-Flow 'homogeneous CPU miss defaults to physical minus two' -Inputs @('', $model, '', '', '', '', '', 'y', '', '', '') -Check {
+    Test-Flow 'homogeneous CPU miss defaults to physical minus two' -Inputs @('',  $model,  '',  '',  '',  '',  '',  'y',  '',  '',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=4' -in $nativeArgs) 'Six physical cores should default to four compute cores'
         Assert ('kernels.vulkan.cpu_miss_max=1' -in $nativeArgs) 'CPU miss count default changed'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kernels\.vulkan\.amdvlk_hd256_flash=' }).Count)) 'The wizard must not pin amdvlk_hd256_flash; the engine default decides'
     }
     $script:CpuTopology = [pscustomobject]@{ Physical = 24; Preferred = 8; Detected = $true }
-    Test-Flow 'hybrid CPU miss defaults to total physical minus two' -Inputs @('', $model, '', '', '', '', '', 'y', '', '', '') -Check {
+    Test-Flow 'hybrid CPU miss defaults to total physical minus two' -Inputs @('',  $model,  '',  '',  '',  '',  '',  'y',  '',  '',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=22' -in $nativeArgs) 'Hybrid default should include efficiency cores while reserving two performance cores'
     }
-    Test-Flow 'hybrid CPU miss allows selecting all physical cores' -Inputs @('', $model, '', '', '', '', '', 'y', '', '24', '') -Check {
+    Test-Flow 'hybrid CPU miss allows selecting all physical cores' -Inputs @('',  $model,  '',  '',  '',  '',  '',  'y',  '',  '24',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=24' -in $nativeArgs) 'Explicit all-core selection must be honored'
     }
     $cpuSaved = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = $model; device = 'Vulkan0'; cpu_miss_enabled = $true; cpu_miss_cores = '8'; cpu_miss_max = '2' }
-    Test-Flow 'saved CPU miss count survives reconfiguration' -Saved $cpuSaved -Inputs @('n', '', '', '', '', '', '', '', '', '', '', '') -Check {
+    Test-Flow 'saved CPU miss count survives reconfiguration' -Saved $cpuSaved -Inputs @('n',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert ('kernels.vulkan.cpu_miss_threads=8' -in $nativeArgs) 'Saved custom CPU core count lost'
         Assert ('kernels.vulkan.cpu_miss_max=2' -in $nativeArgs) 'Saved CPU miss limit lost'
     }
     $script:CpuTopology = [pscustomobject]@{ Physical = 6; Preferred = 6; Detected = $true }
-    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', '', '', '', 'n', $model, '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'aggressive API three slots and local cache' -Inputs @('2', '', '', '', 'n', $model, '', '', '2', '', '', '', '', '3', '100k', 'y', '', '', '', '', '') -Check {
         Assert ($nativeArgs[0] -eq 'serve' -and 'device.auto_profile=aggressive' -in $nativeArgs) 'Expected aggressive API'
         Assert ($state.server_parallel -eq '3' -and $state.context -eq '100k') 'Parallel/context prompts shifted'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Cache must default to the install directory'
         Assert ('serve.api_key=' -in $nativeArgs) 'Explicit no-auth override lost'
+        Assert (-not ('kv.paged=true' -in $nativeArgs)) 'The paged radix tree must stay opt-in'
     }
-    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', '', '', '', 'n', $model, '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
+    Test-Flow 'fresh API enables local cache by default' -Inputs @('2', '', '', '', 'n', $model, '', '', '', '', '', '', '', '', '', '', '', '', '', '', '') -Check {
         Assert ($state.server_session_cache) 'Fresh API installs should enable SSD KV caching'
         Assert ("kv.session_cache_dir=$testRoot\kv-sessions" -in $nativeArgs) 'Default SSD KV cache path was not emitted'
     }
-    Test-Flow 'manual hardware and sampling' -Inputs @('', $model, '', '3', '3072', '4', '', '', 'n', '3', '256', 'n', 'paging.expert_prefetch=false', 'n', '2048', 'y', '0.7', '20', '0.95', '9', 'n', '20k') -Check {
+    Test-Flow 'API paged tree with no RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', 'n', '', 'n', '', '') -Check {
+        Assert ('kv.paged=true' -in $nativeArgs) 'The corridor-only paged tree was not emitted'
+        Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The corridor-only tree lost the frame page size'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv\.paged_cache_max=' }).Count)) 'Declining the RAM pool must not emit a pool budget'
+        Assert ($state.kv_paged_tree -and -not $state.kv_paged_cache_max) 'The corridor-only tree choice was not saved'
+        Assert (-not $state.server_session_cache) 'The paged tree must turn off the mutually exclusive disk session cache'
+        Assert (-not ('kv.paged_elastic=true' -in $nativeArgs)) 'Declining the elastic corridor must keep the fixed lease'
+        Assert (-not $state.kv_paged_elastic) 'The declined elastic corridor was saved as on'
+        Assert (-not ('kv.paged_yield_under_pressure=true' -in $nativeArgs)) 'A corridor-only tree has nowhere to sink, so the yield must not be offered or emitted'
+    }
+    # A fresh install is RECOMMENDED the pool: accepting the default must emit a budget, because a
+    # corridor-only tree evicts the very chain an alternating session would hit (cached_tokens=0).
+    Test-Flow 'fresh API paged tree takes the recommended RAM pool' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', 'n', '', '') -Check {
+        Assert ('kv.paged=true' -in $nativeArgs) 'The paged tree was not emitted'
+        Assert ('kv.paged_cache_max=16GiB' -in $nativeArgs) 'Accepting the recommended default must emit the RAM frame-pool cap'
+        Assert ('kv.paged_page_tokens=64' -in $nativeArgs) 'The recommended tree lost the frame page size'
+        Assert ($state.kv_paged_cache_max -eq '16GiB') 'The recommended pool cap was not saved'
+        Assert (@($script:Output | Where-Object { $_ -match '98\.9%' }).Count) 'The recommendation did not explain the measured reuse consequence'
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'A fresh install must be recommended the elastic corridor'
+        Assert ($state.kv_paged_elastic) 'The recommended elastic corridor was not saved'
+        Assert (@($script:Output | Where-Object { $_ -match '145\.9' }).Count) 'The elastic recommendation did not explain the measured decode consequence'
+        Assert (-not ('kv.paged_yield_under_pressure=true' -in $nativeArgs)) 'The pressure yield must stay opt-in on a fresh install'
+        Assert (-not $state.kv_paged_yield_under_pressure) 'The declined pressure yield was saved as on'
+    }
+    # The yield is the only knob that needs BOTH the elastic corridor and a RAM pool, so accepting it
+    # is a separate leg: the recommended-pool leg above declines it and must not emit it.
+    Test-Flow 'API paged tree accepts the expert-pressure yield' -Inputs @('2', '', '', '', '', $model, '', '', '', '', '', '', '', '', '', '', '', 'y', '', '', '', '', 'y', '', '') -Check {
+        Assert ('kv.paged_yield_under_pressure=true' -in $nativeArgs) 'The accepted pressure yield was not emitted'
+        Assert ($state.kv_paged_yield_under_pressure) 'The accepted pressure yield was not saved'
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'The yield leg lost its elastic corridor prerequisite'
+        Assert ('kv.paged_cache_max=16GiB' -in $nativeArgs) 'The yield leg lost its RAM pool prerequisite'
+    }
+    # The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout, so a saved profile that
+    # pairs it with another KV format must heal rather than emit a command line the engine refuses.
+    $f16TreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'f16'; kv_type_k = 'f16'; kv_type_v = 'f16'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'a saved F16 KV profile turns the paged tree off' -Saved $f16TreeSettings -Inputs @('') -Check {
+        Assert ($reuseSavedSettings) 'Saved profile should not reconfigure'
+        Assert ('kv.type_k=f16' -in $nativeArgs) 'The saved F16 KV profile was not the one under test'
+        Assert (-not (@($nativeArgs | Where-Object { $_ -match '^kv\.paged' }).Count)) 'An F16 profile still emitted the paged KV tree'
+        Assert (-not $state.kv_paged_tree) 'The healed profile kept the paged tree saved'
+        Assert (@($script:Output | Where-Object { $_ -match 'segmented Q8_0/Q8_0' }).Count) 'Turning the tree off was not explained'
+    }
+    $customQ8TreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = ''; kv_paged_page_tokens = '64'; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'an explicit Q8_0/Q8_0 profile keeps its paged tree' -Saved $customQ8TreeSettings -Inputs @('') -Check {
+        Assert ('kv.paged=true' -in $nativeArgs) 'A Q8_0/Q8_0 profile lost the corridor-only tree'
+        Assert ($state.kv_paged_tree) 'The eligible profile must keep the tree saved'
+        Assert (-not ('kv.paged_elastic=true' -in $nativeArgs)) 'A state file from before the elastic corridor must keep the fixed lease'
+    }
+    # Reuse mode never re-asks, so a profile that DID choose the elastic corridor has to keep emitting
+    # it: the choice is saved separately from the tree and must survive a saved-settings launch.
+    $elasticTreeSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = '16GiB'; kv_paged_page_tokens = '64'; kv_paged_elastic = $true; kv_paged_yield_under_pressure = $true; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'a saved elastic corridor stays elastic on reuse' -Saved $elasticTreeSettings -Inputs @('') -Check {
+        Assert ($reuseSavedSettings) 'Saved profile should not reconfigure'
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'A saved elastic corridor was dropped on reuse'
+        Assert ($state.kv_paged_elastic) 'The elastic corridor choice was not kept saved'
+        Assert ('kv.paged_yield_under_pressure=true' -in $nativeArgs) 'A saved pressure yield was dropped on reuse'
+        Assert ($state.kv_paged_yield_under_pressure) 'The pressure yield choice was not kept saved'
+    }
+    # Reuse mode never re-asks, so a profile that kept the yield but lost its RAM pool must heal:
+    # the engine only wires the knob inside the elastic branch, and a sink needs a host tier.
+    $yieldNoPoolSettings = [pscustomobject]@{ launch_mode = 'server'; setup_mode = 'manual'; model = $model; device = 'Vulkan0'; context = '32k'; server_addr = '127.0.0.1:8080'; server_auth = $false; kv_preset = 'custom'; kv_type_k = 'q8_0'; kv_type_v = 'q8_0'; kv_paged_tree = $true; kv_paged_cache_max = ''; kv_paged_page_tokens = '64'; kv_paged_elastic = $true; kv_paged_yield_under_pressure = $true; server_session_cache = $false; last_command = 'NEVER EXECUTE THIS' }
+    Test-Flow 'a saved pressure yield without a RAM pool is not emitted' -Saved $yieldNoPoolSettings -Inputs @('') -Check {
+        Assert ('kv.paged_elastic=true' -in $nativeArgs) 'The corridor-only profile lost its elastic corridor'
+        Assert (-not ('kv.paged_yield_under_pressure=true' -in $nativeArgs)) 'A yield with nowhere to sink was still emitted'
+    }
+    Test-Flow 'manual hardware and sampling' -Inputs @('',  $model,  '',  '3',  '3072',  '4',  '',  '',  'n',  '3',  '256',  'n',  'paging.expert_prefetch=false',  'n',  '2048',  'y',  '0.7',  '20',  '0.95',  '9',  'n',  '20k') -Check {
         foreach ($value in @('--ubatch', '3072', '--threads', '4', 'device.submit_dispatches=256', 'paging.expert_prefetch=false', '--temp', '0.7', '--seed', '9')) {
             Assert ($value -in $nativeArgs) "Missing manual setting $value"
         }
         Assert ($state.context -eq '20k') 'Manual context should be asked once at the common step'
     }
-    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', '', 'y', '', 'n', $model, 'y', $aux, $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '') -Check {
+    Test-Flow 'vision embedding before device and concurrency' -Inputs @('2', '', 'y', '', 'n', $model, 'y', $aux, 'y', $aux, '17', '', '', '', '', '', '', '2', '20k', 'y', '', '', '', '', '') -Check {
         foreach ($value in @('spec.mtp=false', '--mmproj', '--embedding-model')) {
             Assert ($value -in $nativeArgs) "Missing auxiliary setting $value"
         }
         Assert ($state.embedding_idle_timeout -eq '17') 'Auxiliary settings changed'
-        $order = @('Enable the language model API', 'Enable the Embedding API', 'Enable the local transcription API', 'Enable image understanding', 'GGUF file or directory', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
+        # The image_url policy is emitted both ways, so a No can also close what infr.toml opened.
+        Assert ('vision.image_url_allow_private=true' -in $nativeArgs) 'Private image URLs were not emitted'
+        Assert ($state.image_url_allow_private) 'Private image URLs were not saved'
+        $order = @('Enable the language model API', 'Enable the Embedding API', 'Enable the local transcription API', 'Enable image understanding', 'GGUF file or directory', 'Allow image_url to fetch', 'Compute device', 'Configuration', 'Configure default reasoning', 'experimental CPU', 'Concurrent slots', 'Context window', 'Cache idle-session', 'Listen address')
         $previous = -1
         foreach ($pattern in $order) {
             $position = -1
@@ -230,27 +356,64 @@ try {
             $previous = $position
         }
     }
-    Test-Flow 'FlashNext native reasoning effort' -Inputs @('', $model, '', '', 'y', 'y', '4', '', '', '', '') -Check {
+    Test-Flow 'FlashNext native reasoning effort' -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'n') -Check {
         Assert ('--think' -in $nativeArgs -and 'xhigh' -in $nativeArgs) 'FlashNext reasoning effort was not emitted'
+        Assert (-not (@($nativeArgs | Where-Object { $_.StartsWith('uncensor.vector=') }).Count)) 'declined projection was still emitted'
+        Assert (-not $state.uncensor_vector) 'a declined projection was saved as consent'
     }
-    Test-Flow '35B prompt reasoning effort' -Inputs @('', $model35, '', '', 'y', 'y', '5', '', '', '', '') -Check {
+    Test-Flow 'uncensor consent reaches the engine after the mirror fallback' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        $urls = @($script:UncensorFixture.Urls)
+        Assert ($urls.Count -eq 2 -and $urls[0].StartsWith('https://huggingface.co/') -and $urls[1].StartsWith('https://hf-mirror.com/')) "direction vector did not fall back to the mirror: $($urls -join ' ')"
+        $vector = Get-UncensorVectorPath
+        Assert ("uncensor.vector=$vector" -in $nativeArgs) 'consented projection never reached the command line'
+        Assert ($state.uncensor_vector -eq $vector) 'the consent was not remembered for the next launch'
+        Assert (($script:Output -join "`n") -match '开启即视为同意') 'the projection ran without showing the consent notice'
+    }
+    Test-Flow 'uncensor falls back when the reachable origin stalls' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        $urls = @($script:UncensorFixture.Urls)
+        Assert ($urls.Count -eq 2 -and $urls[0].StartsWith('https://huggingface.co/') -and $urls[1].StartsWith('https://hf-mirror.com/')) "a hub that answers but does not serve did not fall back: $($urls -join ' ')"
+        Assert ($state.uncensor_vector -eq (Get-UncensorVectorPath)) 'the stalled-origin run did not end up on the mirror file'
+    }
+    Test-Flow 'uncensor stays off when neither endpoint answers' -Setup { Use-UncensorFixture -Unreachable @('https://huggingface.co', 'https://hf-mirror.com') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        Assert (@($script:UncensorFixture.Urls).Count -eq 0) 'an unroutable endpoint was still attempted'
+        Assert (-not $state.uncensor_vector -and -not (@($nativeArgs | Where-Object { $_.StartsWith('uncensor.vector=') }).Count)) 'no endpoint answered and the projection still turned on'
+        Assert (($script:Output -join "`n") -match '两个来源都连不上') 'the offline case did not say which half failed — probe skips versus download failures read differently'
+    }
+    Test-Flow 'a verified direction vector is never downloaded again' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co', 'https://hf-mirror.com') -Cached } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        Assert (@($script:UncensorFixture.Urls).Count -eq 0) 'the cached vector was re-downloaded'
+        Assert ("uncensor.vector=$(Get-UncensorVectorPath)" -in $nativeArgs) 'the cached vector was not handed to the engine'
+    }
+    Test-Flow 'uncensor stays off when no endpoint has the vector' -Setup { Use-UncensorFixture -FailFor @('https://huggingface.co', 'https://hf-mirror.com') } -Inputs @('',  $model,  '',  '',  'y',  'y',  '4',  '',  '',  '',  '', 'y') -Check {
+        Assert (@($script:UncensorFixture.Urls).Count -eq 2) 'both endpoints were not tried'
+        Assert (-not (@($nativeArgs | Where-Object { $_.StartsWith('uncensor.vector=') }).Count)) 'a failed download still enabled the projection'
+        Assert (-not (Test-Path -LiteralPath (Get-UncensorVectorPath))) 'a download nobody verified survived as the direction'
+        Assert (-not $state.uncensor_vector) 'a failed download was saved as consent'
+    }
+    $uncensorSaved = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = $model; device = 'Vulkan0'; uncensor_vector = 'M:\models\cvec.gguf'; reasoning_probe_efforts = @('low', 'medium', 'xhigh') }
+    Test-Flow 'saved consent reuses the vector without re-asking' -Saved $uncensorSaved -Inputs @('') -Check {
+        Assert ('uncensor.vector=M:\models\cvec.gguf' -in $nativeArgs) 'saved consent was not handed to the engine'
+        Assert (-not (@($script:Events | Where-Object { $_ -match 'Enable the refusal-direction projection' }).Count)) 'the saved yes was asked again'
+        Assert (($script:Output -join "`n") -match '开启即视为同意') 'the reuse launched without printing the risk again'
+    }
+    Test-Flow '35B prompt reasoning effort' -Inputs @('',  $model35,  '',  '',  'y',  'y',  '5',  '',  '',  '',  '') -Check {
         Assert ('--think' -in $nativeArgs -and '--reasoning-effort' -in $nativeArgs -and 'max' -in $nativeArgs) '35B reasoning effort was not emitted'
+        Assert (-not (@($script:Events | Where-Object { $_ -match 'refusal-direction projection' }).Count)) 'a model the projection cannot serve was still asked for consent'
     }
-    Test-Flow 'default reasoning disabled' -Inputs @('', $model, '', '', 'y', 'n', '', '', '', '') -Check {
+    Test-Flow 'default reasoning disabled' -Inputs @('',  $model,  '',  '',  'y',  'n',  '',  '',  '',  '') -Check {
         Assert ('--no-think' -in $nativeArgs -and -not ('--reasoning-effort' -in $nativeArgs)) 'Disable reasoning failed'
     }
-    Test-Flow 'benchmark skips API and generation defaults' -Inputs @('3', $model, '', '', '', '4', '3', '1024', '64', '3', '2048', '2') -Check {
+    Test-Flow 'benchmark skips API and generation defaults' -Inputs @('3',  $model,  '',  '',  '',  '4',  '3',  '1024',  '64',  '3',  '2048',  '2') -Check {
         Assert ($nativeArgs[0] -eq 'bench' -and '--pg' -in $nativeArgs -and '--json' -in $nativeArgs) 'Benchmark flags lost'
         Assert (-not ('--max-new' -in $nativeArgs) -and -not ('spec.mtp=false' -in $nativeArgs) -and -not ('--ctx' -in $nativeArgs)) 'Benchmark received chat or context settings'
         Assert (($script:Output -join "`n") -match 'Current plan') 'Manual benchmark did not show the incremental plan'
     }
-    Test-Flow 'manual mode changes restore positive defaults' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '0'; gen_tokens = '0'; depth_tokens = '0' }) -Inputs @('3', $model, '', '1', '', '4', '3', '', '', '2', '', '1') -Check {
+    Test-Flow 'manual mode changes restore positive defaults' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '0'; gen_tokens = '0'; depth_tokens = '0' }) -Inputs @('3',  $model,  '',  '1',  '',  '4',  '3',  '',  '',  '2',  '',  '1') -Check {
         Assert ('6144,512' -in $nativeArgs -and '-d' -in $nativeArgs -and '6144' -in $nativeArgs) 'Zero defaults survived switching manual modes'
     }
-    Test-Flow 'manual positive defaults stay unchanged' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '1024'; gen_tokens = '64'; depth_tokens = '2048' }) -Inputs @('3', $model, '', '1', '', '4', '3', '', '', '2', '', '1') -Check {
+    Test-Flow 'manual positive defaults stay unchanged' -Saved ([pscustomobject]@{ setup_mode = 'conservative'; prompt_tokens = '1024'; gen_tokens = '64'; depth_tokens = '2048' }) -Inputs @('3',  $model,  '',  '1',  '',  '4',  '3',  '',  '',  '2',  '',  '1') -Check {
         Assert ('1024,64' -in $nativeArgs -and '-d' -in $nativeArgs -and '2048' -in $nativeArgs) 'Valid manual defaults were overwritten'
     }
-    Test-Flow 'automatic standard benchmark' -Inputs @('3', $model, '', '', '', '2', '3') -Check {
+    Test-Flow 'automatic standard benchmark' -Inputs @('3',  $model,  '',  '',  '',  '2',  '3') -Check {
         $joinedOutput = $script:Output -join "`n"
         Assert ($nativeArgs[0] -eq 'bench' -and '--suite' -in $nativeArgs -and 'standard' -in $nativeArgs) 'Automatic suite flags lost'
         Assert ('--parallel' -in $nativeArgs -and '3' -in $nativeArgs -and '--result-dir' -in $nativeArgs) 'Automatic concurrency or result directory lost'
@@ -289,7 +452,7 @@ try {
         Assert ('device.auto_profile=conservative' -in $nativeArgs) 'Legacy quick profile must migrate'
         Assert (-not ($commandText -match 'NEVER EXECUTE')) 'Saved command text must not execute'
     }
-    Test-Flow 'decline saved launch keeps defaults' -Saved $chatSettings -Inputs @('n', '', '', '', '', '', '', 'y', 'y', '', '', '', '', '') -Check {
+    Test-Flow 'decline saved launch keeps defaults' -Saved $chatSettings -Inputs @('n',  '',  '',  '',  '',  '',  '',  '',  'y',  'y',  '',  '',  '',  '', 'n') -Check {
         Assert (-not $reuseSavedSettings -and $state.reasoning_effort -eq 'medium') 'Saved defaults were discarded'
     }
     $legacy = [pscustomobject]@{ launch_mode = 'chat'; model = $model; device = 'Vulkan0'; configure_memory = $true; dram_cache = '48g'; ubatch = '3072'; submit_mode = 'fixed'; submit_cap = '256'; max_new = '' }
@@ -302,7 +465,7 @@ try {
         Assert ($script:Events.Count -eq 2 -and $serverApiKey -eq 'fixture-secret-not-a-real-key') 'Saved authentication prompt changed'
         Assert (-not (($state | ConvertTo-Json) -match 'fixture-secret')) 'Secret leaked into saved settings'
     }
-    Test-Flow 'explicit launcher model overrides previous model' -Saved $chatSettings -InitialPath $model35 -Inputs @('', '', '', '', 'y', 'y', '', '', '', '', '') -Check {
+    Test-Flow 'explicit launcher model overrides previous model' -Saved $chatSettings -InitialPath $model35 -Inputs @('',  '',  '',  '',  'y',  'y',  '',  '',  '',  '',  '') -Check {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model35) 'Launcher model must win'
         Assert ('--reasoning-effort' -in $nativeArgs -and 'medium' -in $nativeArgs) 'A reasoning effort supported by both models should survive the switch'
         Assert (@($state.model_history).Count -eq 2 -and $state.model_history[0] -eq $model35 -and $state.model_history[1] -eq $model) 'Model history must retain every valid selected model'
@@ -588,12 +751,13 @@ try {
     $script:Passed++
     Microsoft.PowerShell.Utility\Write-Host 'PASS error report description review and launcher wiring'
     $missingSettings = [pscustomobject]@{ launch_mode = 'chat'; setup_mode = 'conservative'; model = (Join-Path $testRoot 'missing.gguf') }
-    Test-Flow 'missing saved model goes through model selection' -Saved $missingSettings -Inputs @('', $model, '', '', '', '', '', '', '') -Check {
+    Test-Flow 'missing saved model goes through model selection' -Saved $missingSettings -Inputs @('',  $model,  '',  '',  '',  '',  '',  '',  '') -Check {
         Assert (-not $reuseSavedSettings -and $state.model -eq $model) 'Missing model should not launch directly'
         Assert (@($script:Events | Where-Object { $_ -match 'Start with the previous settings' }).Count -eq 0) 'Missing model should not offer direct launch'
     }
-    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', '', 'n', '', 'n', $model, 'y', $aux, '', '', '', '', '', '', '1', '100k', 'y', '', '', '') -Check {
+    Test-Flow 'single slot with vision keeps SSD cache' -Inputs @('2', '', 'n', '', 'n', $model, 'y', $aux, '', '', '', '', '', '', '', '1', '100k', 'y', '', '', '', '', '') -Check {
         Assert ($state.server_parallel -eq '1' -and $state.server_session_cache) 'Vision serving should keep SSD KV caching available'
+        Assert ('vision.image_url_allow_private=false' -in $nativeArgs) 'The default image_url policy should still be written down'
     }
     $script:Saved = $null
     $script:ReasoningProbeModel = ''

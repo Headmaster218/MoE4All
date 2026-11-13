@@ -179,6 +179,32 @@ pub(crate) fn split_path(path: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// One config leaf as a graphical launcher needs it: the dotted path, the value grammar's type
+/// name, the shipped default and the knob's own doc comment.
+///
+/// Generated from the SAME declaration as the resolved struct, so a launcher cannot drift from the
+/// engine the way a hand-copied knob list does.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConfigField {
+    pub path: String,
+    /// The Rust leaf type with spaces removed (`bool`, `u32`, `Option<PathBuf>`, `SizeSpec`, …).
+    /// A launcher renders a widget from this instead of from a per-key table it has to maintain.
+    pub ty: String,
+    pub default: String,
+    pub doc: String,
+}
+
+/// Join a declaration's `#[doc = "…"]` attributes into one string.
+///
+/// Takes the bracketed groups as token trees (a `meta` fragment arrives opaque and cannot be
+/// inspected) and matches them in ONE repetition — a per-attribute tt-muncher recurses once per
+/// doc line and blows the crate's recursion limit on the heavily documented sections. A leaf that
+/// carries a non-doc attribute therefore fails to expand loudly rather than losing its doc
+/// silently; add such an attribute here if one is ever needed.
+macro_rules! cfg_doc {
+    ($([doc = $s:literal])*) => { concat!($($s, "\n"),*) };
+}
+
 /// Declare one config section: the resolved struct, its `Default` (= today's shipped behaviour),
 /// its partial twin, the fold, and the dotted-path accessors.
 ///
@@ -212,7 +238,7 @@ macro_rules! cfg_struct {
             }
             leaves {
                 $(
-                    $(#[$lmeta:meta])*
+                    $(#$lmeta:tt)*
                     $lf:ident : $LT:ty = $ldef:expr,
                 )*
             }
@@ -222,7 +248,7 @@ macro_rules! cfg_struct {
         #[derive(Debug, Clone, PartialEq)]
         pub struct $Name {
             $( $(#[$submeta])* pub $sf: $ST, )*
-            $( $(#[$lmeta])* pub $lf: $LT, )*
+            $( $(#$lmeta)* pub $lf: $LT, )*
         }
 
         impl Default for $Name {
@@ -255,6 +281,21 @@ macro_rules! cfg_struct {
             pub fn collect_paths(prefix: &str, out: &mut Vec<String>) {
                 $( <$ST>::collect_paths(&format!("{prefix}{}.", stringify!($sf)), out); )*
                 $( out.push(format!("{prefix}{}", stringify!($lf))); )*
+            }
+
+            /// Append every leaf's schema under `prefix`, in declaration order. Same table as
+            /// [`Self::collect_paths`], with the type, default and doc a graphical launcher needs.
+            pub fn collect_schema(prefix: &str, out: &mut Vec<$crate::config::partial::ConfigField>) {
+                $( <$ST>::collect_schema(&format!("{prefix}{}.", stringify!($sf)), out); )*
+                $( out.push($crate::config::partial::ConfigField {
+                    path: format!("{prefix}{}", stringify!($lf)),
+                    ty: stringify!($LT).replace(' ', ""),
+                    default: {
+                        let value: $LT = $ldef;
+                        $crate::config::partial::ConfigValue::to_display(&value)
+                    },
+                    doc: $crate::config::partial::cfg_doc!($($lmeta)*).trim().to_string(),
+                }); )*
             }
         }
 
@@ -345,4 +386,5 @@ macro_rules! cfg_struct {
     };
 }
 
+pub(crate) use cfg_doc;
 pub(crate) use cfg_struct;

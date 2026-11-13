@@ -150,6 +150,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     }
     p.device.vram_budget = opt_size(get, "INFR_VRAM_BUDGET");
     p.device.ram_budget = opt_size(get, "INFR_RAM_BUDGET");
+    p.device.mem_guard_headroom = opt_size(get, "INFR_MEM_GUARD_HEADROOM");
+    p.device.mem_guard_ram_headroom = opt_size(get, "INFR_MEM_GUARD_RAM_HEADROOM");
+    p.device.mem_guard_poll_ms = num(get, "INFR_MEM_GUARD_POLL_MS");
     p.device.vram_reserve = opt_size(get, "INFR_VRAM_RESERVE");
     // §6.12: the VALUE (`>0`, else fall through) and the PRESENCE (the placement sweeps' "the user
     // pinned a height") are recorded separately — `INFR_UBATCH=0`/`=abc` is specified-but-unusable.
@@ -182,6 +185,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         };
         p.device.subgroup_pref = Some(Some(sg));
     }
+    // The GPU startup lock's bypass, spelled like `INFR_CPU_NO_SPINPOOL`: set AND `!= "0"` turns the
+    // (positive) `device.gpu_lock` field OFF, so `INFR_NO_GPU_LOCK=0` keeps the check ON.
+    p.device.gpu_lock = set_not_zero_inv(get, "INFR_NO_GPU_LOCK");
 
     // ── sampling ─────────────────────────────────────────────────────────────
     p.sampling.temp = num(get, "INFR_TEMP");
@@ -206,8 +212,22 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.session_cache_max =
         get("INFR_KV_SESSION_CACHE_MAX").and_then(|value| crate::parse_size(&value));
     p.kv.session_cache_ttl_hours = num(get, "INFR_KV_SESSION_CACHE_TTL_HOURS");
+    p.kv.ram_cache_max = opt_size(get, "INFR_KV_RAM_CACHE_MAX");
     p.kv.ring = presence_inv(get, "INFR_NO_KV_RING");
     p.kv.dynamic = presence_inv(get, "INFR_NO_DYNAMIC_KV");
+    p.kv.paged = flag(get, "INFR_KV_PAGED");
+    p.kv.paged_elastic = flag(get, "INFR_KV_PAGED_ELASTIC");
+    p.kv.paged_yield_under_pressure = flag(get, "INFR_KV_PAGED_YIELD_UNDER_PRESSURE");
+    p.kv.paged_page_tokens = num_pos(get, "INFR_KV_PAGED_PAGE_TOKENS");
+    p.kv.paged_cache_max = opt_size(get, "INFR_KV_PAGED_CACHE_MAX");
+    p.kv.disk_cache_max = opt_size(get, "INFR_KV_DISK_CACHE_MAX");
+    p.kv.disk_cache_path = opt_path(get, "INFR_KV_DISK_CACHE_PATH");
+    // Refusal-direction projection (`crates/infr-uncensor`): three launch-time values, read once at
+    // model load. `vector` names the file, and naming it IS the request — so an empty value means
+    // the feature does not exist, which is the default state of every session.
+    p.uncensor.vector = opt_path(get, "INFR_UNCENSOR_VECTOR");
+    p.uncensor.first_layer = num_pos(get, "INFR_UNCENSOR_FIRST_LAYER");
+    p.uncensor.last_layer = num_pos(get, "INFR_UNCENSOR_LAST_LAYER");
     p.kv.inline_decode = presence(get, "INFR_KV_INLINE");
     p.kv.coopmat_bda = presence(get, "INFR_KV_COOPMAT_BDA");
     p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");
@@ -393,6 +413,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.spec.mtp_ple_overlap = presence_inv(get, "INFR_NO_MTP_PLE_OVERLAP");
     p.spec.draft = opt_path(get, "INFR_SPEC_DRAFT");
     p.spec.k = num(get, "INFR_SPEC_K");
+    p.spec.mtp_min_alpha = num(get, "INFR_SPEC_MTP_MIN_ALPHA");
     p.spec.debug = presence(get, "INFR_SPEC_DEBUG");
     p.spec.decode_chain = num(get, "INFR_DECODE_CHAIN");
     p.spec.gpu_draft_prob = presence_inv(get, "INFR_NO_GPU_DRAFT_PROB");
@@ -438,7 +459,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.debug.state_trace = presence(get, "INFR_STATE_TRACE");
     p.debug.moe_counts = presence(get, "INFR_MOE_COUNTS_DEBUG");
     p.debug.moe_counts_dump = presence(get, "INFR_MOE_COUNTS_DUMP");
+    p.debug.qsa_index_dump = presence(get, "INFR_QSA_INDEX_DUMP");
     p.debug.poison_uninit = presence(get, "INFR_POISON_UNINIT");
+    p.debug.paged_frontier_cut = presence(get, "INFR_PAGED_FRONTIER_CUT");
     p.debug.no_barrier = presence(get, "INFR_NOBARRIER");
     p.debug.full_barrier = presence(get, "INFR_FULLBARRIER");
 
@@ -455,6 +478,15 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
     p.serve.shutdown_file = opt_path(get, "INFR_SHUTDOWN_FILE");
     p.serve.embedding_runner = opt_path(get, "INFR_EMBEDDING_RUNNER");
+    // Same "`0` is a VALUE" grammar as the deadline above: `0` means "response state OFF" (the
+    // stateless rejection path), so it must survive this layer to turn a config-file setting off.
+    p.serve.response_store_entries = num::<u32>(get, "INFR_RESPONSE_STORE_ENTRIES");
+    p.serve.response_store_path = opt_path(get, "INFR_RESPONSE_STORE_PATH");
+
+    // ── vision ───────────────────────────────────────────────────────────────
+    // `Flag`, not `presence`: the security ceiling is lifted by a value that says so, and `0` means
+    // "keep refusing private addresses" so a file layer that raised it can be turned back down.
+    p.vision.image_url_allow_private = flag(get, "INFR_IMAGE_URL_ALLOW_PRIVATE");
 
     // ── hub ──────────────────────────────────────────────────────────────────
     if let Some(endpoint) = get("INFR_HF_ENDPOINT") {

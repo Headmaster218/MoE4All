@@ -8,6 +8,82 @@ use anyhow::{ensure, Result};
 
 pub(crate) const MAX_VERIFY_ROWS: usize = 4;
 
+#[derive(Default)]
+pub(crate) struct MtpCostPolicy {
+    samples: [u8; MAX_VERIFY_ROWS],
+    seconds: [f64; MAX_VERIFY_ROWS],
+    committed: [f64; MAX_VERIFY_ROWS],
+    choose_tick: u8,
+    next_probe: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MtpChoice {
+    pub(crate) rows: usize,
+    pub(crate) probe: bool,
+}
+
+impl MtpCostPolicy {
+    pub(crate) fn choose(&mut self, max_rows: usize, allow_plain: bool) -> MtpChoice {
+        let max_rows = max_rows.clamp(2, MAX_VERIFY_ROWS);
+        self.choose_tick = (self.choose_tick + 1) % 16;
+
+        for rows in (2..=max_rows).chain(allow_plain.then_some(1)) {
+            if self.samples[rows - 1] < 2 {
+                return MtpChoice { rows, probe: true };
+            }
+        }
+
+        if self.choose_tick == 0 {
+            let arm_count = max_rows - 1 + usize::from(allow_plain);
+            let index = self.next_probe % arm_count;
+            self.next_probe = (index + 1) % arm_count;
+            let rows = if index < max_rows - 1 { index + 2 } else { 1 };
+            return MtpChoice { rows, probe: true };
+        }
+
+        let mut rows = 2;
+        for candidate in 3..=max_rows {
+            if self.cost(candidate) < self.cost(rows) {
+                rows = candidate;
+            }
+        }
+        if allow_plain && self.cost(rows) > self.cost(1) * 0.97 {
+            rows = 1;
+        }
+        MtpChoice { rows, probe: false }
+    }
+
+    /// Bill one cycle to the arm that was DRAFTED, not the arm that survived the confidence trim.
+    ///
+    /// `drafted_rows` is the width [`Self::choose`] requested — the counterfactual this policy is
+    /// choosing between. `seconds` covers that full draft even when the trim shortened VERIFY, so
+    /// billing the trimmed width would credit arm 2 with arm 4's draft cost and make the wide arms
+    /// look free. `committed` is the rows actually retained, which is the payoff either way.
+    pub(crate) fn record(&mut self, drafted_rows: usize, seconds: f64, committed: usize) {
+        if !(1..=MAX_VERIFY_ROWS).contains(&drafted_rows)
+            || !seconds.is_finite()
+            || seconds <= 0.0
+            || committed == 0
+        {
+            return;
+        }
+        let index = drafted_rows - 1;
+        if self.samples[index] == 0 {
+            self.seconds[index] = seconds;
+            self.committed[index] = committed as f64;
+        } else {
+            self.seconds[index] = self.seconds[index] * 0.875 + seconds * 0.125;
+            self.committed[index] = self.committed[index] * 0.875 + committed as f64 * 0.125;
+        }
+        self.samples[index] = (self.samples[index] + 1).min(2);
+    }
+
+    fn cost(&self, rows: usize) -> f64 {
+        self.seconds[rows - 1] / self.committed[rows - 1]
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VerifyIdentity {
@@ -220,6 +296,280 @@ impl<'a> GreedyVerify<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_choice_respects_the_clamped_width_cap() {
+        for requested in [0, 1, 2, 3, 4, 5, usize::MAX] {
+            let max_rows = requested.clamp(2, MAX_VERIFY_ROWS);
+            let mut policy = MtpCostPolicy::default();
+            for rows in 1..=MAX_VERIFY_ROWS {
+                for _ in 0..2 {
+                    policy.record(rows, (MAX_VERIFY_ROWS + 1 - rows) as f64, rows);
+                }
+            }
+            for _ in 0..128 {
+                let choice = policy.choose(requested, true);
+                assert!((1..=max_rows).contains(&choice.rows));
+                if !choice.probe {
+                    assert_eq!(choice.rows, max_rows);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_never_selects_plain_when_disabled_even_if_it_is_fastest() {
+        let mut policy = MtpCostPolicy::default();
+        for _ in 0..2 {
+            policy.record(1, 0.001, 1);
+            for rows in 2..=MAX_VERIFY_ROWS {
+                policy.record(rows, rows as f64, 1);
+            }
+        }
+        for _ in 0..128 {
+            let choice = policy.choose(MAX_VERIFY_ROWS, false);
+            assert!((2..=MAX_VERIFY_ROWS).contains(&choice.rows));
+            if !choice.probe {
+                assert_eq!(choice.rows, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_cold_start_collects_two_valid_samples_in_arm_order() {
+        for max_rows in 2..=MAX_VERIFY_ROWS {
+            for allow_plain in [false, true] {
+                let mut policy = MtpCostPolicy::default();
+                let unrecorded = policy.choose(max_rows, allow_plain);
+                assert_eq!(unrecorded.rows, 2);
+                assert!(unrecorded.probe);
+                for rows in (2..=max_rows).chain(allow_plain.then_some(1)) {
+                    for _ in 0..2 {
+                        let choice = policy.choose(max_rows, allow_plain);
+                        assert_eq!(choice.rows, rows);
+                        assert!(choice.probe);
+                        policy.record(choice.rows, 1.0, choice.rows);
+                    }
+                }
+                let choice = policy.choose(max_rows, allow_plain);
+                assert_eq!(choice.rows, max_rows);
+                assert!(!choice.probe);
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_slow_verification_falls_back_to_plain() {
+        let mut policy = MtpCostPolicy::default();
+        for _ in 0..MAX_VERIFY_ROWS * 2 {
+            let choice = policy.choose(MAX_VERIFY_ROWS, true);
+            assert!(choice.probe);
+            let seconds = if choice.rows == 1 {
+                1.0
+            } else {
+                choice.rows as f64 * 2.0
+            };
+            policy.record(choice.rows, seconds, choice.rows);
+        }
+        let choice = policy.choose(MAX_VERIFY_ROWS, true);
+        assert_eq!(choice.rows, 1);
+        assert!(!choice.probe);
+    }
+
+    #[test]
+    fn mtp_requires_at_least_three_percent_gain_over_plain() {
+        for (seconds, expected) in [(1.0, 1), (0.98, 1), (0.971, 1), (0.97, 2), (0.96, 2)] {
+            let mut policy = MtpCostPolicy::default();
+            for _ in 0..2 {
+                policy.record(1, 1.0, 1);
+                policy.record(2, seconds, 1);
+            }
+            let choice = policy.choose(2, true);
+            assert_eq!(choice.rows, expected, "seconds={seconds}");
+            assert!(!choice.probe);
+        }
+    }
+
+    #[test]
+    fn mtp_cost_uses_separate_emas_not_the_ema_of_per_round_ratios() {
+        let mut policy = MtpCostPolicy::default();
+        for _ in 0..2 {
+            policy.record(1, 1.5, 1);
+            policy.record(2, 3.0, 1);
+            policy.record(3, 3.0, 1);
+        }
+        policy.record(4, 2.0, 1);
+        assert_eq!(policy.seconds[3], 2.0);
+        assert_eq!(policy.committed[3], 1.0);
+        policy.record(4, 1.0, 4);
+        assert_eq!(policy.seconds[3], 1.875);
+        assert_eq!(policy.committed[3], 1.375);
+        let choice = policy.choose(MAX_VERIFY_ROWS, true);
+        assert_eq!(choice.rows, 4);
+        assert!(!choice.probe);
+    }
+
+    /// The confidence trim shortens VERIFY *after* the head already drafted at full width, so the
+    /// cycle's cost belongs to the DRAFTED arm — the width `choose()` will request next. Billing the
+    /// trimmed width instead would leave the wide arm frozen on its warm-up sample while arm 2
+    /// absorbs every expensive cycle. Both call sites pass the pre-trim width (`mtp/qwen4.rs`'s
+    /// `drafted_rows`, `parallel.rs`'s `choice.rows`); this locks the semantics they depend on.
+    #[test]
+    fn a_trimmed_cycle_bills_the_drafted_arm_and_never_falls_back_to_plain() {
+        let mut policy = MtpCostPolicy::default();
+        for _ in 0..2 {
+            policy.record(1, 0.040, 1);
+            policy.record(2, 0.050, 2);
+            policy.record(3, 0.060, 3);
+            policy.record(4, 0.070, 4);
+        }
+        let warm_seconds = policy.seconds;
+        let warm_committed = policy.committed;
+        assert_eq!(policy.choose(MAX_VERIFY_ROWS, true).rows, 4);
+
+        // A real trim: four drafted rows whose cumulative confidence only justifies two VERIFY rows.
+        let probabilities = [0.9f32, 0.01, 0.9];
+        let drafted_rows = MAX_VERIFY_ROWS;
+        let verified_rows = crate::mtp::confidence_verify_rows(&probabilities, drafted_rows, 0.5);
+        assert_eq!(verified_rows, 2);
+
+        for _ in 0..100 {
+            // Both retained rows were accepted, and the cycle still cost a full wide draft.
+            policy.record(drafted_rows, 0.064, verified_rows);
+        }
+        assert_eq!(
+            policy.seconds[1], warm_seconds[1],
+            "arm 2 was never drafted"
+        );
+        assert_eq!(policy.committed[1], warm_committed[1]);
+        assert_eq!(
+            policy.seconds[2], warm_seconds[2],
+            "arm 3 was never drafted"
+        );
+        assert_eq!(policy.committed[2], warm_committed[2]);
+        assert!(
+            (policy.seconds[3] - 0.064).abs() < 1e-6,
+            "arm 4 must absorb the trimmed cycles: {}",
+            policy.seconds[3]
+        );
+        assert!(
+            (policy.committed[3] - 2.0).abs() < 1e-4,
+            "arm 4 must bill the retained rows, not the drafted ones: {}",
+            policy.committed[3]
+        );
+        for _ in 0..128 {
+            let choice = policy.choose(MAX_VERIFY_ROWS, true);
+            assert!(
+                choice.probe || choice.rows >= 2,
+                "trimming must not push the policy to plain"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_periodic_probes_rotate_through_every_allowed_arm() {
+        for max_rows in 2..=MAX_VERIFY_ROWS {
+            for allow_plain in [false, true] {
+                let mut policy = MtpCostPolicy::default();
+                for _ in 0..2 {
+                    policy.record(1, 1.0, 1);
+                    for rows in 2..=MAX_VERIFY_ROWS {
+                        policy.record(rows, 10.0, 1);
+                    }
+                }
+                let mut expected = (2..=max_rows).chain(allow_plain.then_some(1)).cycle();
+                for call in 1..=16 * MAX_VERIFY_ROWS * 2 {
+                    let choice = policy.choose(max_rows, allow_plain);
+                    assert_eq!(choice.probe, call % 16 == 0);
+                    if choice.probe {
+                        assert_eq!(choice.rows, expected.next().unwrap());
+                    } else {
+                        assert_eq!(choice.rows, if allow_plain { 1 } else { 2 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_reprobe_restores_a_previously_slow_wide_arm() {
+        for allow_plain in [false, true] {
+            let mut policy = MtpCostPolicy::default();
+            for _ in 0..2 {
+                policy.record(1, 1.0, 1);
+                policy.record(2, 2.0, 2);
+                policy.record(3, 6.0, 3);
+                policy.record(4, 8.0, 4);
+            }
+            let baseline = if allow_plain { 1 } else { 2 };
+            let initial = policy.choose(MAX_VERIFY_ROWS, allow_plain);
+            assert_eq!(initial.rows, baseline);
+            assert!(!initial.probe);
+            let mut wide_probes = 0;
+            let mut recovered = false;
+            for _ in 0..16 * MAX_VERIFY_ROWS * 16 {
+                let choice = policy.choose(MAX_VERIFY_ROWS, allow_plain);
+                if choice.rows == 4 {
+                    if !choice.probe {
+                        recovered = true;
+                        break;
+                    }
+                    wide_probes += 1;
+                    policy.record(4, 0.4, 4);
+                } else {
+                    if !choice.probe {
+                        assert_eq!(choice.rows, baseline);
+                    }
+                    let seconds = match choice.rows {
+                        1 => 1.0,
+                        2 => 2.0,
+                        3 => 6.0,
+                        _ => unreachable!(),
+                    };
+                    policy.record(choice.rows, seconds, choice.rows);
+                }
+            }
+            assert!(wide_probes > 0);
+            assert!(recovered, "allow_plain={allow_plain}");
+        }
+    }
+
+    #[test]
+    fn mtp_invalid_samples_do_not_change_observations() {
+        for trained in [false, true] {
+            let mut policy = MtpCostPolicy::default();
+            if trained {
+                for rows in 1..=MAX_VERIFY_ROWS {
+                    for _ in 0..2 {
+                        policy.record(rows, 1.0, rows);
+                    }
+                }
+            }
+            let samples = policy.samples;
+            let seconds = policy.seconds;
+            let committed = policy.committed;
+            for (rows, elapsed, tokens) in [
+                (0, 1.0, 1),
+                (MAX_VERIFY_ROWS + 1, 1.0, 1),
+                (usize::MAX, 1.0, 1),
+                (1, f64::NAN, 1),
+                (2, f64::INFINITY, 1),
+                (3, f64::NEG_INFINITY, 1),
+                (4, 0.0, 1),
+                (1, -0.0, 1),
+                (2, -1.0, 1),
+                (4, 1.0, 0),
+            ] {
+                policy.record(rows, elapsed, tokens);
+                assert_eq!(policy.samples, samples);
+                assert_eq!(policy.seconds, seconds);
+                assert_eq!(policy.committed, committed);
+            }
+            let choice = policy.choose(MAX_VERIFY_ROWS, true);
+            assert_eq!(choice.rows, if trained { 4 } else { 2 });
+            assert_eq!(choice.probe, !trained);
+        }
+    }
 
     const EOS: u32 = 1_000;
     const ID: VerifyIdentity = VerifyIdentity {

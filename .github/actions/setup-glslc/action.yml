@@ -1,0 +1,32 @@
+name: Set up glslc (shaderc)
+description: Install the shader compiler the Vulkan build needs, surviving a transient apt outage.
+
+runs:
+  using: composite
+  steps:
+    - name: Install glslc (shaderc)
+      shell: bash
+      run: |
+        if command -v glslc >/dev/null 2>&1; then
+          glslc --version
+          exit 0
+        fi
+        # Every Linux job once died here before reaching the compiler: the runner's resolver
+        # failed for archive.ubuntu.com, azure.archive.ubuntu.com AND security.ubuntu.com at
+        # once ("Temporary failure resolving"), so apt could not fetch glslc or libshaderc1.
+        # `update` runs again on each attempt because a stale index can also name a package
+        # version the mirror has already superseded. Timeouts are bounded so a dead resolver
+        # costs seconds per attempt instead of the twenty seconds per host apt waits by default.
+        options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+        for attempt in 1 2 3; do
+          if sudo apt-get "${options[@]}" update && sudo apt-get "${options[@]}" install -y glslc; then
+            glslc --version
+            exit 0
+          fi
+          echo "::warning::glslc install attempt ${attempt} failed; retrying in $((attempt * 20))s"
+          sleep $((attempt * 20))
+        done
+        # Fail here, loudly: a missing glslc otherwise surfaces much later as a shader build
+        # error that reads like a code defect.
+        echo "::error::could not install glslc after 3 attempts"
+        exit 1

@@ -1136,6 +1136,15 @@ fn main() {
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
         ("softmax", "softmax_dyn", &["-DUSE_SCALE_BUF"]),
+        // Uncensor projection (`crates/infr-uncensor`, `Op::UncensorProject`): the plain build
+        // bakes the projection strength into a push constant, the `_dyn` twin reads the session's
+        // current on/off value off the device, so a per-request flip never rebuilds a cached plan.
+        ("uncensor_project", "uncensor_project", &[]),
+        (
+            "uncensor_project",
+            "uncensor_project_dyn",
+            &["-DUSE_SCALE_BUF"],
+        ),
         ("deltanet", "deltanet", &[]),
         ("kda", "kda", &[]),
         // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).
@@ -1357,7 +1366,9 @@ fn main() {
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
-        // Narrow projection: exact native-weight widening into bounded F32 scratch.
+        // Expand a NARROW-output native weight into f32 scratch once per Prefill chunk so the
+        // mrow8/vec4 f32 GEMV can contract it (see the shader's doc and `dense_narrow_f32_applies`).
+        // Only the formats Qwen3.8-Flash-Next's narrow tensors actually ship in are built.
         ("weight_f32", "weight_f32_q8_0", &["-DFMT_Q8_0"]),
         ("weight_f32", "weight_f32_bf16", &["-DFMT_BF16"]),
         // Quantize a KV row into the Q8_0 cache. f32 source (V) + f16 source (un-fused roped K),
@@ -1967,6 +1978,19 @@ fn main() {
             "native_mrow_q8_0_m4",
             &["-DFMT_Q8_0", "-DMR=4"],
         ),
+        // Narrow-in_f packing probe (NOT auto-selected): in_f=320 leaves 54 of 64 lanes idle in the
+        // one-output grid. OR packs that many outputs per workgroup so the lanes are filled; the
+        // per-output sum becomes lane-order, so these are reassociation-tolerant, not bit-identical.
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m4_or4",
+            &["-DFMT_Q8_0", "-DMR=4", "-DOR=4"],
+        ),
+        (
+            "native_gemv_mrow",
+            "native_mrow_q8_0_m4_or8",
+            &["-DFMT_Q8_0", "-DMR=4", "-DOR=8"],
+        ),
         ("native_gemv_mrow", "native_mrow_bf16", &["-DFMT_BF16"]),
         ("native_gemv_mrow", "native_mrow_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemv_mrow", "native_mrow_q4_1", &["-DFMT_Q4_1"]),
@@ -2304,6 +2328,24 @@ fn main() {
             "native_idm_iq4nl_paged",
             &["-DFMT_IQ4NL", "-DPAGED"],
         ),
+        // NR=n amortizes one decoded IQ4_NL block scale and one per-slot activation row across n
+        // adjacent output rows. Causal Verify's Down (`native_idm_iq4nl_paged` at rows=4) is the
+        // dominant FFN dispatch, so this family is measured before any admission.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_nr2_paged",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_nr4_paged",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_nr8_paged",
+            &["-DFMT_IQ4NL", "-DPAGED", "-DNR=8"],
+        ),
         (
             "native_gemv_id_multi",
             "native_idm_iq4xs_paged",
@@ -2425,6 +2467,31 @@ fn main() {
                 "-DSHARED_Q8",
                 "-DNR=8",
             ],
+        ),
+        // Qwen3.8-Flash-Next GSQ mixed-quant banks: IQ3_XXS is the largest gate/up family (17 of
+        // 48) after IQ2_S. Same codebook-in-buffer treatment as the IQ2_S/IQ3_S twins above; the
+        // buffer carries G_IQ3XXS + KSIGNS (see native_decode.glsl's IQ3XXS_GRID_BUFFER block).
+        // No -DSHARED_Q8 arm: the shared-expert peephole needs a Q8_0 shared gate/up, which the
+        // GSQ mixed K-quant shared banks never are.
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_paged",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_nr2_paged",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_nr4_paged",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_buffer_nr8_paged",
+            &["-DFMT_IQ3XXS", "-DIQ3XXS_GRID_BUFFER", "-DPAGED", "-DNR=8"],
         ),
         // Qwen shared-expert decode: routed slots keep their native quant while the final slot
         // reads one fixed Q8_0 shared-expert matrix by BDA. Keep the format set aligned with
@@ -2746,6 +2813,56 @@ fn main() {
                 "-DPAGED",
                 "-DSHARED_Q8",
             ],
+        ),
+        // Q5_1 SG id variant (2026-10-19): the UD-Q4_K_XL Qwen3.8-Flash-Next stores 43 of 48
+        // expert DOWN projections as Q5_1 at the 640x2560 shape the Q5_K down band was cut for
+        // (24B/32-elem blocks, y = d*q5 + m). Same wave32 + subgroupAdd tier; enrollment is
+        // A/B-gated by `kernels.vulkan.gemv.id_sg_q51` (default OFF keeps the tree) until the
+        // UD-Q4_K_XL decode A/B lands. NR ∈ {2,4,8}.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg2",
+            &["-DFMT_Q5_1", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg4",
+            &["-DFMT_Q5_1", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg8",
+            &["-DFMT_Q5_1", "-DNR=8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg2_paged",
+            &["-DFMT_Q5_1", "-DNR=2", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg4_paged",
+            &["-DFMT_Q5_1", "-DNR=4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg8_paged",
+            &["-DFMT_Q5_1", "-DNR=8", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg2_paged_shexp",
+            &["-DFMT_Q5_1", "-DNR=2", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg4_paged_shexp",
+            &["-DFMT_Q5_1", "-DNR=4", "-DPAGED", "-DSHARED_Q8"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q51_sg8_paged_shexp",
+            &["-DFMT_Q5_1", "-DNR=8", "-DPAGED", "-DSHARED_Q8"],
         ),
         (
             "native_gemv_id_swiglu_sg",
@@ -4121,6 +4238,57 @@ fn main() {
             "native_gemm_warp",
             "native_gemm_warp_q8_0_n128_ag_bm128",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        // BM128 (128x128 single-buffer) warptile for the rest of the native-dense formats. The
+        // tile itself is format-agnostic — A_GLOBAL only changes how the A fragment is loaded and
+        // the dequant path is unchanged — so each is the SAME -DBM128 switch on its own FMT define.
+        // The recorder's `dense_bm128_applies` decides when it is taken (measured-large m with
+        // wide k/n; the bench loses at m=128 and several short-k/narrow-n shapes regressed in
+        // isolated BAAB, so this is not a blanket "always on").
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n128_ag_bm128",
+            &["-DFMT_BF16", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_n128_ag_bm128",
+            &["-DFMT_IQ4NL", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4xs_n128_ag_bm128",
+            &["-DFMT_IQ4XS", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q2k_n128_ag_bm128",
+            &["-DFMT_Q2K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_n128_ag_bm128",
+            &["-DFMT_Q3K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4_0_n128_ag_bm128",
+            &["-DFMT_Q4_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_ag_bm128",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_ag_bm128",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_ag_bm128",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_GLOBAL", "-DBM128"],
         ),
         (
             // Qwen3.8 recurrent projection: N=320 is divisible by 64 but not 128, so it used to

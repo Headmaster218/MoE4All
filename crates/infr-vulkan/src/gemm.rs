@@ -247,6 +247,29 @@ pub(crate) fn native_mrow_spv(
     }
 }
 
+/// Probe-only accessor for the narrow-in_f output-packing arms (`-DOR=N`). No production selector
+/// reaches these until the bandwidth win and the reassociation error are both qualified.
+pub(crate) fn native_mrow_or_probe_spv(or: u32) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match or {
+        1 => native_mrow_spv(infr_core::DType::Q8_0, 4),
+        4 => v!("native_mrow_q8_0_m4_or4"),
+        8 => v!("native_mrow_q8_0_m4_or8"),
+        _ => None,
+    }
+}
+
 /// The multi-output-row decode GEMV (`RM` rows/workgroup, bit-identical per row to the RM=1 native
 /// GEMV) — kernel-cache name + SPIR-V, the ONLY weight build for this family (the bound-SSBO
 /// resident build died with the eager `Recorder::linear_native_rm` caller, its sole consumer). `rm`
@@ -489,6 +512,37 @@ pub(crate) fn native_idm_grid_nr_paged_build_spv(
         (Iq2S, 2) => v!("native_idm_iq2s_nr2_paged"),
         (Iq2S, 4) => v!("native_idm_iq2s_nr4_paged"),
         (Iq2S, 8) => v!("native_idm_iq2s_nr8_paged"),
+        // Reached only through `iq4nl_down_nr4_applies`; the device's own grid NR never selects
+        // an IQ4_NL build.
+        (Iq4Nl, 4) => v!("native_idm_iq4nl_nr4_paged"),
+        _ => None,
+    }
+}
+
+/// Probe-only accessor for the unadmitted IQ4_NL multi-row builds at the causal-Verify Down
+/// geometry. `nr == 1` returns the exact production kernel, so the baseline arm of the probe is
+/// the dispatched binary rather than a stand-in.
+pub(crate) fn native_idm_iq4nl_nr_probe_spv(nr: u32) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match nr {
+        1 => Some((
+            "native_idm_iq4nl_paged",
+            native_idm_paged_build_spv(infr_core::DType::Iq4Nl)?,
+        )),
+        2 => v!("native_idm_iq4nl_nr2_paged"),
+        4 => v!("native_idm_iq4nl_nr4_paged"),
+        8 => v!("native_idm_iq4nl_nr8_paged"),
         _ => None,
     }
 }
@@ -522,6 +576,10 @@ pub(crate) fn native_idm_grid_buffer_paged_spv(
         (Iq3S, 2) => variant!("native_idm_iq3s_buffer_nr2_paged"),
         (Iq3S, 4) => variant!("native_idm_iq3s_buffer_nr4_paged"),
         (Iq3S, 8) => variant!("native_idm_iq3s_buffer_nr8_paged"),
+        (Iq3Xxs, 1) => variant!("native_idm_iq3xxs_buffer_paged"),
+        (Iq3Xxs, 2) => variant!("native_idm_iq3xxs_buffer_nr2_paged"),
+        (Iq3Xxs, 4) => variant!("native_idm_iq3xxs_buffer_nr4_paged"),
+        (Iq3Xxs, 8) => variant!("native_idm_iq3xxs_buffer_nr8_paged"),
         _ => None,
     }
 }
@@ -745,6 +803,12 @@ pub(crate) fn native_idm_sg_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16"),
+        (Q5_1, 2, false) => v!("native_idm_q51_sg2"),
+        (Q5_1, 4, false) => v!("native_idm_q51_sg4"),
+        (Q5_1, 8, false) => v!("native_idm_q51_sg8"),
+        (Q5_1, 2, true) => v!("native_idm_q51_sg2_sg16"),
+        (Q5_1, 4, true) => v!("native_idm_q51_sg4_sg16"),
+        (Q5_1, 8, true) => v!("native_idm_q51_sg8_sg16"),
         _ => None,
     }
 }
@@ -788,6 +852,12 @@ pub(crate) fn native_idm_sg_paged_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_sg16"),
+        (Q5_1, 2, false) => v!("native_idm_q51_sg2_paged"),
+        (Q5_1, 4, false) => v!("native_idm_q51_sg4_paged"),
+        (Q5_1, 8, false) => v!("native_idm_q51_sg8_paged"),
+        (Q5_1, 2, true) => v!("native_idm_q51_sg2_paged_sg16"),
+        (Q5_1, 4, true) => v!("native_idm_q51_sg4_paged_sg16"),
+        (Q5_1, 8, true) => v!("native_idm_q51_sg8_paged_sg16"),
         (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged"),
         (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_sg16"),
         _ => None,
@@ -832,6 +902,12 @@ pub(crate) fn native_idm_sg_paged_shared_build_spv(
         (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_paged_shexp_sg16"),
         (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_paged_shexp_sg16"),
         (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_paged_shexp_sg16"),
+        (Q5_1, 2, false) => v!("native_idm_q51_sg2_paged_shexp"),
+        (Q5_1, 4, false) => v!("native_idm_q51_sg4_paged_shexp"),
+        (Q5_1, 8, false) => v!("native_idm_q51_sg8_paged_shexp"),
+        (Q5_1, 2, true) => v!("native_idm_q51_sg2_paged_shexp_sg16"),
+        (Q5_1, 4, true) => v!("native_idm_q51_sg4_paged_shexp_sg16"),
+        (Q5_1, 8, true) => v!("native_idm_q51_sg8_paged_shexp_sg16"),
         (Iq2Xs, 8, false) => v!("native_idm_iq2xs_sg8_paged_shexp"),
         (Iq2Xs, 8, true) => v!("native_idm_iq2xs_sg8_paged_shexp_sg16"),
         _ => None,
@@ -1468,6 +1544,23 @@ pub(crate) fn attn_nc_fa_spv(hd: usize) -> Option<(&'static str, &'static [u32],
         return None;
     })
 }
+/// Workgroup shared memory (bytes) declared by the [`attn_nc_fa_spv`] build selected for `hd`:
+/// `attn_nc_fa.comp`'s Qs + KVs + Ss + Os + per-row scalars, mirroring the shader's BM/HD_MAX
+/// selection (37632 / 54016 / 47616 B). `None` for hd > 512. `adapter.rs` keeps `nc_fa_ok`
+/// inside the device's `maxComputeSharedMemorySize` with it (VUID-RuntimeSpirv-Workgroup-06530).
+pub(crate) fn attn_nc_fa_shared_bytes(hd: usize) -> Option<u32> {
+    let (bm, hd_max) = if hd <= 128 {
+        (32usize, 128usize)
+    } else if hd <= 256 {
+        (32, 256)
+    } else if hd <= 512 {
+        (16, 512)
+    } else {
+        return None;
+    };
+    let floats = bm * 33 + 64 * 33 + bm * 64 + bm * hd_max + 3 * bm;
+    u32::try_from(floats * 4).ok()
+}
 /// SPIR-V for the int8 cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — measurement kernel
 /// gated behind `INFR_I8_COOPMAT=1` (see `native_gemm_i8cm_q8_0.comp` for the design doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1986,17 +2079,6 @@ pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
     })
 }
 
-/// BM128 variants built only for qualified dense Prefill projections.
-pub(crate) fn native_gemm_warp_n128_ag_bm128_kernel_name(
-    dtype: infr_core::DType,
-) -> Option<&'static str> {
-    match dtype {
-        infr_core::DType::Q8_0 => Some("native_gemm_warp_q8_0_n128_ag_bm128"),
-        infr_core::DType::Q6K => Some("native_gemm_warp_q6k_n128_ag_bm128"),
-        _ => None,
-    }
-}
-
 /// BN=64/BK=64 A_GLOBAL warptile for output widths divisible by 64 but not 128.
 /// This keeps the logical output width while avoiding the legacy BN=64/BK=32 fallback.
 /// Bf16 is Qwen3.8-Flash-Next's HC-projection width (320x10240 / 10240x320 at prefill m).
@@ -2042,6 +2124,31 @@ pub(crate) fn native_gemm_warp_n128_ag_bm32_kernel_name(
         Q5K => "native_gemm_warp_q5k_n128_ag_bm32",
         Q6K => "native_gemm_warp_q6k_n128_ag_bm32",
         Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm32",
+        _ => return None,
+    })
+}
+
+/// BM=128 row-tile variant of [`native_gemm_warp_n128_ag_kernel_name`]: NARROW_N + A_GLOBAL with
+/// the row tile doubled (WM 32→64, 4×4 accumulator frags per warp — more B-frag reuse per LDS
+/// load). `kernel-bench`'s `t128sb` sweep measured 52.9 → 72.3 TF on 2048x4096x14336 and 53.4 →
+/// 63.0 on 2048x4096x4096, but a LOSS at m=128 (4.9 vs 3.8 TF), so the recorder only takes this
+/// tile at measured-large m with wide k/n — see `dense_bm128_applies`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_ag_bm128_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Bf16 => "native_gemm_warp_bf16_n128_ag_bm128",
+        Iq4Nl => "native_gemm_warp_iq4nl_n128_ag_bm128",
+        Iq4Xs => "native_gemm_warp_iq4xs_n128_ag_bm128",
+        Q2K => "native_gemm_warp_q2k_n128_ag_bm128",
+        Q3K => "native_gemm_warp_q3k_n128_ag_bm128",
+        Q4_0 => "native_gemm_warp_q4_0_n128_ag_bm128",
+        Q4K => "native_gemm_warp_q4k_n128_ag_bm128",
+        Q5K => "native_gemm_warp_q5k_n128_ag_bm128",
+        Q6K => "native_gemm_warp_q6k_n128_ag_bm128",
+        Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm128",
         _ => return None,
     })
 }
@@ -4694,6 +4801,11 @@ dyn_spv!(
 // record-once decode replay's pos/kv_len — see `Op::Softmax::scale_buf`'s doc and `Recorder::
 // softmax_dyn`.
 dyn_spv!(softmax_dyn_spv, "softmax_dyn");
+// Uncensor projection (`crates/infr-uncensor`, `Op::UncensorProject`): the plain build takes the
+// projection strength from a push constant, the `_dyn` twin (`-DUSE_SCALE_BUF`) reads the session's
+// current on/off value off the device — see `Recorder::uncensor_project_dyn`.
+dyn_spv!(uncensor_project_spv, "uncensor_project");
+dyn_spv!(uncensor_project_dyn_spv, "uncensor_project_dyn");
 dyn_spv!(rope_f16_spv, "rope_f16");
 dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
@@ -5462,6 +5574,10 @@ mod tests {
                 );
             }
         }
+        // Split-K and the small-M row tiles are deliberately NOT extended to Bf16 — see the
+        // `dense_small_m_row_tile_bench` note on `native_gemm_warp_sk_ag_kernel_name`.
+        assert_eq!(native_gemm_warp_sk_ag_kernel_name(Bf16), None);
+        assert_eq!(native_gemm_warp_n128_ag_bm32_kernel_name(Bf16), None);
     }
 
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never
