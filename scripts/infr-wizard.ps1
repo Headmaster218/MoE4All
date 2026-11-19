@@ -266,6 +266,28 @@ function Invoke-BenchmarkStartupGuide {
     return ($answer -eq 'try')
 }
 
+function Test-PagedKvEligible {
+    param(
+        [Parameter(Mandatory = $true)][string]$Preset,
+        [AllowEmptyString()][string]$TypeK = '',
+        [AllowEmptyString()][string]$TypeV = '',
+        [bool]$Overflow = $false
+    )
+    # The wizard's mirror of the engine's `segmented_kv_wanted`: every paged-KV tier IS the dynamic
+    # segmented layout, and that layout only exists over a Q8_0/Q8_0 cache with no RAM overflow.
+    # `auto` counts as eligible because the Vulkan runner resolves it to Q8 for these models.
+    if ($Overflow) {
+        return $false
+    }
+    if ($Preset -in @('auto', 'q8')) {
+        return $true
+    }
+    if ($Preset -eq 'custom') {
+        return ($TypeK -eq 'q8_0' -and $TypeV -eq 'q8_0')
+    }
+    return $false
+}
+
 function Read-TextValue {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -909,6 +931,7 @@ function Invoke-FileDownloadWithProgress {
         [int]$ProgressId = 71,
         [int]$ParentProgressId = -1,
         [string]$UserAgent = 'MoE4All-Wizard/1.0',
+        [int]$AttemptTimeoutMs = 30000,
         [switch]$ReplaceExisting
     )
 
@@ -942,7 +965,7 @@ function Invoke-FileDownloadWithProgress {
 
             $request = [System.Net.HttpWebRequest]::Create($Url)
             $request.AllowAutoRedirect = $true
-            $request.Timeout = 30000
+            $request.Timeout = $AttemptTimeoutMs
             $request.ReadWriteTimeout = 120000
             $request.UserAgent = $UserAgent
             if ($resumeAt -gt 0) { $request.AddRange($resumeAt) }
@@ -1023,6 +1046,7 @@ function Invoke-ModelFileDownload {
         [Parameter(Mandatory = $true)][string]$Destination,
         [Parameter(Mandatory = $true)][string]$Label,
         [int]$MaximumAttempts = 3,
+        [int]$AttemptTimeoutMs = 30000,
         [long]$ExpectedBytes = 0
     )
 
@@ -1031,6 +1055,7 @@ function Invoke-ModelFileDownload {
         -Destination $Destination `
         -Label $Label `
         -MaximumAttempts $MaximumAttempts `
+        -AttemptTimeoutMs $AttemptTimeoutMs `
         -ExpectedBytes $ExpectedBytes `
         -ProgressId 71 `
         -ParentProgressId 70
@@ -2832,6 +2857,106 @@ function Add-SetArgument {
     [void]$Arguments.Add("$Path=$Value")
 }
 
+# The refusal-direction control vector `[uncensor] vector` projects. Pinned by repository, file name
+# AND sha256 on purpose: the hub also carries a same-named look-alike with DIFFERENT numbers, and a
+# wrong direction is exactly the kind of mistake nobody notices until the model behaves oddly. A
+# function rather than script variables because the wizard's own tests load function definitions
+# one at a time, where a script-scope assignment would never have run.
+function Get-UncensorVectorSpec {
+    return @{
+        Repo = 'cjxzdzh/Qwen3.8-Flash-Next-refusal-direction-qwen4exp-cvec'
+        File = 'cvec-qwen4exp.gguf'
+        Sha256 = 'EF0724C5B79297E481017BE85769832BC26EB220C984ECBA2B0E1B0C8426312B'
+    }
+}
+
+function Get-UncensorVectorPath {
+    $spec = Get-UncensorVectorSpec
+    return Join-Path (Join-Path $repoRoot 'models\control-vectors') $spec.File
+}
+
+function Test-UncensorVectorCurrent {
+    $spec = Get-UncensorVectorSpec
+    $path = Get-UncensorVectorPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -eq $spec.Sha256
+}
+
+# Whether a host answers at all, decided in about a second instead of in the downloader's 30 s
+# request timeout times three attempts. A TCP connect is deliberately the only test: it separates
+# "this machine has no route to the hub" (mainland China boxes that can only reach the mirror) from
+# "the hub is up but this file is slow", which the download itself has to discover.
+function Test-EndpointReachable {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [int]$TimeoutMs = 1500
+    )
+    try {
+        $probeHost = ([System.Uri]$BaseUrl).Host
+    } catch { return $false }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $wait = $client.ConnectAsync($probeHost, 443).Wait($TimeoutMs)
+        return ($wait -and $client.Connected)
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+# huggingface.co first, then the mirror: some machines cannot reach the origin at all and others can
+# only reach the origin. A partial download, or one whose hash does not match, is DELETED - never
+# kept as if it were the direction. An endpoint that does not answer the probe is skipped outright,
+# and one that answers gets a short first attempt, so "no route" costs ~1 s and "reachable but
+# stalling" costs 8 s rather than minute-and-a-half of retries before the mirror is even tried.
+function Get-UncensorDirectionVector {
+    $spec = Get-UncensorVectorSpec
+    $path = Get-UncensorVectorPath
+    if (Test-UncensorVectorCurrent) { return $path }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+    $attempts = 0
+    foreach ($origin in @('https://huggingface.co', 'https://hf-mirror.com')) {
+        if (-not (Test-EndpointReachable -BaseUrl $origin)) {
+            Write-Host "连不上，跳过 / no route to $origin, going straight to the next endpoint" -ForegroundColor DarkGray
+            continue
+        }
+        $url = "$origin/$($spec.Repo)/resolve/main/$($spec.File)"
+        Write-Host "获取方向文件 / Fetching the direction vector: $url" -ForegroundColor DarkGray
+        # The origin gets one short attempt because it is the one that may be a black hole; the
+        # mirror, once reached, is worth the downloader's full retry ladder.
+        $attempts++
+        $isOrigin = $origin -eq 'https://huggingface.co'
+        try {
+            Invoke-ModelFileDownload -Url $url -Destination $path -Label $spec.File `
+                -MaximumAttempts $(if ($isOrigin) { 1 } else { 3 }) `
+                -AttemptTimeoutMs $(if ($isOrigin) { 8000 } else { 30000 })
+        } catch {
+            Write-Host "该来源失败，尝试下一个 / this endpoint failed, trying the next one: $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+        if (Test-UncensorVectorCurrent) { return $path }
+        Write-Host "校验和不匹配，已删除 / sha256 mismatch, discarded" -ForegroundColor Yellow
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+    if ($attempts -eq 0) {
+        Write-Host '两个来源都连不上 / neither endpoint answered, so no vector could be fetched' -ForegroundColor Yellow
+    }
+    return ''
+}
+
+function Show-UncensorNotice {
+    Write-Host ''
+    Write-Host '去审查投影 / Uncensor (refusal-direction projection)' -ForegroundColor Yellow
+    Write-Host '  只支持 Qwen3.8-Flash-Next（qwen4exp）；给别的模型指定方向文件会直接启动失败，不会被静默忽略。' 
+    Write-Host '  Supported on Qwen3.8-Flash-Next (qwen4exp) ONLY; naming a file for another model fails startup.'
+    Write-Host '  它移除的是模型训练出来的拒绝行为：本服务器之后回答什么由你负责，安全、合规与法律风险自行承担，'
+    Write-Host '  模型许可证的使用条款仍然适用。开启即视为同意。默认：关闭。'
+    Write-Host '  It REMOVES A TRAINED REFUSAL: safety, compliance and legal risk are yours to carry, the model'
+    Write-Host '  licence still applies, and enabling it counts as consent. Default: OFF.'
+    Write-Host ''
+}
+
 function Get-BenchmarkEstimateArguments {
     if (-not (Test-Path -LiteralPath $infrPath -PathType Leaf) -or [string]::IsNullOrWhiteSpace($modelPath)) {
         return @()
@@ -3489,8 +3614,12 @@ function Invoke-WizardExecutionPlan {
             Write-Host "本地语音合成 API / Local speech synthesis API: http://$clientAddress/v1/audio/speech (WAV/PCM, CPU)" -ForegroundColor Cyan
         }
         if ($llmEnabled -and $serverVision) {
-            Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url data URI。' -ForegroundColor Cyan
-            Write-Host 'Vision chat enabled: send an image_url data URI in /v1/chat/completions content parts.' -ForegroundColor Cyan
+            Write-Host '视觉聊天已启用：在 /v1/chat/completions 的 content parts 中发送 image_url（data URI、裸 base64 或 http(s) URL）。' -ForegroundColor Cyan
+            Write-Host 'Vision chat enabled: send an image_url in /v1/chat/completions content parts — data URI, bare base64, or http(s) URL.' -ForegroundColor Cyan
+            if ($imageUrlAllowPrivate) {
+                Write-Host 'image_url 允许抓取本机与内网地址：这台服务器可以被请求指向私网。' -ForegroundColor Yellow
+                Write-Host 'image_url may address loopback and private hosts: a request can point this server into your network.' -ForegroundColor Yellow
+            }
         }
         Write-Host '按 Ctrl+C 停止服务器。Press Ctrl+C to stop the server.' -ForegroundColor Yellow
     } elseif ($launchMode -eq 'chat') {
@@ -3764,10 +3893,19 @@ if ([string]::Equals($sessionCacheDir, $legacySessionCacheDir, [System.StringCom
 $sessionIdleSecs = [string](Get-SavedValue 'session_idle_secs' '120')
 $sessionCacheMax = [string](Get-SavedValue 'session_cache_max' '5GiB')
 $sessionCacheTtlHours = [string](Get-SavedValue 'session_cache_ttl_hours' '24')
+$kvRamCacheMax = [string](Get-SavedValue 'kv_ram_cache_max' '')
+$kvPagedCacheMax = [string](Get-SavedValue 'kv_paged_cache_max' '')
+# The tree and its RAM frame pool are two choices now. A state file from before `kv_paged_tree`
+# asked for a pool whenever it named one, so a saved size still implies the tree.
+$kvPagedTree = [bool](Get-SavedValue 'kv_paged_tree' ([bool]$kvPagedCacheMax))
+$kvPagedPageTokens = [string](Get-SavedValue 'kv_paged_page_tokens' '')
 $serverAuth = [bool](Get-SavedValue 'server_auth' $false)
 $serverApiKey = ''
 $serverVision = [bool](Get-SavedValue 'server_vision' $false)
 $visionProjectorPath = [string](Get-SavedValue 'vision_projector' '')
+# A state file from before this key asked for nothing of the sort, and the engine default is the
+# closed one — so an absent key means private image URLs stay refused, never an accidental open.
+$imageUrlAllowPrivate = [bool](Get-SavedValue 'image_url_allow_private' $false)
 $serverLlmEnabled = ([string](Get-SavedValue 'server_llm_enabled' $true) -ieq 'true')
 $serverEmbedding = ([string](Get-SavedValue 'server_embedding' $false) -ieq 'true')
 $embeddingModelPath = [string](Get-SavedValue 'embedding_model' '')
@@ -3816,9 +3954,12 @@ if (-not $reuseSavedSettings) {
         }
         $serverVision = Read-YesNo -Label '启用视觉图片理解？/ Enable image understanding?' -Default $serverVision
         if ($serverVision) {
-            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片请使用 data URI 或 base64。' -ForegroundColor DarkGray
-            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images must be data URIs or base64.' -ForegroundColor DarkGray
+            Write-Host '视觉权重按图片请求从 SSD 临时载入统一显存，处理完全部图片后立即释放。API 图片可用 data URI、裸 base64，或 http(s) URL。' -ForegroundColor DarkGray
+            Write-Host 'Vision weights use request-scoped unified VRAM and are released after the image batch. API images may be data URIs, bare base64, or http(s) URLs.' -ForegroundColor DarkGray
             $visionProjectorPath = Select-VisionProjectorPath -Default $visionProjectorPath
+            Write-Host '抓取 URL 是服务端替客户端出网，所以上了三层界：单图 32 MiB、每跳 10 秒、且只允许公网可路由地址——回环、RFC1918、链路本地（云元数据端点就在 169.254.169.254）、CGNAT 与保留段全部拒绝。打开它就是把这台机器所在内网交给请求方探测，默认关。' -ForegroundColor DarkGray
+            Write-Host 'A URL fetch is the server going out on the caller''s behalf, so it is capped at 32 MiB and 10 s per hop, and only publicly routable addresses are allowed. Opening this hands your local network to whoever can send a request.' -ForegroundColor DarkGray
+            $imageUrlAllowPrivate = Read-YesNo -Label '允许 image_url 抓取本机或局域网地址（NAS、网络摄像头）？/ Allow image_url to fetch loopback or LAN hosts?' -Default $imageUrlAllowPrivate
         }
     }
     if ($launchMode -eq 'server') {
@@ -3891,6 +4032,7 @@ if (-not $reuseSavedSettings) {
             $vramBudget = Read-TextValue -Label '总显存预算 / Total VRAM budget' -Default $vramBudget
             $vramReserve = Read-TextValue -Label '额外显存保留 / Additional VRAM reserve' -Default $vramReserve
             $expertCache = Read-TextValue -Label 'GPU 专家缓存 / GPU expert cache' -Default $expertCache
+            Write-Host '留空＝自动：按物理内存标定——保守档＝当前空闲减 3 GiB，激进档＝总量减 13 GiB。Windows 的 commit 余量只记录、不绑定：系统托管的页面文件会在两次启动之间移动这条线，同一份 71.73 GiB 的 store 先见过 104.6 GB 的上限、又见过 116.8 GB，拿它标定等于拿将要变长的数丢吞吐。你把熔断的 commit 轴（device.mem_guard_headroom）显式打开时，自动档才改为留 2 GiB commit 余量。填了＝按你说的兑现，引擎不再替你缩减。/ Blank = automatic, sized from PHYSICAL RAM: conservative gives free-minus-3 GiB, aggressive total-minus-13 GiB. Commit headroom is reported, never obeyed, because a system-managed page file moves that line between launches. Arm the commit axis of the breaker (device.mem_guard_headroom) and the automatic store leaves 2 GiB of commit slack instead. A value is honored verbatim; the engine does not trim it for you.' -ForegroundColor DarkGray
             $ramBudget = Read-TextValue -Label '进程总 RAM 预算，0 为禁用 RAM tier / Total process RAM budget, 0 disables RAM tier' -Default $ramBudget
             $hostDma = Read-YesNo -Label '启用 RAM 到 VRAM Host DMA？/ Enable RAM-to-VRAM Host DMA?' -Default $hostDma
             $pagerRing = Read-TextValue -Label 'Pager staging ring，留空为自动 / Pager staging ring, blank for auto' -Default $pagerRing
@@ -4001,6 +4143,83 @@ if (-not $reuseSavedSettings) {
         }
     }
     if ($launchMode -eq 'server') {
+        # The paged/RAM KV tiers are LLM concepts; the author's module interview can now produce an
+        # audio-only server with no LLM, so gate these prompts exactly like the KV prompts above.
+        if ($llmEnabled) {
+        $kvPagedTree = Read-YesNo -Label '改用地基树分页 KV 前缀缓存（试验性，零拷贝帧共享，命中只改写页表）？/ Use the paged radix-frame KV prefix cache instead (experimental, zero-copy frame sharing; a hit rewrites page tables)?' -Default $kvPagedTree
+        # The tree IS the segmented KV layout, and that layout only exists on a Q8_0/Q8_0 cache with
+        # the RAM overflow off. A manual KV choice outside that pair therefore meant a command line
+        # the engine refused to boot, so resolve the conflict here the same way the mutually
+        # exclusive RAM/SSD tiers below already do.
+        if ($kvPagedTree -and -not (Test-PagedKvEligible -Preset $kvPreset -TypeK $kvTypeK -TypeV $kvTypeV -Overflow $kvOverflow)) {
+            $treeBlocker = if ($kvOverflow) { 'KV overflow is on' } else { "KV is $kvTypeK/$kvTypeV" }
+            Write-Host "分页树只建立在 Q8_0/Q8_0 动态分段 KV 上：$treeBlocker，已关闭分页树而不是让启动失败。" -ForegroundColor Yellow
+            Write-Host "The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout; $treeBlocker, so it was turned off instead of refusing at startup. Pick KV auto/Q8 and keep overflow off to use it." -ForegroundColor DarkGray
+            $kvPagedTree = $false
+            $kvPagedCacheMax = ''
+            $kvPagedPageTokens = ''
+        }
+        if ($kvPagedTree) {
+            # One prerequisite the wizard cannot test: the corridor is claimed from the unified VRAM
+            # arena, and a session whose experts all loaded resident never builds one. Say so before
+            # the operator commits, since the startup refusal now names the same condition.
+            Write-Host '前置条件：Qwen3.5/3.6/3.8 架构、Q8_0/Q8_0 KV、kv.dynamic 开启、且存在统一显存 arena（专家被分页才会建立；整机全部常驻的显存充裕设备没有 arena）。不满足时启动会拒绝并逐条列出未满足的条件。' -ForegroundColor Yellow
+            Write-Host 'Prerequisites: a Qwen3.5/3.6/3.8 model, Q8_0/Q8_0 KV, kv.dynamic on, and a unified VRAM arena (it is only built when MoE experts are paged - a fully resident model on a roomy device has none). A startup that misses a prerequisite now lists exactly which.' -ForegroundColor DarkGray
+            # The tree and its host-RAM frame pool are separate choices: with no pool every frame
+            # stays inside the VRAM corridor and a cold prefix evicts instead of sinking. The
+            # corridor is sized to the LIVE sessions' own context, so without a pool several
+            # conversations evict exactly the chain the next request would hit and every revisit
+            # reports cached_tokens=0. Recommend the pool on a fresh install; a reconfiguration
+            # keeps whatever the operator saved (an explicit decline saves an empty cap).
+            Write-Host '推荐开启 RAM 帧池：显存走廊只装得下活跃会话自己的上下文，没有帧池时几个会话的 KV 加起来超过走廊就会互相驱逐，交替请求永远命中不了（cached_tokens=0）。实测三个会话各 1812 token、ctx 4096：开 2GiB 帧池后回访命中 1792/1812（98.9%），单次耗时从约 1200ms 降到约 190ms。' -ForegroundColor Yellow
+            Write-Host 'Recommended: the VRAM corridor only holds the live sessions own context, so without a frame pool several conversations evict exactly the chain the next request would hit and every revisit reports cached_tokens=0. Measured with three 1812-token conversations at ctx 4096: a 2GiB pool gives 1792/1812 (98.9%) reuse on revisit and cuts a request from ~1200ms to ~190ms.' -ForegroundColor DarkGray
+            $ramPoolDefault = if ($null -eq $script:Saved) { $true } else { [bool]$kvPagedCacheMax }
+            $kvPagedRamPool = Read-YesNo -Label '为分页树分配 RAM 帧池（推荐；显存走廊放不下的冷前缀整链 DMA 下沉到内存、命中再换回）？/ Give the paged tree a host-RAM frame pool (recommended; cold chains the VRAM corridor cannot hold DMA down and promote back on a hit)?' -Default $ramPoolDefault
+            if ($kvPagedRamPool) {
+                if (-not $kvPagedCacheMax) { $kvPagedCacheMax = '16GiB' }
+                Write-Host '帧按实际下沉量惰性增长、开机不预占，也不从专家 store 的额度里预扣——分页树建立时按当时的空闲物理内存夹紧帧数（留 1 GiB 不花），夹不住的冷前缀直接逐出、不再下沉。/ Frames grow lazily with actual demotions, reserve nothing at boot and are no longer pre-carved from the expert store budget: on Windows the paged tree clamps the frame count against the free physical RAM it sees, leaving 1 GiB unspent, and a cold prefix that cannot fit evicts instead of sinking.' -ForegroundColor DarkGray
+                $kvPagedCacheMax = Read-TextValue -Label '分页 KV 的 RAM 帧池上限 / Paged KV RAM frame-pool cap' -Default $kvPagedCacheMax -Required
+            } else {
+                $kvPagedCacheMax = ''
+                Write-Host '不分配 RAM 帧池：树只使用显存帧走廊，冷前缀直接逐出、不再下沉。多个会话的 KV 加起来超过走廊时会互相驱逐，交替请求的复用率会是 0；只有单个会话在走廊内重放才命中。混合递归模型续接所需的状态快照仍保留 512 MiB 主机内存上限，按快照逐个分配、不预占。' -ForegroundColor Yellow
+                Write-Host 'No RAM frame pool: every frame stays in the VRAM corridor and cold prefixes evict instead of sinking. Once several conversations hold more KV than the corridor they evict each other, so alternating requests reuse nothing; only a single conversation replayed inside the corridor hits. Recurrent/PLE state snapshots keep a 512 MiB host cap, claimed one snapshot at a time.' -ForegroundColor DarkGray
+                Write-Host '没有 RAM 帧池时磁盘帧层不生效：冷链不经过内存就无法落到磁盘。No disk frame tier without a pool: a cold chain cannot reach the file without a host frame to sink through.' -ForegroundColor DarkGray
+            }
+            if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
+            $kvPagedPageTokens = Read-TextValue -Label '每帧 token 数（2 的幂，如 64；越小共享越细、重算尾巴越短）/ Tokens per frame (power of two, e.g. 64; smaller shares finer with shorter recompute tails)' -Default $kvPagedPageTokens -Required
+            Write-Host '试验性特性：分页走廊占用全部 KV 显存（会话与缓存树共用，不再为每个会话单独保留 KV）。' -ForegroundColor Yellow
+            Write-Host 'Experimental: the frame corridor claims the FULL KV VRAM space (resident sessions and the cache tree share it; no per-slot KV reserve).' -ForegroundColor DarkGray
+            Write-Host '命中只到帧边界，尾帧重算；多模态会话不入树；与 MTP 联用未验收（draft 状态在树恢复时丢弃，且 draft KV 在走廊之外另占显存），建议关闭 MTP。' -ForegroundColor Yellow
+            Write-Host 'Hits are frame-aligned (tail frame recomputed); multimodal sessions never enter the tree; the MTP combination is unvalidated (draft state is dropped on tree restore and the draft KV costs VRAM outside the corridor) - keep MTP off.' -ForegroundColor DarkGray
+            if ($kvRamCacheMax) {
+                Write-Host '分页缓存开启，RAM 基数树缓存已关闭（两者互斥）。The RAM blob cache was turned off: it is mutually exclusive with the paged cache.' -ForegroundColor Yellow
+                $kvRamCacheMax = ''
+            }
+            if ($serverSessionCache) {
+                Write-Host '分页缓存开启，磁盘会话缓存已关闭。The disk session cache was turned off because the paged cache is on.' -ForegroundColor Yellow
+                $serverSessionCache = $false
+            }
+        } else {
+            $kvPagedCacheMax = ''
+            $kvPagedPageTokens = ''
+        }
+        $kvRamCacheEnabled = $false
+        if (-not $kvPagedTree) {
+            $kvRamCacheEnabled = Read-YesNo -Label '改用内存基数树前缀缓存闲置 KV（不落盘，优先于 SSD）？/ Keep idle-session KV in a RAM radix-tree prefix cache instead (no disk, takes precedence over SSD)?' -Default ([bool]$kvRamCacheMax)
+        }
+        if ($kvRamCacheEnabled) {
+            if (-not $kvRamCacheMax) { $kvRamCacheMax = '16GiB' }
+            $kvRamCacheMax = Read-TextValue -Label 'RAM KV 缓存上限（绝对大小或内存百分比，如 16GiB / 25%）/ RAM KV cache limit (absolute size or percent, e.g. 16GiB / 25%)' -Default $kvRamCacheMax -Required
+            Write-Host '试验性特性：此缓存独立分配，不并入进程总 RAM 预算，会从专家 Host Store 的可用内存中挤占；自动策略或核显设备可能触发换页或内存分配失败，建议使用物理内存充裕的设备。' -ForegroundColor Yellow
+            Write-Host 'Experimental: this cache allocates OUTSIDE the process-wide RAM budget and competes with the expert host store; the auto strategy or iGPU devices may page or fail to allocate. Recommended on RAM-rich machines only.' -ForegroundColor DarkGray
+            if ($serverSessionCache) {
+                Write-Host 'RAM 缓存开启，磁盘会话缓存已关闭。The disk session cache was turned off because the RAM cache is on.' -ForegroundColor Yellow
+                $serverSessionCache = $false
+            }
+        } else {
+            $kvRamCacheMax = ''
+        }
+        }
         Write-Host "`nAPI 服务器 / API server" -ForegroundColor Cyan
         $serverAddr = Read-ListenAddress -Label '监听地址（IP:端口）/ Listen address (IP:port)' -Default $serverAddr
         $serverAuth = Read-YesNo -Label '启用 Bearer API key 鉴权？/ Enable Bearer API-key authentication?' -Default $serverAuth
@@ -4219,6 +4438,29 @@ if ($launchMode -eq 'server') {
     [void]$nativeArgs.Add('--addr'); [void]$nativeArgs.Add($serverAddr)
     if ($llmEnabled) {
         [void]$nativeArgs.Add('--parallel'); [void]$nativeArgs.Add($serverParallel)
+        # Reuse mode never re-runs the question campaign, so the eligibility the fresh path enforced
+        # while asking has to be enforced here too: a state file saved with F16 KV (or overflow) plus a
+        # tree would otherwise emit a command line the engine refuses to boot. Correcting $kvPagedTree
+        # before the state write also heals the saved profile.
+        if ($kvPagedTree -and -not (Test-PagedKvEligible -Preset $kvPreset -TypeK $kvTypeK -TypeV $kvTypeV -Overflow $kvOverflow)) {
+            $treeBlocker = if ($kvOverflow) { 'KV overflow is on' } else { "KV is $kvTypeK/$kvTypeV" }
+            Write-Host "分页树只建立在 Q8_0/Q8_0 动态分段 KV 上：$treeBlocker，已关闭分页树而不是让启动失败。" -ForegroundColor Yellow
+            Write-Host "The paged tree only exists on the dynamic segmented Q8_0/Q8_0 layout; $treeBlocker, so it was turned off instead of refusing at startup. Pick KV auto/Q8 and keep overflow off to use it." -ForegroundColor DarkGray
+            $kvPagedTree = $false
+            $kvPagedCacheMax = ''
+        }
+        if ($kvPagedTree) {
+            # `kv.paged` opens the tree; the host-RAM frame pool is a separate budget that only exists
+            # when the wizard named one. Pages must be smaller than the legacy 32K segment or the engine
+            # rejects the config, so a state file that predates the split still gets a usable geometry.
+            Add-SetArgument $nativeArgs 'kv.paged' 'true'
+            if (-not $kvPagedPageTokens) { $kvPagedPageTokens = '64' }
+            Add-SetArgument $nativeArgs 'kv.paged_page_tokens' $kvPagedPageTokens
+            if ($kvPagedCacheMax) { Add-SetArgument $nativeArgs 'kv.paged_cache_max' $kvPagedCacheMax }
+        }
+        if ($kvRamCacheMax) {
+            Add-SetArgument $nativeArgs 'kv.ram_cache_max' $kvRamCacheMax
+        }
         if ($serverSessionCache) {
             Add-SetArgument $nativeArgs 'kv.session_cache_dir' $sessionCacheDir
             Add-SetArgument $nativeArgs 'kv.session_idle_secs' $sessionIdleSecs
@@ -4230,6 +4472,9 @@ if ($launchMode -eq 'server') {
         }
         if ($serverVision) {
             [void]$nativeArgs.Add('--mmproj'); [void]$nativeArgs.Add($visionProjectorPath)
+            # Always emitted, both ways: an answer of No must also be able to turn off a value the
+            # operator set in infr.toml or the environment, exactly like the other boolean switches.
+            Add-SetArgument $nativeArgs 'vision.image_url_allow_private' $imageUrlAllowPrivate.ToString().ToLowerInvariant()
         }
     }
     if ($serverEmbedding) {
@@ -4239,12 +4484,40 @@ if ($launchMode -eq 'server') {
     Add-TranscriptionArguments -Arguments $nativeArgs -Settings $transcription
     Add-SpeechArguments -Arguments $nativeArgs -Settings $speech
 }
-if ($llmEnabled) { [void]$nativeArgs.Add($modelPath) }
-
-$commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
+# Uncensor: the architecture gate is the reasoning probe (only qwen4exp exposes low/medium/xhigh), so
+# a model the projection cannot apply to is never even asked about. A saved ON is reused WITHOUT
+# re-asking — the yes that saved it already carried the consent — but the notice is printed again,
+# because "what this server answers is on you" has to be visible on the run that does it. This sits
+# before the model path: a named file is the request for the projection, so handing it over IS the
+# opt-in, and it happens outside the manual-memory block so automatic profiles carry it too.
 if ($llmEnabled -and $null -ne $script:ModelReasoningProbe -and $script:ModelReasoningProbe.Async.IsCompleted) {
     [void](Get-ModelReasoningEfforts -ModelPath $modelPath)
 }
+$uncensorVector = [string](Get-SavedValue 'uncensor_vector' '')
+if ($launchMode -ne 'benchmark' -and (@($script:ReasoningProbeEfforts) -contains 'xhigh')) {
+    if ($uncensorVector) {
+        Show-UncensorNotice
+        Write-Host "沿用上次开启 / staying on from the last run: $uncensorVector" -ForegroundColor DarkGray
+    } elseif (-not $reuseSavedSettings) {
+        Show-UncensorNotice
+        if (Read-YesNo -Label '开启去审查投影？/ Enable the refusal-direction projection?' -Default $false) {
+            $fetched = Get-UncensorDirectionVector
+            if ($fetched) {
+                $uncensorVector = $fetched
+            } else {
+                Write-Host '未能取得方向文件，本次不开启 / no direction vector could be fetched; staying off' -ForegroundColor Yellow
+            }
+        }
+    }
+}
+if ($uncensorVector) {
+    Add-SetArgument $nativeArgs 'uncensor.vector' $uncensorVector
+    Write-Host '去审查投影：开 / uncensor: ON' -ForegroundColor Yellow
+}
+# An audio-only server has no LLM model path; only append it when the LLM is enabled.
+if ($llmEnabled) { [void]$nativeArgs.Add($modelPath) }
+
+$commandText = '& ' + (Format-PowerShellArgument $infrPath) + ' ' + (($nativeArgs | ForEach-Object { Format-PowerShellArgument $_ }) -join ' ')
 $state = [ordered]@{
     wizard_language = [string](Get-SavedValue 'wizard_language' '')
     wizard_theme = [string](Get-SavedValue 'wizard_theme' 'system')
@@ -4264,6 +4537,7 @@ $state = [ordered]@{
     bench_kind = $benchKind; bench_parallel = $benchParallel; manual_bench_kind = $manualBenchKind
     prompt_tokens = $promptTokens; gen_tokens = $genTokens
     depth_mode = $depthMode; depth_tokens = $depthTokens; reps = $reps; json_output = $jsonOutput
+    uncensor_vector = $uncensorVector
     benchmark_upload = $script:BenchmarkUploadDefault
     benchmark_upload_has_github = $script:BenchmarkUploadHasGithubDefault
     benchmark_upload_gh_auth = $script:BenchmarkUploadGhAuthDefault
@@ -4283,8 +4557,11 @@ $state = [ordered]@{
     server_addr = $serverAddr; server_parallel = $serverParallel; server_auth = $serverAuth
     server_session_cache = $serverSessionCache; session_cache_dir = $sessionCacheDir
     session_idle_secs = $sessionIdleSecs; session_cache_max = $sessionCacheMax
-    session_cache_ttl_hours = $sessionCacheTtlHours
+    session_cache_ttl_hours = $sessionCacheTtlHours; kv_ram_cache_max = $kvRamCacheMax
+    kv_paged_cache_max = $kvPagedCacheMax; kv_paged_page_tokens = $kvPagedPageTokens
+    kv_paged_tree = $kvPagedTree
     server_vision = $serverVision; vision_projector = $visionProjectorPath
+    image_url_allow_private = $imageUrlAllowPrivate
     server_llm_enabled = $serverLlmEnabled
     server_embedding = $serverEmbedding; embedding_model = $embeddingModelPath
     embedding_idle_timeout = $embeddingIdleTimeout

@@ -622,6 +622,274 @@ pub(crate) fn parse_bare_json_call(text: &str) -> Option<ToolCall> {
 }
 
 // ---------------------------------------------------------------------------
+// Progressive tool-call reading (streaming argument deltas)
+// ---------------------------------------------------------------------------
+
+/// The two key names a JSON-dialect call carries its arguments under: Hermes/Qwen use `arguments`,
+/// Llama-3.x's template uses `parameters`.
+const ARGS_KEYS: [&str; 2] = ["arguments", "parameters"];
+
+/// The XML-parameter dialect's tags, assembled rather than spelled out here: this module already
+/// documents that markup once, and a second verbatim copy in a second parser is how the two drift.
+fn tag(name: &str, closing: bool) -> String {
+    if closing {
+        format!("</{name}>")
+    } else {
+        format!("<{name}=")
+    }
+}
+
+/// Read a tool-call region that is STILL BEING GENERATED: `(name, arguments_prefix)`.
+///
+/// `name` is `Some` as soon as the call's name is readable. `arguments_prefix` grows one completed
+/// member at a time and is contractually a **byte prefix** of the canonical `arguments` JSON that the
+/// finished call carries, which is what lets a consumer ship it as `function_call_arguments.delta`
+/// fragments and then top up with `full[prefix.len()..]` once
+/// [`crate::stream::ChatStream::finish`] delivers the authoritative call. Nothing is invented: an
+/// unclosed object has no trailing brace, a half-written value contributes nothing, and a shape we
+/// cannot canonicalize returns `(None, "")` so that call stays whole-delivery exactly as before.
+///
+/// Covered: the JSON body dialects (Hermes/Qwen between the call tags, Llama-3.x bare) and the
+/// XML-parameter dialect Qwen3.5/3.6 templates mandate. Not covered on purpose: the pipe-marker and
+/// Ling dialects, and a JSON call whose `arguments` is an embedded JSON *string* — `finish()`
+/// re-parses that string, so its raw quoted text is not a prefix of the canonical value.
+///
+/// One residual way to break the contract: a call that repeats an argument key. The finished map is
+/// last-wins, so a member already streamed would rebind. The emitter stops at the duplicate instead
+/// of inventing a replacement, so consumers must treat the finished call's `arguments` as
+/// authoritative and only ever EXTEND what streamed, never rewrite it.
+///
+/// `final_text` says the body can grow no further (the stream ended). It is what lets an EMPTY
+/// argument object emit its closing brace: mid-stream, `{}` cannot be told apart from a string-encoded
+/// `arguments` truncated one byte in — and `{` is not a prefix of the re-parsed value that form
+/// produces, so the brace waits for the certainty instead of risking a retract.
+pub fn tool_call_progress(body: &str, final_text: bool) -> (Option<String>, String) {
+    let t = body.trim_start();
+    if let Some(rest) = t.strip_prefix(HERMES_OPEN) {
+        return hermes_progress(rest, final_text);
+    }
+    if t.starts_with('{') {
+        return json_progress(t, final_text);
+    }
+    (None, String::new())
+}
+
+/// The body from after the call opener onward. Truncating at the close marker is what makes the XML
+/// dialect's member list knowable: that parser keeps picking up `parameter` blocks anywhere in the
+/// body it is handed, so only the tags bound what `finish()` will produce.
+fn hermes_progress(body: &str, final_text: bool) -> (Option<String>, String) {
+    let (inner, closed) = match body.find(HERMES_CLOSE) {
+        Some(i) => (&body[..i], true),
+        None => (body, false),
+    };
+    let complete = closed || final_text;
+    let inner = inner.trim_start();
+    let (name, args) = json_progress(inner, complete);
+    if name.is_some() || !args.is_empty() {
+        return (name, args);
+    }
+    let Some(rest) = inner.strip_prefix(&tag("function", false)) else {
+        return (None, String::new());
+    };
+    let (name, mut args) = xml_progress(rest);
+    match &name {
+        Some(_) if complete && !args.ends_with('}') => args.push('}'),
+        Some(_) => {}
+        None => args.clear(),
+    }
+    (name, args)
+}
+
+/// The JSON body dialects, member by member. A member counts only once its terminating delimiter has
+/// arrived, so the accumulated text is always a prefix of the object `finish()` will serialize.
+///
+/// `final_text` is whether the caller knows this body is all the model will write for this call (its
+/// close tag arrived, or the stream ended). It only decides whether an empty argument object may emit
+/// its closing brace — see [`tool_call_progress`].
+fn json_progress(text: &str, final_text: bool) -> (Option<String>, String) {
+    let s = text.as_bytes();
+    if s.first() != Some(&b'{') {
+        return (None, String::new());
+    }
+    let mut name: Option<String> = None;
+    let mut args = String::new();
+    let mut have_args = false;
+    let mut i = skip_ws(s, 1);
+    loop {
+        while s.get(i) == Some(&b',') {
+            i = skip_ws(s, i + 1);
+        }
+        if i >= s.len() || s[i] == b'}' {
+            break;
+        }
+        let Some((key, after_colon)) = strict_key(s, i) else {
+            break;
+        };
+        let vs = skip_ws(s, after_colon);
+        if ARGS_KEYS.contains(&key.as_str()) {
+            match object_progress(s, vs) {
+                // An open arguments object is as far as this body can be read, but a closed one is
+                // not: models that put `name` last still have to reach it, or the call would stream
+                // no name at all.
+                Some((text, None)) => {
+                    args = text;
+                    have_args = true;
+                    break;
+                }
+                Some((text, Some(next))) => {
+                    args = text;
+                    have_args = true;
+                    i = skip_ws(s, next);
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let Some((value, next)) = complete_value(s, vs) else {
+            break;
+        };
+        // A name is a quoted string, exactly as `finish()` requires: an unquoted one parses here but
+        // not there, and a prefix of a call that will never arrive is worse than no stream. Other
+        // members only have to be complete — a numeric sibling must not stop the scan.
+        if key == "name" {
+            match value.as_str().filter(|_| s.get(vs) == Some(&b'"')) {
+                Some(text) => name = Some(text.to_owned()),
+                None => break,
+            }
+        }
+        i = skip_ws(s, next);
+    }
+    (
+        name,
+        if have_args && (final_text || args != "{}") {
+            args
+        } else {
+            String::new()
+        },
+    )
+}
+
+/// The XML-parameter dialect's members, one per COMPLETED parameter: that parser trims every value, so
+/// a parameter's text is only knowable once its close tag has arrived.
+fn xml_progress(rest: &str) -> (Option<String>, String) {
+    let Some(name_end) = rest.find('>') else {
+        return (None, String::new());
+    };
+    let name = rest[..name_end].trim();
+    if name.is_empty() {
+        return (None, String::new());
+    }
+    let (open, close) = (tag("parameter", false), tag("parameter", true));
+    let mut body = &rest[name_end + 1..];
+    let mut out = String::from("{");
+    let mut keys: Vec<&str> = Vec::new();
+    while let Some(start) = body.find(&open) {
+        let after = &body[start + open.len()..];
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
+        let key = after[..key_end].trim();
+        let values = &after[key_end + 1..];
+        let Some(end) = values.find(&close) else {
+            break;
+        };
+        if key.is_empty() || keys.contains(&key) {
+            break;
+        }
+        let raw = values[..end].trim();
+        keys.push(key);
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(key).unwrap_or_default());
+        out.push(':');
+        let value =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        out.push_str(&serde_json::to_string(&value).unwrap_or_default());
+        body = &values[end + close.len()..];
+    }
+    (Some(name.to_owned()), out)
+}
+
+/// A strict JSON object key at `i` — a double-quoted string followed by `:` — returning the unescaped
+/// key and the index after the colon. Single-quoted and bare keys are rejected because `serde_json`
+/// rejects the whole body that contains them, and a streamed prefix must stay a prefix of what
+/// `finish()` actually produces.
+fn strict_key(s: &[u8], i: usize) -> Option<(String, usize)> {
+    if s.get(i) != Some(&b'"') {
+        return None;
+    }
+    let (key, next) = parse_value(s, i, 0)?;
+    let text = key.as_str()?.to_owned();
+    let colon = skip_ws(s, next);
+    (s.get(colon) == Some(&b':')).then_some((text, colon + 1))
+}
+
+/// [`parse_value`] is deliberately lenient — text that simply runs out still yields a best-effort
+/// value — so a value only counts as complete when a delimiter follows it. Without that rule the tail
+/// of a half-written string or number would stream out as if it were final.
+fn complete_value(s: &[u8], i: usize) -> Option<(Value, usize)> {
+    let (value, next) = parse_value(s, i, 0)?;
+    let d = skip_ws(s, next);
+    (d < s.len() && matches!(s[d], b',' | b'}' | b']')).then_some((value, next))
+}
+
+/// The canonical-text prefix of the object at `vs`: `{`, then one `,"key":value` per completed
+/// member, then `}` once the object's own brace arrives. `None` = not an object this module can
+/// canonicalize (string-encoded arguments, an array, a scalar, malformed) → stream nothing. The
+/// second field is the index past the closing brace, or `None` while the object is still open.
+///
+/// Each member's value is re-parsed by serde from the exact span it occupies, which is the same span
+/// serde reads when it parses the finished object — so the pair appended here is byte-identical to the
+/// pair in the final `arguments`, key order included (`serde_json` maps keep insertion order).
+fn object_progress(s: &[u8], vs: usize) -> Option<(String, Option<usize>)> {
+    if s.get(vs) != Some(&b'{') {
+        return None;
+    }
+    let mut out = String::from("{");
+    let mut keys: Vec<String> = Vec::new();
+    let mut i = skip_ws(s, vs + 1);
+    loop {
+        while s.get(i) == Some(&b',') {
+            i = skip_ws(s, i + 1);
+        }
+        match s.get(i) {
+            None => return Some((out, None)),
+            Some(b'}') => {
+                out.push('}');
+                return Some((out, Some(i + 1)));
+            }
+            Some(_) => {}
+        }
+        let (key, after_colon) = match strict_key(s, i) {
+            Some(pair) => pair,
+            // The object opened, so `{` is already a valid prefix: stop rather than retract it.
+            None => return Some((out, None)),
+        };
+        let start = skip_ws(s, after_colon);
+        let (_, next) = match complete_value(s, start) {
+            Some(pair) => pair,
+            None => return Some((out, None)),
+        };
+        let value = match serde_json::from_slice::<Value>(&s[start..next]) {
+            Ok(value) => value,
+            Err(_) => return Some((out, None)),
+        };
+        if keys.contains(&key) {
+            return Some((out, None)); // a repeat rebinds a member already streamed: stop here
+        }
+        keys.push(key.clone());
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push_str(&serde_json::to_string(&key).unwrap_or_default());
+        out.push(':');
+        out.push_str(&serde_json::to_string(&value).unwrap_or_default());
+        i = skip_ws(s, next);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Reasoning split (`<think>…</think>`)
 // ---------------------------------------------------------------------------
 
@@ -913,6 +1181,89 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 262_144, "every case must have returned");
+    }
+
+    /// Growing a call one byte at a time must only ever EXTEND the streamed arguments, and the last
+    /// extension must be exactly the canonical `arguments` of the call `parse_any_tool_calls`
+    /// dispatches. That is the contract `ChatStream`'s progressive deltas, and the "send only the
+    /// remainder" logic that consumes them, both rest on.
+    #[test]
+    fn progressive_arguments_extend_to_the_finished_call() {
+        let (open, close) = (
+            "<".to_string() + "tool_call>",
+            "</".to_owned() + "tool_call>",
+        );
+        let (fn_open, fn_close) = ("<function".to_string() + "=", "</".to_owned() + "function>");
+        let (p_open, p_close) = (
+            "<parameter".to_string() + "=",
+            "</".to_owned() + "parameter>",
+        );
+        let cases = [
+            format!(
+                "{open}{{\"name\": \"run_bash\", \"arguments\": {{\"command\": \"ls -la\", \"timeout\": 30}}}}{close}"
+            ),
+            // The XML-parameter dialect Qwen3.5/3.6 templates mandate, values framed by newlines.
+            format!("{open}\n{fn_open}ls>\n{p_open}path\n.\n{p_close}\n{fn_close}\n{close}"),
+            format!(
+                "{open}\n{fn_open}lookup>\n{p_open}query\n\u{4e2d}\u{6587} \"quoted\"\n{p_close}\n{p_open}limit\n5\n{p_close}\n{fn_close}\n{close}"
+            ),
+            "{\"name\":\"f\",\"parameters\":{\"x\":[1,2,{\"y\":null}]}}".to_string(),
+            "{\"arguments\":{\"a\":1},\"name\":\"f\"}".to_string(),
+        ];
+        for text in cases {
+            let (_clean, calls) = parse_any_tool_calls(&text);
+            assert_eq!(calls.len(), 1, "{text:?}");
+            let final_args = serde_json::to_string(&calls[0].arguments).unwrap();
+            let mut seen = String::new();
+            let mut named: Option<String> = None;
+            for i in 0..=text.len() {
+                if !text.is_char_boundary(i) {
+                    continue;
+                }
+                let (name, prefix) = tool_call_progress(&text[..i], i == text.len());
+                if let Some(had) = &named {
+                    assert_eq!(
+                        name.as_deref(),
+                        Some(had.as_str()),
+                        "the call name changed at byte {i} of {text:?}"
+                    );
+                }
+                if name.is_some() {
+                    named = name;
+                }
+                assert!(
+                    prefix.starts_with(&seen),
+                    "streamed arguments shrank at byte {i}: {seen:?} -> {prefix:?} of {text:?}"
+                );
+                assert!(
+                    final_args.starts_with(&prefix),
+                    "{prefix:?} at byte {i} is not a prefix of the finished {final_args:?}"
+                );
+                seen = prefix;
+            }
+            assert_eq!(
+                seen, final_args,
+                "the finished arguments were never streamed out for {text:?}"
+            );
+        }
+    }
+
+    /// The shapes a prefix cannot track — arguments arriving as an embedded JSON string, the
+    /// pipe-marker form, Ling pairs — must stream NO argument fragments, so they stay whole-call.
+    #[test]
+    fn untrackable_dialects_stream_no_arguments() {
+        let (open, close) = (
+            "<".to_string() + "tool_call>",
+            "</".to_owned() + "tool_call>",
+        );
+        for text in [
+            format!("{open}{{\"name\":\"f\",\"arguments\":\"{{\\\"a\\\":1}}\"}}{close}"),
+            "<".to_string() + "|tool_call>call:foo{x:<|\"|>1<|\"|>}<tool_call|>",
+            format!("{open}search<arg_key>q</arg_key><arg_value>hi</arg_value>{close}"),
+        ] {
+            let (_name, args) = tool_call_progress(&text, true);
+            assert!(args.is_empty(), "{text:?} streamed arguments {args:?}");
+        }
     }
 
     #[test]

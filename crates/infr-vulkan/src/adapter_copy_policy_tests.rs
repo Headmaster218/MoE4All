@@ -53,9 +53,16 @@ mod fixtures {
                             .collect();
                     }
                     let layout = layouts(rows);
+                    // The automatic policy now admits the same causal-Verify cohort as the explicit
+                    // opt-in (E2E-qualified: -4.8% cycle, committed text unchanged); every other
+                    // verify shape keeps the host-service boundary.
                     assert_eq!(
                         resident_copy_requested(None, &graph, &layout),
-                        !verify && (independent || rows == 1)
+                        if verify {
+                            !independent && (2..=4).contains(&rows)
+                        } else {
+                            independent || rows == 1
+                        }
                     );
                     assert!(!resident_copy_requested(Some(false), &graph, &layout));
                     assert_eq!(

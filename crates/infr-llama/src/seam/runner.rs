@@ -8,10 +8,11 @@ use super::sc::{
 use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use super::token_delivery::ParallelTokenCallback;
 use super::weights::{
-    alloc_segmented_plane, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W,
-    FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
-    MtpDeltaCkpt, QsaW, QwenHcW, QwenLayerHcW, QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights,
-    SegmentedKvState, SessionStable, TurnRecurrentCkpt,
+    alloc_segmented_plane, capture_paged_ckpt, AttnW, DeltaW, Dsv4CompressedW, Dsv4CompressorW,
+    Dsv4IndexerW, Dsv4W, FfnW, HcTriple, IndexerW, KdaQkvW, KdaW, LayerHcW, LayerW, MixerW, MlaW,
+    MoeSharedW, MtpDeltaCkpt, PagedFrontierCapture, QsaW, QwenHcW, QwenLayerHcW,
+    QwenMtpVerifyBuffers, QwenPleW, SeamKv, SeamWeights, SegmentedKvState, SessionStable,
+    TurnRecurrentCkpt, UncensorState,
 };
 use super::{
     common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, ParallelSampledOutput,
@@ -101,20 +102,69 @@ pub(crate) trait MtpPrefillHiddenSink {
     ) -> AResult<()>;
 }
 
+/// End of one batched-prefill chunk: the earliest TURN_CHECKPOINT boundary inside the ubatch, or
+/// the natural ubatch end.
+///
+/// `min_rows` is the layer-ring threshold (see [`prefill_uses_layer_ring`]): while a round PAID the
+/// ring reserve, a boundary that would starve the chunk below the threshold is skipped (the
+/// 2026-10-19 memory-bomb fix). Skipping is functionally free — recurrent checkpoints publish only
+/// when a chunk ends exactly on the boundary (`Some(cend) == boundary` at the snapshot sites), so a
+/// starved boundary simply degrades to "no reuse checkpoint this turn" instead of misaligning.
+/// Without it, a 160-token prompt was cut into 45+115-row chunks below every ring decision, the
+/// reserve was paid without the ring ever being used, and the gray chunks storm-missed hundreds of
+/// experts per layer through the emptied corridor into unbounded staging (~23 GiB/s of commit).
 fn prefill_chunk_end(
     start: usize,
     end: usize,
     rows: usize,
     checkpoint_boundaries: &[Option<usize>; super::TURN_CHECKPOINT_COUNT],
+    paged_frontier: Option<usize>,
+    min_rows: usize,
 ) -> usize {
     let natural_end = start.saturating_add(rows).min(end);
     checkpoint_boundaries
         .iter()
         .flatten()
         .copied()
-        .filter(|&boundary| start < boundary && boundary < natural_end)
+        .chain(paged_frontier)
+        .filter(|&boundary| {
+            start < boundary && boundary < natural_end && boundary.saturating_sub(start) >= min_rows
+        })
         .min()
         .unwrap_or(natural_end)
+}
+
+/// Floor `value` down to a multiple of `page` (a zero `page` disables segmentation).
+fn page_floor(value: usize, page: usize) -> usize {
+    if page == 0 {
+        value
+    } else {
+        value - value % page
+    }
+}
+
+/// The page-aligned position a chunked prefill of `prompt_len` tokens stops at: every prefill path
+/// leaves the final prompt token to the decode loop, so the deepest state the chunk loop ever
+/// produces is `prompt_len - 1`. Rounded down to the page, that is the only boundary whose
+/// recurrent/PLE snapshot and whose frame chain describe the SAME tokens — which is what a radix
+/// entry needs to resume a later request without replaying the prefill.
+///
+/// Gated on a paged slot and a recurrent model: a pure-attention model needs no aux (its frames are
+/// the whole state) and a non-paged slot publishes nothing. `above` is the already-cached prefix —
+/// a frontier at or below it would capture state the prefill never produced.
+fn paged_frontier_pos(
+    cfg: &Config,
+    paged: bool,
+    page_tokens: usize,
+    prompt_len: usize,
+    above: usize,
+    max_ctx: usize,
+) -> Option<usize> {
+    if !paged || page_tokens == 0 || !(cfg.qwen35 || cfg.qwen4exp || cfg.bailingmoe3) {
+        return None;
+    }
+    let frontier = page_floor(prompt_len.saturating_sub(1), page_tokens);
+    (frontier > above && frontier <= max_ctx).then_some(frontier)
 }
 
 fn prefill_runtime_candidates(
@@ -145,6 +195,19 @@ fn prefill_runtime_candidates(
             (rows, reserve)
         })
         .collect()
+}
+
+/// Chunk height where one row-slot stops touching more experts than `3 * n_expert` amortizes a
+/// full-layer ring pass — the SAME threshold [`prefill_chunk_end`] must not starve below on a paid
+/// round, and the Vulkan adapter's per-graph `moe_static_phase` boundary. Kept as one expression
+/// so the gate, the chunker and the adapter can never disagree again (2026-10-19 conviction: they
+/// disagreed through the prompt LENGTH vs the actual CHUNK rows and starved the ring).
+pub(crate) fn ring_min_rows(c: &Config) -> Option<usize> {
+    c.moe.map(|moe| {
+        3usize
+            .saturating_mul(moe.n_expert)
+            .div_ceil(moe.n_used.max(1))
+    })
 }
 
 fn prefill_uses_layer_ring(c: &Config, remaining: usize, ubatch: usize) -> bool {
@@ -800,6 +863,11 @@ fn recurrent_extension_start(cached: &[u32], prompt: &[u32]) -> Option<usize> {
 pub(crate) struct PreparedParallelPrompt {
     pub(crate) start: usize,
     pub(crate) checkpoint_boundaries: [Option<usize>; super::TURN_CHECKPOINT_COUNT],
+    /// Paged tier (hybrid recurrent models): the page-aligned prefill position at which this
+    /// request's chunk loop should download the live recurrent/PLE state for the radix entry this
+    /// prefill publishes. `None` on a non-paged slot, a pure-attention model, or when the frontier
+    /// lies at or below the already-cached prefix.
+    pub(crate) paged_frontier: Option<usize>,
 }
 
 /// Prepare one recurrent slot for a layer-synchronous prefill cohort. This mirrors the ordinary
@@ -848,6 +916,8 @@ fn prepare_parallel_prompt_state(
             for checkpoint in kv.turn_recurrent_ckpts.iter_mut().flatten() {
                 checkpoint.invalidate();
             }
+            // A divergent prompt may not publish last turn's host snapshot against this token spine.
+            kv.paged_frontier = None;
             kv.cached.clear();
             0
         }
@@ -871,13 +941,29 @@ fn prepare_parallel_prompt_state(
 
     let mut checkpoint_boundaries = [None; super::TURN_CHECKPOINT_COUNT];
     if let Some(checkpoint) = turn_checkpoint {
+        // Paged mode wants every publishable boundary on a page edge: the radix entry pairs the
+        // recurrent snapshot with `tokens.len() / page` frames, so an off-page boundary describes a
+        // token count the frame chain can never reach and would be rejected at publish. Flooring is
+        // lossless for the device checkpoints too — they publish only when a chunk ENDS on the
+        // boundary, and the chunker is handed the floored value. Non-paged slots keep the caller's
+        // exact semantic boundaries, unchanged.
+        let paged = kv.segmented_kv.paged.is_some();
+        let page = kv.segmented_kv.page_tokens;
         for (index, boundary) in checkpoint.boundaries().into_iter().enumerate() {
-            let boundary = boundary.filter(|&boundary| {
-                recurrent_model
-                    && boundary > start
-                    && boundary < prompt.len()
-                    && boundary <= kv.max_ctx
-            });
+            let boundary = boundary
+                .map(|boundary| {
+                    if paged {
+                        page_floor(boundary, page)
+                    } else {
+                        boundary
+                    }
+                })
+                .filter(|&boundary| {
+                    recurrent_model
+                        && boundary > start
+                        && boundary < prompt.len()
+                        && boundary <= kv.max_ctx
+                });
             checkpoint_boundaries[index] = boundary;
             if let Some(boundary) = boundary {
                 TurnRecurrentCkpt::begin(
@@ -892,10 +978,22 @@ fn prepare_parallel_prompt_state(
             }
         }
     }
+    // The prompt's own page-aligned frontier: the deepest state this request's prefill will produce,
+    // and the one snapshot a later request with the SAME prefix can attach to. Unlike the semantic
+    // turn checkpoints it needs no caller hint, so it exists whenever the slot is paged.
+    let paged_frontier = paged_frontier_pos(
+        c,
+        kv.segmented_kv.paged.is_some(),
+        kv.segmented_kv.page_tokens,
+        prompt.len(),
+        start,
+        kv.max_ctx,
+    );
     kv.cached.truncate(start);
     Ok(PreparedParallelPrompt {
         start,
         checkpoint_boundaries,
+        paged_frontier,
     })
 }
 
@@ -919,7 +1017,7 @@ pub(crate) fn prepare_parallel_prompt(
 /// per-token) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live unbound-Input
 /// panic at execute. The caller still binds the per-site pieces (hidden/tok_ids, positions,
 /// logits, sampling/h-tap/ipl/SC handles).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn bind_layer_io<'a>(
     b: &mut Bindings<'a>,
     h: &DecodeHandles,
@@ -935,6 +1033,8 @@ fn bind_layer_io<'a>(
     qwen_wide_buf: &'a Option<Box<dyn Buffer>>,
     ple_embd_buf: &'a Option<Box<dyn Buffer>>,
     ple_state_buf: &'a Option<Box<dyn Buffer>>,
+    uncensor_dirs_buf: Option<&'a dyn Buffer>,
+    uncensor_scale_buf: Option<&'a dyn Buffer>,
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
@@ -966,6 +1066,12 @@ fn bind_layer_io<'a>(
     }
     if let (Some(id), Some(buf)) = (h.ple_state, ple_state_buf) {
         b.bind(id, buf.as_ref());
+    }
+    if let (Some(id), Some(buf)) = (h.uncensor_dirs, uncensor_dirs_buf) {
+        b.bind(id, buf);
+    }
+    if let (Some(id), Some(buf)) = (h.uncensor_scale, uncensor_scale_buf) {
+        b.bind(id, buf);
     }
 }
 
@@ -1010,6 +1116,8 @@ fn bind_parallel_layer_io<'a>(
     primary_wide: &'a Option<Box<dyn Buffer>>,
     primary_ple_embd: &'a Option<Box<dyn Buffer>>,
     primary_ple_state: &'a Option<Box<dyn Buffer>>,
+    primary_uncensor_dirs: Option<&'a dyn Buffer>,
+    primary_uncensor_scale: Option<&'a dyn Buffer>,
     wide: Option<&'a dyn Buffer>,
     ple_embd: Option<&'a dyn Buffer>,
     peers: &'a [SeamKv],
@@ -1031,6 +1139,8 @@ fn bind_parallel_layer_io<'a>(
         primary_wide,
         primary_ple_embd,
         primary_ple_state,
+        primary_uncensor_dirs,
+        primary_uncensor_scale,
     );
     if let (Some(id), Some(buf)) = (h.qwen_wide, wide) {
         b.bind(id, buf);
@@ -1407,6 +1517,11 @@ pub(super) struct DecodeHandles {
     qwen_wide: Option<TensorId>,
     ple_embd: Option<TensorId>,
     ple_state: Option<TensorId>,
+    // The uncensor projection's pair of Input handles (`crates/infr-uncensor`): the session's layer
+    // directions and the 4-byte scale that switches the projection on or off per request. Both
+    // `None` unless a projection is loaded AND this plan's layer range contains a projected layer.
+    uncensor_dirs: Option<TensorId>,
+    uncensor_scale: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     mtp_k_trace: Vec<Option<TensorId>>,
@@ -1692,6 +1807,7 @@ fn finish_pending_seam_slot(
     v_fmt: DType,
     want_ctx: usize,
     kv_ring: bool,
+    uncensor: Option<&infr_uncensor::Projection>,
 ) -> AResult<SeamKv> {
     if let Some(layout) = segmented_layout {
         for layer in 0..cfg.n_layer {
@@ -1745,10 +1861,9 @@ fn finish_pending_seam_slot(
         vbufs,
         qsa_kbufs: pending.qsa_kbufs,
         qsa_cbufs: pending.qsa_cbufs,
-        segmented_kv: if segmented_layout.is_some() {
-            SegmentedKvState::enabled()
-        } else {
-            SegmentedKvState::default()
+        segmented_kv: match segmented_layout {
+            Some(layout) => SegmentedKvState::enabled(layout.page_tokens),
+            None => SegmentedKvState::default(),
         },
         k_fmt,
         v_fmt,
@@ -1766,10 +1881,17 @@ fn finish_pending_seam_slot(
         },
         ple_embd_buf: pending.ple_embd_buf,
         ple_state_buf: pending.ple_state_buf,
+        // A preallocated sibling starts with an empty KV, so it has no `ran` to inherit; the
+        // directions are the session's, re-uploaded into this slot's own buffer.
+        uncensor: uncensor
+            .map(|proj| UncensorState::new(be, proj.clone(), None))
+            .transpose()?,
         mtp_verify_bufs: pending.mtp_verify_bufs,
         max_ctx: want_ctx,
         kv_ring,
         cached: Vec::new(),
+        ledger_matches_kv: false,
+        image_cache_spans: Vec::new(),
         denoise_cache: None,
         self_cond_w: None,
         sc_embt: None,
@@ -1778,6 +1900,7 @@ fn finish_pending_seam_slot(
         sc_temp_inv_buf: None,
         mtp_delta_ckpt: pending.mtp_delta_ckpt,
         turn_recurrent_ckpts: pending.turn_recurrent_ckpts,
+        paged_frontier: None,
         preallocated_siblings: Vec::new(),
     })
 }
@@ -1805,6 +1928,45 @@ struct ParallelPrefillRequest<'a> {
     prepared: &'a [PreparedParallelPrompt],
     peer_stats: &'a mut Vec<GenStats>,
     on_progress: Option<&'a dyn Fn(usize, infr_core::GenerationProgress)>,
+}
+
+/// Uncensor (`crates/infr-uncensor`): honour this request's flag on every slot about to run.
+///
+/// Flipping is a 4-byte upload per slot (the projection is in the graph either way, see
+/// `Op::UncensorProject`), so the graph, the compiled plans and the pipeline caches all stay valid.
+/// What does NOT stay valid is the KV those slots already materialized: a warm prefix computed with
+/// the refusal direction projected out is not a prefix of a run that leaves it in. So a flip drops
+/// that slot's materialized tokens and its prompt prefills from row 0 — the same forced re-read
+/// llama.cpp (`--cvec-mode`) and Strata (`cvec_set_enabled`) do when the setting changes.
+///
+/// Invalidating is PER SLOT, because a slot's tokens are its own: a peer that has never run (a fresh
+/// sibling, or one restored from disk without a recorded setting) must not throw away a warm prefix
+/// the primary never invalidated. Peers are still included, since a parallel plan projects the shared
+/// wide residual once for all lanes with the primary's scale — a lane left on the other setting would
+/// be running a model its own sampler was not sampling from.
+fn uncensor_apply(
+    be: &dyn Backend,
+    primary: &mut SeamKv,
+    peers: &mut [SeamKv],
+    requested: Option<bool>,
+) -> anyhow::Result<()> {
+    let on = infr_uncensor::effective(requested, primary.uncensor.as_ref().and_then(|u| u.ran()));
+    let primary_flipped = match primary.uncensor.as_mut() {
+        Some(u) => u.select(be, on).map_err(|e| anyhow!("{e}"))?,
+        None => false,
+    };
+    if primary_flipped {
+        primary.reset();
+    }
+    for slot in peers.iter_mut() {
+        let Some(u) = slot.uncensor.as_mut() else {
+            continue;
+        };
+        if u.select(be, on).map_err(|e| anyhow!("{e}"))? {
+            slot.reset();
+        }
+    }
+    Ok(())
 }
 
 fn bind_parallel_mtp_traces<'a>(
@@ -2856,6 +3018,7 @@ pub(crate) fn generate_dense_backend_parallel_mtp_verify(
         .map(|start| PreparedParallelPrompt {
             start,
             checkpoint_boundaries: [None; super::TURN_CHECKPOINT_COUNT],
+            paged_frontier: None,
         })
         .collect::<Vec<_>>();
     let mut request = ParallelMtpVerifyRequest {
@@ -2963,7 +3126,7 @@ fn generate_dense_backend_inner(
     finish_fixed_allocations: Option<&dyn Fn() -> AResult<()>>,
     // Vision request plan. `None` keeps every existing text-only graph and upload unchanged.
     mm: Option<&crate::seam::MropePlan>,
-    parallel_decode: Option<&mut ParallelDecodeRequest<'_, '_>>,
+    mut parallel_decode: Option<&mut ParallelDecodeRequest<'_, '_>>,
     mut parallel_prefill: Option<&mut ParallelPrefillRequest<'_>>,
     parallel_mtp_verify: Option<&mut ParallelMtpVerifyRequest<'_>>,
     prepared_single: Option<PreparedParallelPrompt>,
@@ -3457,18 +3620,26 @@ fn generate_dense_backend_inner(
         let segmented_available = be.segmented_kv_available() || pager_deferred;
         let segmented_kv =
             crate::seam::segmented_kv_wanted(c, ec, kv_ring, k_fmt, v_fmt) && segmented_available;
-        if ec.kv.dynamic
-            && (c.qwen35 || c.qwen4exp)
-            && !kv_ring
-            && !ec.kv.overflow
-            && segmented_available
-            && !segmented_kv
+        if ec.kv.dynamic && (c.qwen35 || c.qwen4exp) && !kv_ring && !ec.kv.overflow && !segmented_kv
         {
-            tracing::info!(
-                k_dtype = ?k_fmt,
-                v_dtype = ?v_fmt,
-                "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
-            );
+            if !segmented_available {
+                // The one case no `kv.*` setting explains: the layout commits its segments from the
+                // unified arena, and a session whose experts all loaded resident never builds that
+                // arena. Silent here used to mean the operator met the refusal later, in
+                // `init_session_cache`, with nothing in the log pointing at the arena.
+                tracing::warn!(
+                    "dynamic segmented KV is unavailable: this session has no unified VRAM arena \
+                     (every MoE expert loaded resident), so KV stays flat and kv.paged / \
+                     kv.paged_cache_max / kv.ram_cache_max / kv.session_cache_dir cannot start \
+                     (reserve an expert cache with paging.cache to build the arena)"
+                );
+            } else {
+                tracing::info!(
+                    k_dtype = ?k_fmt,
+                    v_dtype = ?v_fmt,
+                    "dynamic KV currently requires Q8_0/Q8_0; using flat KV"
+                );
+            }
         }
         let want_ctx = if segmented_kv || pager_deferred {
             want_ctx
@@ -3476,7 +3647,7 @@ fn generate_dense_backend_inner(
             crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)
         };
         let segmented_layout = segmented_kv.then(|| {
-            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt)
+            SegmentedKvLayout::for_qwen(c, want_ctx, k_fmt, v_fmt, ec.kv.paged_page_tokens)
                 .expect("Qwen hybrid models have segmented KV geometry")
         });
 
@@ -3757,6 +3928,20 @@ fn generate_dense_backend_inner(
         } else {
             None
         };
+        // Uncensor (`crates/infr-uncensor`): STARTUP decides whether a projection exists at all.
+        // Resolved here, inside cold init, so a downloaded direction file is read once per session
+        // rather than once per request, and so a file that cannot be honoured stops the session
+        // instead of quietly running the model without the projection it was named for. No
+        // no `uncensor.vector` ⇒ none of this exists: no buffer, no op in the graph, no cost.
+        let uncensor = infr_uncensor::resolve(
+            &infr_uncensor::Config::from_config(&ec.uncensor),
+            c.qwen4exp,
+            ne,
+            c.n_layer,
+        )
+        .map_err(|e| anyhow!("{e}"))?
+        .map(|proj| UncensorState::new(be, proj, None))
+        .transpose()?;
         let ple_worker = super::ple::PleWorker::new(g, c, ec.kernels.ple_single_parallel)?
             .map(std::sync::Arc::new);
         let weights = std::sync::Arc::new(SeamWeights {
@@ -3783,6 +3968,7 @@ fn generate_dense_backend_inner(
                 v_fmt,
                 want_ctx,
                 kv_ring,
+                uncensor.as_ref().map(|u| &u.proj),
             )?);
         }
         // Host DMA imports are optional aliases, but on WDDM they share finite driver allocation
@@ -3797,10 +3983,9 @@ fn generate_dense_backend_inner(
             vbufs,
             qsa_kbufs,
             qsa_cbufs,
-            segmented_kv: if segmented_kv {
-                SegmentedKvState::enabled()
-            } else {
-                SegmentedKvState::default()
+            segmented_kv: match segmented_layout.as_ref() {
+                Some(layout) => SegmentedKvState::enabled(layout.page_tokens),
+                None => SegmentedKvState::default(),
             },
             k_fmt,
             v_fmt,
@@ -3811,10 +3996,13 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor,
             mtp_verify_bufs,
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
+            ledger_matches_kv: false,
+            image_cache_spans: Vec::new(),
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -3823,9 +4011,35 @@ fn generate_dense_backend_inner(
             sc_temp_inv_buf: None,
             mtp_delta_ckpt,
             turn_recurrent_ckpts,
+            paged_frontier: None,
             preallocated_siblings,
         });
     }
+    // Uncensor (`crates/infr-uncensor`): each REQUEST decides whether the projection is ON. Decided
+    // here — after cold init has created the buffers, before the prefix-diff below has read the
+    // cached tokens — because the answer changes what this slot's cached KV MEANS: a warm prefix of
+    // activations computed while projecting is not a prefix of a run that does not project, so a
+    // flip drops it and the prompt prefills again. That forced re-read is exactly what llama.cpp and
+    // Strata do when `cvec` flips, and it is the one thing a "just a device-side scalar" switch does
+    // not get for free. A pass that carries no request of its own (an MTP draft, a verifier step, a
+    // speculative re-forward) keeps running whatever the session is already running: verifying
+    // tokens sampled from a differently-projected model would be verifying the wrong model. A slot
+    // whose KV was restored from disk also counts as a flip, since the setting that produced those
+    // rows was never recorded.
+    let uncensor_peers: &mut [SeamKv] = match parallel_prefill.as_deref_mut() {
+        Some(p) => p.peers,
+        None => match parallel_decode.as_deref_mut() {
+            Some(d) => d.peers,
+            None => &mut [],
+        },
+    };
+    uncensor_apply(
+        be,
+        state.as_mut().expect("seam state just initialized"),
+        uncensor_peers,
+        req.and_then(|r| r.sampling().uncensor),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let parallel_prepared = if let Some(parallel) = parallel_prefill.as_deref_mut() {
         if !c.qwen4exp {
             return Err(anyhow!("parallel prefill currently supports qwen4exp only"));
@@ -3944,9 +4158,14 @@ fn generate_dense_backend_inner(
         qwen_wide_buf,
         ple_embd_buf,
         ple_state_buf,
+        uncensor,
         mtp_verify_bufs,
         max_ctx,
         cached,
+        ledger_matches_kv,
+        // Read only through `set_image_cache_spans` / `paged_cache_view`, both of which own the
+        // conversation-level lifecycle; the generation loop materializes REAL token ids.
+        image_cache_spans: _,
         denoise_cache,
         self_cond_w,
         sc_embt,
@@ -3955,12 +4174,17 @@ fn generate_dense_backend_inner(
         sc_temp_inv_buf,
         mtp_delta_ckpt,
         turn_recurrent_ckpts,
+        paged_frontier,
         preallocated_siblings: _,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
     } = state.as_mut().expect("seam state just initialized");
     let segmented_kv_enabled = segmented_kv.enabled;
+    // Uncensor: the two per-slot buffers are bound at every `bind_layer_io` site, so take shared
+    // references once here (the field itself stays untouched for the rest of the call).
+    let uncensor_dirs_buf: Option<&dyn Buffer> = uncensor.as_ref().map(|u| &*u.dirs_buf);
+    let uncensor_scale_buf: Option<&dyn Buffer> = uncensor.as_ref().map(|u| &*u.scale_buf);
     let SeamWeights {
         wbufs,
         wspecs,
@@ -3980,10 +4204,12 @@ fn generate_dense_backend_inner(
     // and decode. Adding it to the full prompt would count that tail twice. The parallel branch
     // below validates every lane against its current cached depth instead.
     if dense_request_exceeds_capacity(prompt.len(), max_new, max_ctx, parallel_decode.is_some()) {
-        return Err(anyhow!(
-            "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
-            prompt.len(),
-            max_new
+        return Err(anyhow::Error::new(
+            infr_core::error::ContextLengthExceeded {
+                prompt: prompt.len(),
+                max_new,
+                capacity: max_ctx,
+            },
         ));
     }
     macro_rules! ensure_kv_depth {
@@ -4164,15 +4390,43 @@ fn generate_dense_backend_inner(
     if let Some(prepared) = parallel_prepared.as_ref() {
         turn_checkpoint_boundaries = prepared[0].checkpoint_boundaries;
     } else if let Some(checkpoint) = turn_checkpoint {
+        // Same page-flooring rule as `prepare_parallel_prompt_state`: a paged slot may only publish
+        // a snapshot whose boundary is reachable by whole frames.
+        let paged = segmented_kv.paged.is_some();
+        let page = segmented_kv.page_tokens;
         for (index, boundary) in checkpoint.boundaries().into_iter().enumerate() {
-            turn_checkpoint_boundaries[index] = boundary.filter(|&boundary| {
-                (c.qwen35 || c.qwen4exp || c.bailingmoe3)
-                    && boundary > start
-                    && boundary < prompt.len()
-                    && boundary <= max_ctx
-            });
+            turn_checkpoint_boundaries[index] = boundary
+                .map(|boundary| {
+                    if paged {
+                        page_floor(boundary, page)
+                    } else {
+                        boundary
+                    }
+                })
+                .filter(|&boundary| {
+                    (c.qwen35 || c.qwen4exp || c.bailingmoe3)
+                        && boundary > start
+                        && boundary < prompt.len()
+                        && boundary <= max_ctx
+                });
         }
     }
+    // The page-aligned prompt frontier this request may publish (see `paged_frontier_pos`). The
+    // parallel prepare already computed one for its own lane; a single-sequence request has no
+    // prepare step, so the runner synthesizes it here.
+    let paged_frontier_at = parallel_prepared
+        .as_ref()
+        .map(|prepared| prepared[0].paged_frontier)
+        .unwrap_or_else(|| {
+            paged_frontier_pos(
+                c,
+                segmented_kv.paged.is_some(),
+                segmented_kv.page_tokens,
+                prompt.len(),
+                start,
+                max_ctx,
+            )
+        });
     if parallel_prepared.is_none() {
         for (index, boundary) in turn_checkpoint_boundaries.into_iter().enumerate() {
             if let Some(boundary) = boundary {
@@ -4603,6 +4857,17 @@ fn generate_dense_backend_inner(
             .as_ref()
             .map(|_| g.input(TensorDesc::new(vec![max_ctx, 4], DType::I32)));
         let qwen_wide = c.qwen4exp.then(|| g.input(f32d(batch * c.hc_mult * ne)));
+        // Uncensor (`crates/infr-uncensor`): the session's layer directions — one Input, uploaded
+        // once and never rewritten — and the 4-byte scale the projection reads to run on or off.
+        // Declared only for a span that actually contains a projected layer: a plan over layers the
+        // range does not touch must not declare handles nothing reads, since every declared Input has
+        // to be bound at execute.
+        let uncensor_ids = uncensor.as_ref().and_then(|u| {
+            (l_first..l_end)
+                .any(|l| u.proj.covers(l))
+                .then(|| (g.input(f32d(u.proj.n_floats())), g.input(f32d(1))))
+        });
+        let uncensor_proj = uncensor.as_ref().map(|u| &u.proj);
         let span_has_ple = c.qwen4exp && (l_first..l_end).any(|l| c.is_ple_layer(l));
         let ple_embd = span_has_ple.then(|| {
             let heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
@@ -8364,6 +8629,28 @@ fn generate_dense_backend_inner(
                     hc: c.hc_mult as u32,
                     n_embd: ne as u32,
                 });
+                // Uncensor (`crates/infr-uncensor`): the refusal direction comes out of the wide
+                // residual after this layer's LAST write to it and before the next layer reads it —
+                // the one point in a layer where every stream of every token is present at once. The
+                // strength is the per-request device scalar, so one compiled plan serves projected
+                // and unprojected runs alike; `covers(l)` is exactly the layer range cold init
+                // announced when it read the direction file.
+                if let Some((proj, (dirs, scale))) = uncensor_proj
+                    .zip(uncensor_ids)
+                    .filter(|(proj, _)| proj.covers(l))
+                {
+                    g.push(Op::UncensorProject {
+                        x: wide,
+                        dir: dirs,
+                        dst: wide,
+                        rows: batch as u32,
+                        hc: c.hc_mult as u32,
+                        n_embd: ne as u32,
+                        dir_off: proj.dir_off(l) as u32,
+                        scale: 1.0,
+                        scale_buf: Some(scale),
+                    });
+                }
             } else if lw.hc.is_some() {
                 // Close the FFN wrap, ping-ponging back to `hcr[0]` — the stream the NEXT layer's
                 // attention wrap (and, after the last layer, the model head) reads.
@@ -8646,6 +8933,8 @@ fn generate_dense_backend_inner(
                 qwen_wide,
                 ple_embd,
                 ple_state,
+                uncensor_dirs: uncensor_ids.map(|(d, _)| d),
+                uncensor_scale: uncensor_ids.map(|(_, s)| s),
                 k_cache,
                 v_cache,
                 mtp_k_trace,
@@ -8769,6 +9058,7 @@ fn generate_dense_backend_inner(
                         .iter()
                         .flatten()
                         .copied()
+                        .chain(prepared[lane].paged_frontier)
                         .filter(|&boundary| begin < boundary)
                         .min()
                     {
@@ -8922,6 +9212,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
                 Some(wide_batch.as_ref()),
                 None,
                 &*parallel.peers,
@@ -8997,6 +9289,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
                 Some(wide_batch.as_ref()),
                 Some(ple_batch.as_ref()),
                 &*parallel.peers,
@@ -9036,6 +9330,32 @@ fn generate_dense_backend_inner(
                         }
                     }
                 }
+                // The page-aligned prompt frontier: the one snapshot this request's radix entry can
+                // carry, so a later request sharing the prefix attaches frames instead of replaying.
+                // Downloaded to the HOST (not a third device checkpoint) because the entry outlives
+                // the slot and the RAM tier already pays for the frames beside it.
+                if Some(range.end) == prepared[lane].paged_frontier {
+                    if lane == 0 {
+                        *paged_frontier = Some(capture_paged_ckpt(
+                            be,
+                            c,
+                            &kbufs[..],
+                            &vbufs[..],
+                            ple_state_buf.as_deref(),
+                            range.end,
+                        )?);
+                    } else {
+                        let slot = &mut parallel.peers[lane - 1];
+                        slot.paged_frontier = Some(capture_paged_ckpt(
+                            be,
+                            c,
+                            &slot.kbufs,
+                            &slot.vbufs,
+                            slot.ple_state_buf.as_deref(),
+                            range.end,
+                        )?);
+                    }
+                }
             }
             for lane in 0..lanes {
                 if starts[lane] < targets[lane] {
@@ -9059,13 +9379,14 @@ fn generate_dense_backend_inner(
         }
 
         let elapsed = t0.elapsed().as_secs_f64();
-        if cursors[0] == targets[0] {
-            *cached = parallel.prompts[0][..targets[0]].to_vec();
-        }
+        // A cursor advances only after its chunk's KV rows are written, so the depth each lane
+        // reached is a truthful spine whether or not the sweep finished. Recording it on an abort (a
+        // client cancel, a deadline) is what lets the next checkout publish that prefix to the radix
+        // tree; gating it on completion threw minutes of prefill away and made the retry start from
+        // token 0.
+        *cached = parallel.prompts[0][..cursors[0]].to_vec();
         for lane in 1..lanes {
-            if cursors[lane] == targets[lane] {
-                parallel.peers[lane - 1].cached = parallel.prompts[lane][..targets[lane]].to_vec();
-            }
+            parallel.peers[lane - 1].cached = parallel.prompts[lane][..cursors[lane]].to_vec();
         }
         let stats = (0..lanes)
             .map(|lane| GenStats {
@@ -9363,6 +9684,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
         );
         if plan_sc {
             if dyn_sc {
@@ -9672,6 +9995,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
                 Some(fixed.wide.as_ref()),
                 None,
                 &*parallel.peers,
@@ -9738,6 +10063,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
             Some(fixed.wide.as_ref()),
             has_ple.then_some(fixed.ple.as_ref()),
             &*parallel.peers,
@@ -10076,6 +10403,8 @@ fn generate_dense_backend_inner(
                     qwen_wide_buf,
                     ple_embd_buf,
                     ple_state_buf,
+                    uncensor_dirs_buf,
+                    uncensor_scale_buf,
                 );
                 vb0.bind(
                     vh0.qwen_wide.expect("Qwen VERIFY head has a wide residual"),
@@ -10137,6 +10466,8 @@ fn generate_dense_backend_inner(
                 qwen_wide_buf,
                 ple_embd_buf,
                 ple_state_buf,
+                uncensor_dirs_buf,
+                uncensor_scale_buf,
             );
             vb.bind(
                 vh.qwen_wide.expect("Qwen VERIFY has a wide residual"),
@@ -10311,6 +10642,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -10912,6 +11245,8 @@ fn generate_dense_backend_inner(
                             qwen_wide_buf,
                             ple_embd_buf,
                             ple_state_buf,
+                            uncensor_dirs_buf,
+                            uncensor_scale_buf,
                             wide_batch.as_deref(),
                             None,
                             &*parallel.peers,
@@ -10951,6 +11286,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                         wide_batch.as_deref(),
                         ple_batch.as_deref(),
                         &*parallel.peers,
@@ -11132,6 +11469,8 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
+                                    uncensor_dirs_buf,
+                                    uncensor_scale_buf,
                                     wide_batch.as_deref(),
                                     if is_main { ple_batch.as_deref() } else { None },
                                     &*parallel.peers,
@@ -11951,7 +12290,17 @@ fn generate_dense_backend_inner(
         };
         let pf_end = prompt.len() - 1;
         let mut prefill_runtime_reserve = None;
-        if be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch) {
+        // The round pays the ring reserve iff this gate is true; `ring_floor` then forbids any
+        // TURN_CHECKPOINT from cutting a chunk under the threshold the reserve was priced with
+        // (2026-10-19 memory-bomb fix, see `prefill_chunk_end`).
+        let ring_round =
+            be.moe_paged() && prefill_uses_layer_ring(c, pf_end.saturating_sub(start), ubatch);
+        let ring_floor = if ring_round {
+            ring_min_rows(c).unwrap_or(0)
+        } else {
+            0
+        };
+        if ring_round {
             let _gp = req.and_then(|request| request.gate_pass());
             ensure_kv_depth!(pf_end);
             let candidates = prefill_runtime_candidates(
@@ -12002,7 +12351,14 @@ fn generate_dense_backend_inner(
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let ce = prefill_chunk_end(cs, pf_end, ubatch, &turn_checkpoint_boundaries);
+                let ce = prefill_chunk_end(
+                    cs,
+                    pf_end,
+                    ubatch,
+                    &turn_checkpoint_boundaries,
+                    paged_frontier_at,
+                    ring_floor,
+                );
                 v.push((cs, ce));
                 cs = ce;
             }
@@ -12048,6 +12404,9 @@ fn generate_dense_backend_inner(
                     Some(worker.submit_range(prompt, cstart, cend - cstart, c.ple_ngram_size)?);
             }
         }
+        // Assembled at the frontier chunk and published with this request's frames at detach. Held
+        // across the whole sweep because a layer-major prefill fills it one span at a time.
+        let mut frontier_capture: Option<PagedFrontierCapture> = None;
         for group_start in (0..chunks.len()).step_by(group_chunks) {
             let group_end = (group_start + group_chunks).min(chunks.len());
             let preallocate_group = layer_major && c.qwen4exp;
@@ -12064,10 +12423,28 @@ fn generate_dense_backend_inner(
                         // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
                         // The chunk that was already in flight is not cut off — the backend drains it and
                         // returns `Error::Aborted` from `be.execute` below, which lands here as the same
-                        // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
-                        // so this is an error and not a partial success; the CLI turns the latched signal
-                        // into the conventional 130/143 exit status regardless of what this call returns.
+                        // bail. No generation was produced, so this is an error and not a partial
+                        // success; the CLI turns the latched signal into the conventional 130/143 exit
+                        // status regardless of what this call returns. What WAS produced is a prefix:
+                        // the chunks that already ran hold their KV rows, so the spine is handed to
+                        // the session before the error escapes and the next checkout publishes it to
+                        // the radix tree. A client that cancels mid-prefill then pays for the tail on
+                        // its retry instead of the entire prompt.
                         if crate::sampling::abort_requested(req) {
+                            // Chunk-major sweeps one whole-model span per chunk, so `cstart` is the
+                            // deepest position every layer has written. Layer-major runs one span
+                            // across the whole group before the next, so only the chunks BEFORE this
+                            // group are complete at every layer — and `group_start` indexes chunks, so
+                            // its token position has to come from the chunk itself.
+                            let prefilled = if layer_major {
+                                chunks[group_start].0
+                            } else {
+                                cstart
+                            };
+                            *cached = prompt[..prefilled].to_vec();
+                            // Stop BETWEEN chunks, at a position every layer reached: vouch for the
+                            // ledger so `crate::seam`'s error path does not wipe it.
+                            *ledger_matches_kv = true;
                             anyhow::bail!("aborted: shutdown requested");
                         }
                         let _timeline_prefill_chunk = if materialize_only {
@@ -12371,6 +12748,8 @@ fn generate_dense_backend_inner(
                                 ple_embd_buf
                             },
                             ple_state_buf,
+                            uncensor_dirs_buf,
+                            uncensor_scale_buf,
                         );
                         debug_assert!(
                             pf_h.logits.is_none(),
@@ -12448,6 +12827,38 @@ fn generate_dense_backend_inner(
                                         ple_state_buf.as_deref(),
                                     )?;
                                 }
+                            }
+                        }
+                        // Paged tier: the host snapshot this request's radix entry publishes, taken at
+                        // exactly the position the frame chain reaches. Layer-major fills it span by
+                        // span (see `PagedFrontierCapture`); chunk-major reads the whole model once.
+                        if Some(cend) == paged_frontier_at {
+                            let capture = match frontier_capture.as_mut() {
+                                Some(capture) => capture,
+                                None => frontier_capture.insert(PagedFrontierCapture::new(
+                                    c,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    ple_state_buf.as_deref(),
+                                    cend,
+                                )?),
+                            };
+                            if layer_major {
+                                capture.snapshot_layer(be, &kbufs[..], &vbufs[..], span.start)?;
+                                if c.qwen4exp && span.clone().any(|layer| c.is_ple_layer(layer)) {
+                                    capture.snapshot_ple(be, ple_state_buf.as_deref())?;
+                                }
+                            } else {
+                                capture.snapshot_all(
+                                    be,
+                                    &kbufs[..],
+                                    &vbufs[..],
+                                    ple_state_buf.as_deref(),
+                                )?;
+                            }
+                            if si + 1 == spans.len() {
+                                *paged_frontier =
+                                    Some(frontier_capture.take().expect("just created").finish()?);
                             }
                         }
                         // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
@@ -12599,6 +13010,8 @@ fn generate_dense_backend_inner(
             qwen_wide_buf,
             ple_embd_buf,
             ple_state_buf,
+            uncensor_dirs_buf,
+            uncensor_scale_buf,
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -13134,6 +13547,8 @@ fn generate_dense_backend_inner(
                                     qwen_wide_buf,
                                     ple_embd_buf,
                                     ple_state_buf,
+                                    uncensor_dirs_buf,
+                                    uncensor_scale_buf,
                                 );
                                 if let Some(id) = handles.logits {
                                     bindings.bind(id, logits_buf.as_ref());
@@ -13231,6 +13646,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                     );
                     let ple_buf = ple_embd_buf
                         .as_ref()
@@ -13262,6 +13679,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                     );
                     b1.bind(
                         h1.logits.expect("qwen4exp tail build has logits"),
@@ -13367,6 +13786,8 @@ fn generate_dense_backend_inner(
                         qwen_wide_buf,
                         ple_embd_buf,
                         ple_state_buf,
+                        uncensor_dirs_buf,
+                        uncensor_scale_buf,
                     );
                     b.bind(
                         h.logits.expect("decode build has logits"),
@@ -14699,10 +15120,10 @@ mod tests {
 
     use super::{
         allocate_parallel_prefill_rows, command_ahead_cohort_ready, dense_request_exceeds_capacity,
-        full_mrope_positions, mrope_rows_are_plain_rope, mrope_token_position,
-        parallel_decode_should_stop, parallel_prefill_group, parallel_prefill_progress,
-        prefill_chunk_end, qsa_prepare_pair_supported, recurrent_extension_start,
-        resident_after_gen, sampling_suffix_start, validate_token_ids,
+        full_mrope_positions, mrope_rows_are_plain_rope, mrope_token_position, page_floor,
+        paged_frontier_pos, parallel_decode_should_stop, parallel_prefill_group,
+        parallel_prefill_progress, prefill_chunk_end, qsa_prepare_pair_supported,
+        recurrent_extension_start, resident_after_gen, sampling_suffix_start, validate_token_ids,
     };
     use infr_core::DType;
 
@@ -15110,6 +15531,7 @@ mod tests {
         let plan = crate::seam::MropePlan {
             prompt_pos4: vec![0, 0, 0, 0, 5, 2, 3, 0],
             spans: Vec::new(),
+            cache_spans: Vec::new(),
             decode_base: 6,
         };
         assert_eq!(
@@ -15174,16 +15596,122 @@ mod tests {
     #[test]
     fn ordinary_prefill_chunks_stop_at_turn_checkpoints() {
         let checkpoints = [Some(789), Some(2405)];
-        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 789);
-        assert_eq!(prefill_chunk_end(789, 4063, 2048, &checkpoints), 2405);
-        assert_eq!(prefill_chunk_end(2405, 4063, 2048, &checkpoints), 4063);
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints, None, 0), 789);
+        assert_eq!(
+            prefill_chunk_end(789, 4063, 2048, &checkpoints, None, 0),
+            2405
+        );
+        assert_eq!(
+            prefill_chunk_end(2405, 4063, 2048, &checkpoints, None, 0),
+            4063
+        );
+    }
+
+    #[test]
+    fn page_flooring_is_exact_and_a_zero_page_is_identity() {
+        assert_eq!(page_floor(29_999, 64), 29_952);
+        assert_eq!(page_floor(29_952, 64), 29_952);
+        assert_eq!(page_floor(63, 64), 0);
+        // A zero page means the slot is not segmented at all: never divide by it.
+        assert_eq!(page_floor(29_999, 0), 29_999);
+    }
+
+    #[test]
+    fn a_paged_frontier_splits_a_chunk_like_a_checkpoint() {
+        // 30_000-token prompt on 64-token pages: the prefill stops at 29_952 so the published
+        // frames and the recurrent snapshot describe the same token count.
+        let none = [None, None];
+        assert_eq!(
+            prefill_chunk_end(0, 29_999, 32_768, &none, Some(29_952), 0),
+            29_952
+        );
+        assert_eq!(
+            prefill_chunk_end(29_952, 29_999, 32_768, &none, Some(29_952), 0),
+            29_999
+        );
+        // A frontier the ring reserve would starve is skipped exactly like a checkpoint: the
+        // request loses its snapshot and the next one replays, which is a perf loss, not a hazard.
+        assert_eq!(
+            prefill_chunk_end(29_900, 29_999, 32_768, &none, Some(29_952), 154),
+            29_999
+        );
+    }
+
+    #[test]
+    fn paged_frontier_page_aligns_and_gates() {
+        let cfg = crate::Config {
+            qwen4exp: true,
+            ..crate::Config::default()
+        };
+        // A paged recurrent session floors to the page and stays under the prefill's own end.
+        assert_eq!(
+            paged_frontier_pos(&cfg, true, 64, 30_000, 0, 131_072),
+            Some(29_952)
+        );
+        // Non-paged or non-recurrent sessions publish nothing to pair with a snapshot.
+        assert_eq!(
+            paged_frontier_pos(&cfg, false, 64, 30_000, 0, 131_072),
+            None
+        );
+        let dense = crate::Config::default();
+        assert_eq!(
+            paged_frontier_pos(&dense, true, 64, 30_000, 0, 131_072),
+            None
+        );
+        // A prompt shorter than one page, or already past the frontier, captures nothing: the
+        // snapshot would describe state the chunk loop never produced.
+        assert_eq!(paged_frontier_pos(&cfg, true, 64, 40, 0, 131_072), None);
+        assert_eq!(
+            paged_frontier_pos(&cfg, true, 64, 30_000, 29_952, 131_072),
+            None
+        );
+        // The frontier never exceeds the slot's capacity.
+        assert_eq!(paged_frontier_pos(&cfg, true, 64, 30_000, 0, 16_384), None);
+    }
+
+    #[test]
+    fn ring_rounds_never_starve_a_chunk_below_the_ring_threshold() {
+        // The 2026-10-19 bomb shape: a 160-token prompt with a checkpoint at 45. Under min_rows=0
+        // (unpaid round) the boundary still wins; on a paid ring round (min_rows=154) it is skipped
+        // and the whole suffix rides the ring the reserve paid for.
+        let starving = [Some(45), None];
+        assert_eq!(prefill_chunk_end(0, 159, 2048, &starving, None, 0), 45);
+        assert_eq!(prefill_chunk_end(0, 159, 2048, &starving, None, 154), 159);
+        // A qualifying boundary keeps working on paid rounds (skip only starves).
+        let healthy = [Some(160), None];
+        assert_eq!(prefill_chunk_end(0, 4063, 2048, &healthy, None, 154), 160);
+        // `ring_min_rows` agrees with the gate exactly at 153/154 (n_used=10, n_expert=512).
+        let cfg = crate::Config {
+            moe: Some(crate::MoeConfig {
+                n_expert: 512,
+                n_used: 10,
+                n_ff_exp: 640,
+                scale: 1.0,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: true,
+                weight_before: false,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(super::ring_min_rows(&cfg), Some(154));
+        assert!(!super::prefill_uses_layer_ring(&cfg, 153, 4096));
+        assert!(super::prefill_uses_layer_ring(&cfg, 154, 4096));
+        assert_eq!(super::ring_min_rows(&crate::Config::default()), None);
     }
 
     #[test]
     fn frontier_checkpoint_does_not_create_a_tiny_prefill_tail() {
         let checkpoints = [None, Some(4063)];
-        assert_eq!(prefill_chunk_end(0, 4063, 2048, &checkpoints), 2048);
-        assert_eq!(prefill_chunk_end(2048, 4063, 2048, &checkpoints), 4063);
+        assert_eq!(
+            prefill_chunk_end(0, 4063, 2048, &checkpoints, None, 0),
+            2048
+        );
+        assert_eq!(
+            prefill_chunk_end(2048, 4063, 2048, &checkpoints, None, 0),
+            4063
+        );
     }
 
     #[test]

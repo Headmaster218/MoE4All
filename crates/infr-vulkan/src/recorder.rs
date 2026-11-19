@@ -469,7 +469,13 @@ fn native_id_sg_choice(
     if dtype == Iq2Xs {
         return (in_f == 2560 && out_f == 640).then_some(8);
     }
-    if !matches!(dtype, Q6K | Q5K | Iq3S) {
+    // Q5_1 (UD-Q4_K_XL's 43/48 expert downs, 640x2560) fits this band and the same heavy-unpack
+    // rationale, but enrollment is A/B-gated: until the model-level decode A/B lands, the default
+    // keeps every Q5_1 bank on the tree id kernel.
+    if dtype == Q5_1 && !k.id_sg_q51 {
+        return None;
+    }
+    if !matches!(dtype, Q6K | Q5K | Iq3S | Q5_1) {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
@@ -566,7 +572,43 @@ fn splitk_reduce_extents(m: usize, n: usize) -> (usize, usize) {
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
-pub(crate) fn q8_prefill_bm128_applies(
+/// Upper bound on a weight the narrow-f32 route will expand: 128 Ki elements = 512 KiB of f32
+/// scratch. Both Flash-Next narrow tensors fit (10240x4 and 2560x48); anything bigger loses more to
+/// the per-chunk expansion than the batched GEMV wins back.
+pub(crate) const NARROW_F32_MAX_ELEMS: usize = 1 << 17;
+
+/// Shape/dtype half of the narrow-output f32 route — pure so the adapter's dispatch site and
+/// `adapter_stages`' scratch reservation cannot drift. `out_f` has no 64-multiple, so NO tiled GEMM
+/// tile can serve the shape; the weight is small enough that expanding it to f32 once per chunk
+/// costs a few microseconds; and the dtype has a `weight_f32` expansion build.
+pub(crate) fn narrow_f32_gemm_eligible(
+    dtype: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    m > 16
+        && !out_f.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && in_f * out_f <= NARROW_F32_MAX_ELEMS
+        && crate::gemm::weight_f32_build_spv(dtype).is_some()
+}
+
+/// The BM128 (128x128 single-buffer A_GLOBAL) row tile: when to take it instead of the BM64
+/// `*_n128_ag` tile. `kernel-bench`'s `t128sb` sweep measured the tile at 52.9 → 72.3 TF
+/// (2048x4096x14336) and 53.4 → 63.0 (2048x4096x4096), but a LOSS at m=128 (4.9 vs 3.8 TF). The
+/// tile itself is format-agnostic, so this gate is dtype-generic: ANY native-dense format with a
+/// `_n128_ag_bm128` build qualifies (see `native_gemm_warp_n128_ag_bm128_kernel_name`).
+///
+/// `m % 128 == 0` is a CORRECTNESS bound, not a tuning one: the kernel stores whole BM-row C tiles
+/// into the caller's buffer, and `lin_a16` is only padded to 64 rows. A ragged chunk (the usual
+/// tail of a prompt) therefore keeps the BM64 tile.
+///
+/// The shape guards come from this tree's own BAAB record, which the `t128sb` microbenchmark did
+/// not cover: short-K and narrow-N shapes LOST with this tile at m>=1024 (k=512 n=2048, k=1024
+/// n=3072, k=640 n=2560, k=2560 n=640), and of the three Flash m=512 shapes only k=3072 kept its
+/// win. Those stay on BM64; nothing else is excluded.
+pub(crate) fn dense_bm128_applies(
     enabled: bool,
     measured: bool,
     default_ag: bool,
@@ -578,40 +620,12 @@ pub(crate) fn q8_prefill_bm128_applies(
     enabled
         && measured
         && default_ag
-        && dtype == infr_core::DType::Q8_0
-        && matches!(
-            (k, n, m),
-            (3072, 8192, 512)
-                | (8192, 3072, 1024)
-                | (3072, 12288, 512 | 1024)
-                | (2560, 10240, 1024)
-                | (2560, 12288, 1024)
-        )
-}
-
-/// Extend the original six Q8 tuples only to measured large projection shapes.
-/// BM128 writes complete row tiles: ragged Prefill tails must retain BM64.
-/// Windows RX 7900 XTX qualification and the existing A_GLOBAL debug overrides
-/// are supplied by the caller. No expert MMQ, small-M or BF16 routing changes.
-pub(crate) fn dense_prefill_bm128_applies(
-    enabled: bool,
-    measured: bool,
-    default_ag: bool,
-    dtype: infr_core::DType,
-    m: usize,
-    k: usize,
-    n: usize,
-) -> bool {
-    if q8_prefill_bm128_applies(enabled, measured, default_ag, dtype, m, k, n) {
-        return true;
-    }
-    let min_rows = match (dtype, k, n) {
-        (infr_core::DType::Q8_0, 2560, 10240 | 12288)
-        | (infr_core::DType::Q8_0, 2048, 4096 | 8192) => 1024,
-        (infr_core::DType::Q6K, 2048, 4096 | 8192) => 2048,
-        _ => return false,
-    };
-    enabled && measured && default_ag && (min_rows..=12288).contains(&m) && m.is_multiple_of(128)
+        && n.is_multiple_of(128)
+        && k.is_multiple_of(32)
+        && m.is_multiple_of(128)
+        && crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).is_some()
+        && ((m >= 1024 && k >= 2048 && n >= 1024)
+            || matches!((k, n, m), (3072, 8192, 512) | (3072, 12288, 512)))
 }
 
 fn kquant_packed_applies(
@@ -3118,6 +3132,23 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// [`Self::linear_f32_at`] with the f32 weight's SOURCE scratch bound at descriptor slot 0 in
+    /// place of the `x` filler. The weight itself is read by 64-bit address, which the descriptor
+    /// hazard tracker cannot see; binding the buffer it lives in is what keeps the producing
+    /// `dequant_weight_f32` write ordered before this dispatch's pointer read.
+    pub fn linear_f32_tracked(
+        &self,
+        w_addr: u64,
+        w_track: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.linear_f32_inner(w_addr, Some(w_track), x, y, rows, in_f, out_f);
+    }
+
     /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
     /// variant routing (same env escapes) so parity comparisons land on the same kernel.
     /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
@@ -3134,26 +3165,10 @@ impl<'a> Recorder<'a> {
         self.linear_f32_inner(arena_addr, None, x, y, rows, in_f, out_f);
     }
 
-    /// Track the BDA weight read so expansion writes and scratch reuse are ordered.
-    pub(crate) fn linear_f32_tracked(
-        &self,
-        weight: &dyn Buffer,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-    ) {
-        let addr = weight
-            .device_addr()
-            .expect("narrow F32 scratch requires BDA");
-        self.linear_f32_inner(addr, Some(weight), x, y, rows, in_f, out_f);
-    }
-
     fn linear_f32_inner(
         &self,
         arena_addr: u64,
-        weight_track: Option<&dyn Buffer>,
+        w_track: Option<&dyn Buffer>,
         x: &dyn Buffer,
         y: &dyn Buffer,
         rows: usize,
@@ -3203,11 +3218,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         self.dispatch_wide(
             k,
-            &[
-                Self::vkb(weight_track.unwrap_or(x)),
-                Self::vkb(x),
-                Self::vkb(y),
-            ],
+            &[Self::vkb(w_track.unwrap_or(x)), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
             groups,
@@ -3799,9 +3810,10 @@ impl<'a> Recorder<'a> {
                 64,
             )
         };
-        // Qualified shapes have M%128==0 and reach this unsplit A_GLOBAL path;
-        // the existing split policy and 64-row scratch padding remain unchanged.
-        let (name, bn, bm) = if dense_prefill_bm128_applies(
+        // BM128 needs m%128==0 (whole-tile C stores into an m-row buffer, and `lin_a16` is only
+        // padded to 64 rows); `dense_bm128_applies` enforces it, so the padded-dst dance and the
+        // split policy are unchanged.
+        let (name, bn, bm) = if dense_bm128_applies(
             self.vk().q8_prefill_bm128,
             self.be.prefers_q8_prefill_bm128(),
             self.vk().gemm_warp && !self.vk().gemm_direct_a && !self.vk().gemm_wide_tile,
@@ -3811,8 +3823,7 @@ impl<'a> Recorder<'a> {
             n,
         ) {
             (
-                crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype)
-                    .expect("qualified BM128 dtype"),
+                crate::gemm::native_gemm_warp_n128_ag_bm128_kernel_name(dtype).expect("bm128 name"),
                 128,
                 128,
             )
@@ -6630,6 +6641,67 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             rows as u32,
+        );
+    }
+
+    /// Uncensor projection, IN PLACE on `x`: `x -= scale * (x·v) v` over `rows * hc` wide-residual
+    /// streams, each `n_embd` elements, against the unit direction at `dir[dir_off ..]`
+    /// (`Op::UncensorProject`, `crates/infr-uncensor`). One workgroup owns one stream outright,
+    /// which is what lets it reduce over the row and then rewrite it.
+    pub fn uncensor_project(
+        &self,
+        x: &dyn Buffer,
+        dir: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        dir_off: u32,
+        scale: f32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "uncensor_project",
+            crate::gemm::uncensor_project_spv(),
+            2,
+            8,
+            32,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&n_embd.to_ne_bytes());
+        push[4..8].copy_from_slice(&dir_off.to_ne_bytes());
+        push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(kernel, &[Self::vkb(dir), Self::vkb(x)], 1, &push, rows * hc);
+    }
+
+    /// Like [`Self::uncensor_project`], but the strength comes from `scale_buf[0]` (a 1-element
+    /// device buffer, refreshed by a tiny 4-byte `upload`) instead of a push constant — the
+    /// per-request uncensor switch, so a plan compiled/cached with the projection in it runs both
+    /// ways. `scale_buf == 0.0` leaves the residual bit-for-bit untouched.
+    pub fn uncensor_project_dyn(
+        &self,
+        x: &dyn Buffer,
+        dir: &dyn Buffer,
+        scale_buf: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+        dir_off: u32,
+    ) {
+        let kernel = self.be.kernel_sg(
+            "uncensor_project_dyn",
+            crate::gemm::uncensor_project_dyn_spv(),
+            3,
+            8,
+            32,
+        );
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&n_embd.to_ne_bytes());
+        push[4..8].copy_from_slice(&dir_off.to_ne_bytes());
+        self.dispatch(
+            kernel,
+            &[Self::vkb(dir), Self::vkb(scale_buf), Self::vkb(x)],
+            1,
+            &push,
+            rows * hc,
         );
     }
 
@@ -15730,14 +15802,16 @@ impl<'a> Recorder<'a> {
             Self::vkb(lut),
             Self::vkb(y),
         ];
-        if matches!(dtype, infr_core::DType::Iq2S | infr_core::DType::Iq3S)
-            && self.be.use_paged_grid_buffer(in_f, out_f, rows)
+        if matches!(
+            dtype,
+            infr_core::DType::Iq2S | infr_core::DType::Iq3S | infr_core::DType::Iq3Xxs
+        ) && self.be.use_paged_grid_buffer(in_f, out_f, rows)
         {
             let nr = self.be.paged_grid_buffer_nr();
-            let grid = if dtype == infr_core::DType::Iq2S {
-                &self.be.iq2s_grid
-            } else {
-                &self.be.iq3s_grid
+            let grid = match dtype {
+                infr_core::DType::Iq2S => &self.be.iq2s_grid,
+                infr_core::DType::Iq3Xxs => &self.be.iq3xxs_grid,
+                _ => &self.be.iq3s_grid,
             };
             if let Some(grid) = grid.as_ref() {
                 let build = crate::gemm::native_idm_grid_buffer_paged_spv(dtype, nr);
@@ -15757,7 +15831,20 @@ impl<'a> Recorder<'a> {
             }
         }
         if rows > 1 {
-            let nr = self.gemv().id_grid_nr;
+            // Causal Verify's IQ4_NL Down cohort has its own measured NR; every other multi-row
+            // shape keeps the device's tuned grid NR (and IQ4_NL its NR1 baseline) when the knob
+            // is off, so the knob alone is the A/B switch.
+            let nr = if crate::adapter::verify_pair::iq4nl_down_nr4_applies(
+                self.be.cfg().kernels.vulkan.verify_iq4nl_down_nr4,
+                dtype,
+                [rows, in_f, out_f],
+                n_used,
+                x_per_slot,
+            ) {
+                4
+            } else {
+                self.gemv().id_grid_nr
+            };
             if let Some((name, spv)) = crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr) {
                 let k = self.be.kernel(name, spv, 5, 44);
                 let groups = (rows * n_used * out_f.div_ceil(nr as usize)) as u32;
@@ -20097,6 +20184,13 @@ mod tests {
         }
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 1024, k), None);
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 8193, k), None);
+        // Q5_1 rides the same band but stays gated OFF by default (A/B switch `id_sg_q51`).
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, k), None);
+        let mut cfg_on = infr_core::config::Config::default();
+        cfg_on.kernels.vulkan.gemv.id_sg_q51 = true;
+        let kon = &cfg_on.kernels.vulkan.gemv;
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, kon), Some(2));
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 1024, kon), None);
     }
 
     /// #4 drift guard: the ONE unified [`moe_mmq_desc`] table must produce, for every dtype in
@@ -22987,6 +23081,388 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The causal-VERIFY IQ4_NL Down dispatch, on the exact nonshared paged ABI the graph uses
+    /// (`native_idm_iq4nl_paged` at K=640, N=2560, 10 routed slots, per-slot input, 4 rows) — the
+    /// single largest FFN dispatch in the Verify batch. `nr == 1` is the production kernel, so the
+    /// ratio is admitted-vs-candidate, not a stand-in. IQ2_S gate/up (K=2560, N=640) is the harness
+    /// control: its NR8 arm is already qualified, so a probe that cannot reproduce that gain here
+    /// would not be trusted for IQ4_NL either.
+    ///
+    /// NR order rotates every round and each arm keeps its median: a forward NR1→NR8 sweep
+    /// otherwise charges the clock ramp to whichever arm ran first.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; verify IQ4_NL Down NR parity and rotated-median probe"]
+    fn verify_iq4nl_down_nr_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        use infr_core::DType;
+        let be = VulkanBackend::new().unwrap();
+        const ROUTED: usize = 10;
+        const ROWS: usize = 4;
+        for (dtype, k, n, x_per_slot, control) in [
+            (DType::Iq4Nl, 640usize, 2560usize, true, false),
+            (DType::Iq2S, 2560usize, 640usize, false, true),
+        ] {
+            let experts = 64usize;
+            let weight_bytes = infr_testkit::synth_weight(dtype, k * n * experts, 456);
+            let stride = infr_testkit::synth_weight(dtype, k * n, 456).len();
+            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+            let lut_words = (0..experts)
+                .flat_map(|e| {
+                    let address = weight.device_addr().unwrap() + (e * stride) as u64;
+                    [address as u32, (address >> 32) as u32]
+                })
+                .collect::<Vec<_>>();
+            let ids = (0..ROWS)
+                .flat_map(|r| (0..ROUTED).map(move |s| ((s + r * 3) % experts) as u32))
+                .collect::<Vec<_>>();
+            let x_len = if x_per_slot {
+                ROWS * ROUTED * k
+            } else {
+                ROWS * k
+            };
+            let x = (0..x_len)
+                .map(|i| (i as f32 * 0.031).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let lut = be
+                .alloc(lut_words.len() * 4, BufferUsage::Activations)
+                .unwrap();
+            let ids_b = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+            let output = be
+                .alloc(ROWS * ROUTED * n * 4, BufferUsage::Readback)
+                .unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            be.upload(lut.as_ref(), bytemuck::cast_slice(&lut_words))
+                .unwrap();
+            be.upload(ids_b.as_ref(), bytemuck::cast_slice(&ids))
+                .unwrap();
+            let mut push = [0u8; 44];
+            for (word, value) in [
+                k as u32,
+                n as u32,
+                ROUTED as u32,
+                0, // lut window base
+                u32::from(x_per_slot),
+                ROWS as u32,
+                weight.device_addr().unwrap() as u32,
+                (weight.device_addr().unwrap() >> 32) as u32,
+                stride as u32,
+                (1u32 << ROUTED) - 1,
+                0, // static active_mask, no per-row bank
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            let run = |nr: u32, reps: usize| {
+                let (name, spv) = if control {
+                    // IQ2_S NR1 is the plain paged build; only its NR>=2 arms live in the grid
+                    // table, exactly as the production selector composes them.
+                    if nr == 1 {
+                        crate::gemm::native_idm_paged_build_spv(dtype).map(|spv| {
+                            (
+                                crate::linear::native_idm_paged_kernel_name(dtype).unwrap(),
+                                spv,
+                            )
+                        })
+                    } else {
+                        crate::gemm::native_idm_grid_nr_paged_build_spv(dtype, nr)
+                    }
+                } else {
+                    crate::gemm::native_idm_iq4nl_nr_probe_spv(nr)
+                }
+                .unwrap_or_else(|| panic!("{dtype:?} NR={nr} has no probe build"));
+                let kernel = be.kernel(name, spv, 5, 44);
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.dispatch_wide(
+                        kernel,
+                        &[
+                            Recorder::vkb(lut.as_ref()),
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(ids_b.as_ref()),
+                            Recorder::vkb(lut.as_ref()),
+                            Recorder::vkb(output.as_ref()),
+                        ],
+                        1,
+                        &push,
+                        (ROWS * ROUTED * n.div_ceil(nr as usize)) as u32,
+                    );
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                (name, start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            // The control family only ships the two arms the engine already distinguishes.
+            let ars: Vec<u32> = if control {
+                vec![1, 8]
+            } else {
+                vec![1, 2, 4, 8]
+            };
+            // Parity: every NR must match the production NR1 output bit for bit.
+            let measure = |nr: u32| {
+                be.upload(output.as_ref(), &vec![0u8; output.len_bytes()])
+                    .unwrap();
+                run(nr, 1);
+                let mut values = vec![0u8; output.len_bytes()];
+                be.download(output.as_ref(), &mut values).unwrap();
+                values
+            };
+            let reference = measure(1);
+            for &nr in &ars[1..] {
+                assert_eq!(
+                    &measure(nr),
+                    &reference,
+                    "{dtype:?} NR={nr} differs from NR1 at K={k}, N={n}, per_slot={x_per_slot}"
+                );
+            }
+            let names = ars
+                .iter()
+                .map(|&nr| run(nr, 1).0)
+                .collect::<Vec<&'static str>>();
+            let rounds = 5usize;
+            let mut samples = vec![vec![0f64; ars.len()]; rounds];
+            for (round, row) in samples.iter_mut().enumerate() {
+                for slot in 0..ars.len() {
+                    // Rotate which arm is measured first each round, but always store by arm.
+                    let idx = (slot + round) % ars.len();
+                    row[idx] = run(ars[idx], 32).1;
+                }
+            }
+            let mut out = Vec::new();
+            for (slot, &base) in ars.iter().enumerate() {
+                let mut v = samples.iter().map(|r| r[slot]).collect::<Vec<_>>();
+                v.sort_by(|a, b| a.total_cmp(b));
+                out.push((base, v[v.len() / 2]));
+            }
+            let nr1 = out[0].1;
+            println!(
+                "verify_iq4nl_down_nr_probe {dtype:?} K={k} N={n} per_slot={x_per_slot} names={names:?}: {}",
+                out.iter()
+                    .map(|(nr, t)| format!("NR{nr}={t:.1}us({}%)", (100.0 * t / nr1 - 100.0).round()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+
+    /// Isolated bandwidth probe for the dense Q8_0 multi-row GEMV at the shapes the Verify batch
+    /// actually dispatches. `INFR_PROF_OPS` absolutes inflate (~2.5x) and interleave with phase
+    /// markers, so a share-derived GB/s is not trustworthy — this measures one kernel alone.
+    /// Two suspect geometries: `in_f=320` gives nsub=10, so 54 of the 64 threads have no sub-block
+    /// to own; `out_f=320` gives only 320 workgroups, far below this device's thread capacity.
+    /// Also reports the m-scaling at a full-width shape, which is what decides whether the inner
+    /// loop is issue-bound (cost grows with m) or bandwidth-bound (cost stays flat).
+    #[test]
+    #[ignore = "requires a Vulkan GPU; dense mrow Q8_0 isolated bandwidth probe"]
+    fn mrow_q8_bandwidth_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        let be = VulkanBackend::new().unwrap();
+        for (in_f, out_f, rows) in [
+            (320usize, 10240usize, 4usize),
+            (10240, 320, 4),
+            (2560, 10240, 4),
+            (6144, 2560, 4),
+            (2560, 10240, 1),
+            (2560, 10240, 2),
+            (2560, 10240, 8),
+        ] {
+            let weight_bytes = infr_testkit::synth_weight(infr_core::DType::Q8_0, in_f * out_f, 77);
+            let wbytes = weight_bytes.len() as f64;
+            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+            let x = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.017).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let output = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let mut push = [0u8; 24];
+            for (word, value) in [
+                rows as u32,
+                in_f as u32,
+                out_f as u32,
+                0,
+                weight.device_addr().unwrap() as u32,
+                (weight.device_addr().unwrap() >> 32) as u32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            let run = |reps: usize| {
+                // m==1 is the per-row streamed GEMV; m>=2 is the weight-shared mrow build. Both
+                // take the same 24-byte push and the same [x, x, y] bindings.
+                let (name, spv) = if rows == 1 {
+                    crate::gemm::native_streamed_build_spv(infr_core::DType::Q8_0, false).unwrap()
+                } else {
+                    crate::gemm::native_mrow_spv(infr_core::DType::Q8_0, rows).unwrap()
+                };
+                let kernel = be.kernel(name, spv, 3, 24);
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.dispatch_wide(
+                        kernel,
+                        &[
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(output.as_ref()),
+                        ],
+                        1,
+                        &push,
+                        out_f as u32,
+                    );
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                (name, start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            run(4);
+            let mut samples = Vec::new();
+            let mut name = "";
+            for _ in 0..5 {
+                let (n, us) = run(32);
+                name = n;
+                samples.push(us);
+            }
+            samples.sort_by(|a, b| a.total_cmp(b));
+            let us = samples[samples.len() / 2];
+            println!(
+                "mrow_q8 in_f={in_f} out_f={out_f} rows={rows} nsub={} {name}: {us:.1}us {:.0}GB/s",
+                in_f / 32,
+                wbytes / (us * 1e-6) / 1e9
+            );
+        }
+    }
+
+    /// CLOSED LEVER, kept as the measurement record. Output packing (`-DOR=N`) for the Q8_0 m=4
+    /// multi-row GEMV: OR=1 is the production grid, OR>1 gives each output 64/OR lanes.
+    ///
+    /// Measured (rotated medians, RX 7900 XTX): OR=4 wins 2.5x at in_f=320 (the OR=1 grid idles 54 of
+    /// 64 lanes when nsub=10), 1.5x at 2560x10240 and 1.35x at vocab width — but LOSES 3-6x at
+    /// 10240x320 (packing shrinks an already-thin grid) and 6144x2560 (OR=1 already balances nsub=192).
+    /// So it is a shape-gated win, never a global one.
+    ///
+    /// Why it is NOT admitted: the per-output sum becomes lane-order instead of the subgroupAdd tree,
+    /// i.e. reassociation-tolerant (max abs ~1e-5, max rel inflated only by near-zero elements). On
+    /// the real Flash-Next model that flips greedy output — two processes per arm reproduced the same
+    /// divergent text (baseline sha 992eb29c…, packed sha 6949a147…, 686 packed dispatches). MTP
+    /// verify and independent decode rows carry a precision contract, so they must keep OR=1; the
+    /// only bar-free surface is ordinary short-suffix prefill at exactly m=4, which is negligible.
+    /// Excluding the precision partners made the packed dispatch count 0 and restored the baseline
+    /// sha, confirming the gate logic — and confirming the lever delivers nothing there. Production
+    /// admission was therefore reverted; the OR shader branch and these builds remain probe-only.
+    #[test]
+    #[ignore = "requires a Vulkan GPU; narrow-in_f mrow OR packing probe"]
+    fn mrow_narrow_or_probe() {
+        use infr_core::backend::{Backend, BufferUsage};
+        let be = VulkanBackend::new().unwrap();
+        for (in_f, out_f, rows) in [
+            (320usize, 10240usize, 4usize),
+            (10240, 320, 4),
+            (2560, 10240, 4),
+            (6144, 2560, 4),
+            (2560, 65536, 4),
+        ] {
+            let weight_bytes = infr_testkit::synth_weight(infr_core::DType::Q8_0, in_f * out_f, 77);
+            let wbytes = weight_bytes.len() as f64;
+            let weight = be.upload_weight_bytes(&weight_bytes).unwrap();
+            let x = (0..rows * in_f)
+                .map(|i| (i as f32 * 0.017).sin() * 0.2)
+                .collect::<Vec<_>>();
+            let input = be.alloc(x.len() * 4, BufferUsage::Activations).unwrap();
+            let output = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+            be.upload(input.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let mut push = [0u8; 24];
+            for (word, value) in [
+                rows as u32,
+                in_f as u32,
+                out_f as u32,
+                0,
+                weight.device_addr().unwrap() as u32,
+                (weight.device_addr().unwrap() >> 32) as u32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            let run = |or: u32, reps: usize| {
+                let (name, spv) = crate::gemm::native_mrow_or_probe_spv(or).unwrap();
+                let kernel = be.kernel(name, spv, 3, 24);
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.dispatch_wide(
+                        kernel,
+                        &[
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(input.as_ref()),
+                            Recorder::vkb(output.as_ref()),
+                        ],
+                        1,
+                        &push,
+                        out_f.div_ceil(or as usize) as u32,
+                    );
+                }
+                let start = std::time::Instant::now();
+                rec.finish().unwrap();
+                (name, start.elapsed().as_secs_f64() * 1e6 / reps as f64)
+            };
+            let ars = [1u32, 4, 8];
+            // Numerics first: capture each arm's output and its deviation from the OR=1 grid.
+            let mut reference: Vec<f32> = Vec::new();
+            let mut errors = Vec::new();
+            for &or in &ars {
+                be.upload(output.as_ref(), &vec![0u8; output.len_bytes()])
+                    .unwrap();
+                run(or, 4);
+                let mut bytes = vec![0u8; output.len_bytes()];
+                be.download(output.as_ref(), &mut bytes).unwrap();
+                let values: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+                if or == 1 {
+                    reference = values.clone();
+                    errors.push((0f32, 0f32, 0usize, values.len()));
+                } else {
+                    let (mut max_abs, mut max_rel, mut differing) = (0f32, 0f32, 0usize);
+                    for (got, want) in values.iter().zip(&reference) {
+                        let d = (got - want).abs();
+                        if d > 0.0 {
+                            differing += 1;
+                        }
+                        max_abs = max_abs.max(d);
+                        max_rel = max_rel.max(d / want.abs().max(1e-6));
+                    }
+                    errors.push((max_abs, max_rel, differing, values.len()));
+                }
+            }
+            // One rotated timing pass for every arm: a fixed 1->4->8 sweep would charge the clock
+            // ramp to whichever arm ran first, and a 2x claim deserves a clean number.
+            let mut per_arm = vec![Vec::new(); ars.len()];
+            let mut names = vec![""; ars.len()];
+            for round in 0..5usize {
+                for slot in 0..ars.len() {
+                    let idx = (slot + round) % ars.len();
+                    let (n, us) = run(ars[idx], 32);
+                    names[idx] = n;
+                    per_arm[idx].push(us);
+                }
+            }
+            for (idx, &or) in ars.iter().enumerate() {
+                let mut v = per_arm[idx].clone();
+                v.sort_by(|a, b| a.total_cmp(b));
+                let us = v[v.len() / 2];
+                let (max_abs, max_rel, differing, n) = errors[idx];
+                println!(
+                    "mrow_or in_f={in_f} out_f={out_f} OR={or} {}: {us:.1}us {:.0}GB/s \
+                     max_abs={max_abs:.3e} max_rel={max_rel:.3e} differing={differing}/{n}",
+                    names[idx],
+                    wbytes / (us * 1e-6) / 1e9
+                );
             }
         }
     }

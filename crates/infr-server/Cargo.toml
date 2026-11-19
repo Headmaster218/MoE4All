@@ -12,6 +12,7 @@ tts = ["dep:infr-tts"]
 [dependencies]
 infr-core.workspace = true
 infr-engine.workspace = true
+infr-uncensor.workspace = true
 infr-audio = { path = "../infr-audio" }
 infr-tts = { path = "../infr-tts", optional = true }
 axum = { workspace = true, features = ["multipart"] }

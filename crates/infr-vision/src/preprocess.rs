@@ -44,9 +44,14 @@ impl PreparedImage {
 ///
 /// - `data:[<mime>][;base64],<payload>` — base64-decoded.
 /// - a bare base64 string — decoded.
-/// - `http(s)://…` — **not supported in this stage** (V5 wires fetching); bails with a clear error.
-pub fn decode_image_input(url_or_data: &str) -> Result<Vec<u8>> {
-    decode_image_input_inner(url_or_data).map_err(invalid_image_input)
+/// - `http(s)://…` — fetched, under the limits and address policy in [`fetch`].
+/// - any other `scheme://` (including `file://`) — refused; it is NOT handed to the base64 decoder,
+///   which would report a confusing "not valid base64" for what is really an unsupported scheme.
+///
+/// `allow_private_targets` is `Config::vision.image_url_allow_private`: the caller owns the resolved
+/// configuration, and the fetch policy is a launch-time decision rather than ambient state.
+pub fn decode_image_input(url_or_data: &str, allow_private_targets: bool) -> Result<Vec<u8>> {
+    decode_image_input_inner(url_or_data, allow_private_targets).map_err(invalid_image_input)
 }
 
 pub(crate) fn invalid_image_input(error: anyhow::Error) -> anyhow::Error {
@@ -54,11 +59,23 @@ pub(crate) fn invalid_image_input(error: anyhow::Error) -> anyhow::Error {
     error.context(marker)
 }
 
-fn decode_image_input_inner(url_or_data: &str) -> Result<Vec<u8>> {
-    if url_or_data.starts_with("http://") || url_or_data.starts_with("https://") {
+/// A `scheme://` this input cannot mean. `data:` carries no `//`, so it is not a scheme here by
+/// design, and base64's alphabet has no `:`, so a bare payload can never look like one either.
+fn unsupported_scheme(url_or_data: &str) -> Option<&str> {
+    match url_or_data.split_once("://") {
+        Some((scheme, _)) if !fetch::is_fetched_scheme(scheme) => Some(scheme),
+        _ => None,
+    }
+}
+
+fn decode_image_input_inner(url_or_data: &str, allow_private_targets: bool) -> Result<Vec<u8>> {
+    if fetch::is_http(url_or_data) {
+        return fetch::image_bytes(url_or_data, allow_private_targets);
+    }
+    if let Some(scheme) = unsupported_scheme(url_or_data) {
         bail!(
-            "infr-vision V1 does not fetch http(s) image URLs; pass a data: URI or base64 \
-             payload instead"
+            "unsupported image URL scheme {scheme:?}: only http(s)://, data: URIs and bare base64 \
+             are accepted"
         );
     }
     let payload = match url_or_data.strip_prefix("data:") {
@@ -79,6 +96,204 @@ fn decode_image_input_inner(url_or_data: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(payload.trim())
         .context("image input is not valid base64")
+}
+
+/// Fetching an `image_url` the client handed us is the one place where the engine makes an outbound
+/// request on behalf of a request, so it is bounded three ways: bytes, wall clock, and WHO may be
+/// addressed. Without the address rule the server is a port scanner with an oracle — "the URL
+/// returned 404" and "could not fetch" are different answers, and a fetched image can be described
+/// back to the caller.
+mod fetch {
+    use anyhow::{bail, Context, Result};
+    use std::io::Read;
+    use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    /// Largest image accepted from a URL. A legal `MAX_PATCHES` image is already ~1 M pixels, so
+    /// anything past this is either hostile or not a picture.
+    pub const MAX_FETCHED_IMAGE_BYTES: u64 = 32 << 20;
+    /// One hop, start to finish. The caller holds a conversation turn while this runs, and a slot
+    /// with it, so an unresponsive host must not be able to park the GPU path.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Redirects are followed HERE, not by the client, because every hop has to pass the address
+    /// rule: one public URL pointing at `http://169.254.169.254/` is otherwise all it takes.
+    const MAX_HOPS: usize = 4;
+
+    pub fn is_fetched_scheme(scheme: &str) -> bool {
+        scheme == "http" || scheme == "https"
+    }
+
+    pub fn is_http(url_or_data: &str) -> bool {
+        match url_or_data.split_once("://") {
+            Some((scheme, _)) => is_fetched_scheme(scheme),
+            None => false,
+        }
+    }
+
+    /// `allow_private` is `Config::vision.image_url_allow_private`, threaded through by the caller:
+    /// keeping it a parameter is what lets the fetch be exercised against a loopback server without
+    /// a process environment race.
+    pub fn image_bytes(url: &str, allow_private: bool) -> Result<Vec<u8>> {
+        let client = client()?;
+        let mut target =
+            reqwest::Url::parse(url).with_context(|| format!("malformed image URL {url:?}"))?;
+        for _hop in 0..MAX_HOPS {
+            // Every hop, including the redirects this loop follows by hand.
+            guard_target(&target, allow_private)?;
+            let response = client
+                .get(target.clone())
+                .send()
+                .with_context(|| format!("could not fetch image {target}"))?;
+            let status = response.status();
+            if status.is_redirection() {
+                let next = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|location| target.join(location).ok());
+                match next {
+                    Some(next) => {
+                        target = next;
+                        continue;
+                    }
+                    None => bail!("image URL {target} returned {status} without a usable Location"),
+                }
+            }
+            if !status.is_success() {
+                bail!("image URL {target} returned {status}");
+            }
+            return read_capped(response, &target);
+        }
+        bail!("image URL {url} redirected more than {MAX_HOPS} times")
+    }
+
+    /// The shared client, built once: a `blocking::Client` owns a runtime and a pool, so building
+    /// one per image would pay a thread pool for every picture in a screenshot-heavy turn. Redirects
+    /// are disabled because [`image_bytes`] follows them — see the address rule there.
+    fn client() -> Result<&'static reqwest::blocking::Client> {
+        static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
+            std::sync::OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .user_agent(concat!("infr-vision/", env!("CARGO_PKG_VERSION")))
+                    .timeout(TIMEOUT)
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("building the image fetch client: {error}"))
+    }
+
+    fn read_capped(
+        response: reqwest::blocking::Response,
+        target: &reqwest::Url,
+    ) -> Result<Vec<u8>> {
+        // `Content-Length` is the server's claim: it only lets us refuse before reading, and a lie
+        // is caught by the bounded read below.
+        if let Some(claimed) = response.content_length() {
+            over_cap(target, claimed)?;
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_FETCHED_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("could not read the image body from {target}"))?;
+        over_cap(target, bytes.len() as u64)?;
+        Ok(bytes)
+    }
+
+    fn over_cap(target: &reqwest::Url, bytes: u64) -> Result<()> {
+        if bytes > MAX_FETCHED_IMAGE_BYTES {
+            bail!(
+                "image from {target} is {bytes} bytes, above the {} MiB image cap",
+                MAX_FETCHED_IMAGE_BYTES >> 20
+            );
+        }
+        Ok(())
+    }
+
+    /// Address rule: only globally routable targets. Loopback, the RFC1918/LAN ranges, link-local
+    /// (which is where the cloud metadata endpoints live), CGNAT, multicast, reserved and
+    /// documentation ranges are all refused.
+    ///
+    /// `vision.image_url_allow_private` (`INFR_IMAGE_URL_ALLOW_PRIVATE`) lifts it for the legitimate
+    /// local case — an image served by a NAS, a LAN camera, or a local test server — because
+    /// refusing it outright would just push callers back to base64 for images they already have.
+    pub(super) fn guard_target(target: &reqwest::Url, allow_private: bool) -> Result<()> {
+        let scheme = target.scheme();
+        if !is_fetched_scheme(scheme) {
+            bail!("image URL {target} redirected to unsupported scheme {scheme:?}");
+        }
+        if allow_private {
+            return Ok(());
+        }
+        let host = target
+            .host_str()
+            .with_context(|| format!("image URL {target} has no host"))?;
+        let port = target.port_or_known_default().unwrap_or(80);
+        let addresses: Vec<IpAddr> = match IpAddr::from_str(host) {
+            Ok(address) => vec![address],
+            // A name resolves through the platform resolver here and the RESULT is judged. That is
+            // not binding-proof: a public name whose resolver answers `127.0.0.1` on the second
+            // lookup could still slip past. Closing that needs a resolver reqwest then has to use,
+            // which is why the range list below is deliberately conservative.
+            Err(_) => (host, port)
+                .to_socket_addrs()
+                .with_context(|| format!("could not resolve the image host {host:?}"))?
+                .map(|socket| socket.ip())
+                .collect(),
+        };
+        if addresses.into_iter().any(is_public_address) {
+            return Ok(());
+        }
+        bail!("image URL {target} does not resolve to a public address")
+    }
+
+    pub(super) fn is_public_address(address: IpAddr) -> bool {
+        match address {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                !(v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+                    || v4.is_link_local()
+                    || o[0] == 10
+                    || (o[0] == 172 && (16..=31).contains(&o[1]))
+                    || (o[0] == 192 && o[1] == 168)
+                    // 192.0.0/24 IETF protocol assignments, 192.0.2/24 TEST-NET-1.
+                    || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
+                    // 100.64.0.0/10 shared address space (carrier NAT).
+                    || (o[0] == 100 && (64..=127).contains(&o[1]))
+                    || (o[0] == 198 && o[1] == 51 && o[2] == 100)
+                    || (o[0] == 203 && o[1] == 0 && o[2] == 113)
+                    || o[0] >= 240)
+            }
+            IpAddr::V6(v6) => {
+                let o = v6.octets();
+                // ::ffff:a.b.c.d says whatever the embedded v4 says.
+                if o[..10] == [0; 10] && o[10..12] == [0xff, 0xff] {
+                    return is_public_address(IpAddr::V4(Ipv4Addr::new(
+                        o[12], o[13], o[14], o[15],
+                    )));
+                }
+                !(v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    // fc00::/7 unique local.
+                    || (o[0] & 0xfe) == 0xfc
+                    // fe80::/10 link-local.
+                    || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80)
+                    // 2001:db8::/32 documentation, 100::/64 discard-only.
+                    || (o[0] == 0x20 && o[1] == 0x01 && o[2] == 0x0d && o[3] == 0xb8)
+                    || (o[0] == 0x01 && o[1] == 0x00))
+            }
+        }
+    }
 }
 
 /// Smart-resize target dims (llama.cpp mtmd qwen3vl): round each side to the nearest multiple of
@@ -347,7 +562,7 @@ mod tests {
                 "data:image/heif;base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             );
-            let input = decode_image_input(&uri)?;
+            let input = decode_image_input(&uri, false)?;
             let got = prepare_image_bytes(&input, &cfg, &positions)?;
             let rgb = crate::heif::decode(&bytes)?.to_rgb8();
             let want = prepare_image_bytes(&png_of(&rgb), &cfg, &positions)?;
@@ -394,21 +609,19 @@ mod tests {
     #[test]
     fn decode_accepts_data_uri_and_bare_base64() {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello");
-        assert_eq!(decode_image_input(&b64).expect("bare"), b"hello");
+        assert_eq!(decode_image_input(&b64, false).expect("bare"), b"hello");
         let uri = format!("data:image/png;base64,{b64}");
-        assert_eq!(decode_image_input(&uri).expect("data uri"), b"hello");
+        assert_eq!(decode_image_input(&uri, false).expect("data uri"), b"hello");
     }
 
     #[test]
-    fn decode_rejects_http_and_non_base64_data_uri() {
+    fn decode_rejects_malformed_data_uris_and_schemes_it_does_not_fetch() {
         for input in [
-            "https://example.com/x.png",
-            "http://example.com/x.png",
             "data:image/png,raw",
             "data:image/png;base64",
             "not base64 !!!",
         ] {
-            let error = decode_image_input(input).unwrap_err();
+            let error = decode_image_input(input, false).unwrap_err();
             assert!(
                 error
                     .downcast_ref::<infr_core::error::InvalidInput>()
@@ -416,6 +629,157 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    #[test]
+    fn unsupported_scheme_is_named_rather_than_mistaken_for_base64() {
+        // `file://` must be named as the problem. Left to the base64 decoder it reports "image input
+        // is not valid base64", which sends the caller looking at their encoding instead of the
+        // scheme they used.
+        for input in [
+            "file:///etc/passwd",
+            "ftp://host/pub/x.png",
+            "smb://nas/share/x.png",
+        ] {
+            let error = decode_image_input(input, false).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<infr_core::error::InvalidInput>()
+                    .is_some(),
+                "{error:#}"
+            );
+            assert!(
+                error.to_string().contains("unsupported image URL scheme"),
+                "{input}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_globally_routable_addresses_may_be_fetched() {
+        use std::net::IpAddr;
+        let refused = [
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.9",
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.2.1",
+            "203.0.113.7",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fd00::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "0100::",
+            // An IPv4-mapped literal is judged as the v4 address it carries.
+            "::ffff:127.0.0.1",
+        ];
+        let allowed = [
+            "8.8.8.8",
+            "93.184.216.34",
+            "172.32.0.1",
+            "100.63.0.1",
+            "2606:2800:220:1:248:1893:25c8:1946",
+            "::ffff:8.8.8.8",
+        ];
+        for text in refused {
+            let address: IpAddr = text.parse().expect(text);
+            assert!(
+                !fetch::is_public_address(address),
+                "{text} must not be a fetch target"
+            );
+        }
+        for text in allowed {
+            let address: IpAddr = text.parse().expect(text);
+            assert!(
+                fetch::is_public_address(address),
+                "{text} must be fetchable"
+            );
+        }
+    }
+
+    /// IP literals are judged without a resolver, so this leg runs offline — and the redirect case
+    /// is the one that matters: a public first hop is worthless as a guard if hop two may be
+    /// internal, which is why `guard_target` runs on every hop of the hand-rolled redirect walk.
+    #[test]
+    fn the_address_guard_judges_literal_targets() {
+        let public = reqwest::Url::parse("http://8.8.8.8/a.png").expect("url");
+        fetch::guard_target(&public, false).expect("a public literal is fetchable");
+        for refused in [
+            "http://127.0.0.1/a.png",
+            "http://169.254.169.254/latest/meta-data/",
+            "https://[::1]/a.png",
+            "http://192.168.0.1:8080/x.png",
+        ] {
+            let url = reqwest::Url::parse(refused).expect(refused);
+            let error = fetch::guard_target(&url, false).unwrap_err();
+            assert!(error.to_string().contains("public"), "{refused}: {error:#}");
+        }
+        let redirected = reqwest::Url::parse("file:///etc/passwd").expect("url");
+        assert!(fetch::guard_target(&redirected, false)
+            .unwrap_err()
+            .to_string()
+            .contains("scheme"));
+        // The escape hatch is the ONLY way a loopback target is reachable, and it has to be asked
+        // for: the default refuses.
+        let local = reqwest::Url::parse("http://127.0.0.1:8080/x.png").expect("url");
+        assert!(fetch::guard_target(&local, false).is_err());
+        fetch::guard_target(&local, true).expect("the hatch allows it");
+    }
+
+    /// The fetch itself, against a loopback server with a canned 200. Offline, no GPU, and the only
+    /// leg that proves the client is actually usable (timeouts set, redirects handled by hand, so a
+    /// `Policy::none()` client really works) and that the bounded read returns the body whole.
+    #[test]
+    fn image_bytes_reads_a_local_server_and_the_policy_refuses_it_first() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener.local_addr().expect("local addr").port();
+        let url = format!("http://127.0.0.1:{port}/shot.png");
+
+        // Default policy: refused before a single byte is sent, so no connection is accepted.
+        let refused = fetch::image_bytes(&url, false).unwrap_err();
+        assert!(
+            refused.to_string().contains("public"),
+            "loopback must be refused: {refused:#}"
+        );
+
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).expect("read") == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            assert!(
+                request.starts_with(b"GET /shot.png HTTP/1.1"),
+                "{}",
+                String::from_utf8_lossy(&request)
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 5\r\n\r\npng!!",
+                )
+                .expect("respond");
+            socket.flush().expect("flush");
+        });
+
+        let bytes = fetch::image_bytes(&url, true).expect("the hatch fetches it");
+        assert_eq!(bytes, b"png!!");
+        server.join().expect("server thread");
     }
 
     #[test]

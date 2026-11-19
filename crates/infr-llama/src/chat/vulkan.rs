@@ -139,15 +139,57 @@ impl DenseSeamChat {
         if self.model.engine_cfg().spec.draft.is_none() {
             anyhow::bail!("Qwen3.8 MTP requires a sidecar path (`INFR_SPEC_DRAFT` / `spec.draft`)");
         }
-        let base = crate::sampling::Sampler::from_cfg(&self.model.engine_cfg().sampling);
+        // The qwen4 sidecar driver is independent of the parked Qwen3.5 path, so `mtp_enabled()`
+        // does not gate it — but the user must know they are on the path the kill switch warns
+        // about.
+        static PARKED_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !crate::mtp::mtp_enabled()
+            && !PARKED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "Qwen3.8 MTP runs on its own sidecar driver, which the parked master switch \
+                 (`mtp_enabled`) does not gate; it is greedy-only and still experimental"
+            );
+        }
+        // The REQUEST's sampler is what the acceptance test compares against, so a greedy request
+        // may use MTP even when the server default is not greedy (the old gate demanded both and
+        // silently ran ordinary decode for every `temperature: 0` request).
         let effective = crate::sampling::Sampler::resolve(req, &self.model.engine_cfg().sampling);
-        let greedy = |sampler: crate::sampling::Sampler| sampler.temp <= 0.0 || sampler.top_k == 1;
+        let greedy = effective.temp <= 0.0 || effective.top_k == 1;
         let neutral_penalties = req.is_none_or(|ctx| !ctx.sampling().penalties_active());
-        if !greedy(base) || !greedy(effective) || !neutral_penalties {
+        if !greedy || !neutral_penalties {
             tracing::warn!("Qwen3.8 MTP v1 is greedy-only; using ordinary decode for this request");
             return Ok(false);
         }
+        // Drafting must pay for its VERIFY rows: a cycle costs several plain steps, so the driver
+        // publishes its rolling acceptance and ordinary decode takes over when it sits below
+        // `spec.mtp_min_alpha` (measured 29 vs 46 tok/s on a 7900 XTX with the shared Q4_K_M head).
+        let floor = self.model.engine_cfg().spec.mtp_min_alpha;
+        if let Some(alpha) = crate::mtp::last_alpha() {
+            if floor > 0.0 && alpha < floor {
+                tracing::warn!(
+                    alpha,
+                    floor,
+                    "Qwen3.8 MTP draft acceptance is too low for its VERIFY cost; using ordinary \
+                     decode for this request"
+                );
+                return Ok(false);
+            }
+        }
         Ok(true)
+    }
+
+    /// Drop the detached MTP runtime (sidecar weights + KV) and its backend so the ordinary
+    /// decode path has the VRAM back. Only meaningful after MTP has run at least once.
+    fn release_qwen4_mtp(&mut self) {
+        let had_runtime = self.qwen4_mtp.take().is_some();
+        let had_backend = self.mtp_vk.take().is_some();
+        if had_runtime || had_backend {
+            tracing::info!(
+                "[infr] released the Qwen3.8 MTP backend/sidecar KV so ordinary decode has its VRAM"
+            );
+        }
     }
 
     fn ensure_qwen4_mtp(&mut self) -> Result<()> {
@@ -189,6 +231,10 @@ impl DenseSeamChat {
                 .generate_vulkan(vk, &self.model, prompt, max_new, req, |p| on_piece(p))
                 .map(|(stats, _)| stats);
         }
+        // The gate can refuse AFTER MTP has run (rolling acceptance fell below
+        // `spec.mtp_min_alpha`). Its detached backend and sidecar KV are still resident and would
+        // leave the ordinary path without VRAM room, so hand them back before decoding.
+        self.release_qwen4_mtp();
         if self.wants_mtp()? {
             self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
