@@ -219,6 +219,8 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 **`[serve]`** — `api_key`（Bearer 令牌；**空**值表示不鉴权，它限制 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 和 `/v1/models`，但从不限制 `/health`）、`max_tokens_cap`、`request_timeout_secs`（单个请求以秒计的实际时钟期限；默认值 `0` 表示无期限。期限会截断本来合法但较慢的回复，因此为选择启用）以及 `stats_interval_secs`（`INFR_SERVE_STATS_SECS`，控制服务器记录汇总吞吐量和每请求进度的频率；默认 `5`，`0` 关闭周期性行）。`shutdown_file`（`INFR_SHUTDOWN_FILE`）是可选的监督器 IPC 路径：创建该文件会请求与 SIGTERM 相同的优雅排空，包括模型加载期间。`embedding_runner`（`INFR_EMBEDDING_RUNNER`）可选择受管理的 llama-server 可执行文件；否则 INFR 会从自身目录、`PATH` 或 LM Studio 中发现兼容运行器。每请求采样不在此处，仍保留在请求中。
 
+`serve` 还会在启动时报告锁状态：与 `run`/`serve-embedding`/`multi`/`bench` 一样，它先取得 GPU 启动锁（`device.gpu_lock`，见 `[device]`）再触碰设备，因此日志里的 `INFR-E1001` 意味着另一个 `infr` 进程仍在这块卡上运行，而不是显存不足的崩溃。
+
 汇总 `serve stats` 行仅在**有活动时**输出：无事件的区间不输出任何内容，因此空闲服务器会留下干净日志，且不会出现可能被误认为负载的心跳。它的 `prefill_tps`/`decode_tps` 是整个服务器的模型 token 数除以该区间的实际时钟时间，而非累计值。每个活跃请求还会在完成预填充块时及解码期间输出受限频率的 `request progress` 行。它报告精确的模型 token `context_tokens/context_limit`、未缓存预填充进度、缓存前缀、已生成 token（包含推理）和请求本地速率。即使禁用周期性行，阶段变化和 `request done` 仍会记录。请求日志**仅包含计数，绝不包含提示词文本**。
 
 成功的非流式响应和流式响应的终止完成帧，均包含权威的 `usage` 及 llama.cpp 兼容的 `timings` 对象。`timings.context_n` 是完整提示词加补全深度，`context_limit` 是 KV 槽位容量，`cached_n` 将复用的提示词 token 与实际评估的 `prompt_n` token 区分开来。流式指标无条件输出，因此未发送 `stream_options.include_usage` 的客户端不会静默记录零 token。
@@ -234,6 +236,24 @@ Responses API 只接受 plain text 与默认 `text.verbosity="medium"`；`low`/`
 范围下载需要服务器支持；不支持的服务器（没有 `Accept-Ranges`，或请求 `206` 却返回 `200`）会回退为单一流，64 MiB 或更小的文件绝不切分。`0` 和 `1` 都严格表示一条连接，适用于计费链路，或反对来自同一客户端多连接的代理。
 
 **`[debug]`** — 填毒/屏障/转储开关：`coopmat`（输出枚举到和选定的 coopmat 形状，对 Intel Arc 很有用）、`bda_chunk`、`wide_dispatch`、`chat`、`moe_counts`、`moe_counts_dump`、`poison_uninit`、`no_barrier`、`full_barrier`。
+
+## GPU 启动锁 / GPU startup lock
+
+`device.gpu_lock`（默认 `true`，环境变量 `INFR_NO_GPU_LOCK`）让 `infr` 在触碰设备之前检查这块卡上是否已经有另一个 `infr` 进程在运行。原因很实际：两个进程共享一张卡会互相压缩统一显存 arena（实测 30K 解码每 1 GiB arena 约 1 ms/token），所以第二个进程既跑得更差，它测出的数字也不可信——在此之前，唯一的污染信号就是吞吐量本身。
+
+锁是 loopback 上一个固定监听端口（`127.0.0.1:28765`，低于两平台的临时端口下限）的 `bind()`：内核拥有它，进程以任何方式退出（包括 `kill -9` 与断电）都会立刻释放，因此不存在需要清理的陈旧锁文件。持锁进程在同一端口应答一行身份信息（pid、设备、调用形式），所以中断启动只发生在一个活着的 `infr` **自己声称**持有该设备时：
+
+| 结果 | 代码 | 行为 |
+| --- | --- | --- |
+| 同一设备的另一个 `infr` 持锁 | `INFR-E1001` | **启动失败**，错误信息给出持锁者的 pid、设备与命令 |
+| `device.gpu_lock = false` / `INFR_NO_GPU_LOCK=1` | `INFR-W1001` | 警告并启动，不再检测并发实例 |
+| 持锁者是另一块设备上的 `infr` | `INFR-W1002` | 警告并启动（多卡各跑一个进程是合法用法） |
+| 端口被占用，但应答不像 `infr` | `INFR-W1003` | 警告并启动 |
+| 端口根本无法绑定（权限、保留区间） | `INFR-W1004` | 警告并启动 |
+
+设备键按集合比较，并区分编号与否：`Vulkan0,Vulkan1` 与 `Vulkan1` 重叠（共享一张卡），`Vulkan0` 与 `Vulkan1` 不重叠；而**未编号**的默认值 `vulkan`（“由引擎挑选”）与任何 `VulkanN` 都算重叠，因为无法证明它们不是同一块卡——只有可证明不相交的索引才会以 `INFR-W1002` 放行。单卡机器上这正好是想要的严格性；多卡机器上若默认挑选与显式索引确实不同，请用 `--dev` 显式指定两者，或用下面的开关放行。
+
+后四种是刻意的失败开放（fail-open）：这是一把诊断用的锁，不是一份资源预留，任何无法证明「另一个 `infr` 正在用这块卡」的情况都不会拦住启动。`--dev cpu` 完全不参与该锁；`infr devices`、`resources`、`pull`、`report` 这类不加载模型的命令也不。`infr compare` 自己不持锁，它逐个启动的 `infr bench` 子进程各自取锁，因此外部并发仍会被检出。
 
 ## 有意不属于配置的 `INFR_*` 键
 
