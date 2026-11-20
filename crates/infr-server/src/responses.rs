@@ -647,11 +647,17 @@ fn input_content(value: &Value) -> Result<Value, ParamError> {
                             .get("image_url")
                             .and_then(Value::as_str)
                             .ok_or_else(|| invalid("input", "input_image requires image_url"))?;
-                        if !url.starts_with("data:") {
-                            return Err(invalid(
-                                "input",
-                                "this server supports base64 data: image URLs, not remote URLs or file IDs",
-                            ));
+                        // Mirror decode_image_input's accepted set (data:/bare base64/http(s)); refuse other schemes here, before a GPU slot is taken.
+                        if let Some((scheme, _)) = url.split_once("://") {
+                            if scheme != "http" && scheme != "https" {
+                                return Err(invalid(
+                                    "input",
+                                    format!(
+                                        "unsupported image_url scheme {scheme:?}: only http(s)://, \
+                                         data: URIs and bare base64 are accepted"
+                                    ),
+                                ));
+                            }
                         }
                         if let Some(detail) = part.get("detail").and_then(Value::as_str) {
                             if detail != "auto" {
@@ -3279,6 +3285,22 @@ mod tests {
         );
     }
 
+    /// Remote http(s) image_url now reaches the vision path verbatim (the seam fetches it); the fixture echoes, so this stays offline.
+    #[tokio::test]
+    async fn remote_image_url_is_passed_to_the_vision_path() {
+        let response = post(json!({"model":"fixture","input":[{"role":"user","content":[
+            {"type":"input_text","text":"describe"},
+            {"type":"input_image","image_url":"https://example.com/shot.png"}
+        ]}]}))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            "image:https://example.com/shot.png"
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_semantics_are_rejected_before_generation() {
         for (field, value) in [
@@ -3299,7 +3321,8 @@ mod tests {
         for part in [
             json!({"type":"input_file","file_data":"ignored"}),
             json!({"type":"input_image","file_id":"file_1"}),
-            json!({"type":"input_image","image_url":"https://example.com/image.png"}),
+            json!({"type":"input_image","image_url":"file:///etc/passwd"}),
+            json!({"type":"input_image","image_url":"ftp://example.com/image.png"}),
         ] {
             let response =
                 post(json!({"model":"fixture","input":[{"role":"user","content":[part]}]})).await;
