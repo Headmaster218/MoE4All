@@ -580,6 +580,14 @@ impl Config {
             || (self.bailingmoe3 && !self.is_bailing_mla_layer(il))
     }
 
+    /// Whether this architecture summarizes its prefix into state the KV page table cannot
+    /// address (DeltaNet, KDA, PLE). A paged chain for such a model resumes ONLY at a host
+    /// snapshot boundary, so a chain published without one is unreachable cache rather than a
+    /// slightly slower hit.
+    pub fn has_recurrent_state(&self) -> bool {
+        self.qwen35 || self.qwen4exp || self.bailingmoe3
+    }
+
     /// Whether this architecture has been validated with independent sequence rows in one
     /// layer-synchronous token graph. This is deliberately narrower than "has recurrent layers":
     /// each architecture must first define correct row-wise persistent-state bindings.

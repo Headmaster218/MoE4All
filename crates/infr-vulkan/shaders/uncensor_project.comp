@@ -1,0 +1,66 @@
+#version 460
+// Uncensor projection: `x -= scale * (x·v) v`, one workgroup per (row, hyper-connection stream),
+// IN PLACE. `x` is a wide residual row of `n_embd` elements and `v` is this layer's unit direction,
+// read from `dir[pc.dir_off ..]`; the same direction is applied to every one of a token's
+// hyper-connection streams, which is why the dispatch is `rows * hc` workgroups of `n_embd`
+// elements each. Semantics, file format and the on/off rules live in `crates/infr-uncensor`;
+// `Recorder::uncensor_project[_dyn]` dispatches it.
+//
+// USE_SCALE_BUF (`uncensor_project_dyn`, see `Op::UncensorProject::scale_buf`): `scale` comes from a
+// 1-element device buffer instead of a push constant, so the per-request uncensor switch is a
+// 4-byte host `upload` between requests rather than a plan rebuild. `scale == 0.0` leaves the
+// residual bit-for-bit untouched, which is what makes "off" a value in a slot instead of a graph
+// change — the same trick `softmax.comp` uses for the DiffusionGemma softmax temperature.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef USE_SCALE_BUF
+layout(push_constant) uniform PC { uint n_embd; uint dir_off; } pc;
+// `x` is bound last because it is the buffer this kernel WRITES: the recorder names the write by
+// the trailing binding, and an in-place kernel's write is the buffer it also reads.
+layout(binding = 0) readonly buffer DB { float dir[]; };
+layout(binding = 1) readonly buffer SB { float scale_buf; };
+layout(binding = 2) buffer XB { float x[]; };
+#else
+layout(push_constant) uniform PC { uint n_embd; uint dir_off; float scale; } pc;
+layout(binding = 0) readonly buffer DB { float dir[]; };
+layout(binding = 1) buffer XB { float x[]; };
+#endif
+
+// Sized 256/MIN_SG (min subgroup 16) so a 16-lane subgroup can't overrun; the pipeline pins
+// requiredSubgroupSize=32 (kernel_sg(..., 32)), so only part[0..gl_NumSubgroups) (=8) is ever used.
+shared float part[16]; // one partial per subgroup (256 threads / sg; 8 waves @ sg32)
+
+void main() {
+    // Owning one row outright is what makes the in-place write legal: no other workgroup reads or
+    // writes these elements, so this kernel can reduce over the row and then rewrite it.
+    uint rh = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint base = rh * pc.n_embd;
+#ifdef USE_SCALE_BUF
+    float scale = scale_buf;
+#else
+    float scale = pc.scale;
+#endif
+
+    float dp = 0.0;
+    for (uint d = t; d < pc.n_embd; d += 256u) {
+        dp += x[base + d] * dir[pc.dir_off + d];
+    }
+    dp = subgroupAdd(dp);
+    if (subgroupElect()) { part[gl_SubgroupID] = dp; }
+    barrier();
+
+    float total = 0.0;
+    for (uint subgroup = 0u; subgroup < gl_NumSubgroups; ++subgroup) {
+        total += part[subgroup];
+    }
+    // The row is read a second time rather than staged in shared: the barrier above orders the
+    // whole reduction ahead of the first write, this workgroup owns the row, and each element below
+    // is read and written by this same invocation.
+    for (uint d = t; d < pc.n_embd; d += 256u) {
+        x[base + d] -= (scale * total) * dir[pc.dir_off + d];
+    }
+}

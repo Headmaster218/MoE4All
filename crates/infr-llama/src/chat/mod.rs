@@ -585,6 +585,17 @@ impl OaiRenderer {
         )
     }
 
+    /// Build the structured-output constraint for this model's tokenizer (see
+    /// [`crate::grammar::output_constraint_for`]). `schema` has already passed the server's JSON
+    /// Schema subset gate; a failure here is reported to the client, never downgraded to free text.
+    pub fn output_constraint(
+        &self,
+        schema: &serde_json::Value,
+    ) -> Result<crate::grammar::Constraint> {
+        let vocab = self.tokenizer.get_vocab_size(true);
+        crate::grammar::output_constraint_for(&self.tokenizer, vocab, &self.eos_ids, schema)
+    }
+
     /// Detokenize ids (markers preserved) — the serve-side parse of a constrained tool-call body.
     pub fn decode_ids(&self, ids: &[u32]) -> Result<String> {
         self.tokenizer

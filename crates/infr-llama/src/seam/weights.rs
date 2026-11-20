@@ -2,7 +2,7 @@
 //! Pure-move split of `seam.rs` — see `super` for the module overview.
 use super::common_prefix_len;
 use super::sc::{DenoiseCache, SelfCondWeights};
-use super::segmented_kv::{PlaneKind, SegmentedKvLayout, KV_GROW_ROWS};
+use super::segmented_kv::{PlaneKind, SegmentedKvLayout};
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
@@ -390,6 +390,86 @@ pub(crate) struct SessionStable {
     pub(super) moe_batched_ok: bool,
 }
 
+/// This slot's uncensor projection (`crates/infr-uncensor`): every layer's unit direction in one
+/// buffer, and the 4-byte scale the graph reads to run projected or not.
+///
+/// The directions are session constants — uploaded once and never rewritten, and identical across
+/// the slots of one model, so a fork re-uploads them instead of device-copying. The scale is the
+/// per-request switch: `1.0` projects the refusal direction out, `0.0` computes `h - 0·v` and
+/// leaves the residual bit-for-bit alone, which is what lets one compiled/cached plan serve both
+/// ways (the same `scale_buf` mechanism as `Op::Softmax`'s dynamic temperature).
+///
+/// `uploaded` and `ran` live here because both outlive a single forward pass. `uploaded` keeps the
+/// 4-byte host→device transfer to the moments the value actually changes; `ran` records what this
+/// slot's RESIDUAL state was built with, which is what a request-less pass (an MTP draft, a
+/// verifier step) inherits, and what tells the caller its cached KV prefix is stale.
+pub(super) struct UncensorState {
+    pub(super) proj: infr_uncensor::Projection,
+    pub(super) dirs_buf: Box<dyn Buffer>,
+    pub(super) scale_buf: Box<dyn Buffer>,
+    /// The value currently in `scale_buf`, so [`Self::select`] uploads only on a real change.
+    uploaded: f32,
+    /// What this slot last really ran; `None` before its first forward pass — including a slot
+    /// whose KV was RESTORED from disk, whose producing setting nobody recorded.
+    ran: Option<bool>,
+}
+
+impl UncensorState {
+    /// Allocate and fill both buffers for a freshly resolved projection, carrying `ran` from the
+    /// state this slot begins with (a cold slot has none; a fork inherits its parent's, because a
+    /// forked conversation starts from the parent's KV rows).
+    pub(super) fn new(
+        be: &dyn Backend,
+        proj: infr_uncensor::Projection,
+        ran: Option<bool>,
+    ) -> anyhow::Result<Self> {
+        let dirs_buf = be
+            .alloc(proj.byte_len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        let scale_buf = be
+            .alloc(4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        // A fresh slot runs the default (`effective(None, None)`): naming a direction file IS the
+        // request for the projection.
+        let uploaded = infr_uncensor::scale(ran.unwrap_or(true));
+        be.upload(dirs_buf.as_ref(), proj.bytes())
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(scale_buf.as_ref(), &uploaded.to_le_bytes())
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(Self {
+            proj,
+            dirs_buf,
+            scale_buf,
+            uploaded,
+            ran,
+        })
+    }
+
+    /// What this slot last really ran.
+    pub(super) fn ran(&self) -> Option<bool> {
+        self.ran
+    }
+
+    /// Run the projection `on` for the requests that follow, and report whether this slot's
+    /// existing KV was produced under a DIFFERENT setting (and must therefore be dropped).
+    ///
+    /// The two writes are deliberately separate. The scale slot is refreshed only when the value in
+    /// it changes, because a 4-byte upload is not free on every request; `ran` records the state
+    /// the cached activations came from, and it is that state — not the transfer — that makes the
+    /// cached prefix unusable.
+    pub(super) fn select(&mut self, be: &dyn Backend, on: bool) -> anyhow::Result<bool> {
+        let stale = infr_uncensor::flipped(self.ran, on);
+        let want = infr_uncensor::scale(on);
+        if self.uploaded != want {
+            be.upload(self.scale_buf.as_ref(), &want.to_le_bytes())
+                .map_err(|e| anyhow!("{e}"))?;
+            self.uploaded = want;
+        }
+        self.ran = Some(on);
+        Ok(stale)
+    }
+}
+
 pub(crate) struct SeamKv {
     /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
     /// only its KV + IO buffers, never a re-upload.
@@ -420,6 +500,10 @@ pub(crate) struct SeamKv {
     pub(super) ple_embd_buf: Option<Box<dyn Buffer>>,
     /// Persistent PLE dilated-convolution history (9 x hc*n_embd f32 on the released model).
     pub(super) ple_state_buf: Option<Box<dyn Buffer>>,
+    /// The uncensor projection this slot runs, when the session loaded a direction file at all
+    /// (see [`UncensorState`] and `crates/infr-uncensor`). `None` is the ordinary case and costs
+    /// nothing: no buffer, no op in the graph, and the model runs exactly as it did before.
+    pub(super) uncensor: Option<UncensorState>,
     /// Fixed Qwen3.8 MTP VERIFY IO. A single slot needs four rows; parallel serving reserves the
     /// whole four-rows-per-lane cohort so whichever slot becomes the primary can own the graph.
     /// These buffers are allocated before the deferred Vulkan pager measures the remaining room,
@@ -436,6 +520,16 @@ pub(crate) struct SeamKv {
     pub(super) kv_ring: bool,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
+    /// `cached` still matches what EVERY LAYER has written, even though this turn ended in error:
+    /// the prefill sweep stopped BETWEEN two chunks. The error paths in [`crate::seam`] keep the
+    /// ledger when this is set and empty it otherwise, because a slot cut off in the middle of a
+    /// chunk carries recurrent/PLE state past the spine — resuming at the spine would then be wrong.
+    pub(super) ledger_matches_kv: bool,
+    /// This conversation's image spans in the shared paged-KV tree's key space; empty for a text
+    /// conversation. `cached` stays the REAL ids the model runs on — the tree is addressed through
+    /// these blocks instead, which is what lets an image-bearing chain be reused without ever being
+    /// mistaken for a different picture. See [`Self::paged_cache_view`].
+    pub(super) image_cache_spans: Vec<crate::seam::ImageCacheSpan>,
     /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
     /// non-diffusion-gemma caller (never populated). Reset to `None` whenever the (cc, p) key
     /// changes (see `DenoiseCache`).
@@ -479,6 +573,20 @@ pub(crate) struct SeamKv {
     /// and the prefix immediately before the latest user message. Attention/QSA rows remain in
     /// their ordinary cache; only the fixed recurrent/PLE summaries are duplicated here.
     pub(super) turn_recurrent_ckpts: [Option<TurnRecurrentCkpt>; super::TURN_CHECKPOINT_COUNT],
+    /// Paged tier (hybrid recurrent models): HOST snapshot of this slot's recurrent/PLE state at a
+    /// page-aligned prefill boundary — the state a radix entry needs so a tree hit can resume
+    /// without replaying the prefill. Captured once while the chunked prefill crosses the
+    /// boundary (or inherited from the entry this slot attached), handed to the tree on publish.
+    /// Costs no VRAM-plan space, unlike a third device checkpoint; invalidated with the token
+    /// stream it describes.
+    pub(super) paged_frontier: Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
+    /// The frontier the last capture replaced, kept for the same reason the turn checkpoints come
+    /// in pairs: a continuation never detaches, so overwriting the frontier destroys the exact
+    /// boundary a fork branches at. Both describe this slot's token spine and leave together.
+    /// Bounded at one extra snapshot — on a 48-layer hybrid that is ~112 MiB of the tree's aux
+    /// budget per conversation, which `admit_ckpts` yields before any inherited anchor under
+    /// pressure.
+    pub(super) paged_frontier_prev: Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
     /// Additional serve slots whose persistent device allocations were materialized beside slot
     /// 0 before the unified arena consumed the measured remainder. Startup drains this vector
     /// immediately; ordinary one-shot/session paths always keep it empty.
@@ -535,19 +643,32 @@ impl QwenMtpVerifyBuffers {
 #[derive(Default)]
 pub(super) struct SegmentedKvState {
     pub(super) enabled: bool,
+    /// Tokens per physical segment (page). Carried on the slot so depth commits and session
+    /// release rebuild the exact same geometry without threading `EngineConfig` everywhere.
+    pub(super) page_tokens: usize,
     pub(super) committed_tokens: usize,
+    /// Paged radix tier (`kv.paged_cache_max`): the engine-wide frame pool + tree. `None` keeps
+    /// the blob path (arena-committed segments per slot) byte-for-byte.
+    pub(super) paged: Option<std::sync::Arc<std::sync::Mutex<crate::paged_cache::PagedKv>>>,
+    /// The frames this slot's page table points at, one per committed page, POSITIONAL from
+    /// token 0 — the same chain form the radix tree publishes, so a demote/attach swap is a
+    /// Vec move plus table writes, never a byte copy.
+    pub(super) chain: Vec<super::kv_frame_pool::FrameId>,
 }
 
 impl SegmentedKvState {
-    pub(super) fn enabled() -> Self {
+    pub(super) fn enabled(page_tokens: usize) -> Self {
         Self {
             enabled: true,
+            page_tokens,
             committed_tokens: 0,
+            paged: None,
+            chain: Vec::new(),
         }
     }
 
     /// Commit every per-token plane through `tokens`. The fast path is one comparison; allocation
-    /// and address-table updates happen only when a call crosses a 32K-token boundary.
+    /// and address-table updates happen only when a call crosses a page boundary.
     pub(super) fn ensure_depth(
         &mut self,
         be: &dyn Backend,
@@ -569,7 +690,7 @@ impl SegmentedKvState {
                 "KV depth {tokens} exceeds the session capacity {max_ctx}"
             ));
         }
-        let layout = SegmentedKvLayout::for_qwen(cfg, max_ctx, k_fmt, v_fmt)
+        let layout = SegmentedKvLayout::for_qwen(cfg, max_ctx, k_fmt, v_fmt, self.page_tokens)
             .ok_or_else(|| anyhow!("segmented KV enabled for a non-Qwen session"))?;
         let segments = layout.segments_for_tokens(tokens);
         let buffers: Vec<&dyn Buffer> = layout
@@ -588,9 +709,32 @@ impl SegmentedKvState {
                 })
             })
             .collect::<AResult<_>>()?;
+        if let Some(paged) = &self.paged {
+            // Paged tier: growth is a corridor frame claim + one table write per plane. No arena
+            // segment is ever committed for this slot — the frames are shared by refcount with
+            // the radix tree, so the blob reservation/loan machinery must not see them.
+            let mut kv = paged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while self.chain.len() < segments {
+                let page = self.chain.len();
+                let frame = kv.alloc_frame(be).ok_or_else(|| {
+                    anyhow!("paged KV corridor exhausted at page {page} (every frame is owned by a live session)")
+                })?;
+                for (plane, &buffer) in buffers.iter().enumerate() {
+                    be.set_kv_table_entry(buffer, page, kv.plane_addr(frame, plane))
+                        .map_err(|e| {
+                            anyhow!("paged KV table write at page {page} plane {plane}: {e}")
+                        })?;
+                }
+                self.chain.push(frame);
+            }
+            self.committed_tokens = (segments * self.page_tokens).min(max_ctx);
+            return Ok(());
+        }
         be.ensure_segmented_kv_batch(&buffers, segments)
             .map_err(|e| anyhow!("commit segmented KV growth transaction: {e}"))?;
-        self.committed_tokens = (segments * KV_GROW_ROWS).min(max_ctx);
+        self.committed_tokens = (segments * self.page_tokens).min(max_ctx);
         tracing::info!(
             requested_tokens = tokens,
             committed_tokens = self.committed_tokens,
@@ -610,6 +754,12 @@ impl SegmentedKvState {
         qsa_cbufs: &[Option<Box<dyn Buffer>>],
     ) -> AResult<()> {
         if !self.enabled {
+            return Ok(());
+        }
+        if self.paged.is_some() {
+            // Paged frames can be shared with the radix tree (or a second session); zeroing the
+            // committed byte range would clobber another owner's conversation. The paged path
+            // never clears in place — a fresh session overwrites rows through its own chain.
             return Ok(());
         }
         for layer in 0..cfg.n_layer {
@@ -1139,6 +1289,323 @@ impl TurnRecurrentCkpt {
     }
 }
 
+/// A host-side paged frontier snapshot, filled in as the prefill reaches its page-aligned frontier.
+///
+/// A radix entry's frames carry only the per-token attention/QSA rows. DeltaNet's conv window and
+/// recurrent matrix, plus Qwen3.8's model-level PLE history, are SINGLE fixed buffers summarizing
+/// the whole prefix — a session that attaches frames without them does not know what the model's
+/// state was, so it must replay. This snapshot is the missing half: the same bytes a
+/// [`TurnRecurrentCkpt`] holds in VRAM, but host-resident (paid out of the RAM tier's budget, not a
+/// VRAM plan) and shared by `Arc` with every entry that publishes it.
+///
+/// The two prefill orderings need different capture points. Chunk-major sweeps the whole model per
+/// chunk, so [`capture_paged_ckpt`] reads a self-consistent state once, at the chunk that ends on
+/// the frontier. Layer-major inverts the nesting: by the time layer `L`'s span reaches the frontier
+/// chunk, every earlier layer has already swept the chunks AFTER it, so its live buffer holds the
+/// prompt-END state. Each layer's bytes must therefore be taken the moment its own span finishes the
+/// frontier chunk — the same rule [`TurnRecurrentCkpt::snapshot_layer`] applies in VRAM. Either way,
+/// reading the LIVE buffers mid-chunk is wrong: they hold the pre-chunk or post-chunk value, never
+/// the boundary's. A mid-chunk boundary is only reachable through the graph-export path, where the
+/// prefill ops themselves write the snapshot at the exact row (see `runner`'s `StateExport`).
+pub(crate) struct PagedFrontierCapture {
+    ckpt: crate::paged_cache::PagedCkpt,
+    copied: Vec<bool>,
+    ple_copied: bool,
+}
+
+/// One aux storage buffer: host-visible system RAM (`Readback`), so the snapshot costs the host
+/// bytes the tree's aux budget counts and never touches the device-local VRAM plan.
+pub(crate) fn aux_alloc(
+    be: &dyn Backend,
+    bytes: usize,
+    layer: usize,
+    what: &str,
+) -> AResult<Box<dyn Buffer>> {
+    be.alloc(bytes, BufferUsage::Readback)
+        .map_err(|e| anyhow!("allocate paged aux {what} state for layer {layer}: {e}"))
+}
+
+impl PagedFrontierCapture {
+    /// Size the snapshot against one slot's live buffers. Nothing is transferred yet.
+    pub(crate) fn new(
+        cfg: &Config,
+        be: &dyn Backend,
+        kbufs: &[Box<dyn Buffer>],
+        vbufs: &[Box<dyn Buffer>],
+        ple_state_buf: Option<&dyn Buffer>,
+        boundary_tokens: usize,
+    ) -> AResult<Self> {
+        use crate::paged_cache::PagedCkpt;
+        let layers: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&layer| cfg.is_recurrent_layer(layer))
+            .collect();
+        if layers.is_empty() {
+            return Err(anyhow!(
+                "paged recurrent snapshot requested for a model with no recurrent layers"
+            ));
+        }
+        let mut ck = Vec::with_capacity(layers.len());
+        let mut cv = Vec::with_capacity(layers.len());
+        for &layer in &layers {
+            let k = kbufs
+                .get(layer)
+                .ok_or_else(|| anyhow!("recurrent layer {layer} has no state buffer"))?;
+            let v = vbufs
+                .get(layer)
+                .ok_or_else(|| anyhow!("recurrent layer {layer} has no state buffer"))?;
+            ck.push(aux_alloc(be, k.len_bytes(), layer, "conv")?);
+            cv.push(aux_alloc(be, v.len_bytes(), layer, "matrix")?);
+        }
+        let copied = vec![false; ck.len()];
+        Ok(Self {
+            ckpt: PagedCkpt {
+                boundary_tokens,
+                layers,
+                kbufs: ck,
+                vbufs: cv,
+                ple: ple_state_buf
+                    .map(|buffer| aux_alloc(be, buffer.len_bytes(), usize::MAX, "PLE"))
+                    .transpose()?,
+            },
+            copied,
+            ple_copied: false,
+        })
+    }
+
+    /// Copy one recurrent layer's live conv/`S` buffers into the snapshot. A no-op for a layer
+    /// the model does not checkpoint, so a layer-major sweep calls it for every span.
+    pub(crate) fn snapshot_layer(
+        &mut self,
+        be: &dyn Backend,
+        kbufs: &[Box<dyn Buffer>],
+        vbufs: &[Box<dyn Buffer>],
+        layer: usize,
+    ) -> AResult<()> {
+        let Some(index) = self.ckpt.layers.iter().position(|&l| l == layer) else {
+            return Ok(());
+        };
+        if self.copied[index] {
+            return Ok(());
+        }
+        let k = kbufs
+            .get(layer)
+            .ok_or_else(|| anyhow!("recurrent layer {layer} has no state buffer"))?;
+        let v = vbufs
+            .get(layer)
+            .ok_or_else(|| anyhow!("recurrent layer {layer} has no state buffer"))?;
+        if k.len_bytes() != self.ckpt.kbufs[index].len_bytes()
+            || v.len_bytes() != self.ckpt.vbufs[index].len_bytes()
+        {
+            return Err(anyhow!("recurrent layer {layer} changed size mid-prefill"));
+        }
+        be.copy_buffers(&[
+            (k.as_ref(), self.ckpt.kbufs[index].as_ref(), k.len_bytes()),
+            (v.as_ref(), self.ckpt.vbufs[index].as_ref(), v.len_bytes()),
+        ])
+        .map_err(|e| anyhow!("copy recurrent state at layer {layer} into the snapshot: {e}"))?;
+        self.copied[index] = true;
+        Ok(())
+    }
+
+    /// Copy the model-level PLE history, once.
+    pub(crate) fn snapshot_ple(
+        &mut self,
+        be: &dyn Backend,
+        ple_state_buf: Option<&dyn Buffer>,
+    ) -> AResult<()> {
+        if self.ple_copied {
+            return Ok(());
+        }
+        match (ple_state_buf, self.ckpt.ple.as_deref()) {
+            (Some(buffer), Some(dst)) => {
+                if buffer.len_bytes() != dst.len_bytes() {
+                    return Err(anyhow!("PLE state buffer changed size mid-prefill"));
+                }
+                be.copy_buffer(buffer, dst, buffer.len_bytes())
+                    .map_err(|e| anyhow!("copy PLE state into the snapshot: {e}"))?;
+                self.ple_copied = true;
+                Ok(())
+            }
+            (None, None) => {
+                self.ple_copied = true;
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "paged frontier capture PLE buffer differs from its allocation"
+            )),
+        }
+    }
+
+    /// Chunk-major: the whole model has just reached `boundary_tokens`, so read every recurrent
+    /// layer and the PLE history from the live buffers in one pass.
+    pub(crate) fn snapshot_all(
+        &mut self,
+        be: &dyn Backend,
+        kbufs: &[Box<dyn Buffer>],
+        vbufs: &[Box<dyn Buffer>],
+        ple_state_buf: Option<&dyn Buffer>,
+    ) -> AResult<()> {
+        for &layer in &self.ckpt.layers.clone() {
+            self.snapshot_layer(be, kbufs, vbufs, layer)?;
+        }
+        self.snapshot_ple(be, ple_state_buf)
+    }
+
+    /// Publish the snapshot. An incomplete capture is an error rather than a zero-filled snapshot:
+    /// publishing state that was never read would let a later request resume from fabricated history.
+    pub(crate) fn finish(self) -> AResult<std::sync::Arc<crate::paged_cache::PagedCkpt>> {
+        if let Some(index) = self.copied.iter().position(|&done| !done) {
+            return Err(anyhow!(
+                "paged frontier snapshot reached the boundary without layer {} of {}",
+                self.ckpt.layers[index],
+                self.ckpt.layers.len()
+            ));
+        }
+        if !self.ple_copied {
+            return Err(anyhow!(
+                "paged frontier snapshot reached the boundary without its PLE state"
+            ));
+        }
+        Ok(std::sync::Arc::new(self.ckpt))
+    }
+}
+
+/// Chunk-major one-shot convenience over [`PagedFrontierCapture`]: the caller has just run the
+/// WHOLE model over a chunk ending at `boundary_tokens`, so the live buffers are the boundary's
+/// state and one pass captures it. A layer-major sweep must use the struct directly.
+pub(crate) fn capture_paged_ckpt(
+    be: &dyn Backend,
+    cfg: &Config,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    ple_state_buf: Option<&dyn Buffer>,
+    boundary_tokens: usize,
+) -> AResult<std::sync::Arc<crate::paged_cache::PagedCkpt>> {
+    let mut capture =
+        PagedFrontierCapture::new(cfg, be, kbufs, vbufs, ple_state_buf, boundary_tokens)?;
+    capture.snapshot_all(be, kbufs, vbufs, ple_state_buf)?;
+    capture.finish()
+}
+
+/// Install a freshly captured frontier and keep the one it replaces as the slot's second snapshot.
+/// A re-capture at the SAME boundary keeps the older `prev` rather than duplicating a state the
+/// tree would dedup anyway, so a short turn costs no extra aux bytes.
+pub(super) fn set_paged_frontier(
+    frontier: &mut Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
+    prev: &mut Option<std::sync::Arc<crate::paged_cache::PagedCkpt>>,
+    captured: std::sync::Arc<crate::paged_cache::PagedCkpt>,
+) {
+    let boundary = captured.boundary_tokens;
+    if let Some(replaced) = frontier.replace(captured) {
+        if replaced.boundary_tokens != boundary {
+            *prev = Some(replaced);
+        }
+    }
+}
+
+/// Copy an already-valid device checkpoint out of VRAM into a host
+/// [`PagedCkpt`](crate::paged_cache::PagedCkpt) — the publish path for a rolling turn checkpoint,
+/// which a radix entry can carry exactly as well as the frontier snapshot. The bytes come from the
+/// checkpoint's OWN buffers (the state at `tokens.len()`), never the slot's live ones (the state at
+/// the current end), so this is a plain device→host DMA of what `TurnRecurrentCkpt` already holds.
+pub(crate) fn paged_ckpt_from_device(
+    be: &dyn Backend,
+    ck: &TurnRecurrentCkpt,
+) -> AResult<std::sync::Arc<crate::paged_cache::PagedCkpt>> {
+    use crate::paged_cache::PagedCkpt;
+    anyhow::ensure!(ck.valid, "device turn checkpoint is not fully captured");
+    let mut kbufs = Vec::with_capacity(ck.kbufs.len());
+    let mut vbufs = Vec::with_capacity(ck.vbufs.len());
+    for (index, &layer) in ck.layers.iter().enumerate() {
+        kbufs.push(aux_alloc(be, ck.kbufs[index].len_bytes(), layer, "conv")?);
+        vbufs.push(aux_alloc(be, ck.vbufs[index].len_bytes(), layer, "matrix")?);
+    }
+    let ple = ck
+        .ple_state
+        .as_deref()
+        .map(|buffer| aux_alloc(be, buffer.len_bytes(), usize::MAX, "PLE"))
+        .transpose()?;
+    let mut copies = Vec::with_capacity(ck.kbufs.len() * 2 + usize::from(ple.is_some()));
+    for index in 0..ck.layers.len() {
+        copies.push((
+            ck.kbufs[index].as_ref(),
+            kbufs[index].as_ref(),
+            ck.kbufs[index].len_bytes(),
+        ));
+        copies.push((
+            ck.vbufs[index].as_ref(),
+            vbufs[index].as_ref(),
+            ck.vbufs[index].len_bytes(),
+        ));
+    }
+    if let (Some(src), Some(dst)) = (ck.ple_state.as_deref(), ple.as_deref()) {
+        copies.push((src, dst, src.len_bytes()));
+    }
+    be.copy_buffers(&copies)
+        .map_err(|e| anyhow!("copy turn checkpoint into host aux: {e}"))?;
+    Ok(std::sync::Arc::new(PagedCkpt {
+        boundary_tokens: ck.tokens.len(),
+        layers: ck.layers.clone(),
+        kbufs,
+        vbufs,
+        ple,
+    }))
+}
+
+/// Copy a host [`PagedCkpt`](crate::paged_cache::PagedCkpt) into a slot's live recurrent/PLE
+/// buffers — the restore half of [`PagedFrontierCapture`]. Device-side addressing of the state lives
+/// entirely in the ordinary single-buffer path, so no KV table work is involved here.
+pub(crate) fn restore_paged_ckpt(
+    be: &dyn Backend,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    ple_state_buf: Option<&dyn Buffer>,
+    ckpt: &crate::paged_cache::PagedCkpt,
+) -> AResult<()> {
+    let mut copies = Vec::with_capacity(ckpt.layers.len() * 2 + usize::from(ckpt.ple.is_some()));
+    for (index, &layer) in ckpt.layers.iter().enumerate() {
+        let k = kbufs
+            .get(layer)
+            .ok_or_else(|| anyhow!("paged snapshot names layer {layer} the slot does not have"))?;
+        let v = vbufs
+            .get(layer)
+            .ok_or_else(|| anyhow!("paged snapshot names layer {layer} the slot does not have"))?;
+        let (ck, cv) = (&ckpt.kbufs[index], &ckpt.vbufs[index]);
+        if k.len_bytes() != ck.len_bytes() || v.len_bytes() != cv.len_bytes() {
+            return Err(anyhow!(
+                "paged snapshot geometry differs from the resident slot at layer {layer} ({}+{} vs {}+{})",
+                ck.len_bytes(),
+                cv.len_bytes(),
+                k.len_bytes(),
+                v.len_bytes(),
+            ));
+        }
+        copies.push((ck.as_ref(), k.as_ref(), ck.len_bytes()));
+        copies.push((cv.as_ref(), v.as_ref(), cv.len_bytes()));
+    }
+    match (ple_state_buf, ckpt.ple.as_deref()) {
+        (Some(buffer), Some(src)) => {
+            if buffer.len_bytes() != src.len_bytes() {
+                return Err(anyhow!(
+                    "paged snapshot PLE size {} differs from the resident slot's {}",
+                    src.len_bytes(),
+                    buffer.len_bytes()
+                ));
+            }
+            copies.push((src, buffer, src.len_bytes()));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(anyhow!(
+                "paged snapshot PLE presence differs from the resident slot"
+            ));
+        }
+    }
+    be.copy_buffers(&copies)
+        .map_err(|e| anyhow!("restore paged recurrent snapshot: {e}"))?;
+    Ok(())
+}
+
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
 /// the rope_freqs constant. Shared across conversation slots via `Arc`.
 pub(crate) struct SeamWeights {
@@ -1222,6 +1689,30 @@ impl SeamKv {
         live.into_iter().chain(checkpoint).max()
     }
 
+    /// [`Self::continuation_prefix_len`] applied in the paged tree's KEY space: `key_view` is the
+    /// requesting prompt's [`crate::seam::MropePlan::cache_view`], and this slot's side is its own
+    /// [`Self::paged_cache_view`]. Comparing in that space is what allows a slot that materialized
+    /// picture A to continue a request carrying picture A — and never one carrying picture B, whose
+    /// key differs from the first pad token onward. The rolling recurrent checkpoints are real-token
+    /// prefixes, so they stay out of this comparison; a multimodal session continues from its live
+    /// frontier or from the tree, which is the same rule the resident path already applies.
+    ///
+    /// `projection` is the setting the REQUEST resolves to. Rows computed under the other setting
+    /// are not a continuation of it at any depth, so a mismatch refuses the whole slot — the same
+    /// separation the tree gets from addressing a different root.
+    pub(crate) fn continuation_prefix_len_keyed(
+        &self,
+        key_view: &[u32],
+        projection: Option<bool>,
+    ) -> Option<usize> {
+        if self.paged_cache_projection() != projection {
+            return None;
+        }
+        let view = self.paged_cache_view();
+        let score = common_prefix_len(&view, key_view);
+        (score > 0 && (score == view.len() || score == key_view.len())).then_some(score)
+    }
+
     /// Longest prefix this slot can copy into another slot without replaying model work. Hybrid
     /// recurrent models can only export their live frontier or a captured turn checkpoint; an
     /// arbitrary token LCP has no matching recurrent/PLE summary.
@@ -1255,6 +1746,8 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        self.ledger_matches_kv = false;
+        self.image_cache_spans.clear();
         self.invalidate_turn_checkpoint();
         self.invalidate_delta_checkpoint();
     }
@@ -1268,10 +1761,81 @@ impl SeamKv {
         &self.cached
     }
 
+    /// The token vector this slot's KV may be SHARED under: `cached`, with every image span's pad
+    /// run replaced by that image's content block. Byte-identical to `cached` for a text
+    /// conversation, so a slot that never saw an image keys and publishes exactly as before.
+    ///
+    /// The projection setting is NOT folded in here — it selects which tree the key addresses
+    /// ([`crate::paged_cache::PagedKv::best_match`]'s `projection`), because overwriting a key
+    /// position with a setting tag would erase the first token's identity.
+    pub(crate) fn paged_cache_view(&self) -> Vec<u32> {
+        crate::seam::image_cache_view(&self.cached, &self.image_cache_spans)
+    }
+
+    /// The projection setting this slot's own rows were materialized under, or `None` when the
+    /// session has no projection at all. This is the tree its [`Self::paged_cache_view`] belongs
+    /// to; a request resolves to its own setting through [`Self::uncensor_setting`].
+    pub(crate) fn paged_cache_projection(&self) -> Option<bool> {
+        self.uncensor_setting(None)
+    }
+
+    /// The tree key for a request about to run ON THIS SLOT: `tokens` tagged with the setting the
+    /// request resolves to, or `None` when the session has no projection at all — in which case the
+    /// caller uses the plain tokens and keys behave exactly as they did before this feature.
+    /// The setting a request resolves to on this slot, or `None` when the session has no projection.
+    /// The checkout needs it twice: to address the tree, and to tell the slot that the chain it just
+    /// attached WAS materialized under it.
+    pub(crate) fn uncensor_setting(&self, requested: Option<bool>) -> Option<bool> {
+        self.uncensor.as_ref().map(|_| {
+            infr_uncensor::effective(requested, self.uncensor.as_ref().and_then(|u| u.ran()))
+        })
+    }
+
+    /// A tree attach gave this slot rows produced under `on`, so its history no longer comes from the
+    /// other setting: `uncensor_apply` must upload the scale, not drop the prefix it just attached.
+    /// The upload itself stays `select`'s job — only the bookkeeping of "what produced these rows"
+    /// moves here.
+    pub(crate) fn note_uncensor_attached(&mut self, on: bool) {
+        if let Some(u) = self.uncensor.as_mut() {
+            u.ran = Some(on);
+        }
+    }
+
+    /// Record the image spans of the prompt this slot is about to materialize, so its chain is
+    /// published and matched under a key that names the PICTURES rather than the pad token they
+    /// replaced. Callers own the ordering: set it for the whole conversation before the first
+    /// prefill, and let [`Self::reset`] / the paged publish clear it when the conversation ends.
+    pub(crate) fn set_image_cache_spans(&mut self, spans: Vec<crate::seam::ImageCacheSpan>) {
+        self.image_cache_spans = spans;
+    }
+
+    /// Paged tier: does this slot still own corridor frames (a published chain, or warm-reuse
+    /// frames past a `reset()`)? A paged attach needs an empty chain; see `checkout_with_paged_cache`.
+    pub(crate) fn paged_holds_frames(&self) -> bool {
+        !self.segmented_kv.chain.is_empty()
+    }
+
+    /// A turn that ended in error must not hand its slot back as reusable... unless the prefill
+    /// sweep vouched for its ledger: stopping BETWEEN two chunks leaves `cached` exactly equal to
+    /// what every layer wrote, and then the next checkout publishes that prefix to the radix tree
+    /// instead of losing minutes of work to a client cancel. Anything else (a cut-off mid-chunk, a
+    /// failed decode step) keeps the empty-ledger rule.
+    ///
+    /// Every failed-generation guard calls this, so the rule has one home. A caller that knows the
+    /// state is CORRUPT (non-finite output) calls [`Self::reset`] instead — that survives any
+    /// voucher.
+    pub(crate) fn reset_after_failed_turn(&mut self) {
+        if !self.ledger_matches_kv {
+            self.reset();
+        }
+    }
+
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        self.ledger_matches_kv = false;
+        self.image_cache_spans.clear();
         self.invalidate_turn_checkpoint();
         self.invalidate_delta_checkpoint();
     }
@@ -1394,6 +1958,9 @@ impl SeamKv {
         for ck in self.turn_recurrent_ckpts.iter_mut().flatten() {
             ck.invalidate();
         }
+        // The host frontier snapshots describe a token stream this slot no longer owns.
+        self.paged_frontier = None;
+        self.paged_frontier_prev = None;
     }
 
     /// Restore a rolling recurrent checkpoint when `prompt` strictly extends it. A mismatch is
@@ -1744,8 +2311,14 @@ impl SeamKv {
         let mut qsa_kbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let mut qsa_cbufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         let segmented_layout = self.segmented_kv.enabled.then(|| {
-            SegmentedKvLayout::for_qwen(cfg, self.max_ctx, self.k_fmt, self.v_fmt)
-                .expect("a segmented Qwen slot keeps its Qwen geometry when forked")
+            SegmentedKvLayout::for_qwen(
+                cfg,
+                self.max_ctx,
+                self.k_fmt,
+                self.v_fmt,
+                self.segmented_kv.page_tokens,
+            )
+            .expect("a segmented Qwen slot keeps its Qwen geometry when forked")
         });
         for l in 0..cfg.n_layer {
             let (k_bytes, v_bytes) = crate::seam::layer_state_bytes(
@@ -1894,7 +2467,7 @@ impl SeamKv {
             qsa_kbufs,
             qsa_cbufs,
             segmented_kv: if self.segmented_kv.enabled {
-                SegmentedKvState::enabled()
+                SegmentedKvState::enabled(self.segmented_kv.page_tokens)
             } else {
                 SegmentedKvState::default()
             },
@@ -1925,6 +2498,14 @@ impl SeamKv {
             } else {
                 None
             },
+            // The directions are a session constant, so the fork re-uploads the same bytes into its
+            // own buffer; `ran` carries over because the fork STARTS from this slot's KV rows, and
+            // those rows came out of a run whose setting has to stay true of the child too.
+            uncensor: self
+                .uncensor
+                .as_ref()
+                .map(|u| UncensorState::new(be, u.proj.clone(), u.ran))
+                .transpose()?,
             ple_embd_buf: if self.ple_embd_buf.is_some() {
                 let heads = (cfg.ple_ngram_size - 1) * cfg.ple_heads_per_ngram;
                 Some(
@@ -1939,6 +2520,10 @@ impl SeamKv {
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
+            ledger_matches_kv: false,
+            // A forked slot materializes nothing yet, so it has no image identity to key by — and
+            // `seed_from` below carries the source's spans whenever it copies real rows.
+            image_cache_spans: Vec::new(),
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
             // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
@@ -1955,6 +2540,9 @@ impl SeamKv {
             sc_temp_inv_buf: None,
             mtp_delta_ckpt,
             turn_recurrent_ckpts,
+            // The fork's token stream starts empty: no host snapshot describes it yet.
+            paged_frontier: None,
+            paged_frontier_prev: None,
             preallocated_siblings: Vec::new(),
         })
     }
@@ -2257,8 +2845,8 @@ impl SeamKv {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_extension_start, FfnW, MoeSharedW, MtpDeltaCkpt, SeamKv, SeamWeights,
-        SegmentedKvState, SessionStable, TurnRecurrentCkpt,
+        checkpoint_extension_start, set_paged_frontier, FfnW, MoeSharedW, MtpDeltaCkpt, SeamKv,
+        SeamWeights, SegmentedKvState, SessionStable, TurnRecurrentCkpt,
     };
     use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
     use infr_core::error::{Error as BackendError, Result as BackendResult};
@@ -2364,6 +2952,11 @@ mod tests {
         }
         fn sync(&self) -> BackendResult<()> {
             self.inner.sync()
+        }
+        // The CPU has no device page table to zero, so the paged detach's release is a no-op here
+        // instead of the trait's "unsupported by this backend" error.
+        fn release_segmented_kv(&self, _buffer: &dyn Buffer) -> BackendResult<()> {
+            Ok(())
         }
     }
 
@@ -2519,6 +3112,9 @@ mod tests {
             max_ctx: 16,
             kv_ring: false,
             cached: vec![10, 20, 30, 40],
+            ledger_matches_kv: false,
+            image_cache_spans: Vec::new(),
+            uncensor: None,
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -2527,6 +3123,8 @@ mod tests {
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: checkpoint,
             turn_recurrent_ckpts: std::array::from_fn(|_| None),
+            paged_frontier: None,
+            paged_frontier_prev: None,
             preallocated_siblings: Vec::new(),
         };
         (cfg, slot)
@@ -3214,5 +3812,162 @@ mod tests {
         assert!(checkpoint.tokens.is_empty());
         assert_eq!(checkpoint.copied, [false, false]);
         assert!(!checkpoint.ple_copied);
+    }
+
+    /// A publish can be REFUSED: a chain that does not cover the token prefix, or a recurrent
+    /// anchor that will not fit the aux budget. The slot has to survive that holding its frontier
+    /// — the one snapshot that can make a later publish resumable. Consuming it on the first
+    /// refusal would leave a conversation that re-prefills forever and still never enters the tree.
+    #[test]
+    fn a_refused_paged_publish_keeps_the_frontier_for_the_retry() {
+        let be = CountingRollbackBackend::new();
+        let (cfg, mut slot) = rollback_slot(&be, true, false, 31);
+        let page = 4;
+        let tokens: Vec<u32> = (1..=8).collect();
+        slot.segmented_kv = SegmentedKvState::enabled(page);
+        slot.cached = tokens.clone();
+        slot.paged_frontier = Some(Arc::new(crate::paged_cache::PagedCkpt {
+            boundary_tokens: tokens.len(),
+            layers: Vec::new(),
+            kbufs: vec![be.inner.alloc(64, BufferUsage::Readback).unwrap()],
+            vbufs: Vec::new(),
+            ple: None,
+        }));
+        let tree = Arc::new(std::sync::Mutex::new(crate::paged_cache::PagedKv::new(
+            1 << 20,
+            page,
+            vec![0],
+            8,
+            0,
+            0,
+            None,
+            cfg.has_recurrent_state(),
+        )));
+        slot.set_paged(tree.clone());
+        let mut tree = tree.lock().unwrap();
+        tree.set_vram_segments(&[infr_core::backend::KvFrameCorridor {
+            base: 0x1_0000_0000,
+            frames: 8,
+        }]);
+        tree.set_aux_budget(1 << 20);
+        let chain: Vec<_> = (0..2).map(|_| tree.alloc_frame(&be).unwrap()).collect();
+
+        // A chain shorter than the ledger's complete pages must be a refusal, not a slice panic:
+        // paged growth stops mid-loop when a frame claim or a table write fails.
+        slot.segmented_kv.chain = chain[..1].to_vec();
+        assert!(slot.paged_publish_detach(&be, &cfg, &mut tree).is_err());
+        assert!(slot.paged_frontier.is_some());
+        slot.segmented_kv.chain = chain.clone();
+
+        // The refusal that matters: the chain is well formed, so the snapshots are collected
+        // FIRST and the tree rejects the anchor afterwards. This is the ordering that used to
+        // consume the frontier on a publish that never happened.
+        tree.set_aux_budget(32);
+        assert!(slot.paged_publish_detach(&be, &cfg, &mut tree).is_err());
+        assert!(
+            slot.paged_frontier.is_some(),
+            "a refused publish consumed the frontier"
+        );
+        assert_eq!(slot.cached, tokens, "a refused publish cleared the ledger");
+        assert_eq!(slot.segmented_kv.chain, chain);
+        assert!(
+            tree.best_match(&tokens, None).is_none(),
+            "a refused publish still entered the tree"
+        );
+
+        // The retry carries the SAME snapshot, publishes, and only then lets the frontier go.
+        tree.set_aux_budget(1 << 20);
+        assert_eq!(slot.paged_publish_detach(&be, &cfg, &mut tree).unwrap(), 8);
+        assert!(slot.paged_frontier.is_none());
+        assert!(slot.cached.is_empty());
+        let (node, reusable) = tree.best_match(&tokens, None).unwrap();
+        assert_eq!(reusable, 8);
+        let (depth, ckpt) = tree.hit_prefix(node, cfg.has_recurrent_state(), reusable);
+        assert_eq!(depth, 8);
+        assert!(ckpt.is_some(), "the retried publish lost the anchor");
+    }
+
+    /// A continuation never detaches, so capturing its own frontier used to destroy the boundary
+    /// the previous turn ended at — the exact depth a fork of that turn branches from. The slot
+    /// keeps the replaced snapshot, the publish carries both, and the fork resumes instead of
+    /// replaying.
+    #[test]
+    fn a_continuation_keeps_the_frontier_a_fork_branches_at() {
+        let be = CountingRollbackBackend::new();
+        let (cfg, mut slot) = rollback_slot(&be, true, false, 37);
+        let page = 4;
+        let tokens: Vec<u32> = (1..=8).collect();
+        slot.segmented_kv = SegmentedKvState::enabled(page);
+        slot.cached = tokens.clone();
+        let ckpt = |boundary: usize| {
+            Arc::new(crate::paged_cache::PagedCkpt {
+                boundary_tokens: boundary,
+                layers: Vec::new(),
+                kbufs: vec![be.inner.alloc(64, BufferUsage::Readback).unwrap()],
+                vbufs: Vec::new(),
+                ple: None,
+            })
+        };
+        let capture = |slot: &mut SeamKv, boundary: usize| {
+            set_paged_frontier(
+                &mut slot.paged_frontier,
+                &mut slot.paged_frontier_prev,
+                ckpt(boundary),
+            );
+        };
+        capture(&mut slot, 4);
+        assert!(
+            slot.paged_frontier_prev.is_none(),
+            "the first capture has nothing to keep"
+        );
+        capture(&mut slot, 8);
+        assert_eq!(
+            slot.paged_frontier_prev.as_ref().unwrap().boundary_tokens,
+            4,
+            "the continuation overwrote the fork's boundary"
+        );
+        // A turn too short to cross a page re-captures the same boundary: keep the older snapshot
+        // rather than pay aux bytes for a state the tree would dedup anyway.
+        capture(&mut slot, 8);
+        assert_eq!(
+            slot.paged_frontier_prev.as_ref().unwrap().boundary_tokens,
+            4
+        );
+
+        let tree = Arc::new(std::sync::Mutex::new(crate::paged_cache::PagedKv::new(
+            1 << 20,
+            page,
+            vec![0],
+            8,
+            0,
+            0,
+            None,
+            cfg.has_recurrent_state(),
+        )));
+        slot.set_paged(tree.clone());
+        let mut tree = tree.lock().unwrap();
+        tree.set_vram_segments(&[infr_core::backend::KvFrameCorridor {
+            base: 0x1_0000_0000,
+            frames: 8,
+        }]);
+        tree.set_aux_budget(1 << 20);
+        slot.segmented_kv.chain = (0..2).map(|_| tree.alloc_frame(&be).unwrap()).collect();
+        assert_eq!(slot.paged_publish_detach(&be, &cfg, &mut tree).unwrap(), 8);
+        assert!(slot.paged_frontier.is_none());
+        assert!(
+            slot.paged_frontier_prev.is_none(),
+            "the detach kept a snapshot it handed over"
+        );
+
+        // The fork shares only the first page. Its entry is the deeper one, so the shallow boundary
+        // has to come from the snapshot the continuation would otherwise have destroyed.
+        let (node, reusable) = tree.best_match(&tokens[..4], None).unwrap();
+        assert_eq!(reusable, 4);
+        let (depth, ckpt) = tree.hit_prefix(node, cfg.has_recurrent_state(), reusable);
+        assert_eq!(
+            depth, 4,
+            "the fork could not resume at the boundary it branched from"
+        );
+        assert_eq!(ckpt.unwrap().boundary_tokens, 4);
     }
 }

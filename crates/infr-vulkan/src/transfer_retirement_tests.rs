@@ -24,6 +24,7 @@ fn empty_queue() -> DedicatedTransferQueue {
             .collect(),
         cursor: 0,
         next_value: 1,
+        last_value: 0,
         profile_query_pool: vk::QueryPool::null(),
         profile_timestamp_period_ns: 1.0,
         profile_timestamp_valid_bits: 64,

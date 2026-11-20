@@ -93,8 +93,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/setup-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
@@ -143,8 +142,7 @@ jobs:
         run: node --test scripts/test-benchmark-index.mjs scripts/test-benchmark-main.mjs
       - name: Trusted benchmark summary comment tests
         run: node --test scripts/test-benchmark-summary-comment.mjs
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/setup-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
@@ -227,8 +225,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/setup-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
@@ -262,8 +259,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/setup-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
@@ -286,8 +282,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/setup-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: aarch64-apple-darwin
