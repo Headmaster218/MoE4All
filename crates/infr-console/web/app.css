@@ -104,7 +104,7 @@ a { color: var(--accent); }
 }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
 .dot.live { background: var(--ok); }
-.dot.busy { background: var(--accent); }
+.dot.busy { background: var(--accent); animation: badge-pulse 1.4s ease-in-out infinite; }
 .dot.bad { background: var(--bad); }
 
 .icon-btn {
@@ -128,7 +128,9 @@ a { color: var(--accent); }
   border-radius: var(--radius);
   padding: 14px;
   margin-bottom: 14px;
+  transition: border-color 0.2s ease;
 }
+.card:hover { border-color: var(--text-faint); }
 .card > h2 {
   margin: 0 0 10px;
   font-size: 12px;
@@ -154,22 +156,49 @@ a { color: var(--accent); }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 10px 12px;
+  transition: border-color 0.2s ease;
 }
+.tile:hover { border-color: var(--text-faint); }
 .tile .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
 .tile .value { font: 600 21px/1.25 var(--mono); margin-top: 3px; }
 .tile .sub { font-size: 11px; color: var(--text-faint); font-family: var(--mono); }
 .tile.absent .value { color: var(--text-faint); }
+.tile-meter { height: 4px; border-radius: 2px; background: var(--bg-raised); overflow: hidden; margin-top: 7px; }
+.tile-meter > i { display: block; height: 100%; background: var(--accent); transition: width 0.4s ease; }
 
 /* ── Chart ─────────────────────────────────────────────────────────────── */
 
-.chart-wrap { position: relative; }
+.speed-readout { display: flex; gap: 12px; margin-bottom: 10px; }
+.speed-cell {
+  flex: 1; min-width: 0;
+  background: var(--bg-inset); border: 1px solid var(--border);
+  border-left: 3px solid var(--border); border-radius: var(--radius); padding: 8px 12px;
+}
+.speed-cell.decode { border-left-color: var(--decode); }
+.speed-cell.prefill { border-left-color: var(--prefill); }
+.speed-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+.speed-value { display: flex; align-items: baseline; gap: 5px; margin-top: 2px; }
+.speed-num { font: 650 28px/1.1 var(--mono); }
+.speed-cell.decode .speed-num { color: var(--decode); }
+.speed-cell.prefill .speed-num { color: var(--prefill); }
+.speed-unit { font-size: 12px; color: var(--text-faint); }
+.speed-peak { font-size: 11px; color: var(--text-faint); font-family: var(--mono); margin-top: 2px; }
+
+/* The plot fills the padded content box; the axis NUMBERS live in the padding so the stretched
+   SVG (preserveAspectRatio=none) never squishes them. Gridline rows map 1:1 to pixels. */
+.chart-wrap { position: relative; padding: 0 50px 0 42px; }
 .chart { width: 100%; height: 150px; display: block; }
 .chart .grid { stroke: var(--border); stroke-width: 0.5; }
 .chart .series-decode { stroke: var(--decode); }
 .chart .series-prefill { stroke: var(--prefill); }
 .chart path.line { fill: none; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
 .chart path.area { stroke: none; opacity: 0.13; }
-.chart text { fill: var(--text-faint); font: 9px var(--mono); }
+.axis { position: absolute; top: 0; height: 150px; pointer-events: none; }
+.axis-left { left: 0; width: 38px; }
+.axis-right { right: 0; width: 48px; }
+.axis span { position: absolute; transform: translateY(-50%); font: 10px var(--mono); white-space: nowrap; }
+.axis-left span { right: 6px; color: var(--decode); }
+.axis-right span { left: 6px; color: var(--prefill); }
 .legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 
@@ -192,6 +221,9 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr.clickable { cursor: pointer; }
 tbody tr.clickable:hover { background: var(--bg-inset); }
 tbody tr.selected { background: var(--accent-soft); }
+tbody tr.active { background: var(--accent-soft); }
+@keyframes row-enter { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+tr.row-enter { animation: row-enter 0.28s ease; }
 .num { font-family: var(--mono); text-align: right; white-space: nowrap; }
 .empty { color: var(--text-faint); padding: 18px 8px; text-align: center; }
 
@@ -214,6 +246,9 @@ tbody tr.selected { background: var(--accent-soft); }
 .badge.idle, .badge.done { color: var(--text-dim); }
 .badge.error, .badge.cancelled { color: var(--bad); border-color: var(--bad); }
 .badge.on { color: var(--warn); border-color: var(--warn); }
+.badge.queued { color: var(--text-dim); border-color: var(--text-faint); border-style: dashed; }
+.badge.live { animation: badge-pulse 1.6s ease-in-out infinite; }
+@keyframes badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 .bar { height: 5px; border-radius: 3px; background: var(--bg-inset); overflow: hidden; min-width: 60px; }
 .bar > i { display: block; height: 100%; background: var(--accent); }
@@ -238,6 +273,17 @@ tbody tr.selected { background: var(--accent-soft); }
 .sidebar-tabs { display: flex; gap: 2px; padding: 8px 12px 0; }
 .sidebar-body { flex: 1; overflow: auto; padding: 10px 12px; }
 
+/* 会话内轮次导航：一个 agent 会话归为一个窗口后，用这排 chip 在各轮之间切换。 */
+.sidebar-rounds { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 12px 0; }
+.round-chip {
+  background: var(--bg-inset); border: 1px solid var(--border); border-radius: 999px;
+  padding: 2px 9px; cursor: pointer; color: var(--text-dim); font: 11px var(--mono);
+}
+.round-chip:hover { color: var(--text); border-color: var(--accent); }
+.round-chip.selected { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.round-chip.live { border-color: var(--output); color: var(--output); }
+.round-count { margin-left: 6px; }
+
 pre.json {
   margin: 0 0 6px;
   padding: 7px 9px;
@@ -253,6 +299,9 @@ pre.json .s { color: var(--ok); }
 pre.json .n { color: var(--tool); }
 pre.json .b { color: var(--think); }
 .frame-seq { color: var(--text-faint); font: 10px var(--mono); }
+.token-cell { display: flex; align-items: center; gap: 6px; }
+.token-cell code { flex: 1; min-width: 0; word-break: break-all; }
+.copy-btn { padding: 3px 8px; font-size: 11px; flex: none; }
 .prose { white-space: pre-wrap; word-break: break-word; font-size: 13px; }
 .prose.thinking { color: var(--text-dim); border-left: 2px solid var(--think); padding-left: 10px; }
 
@@ -389,6 +438,7 @@ details.reply > .prose { padding: 0 9px 9px; }
   align-items: center;
   justify-content: center;
   z-index: 60;
+  animation: fade-in 0.18s ease;
 }
 .modal {
   background: var(--bg-raised);
@@ -398,6 +448,7 @@ details.reply > .prose { padding: 0 9px 9px; }
   max-width: 520px;
   width: calc(100% - 32px);
   padding: 20px;
+  animation: modal-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .modal h3 { margin: 0 0 10px; font-size: 16px; }
 .modal .risk { border-left: 3px solid var(--bad); padding: 8px 12px; background: var(--bg-inset); border-radius: 0 6px 6px 0; margin-bottom: 14px; font-size: 13px; }
@@ -418,6 +469,7 @@ details.reply > .prose { padding: 0 9px 9px; }
   z-index: 70;
   font-size: 13px;
   max-width: 70vw;
+  animation: toast-in 0.22s ease;
 }
 .toast.bad { border-left-color: var(--bad); }
 .toast.ok { border-left-color: var(--ok); }
@@ -426,4 +478,17 @@ details.reply > .prose { padding: 0 9px 9px; }
 
 @media (max-width: 1100px) {
   .sidebar.open { position: fixed; right: 0; top: 49px; width: 100%; min-width: 0; z-index: 40; box-shadow: var(--shadow); }
+}
+
+/* ── Motion ────────────────────────────────────────────────────────────── */
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

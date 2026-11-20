@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use tokio::sync::broadcast;
@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let state_path = cli.state.unwrap_or_else(default_state_path);
     let keys = load_keys(&state_path);
     let (events, _) = broadcast::channel(4096);
+    let (state_dirty, _) = broadcast::channel(8);
     let console = Arc::new(Console {
         upstream: Mutex::new(cli.upstream.trim_end_matches('/').to_string()),
         upstream_key: Mutex::new(cli.upstream_key),
@@ -74,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         schema: Mutex::new(None),
         conversations: Mutex::new(HashMap::new()),
         events,
+        state_dirty,
         subscribers: AtomicUsize::new(0),
         next_round: AtomicU64::new(1),
         console_log: Mutex::new(Default::default()),
@@ -123,16 +125,9 @@ fn load_keys(path: &std::path::Path) -> Vec<state::ApiKey> {
 /// reporter's statistics window or the dashboard's decode counter.
 async fn poll_engine(console: Arc<Console>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    // (slot ordinal, req_id) -> prefill tokens at the previous sample. The engine reports prefill
-    // PROGRESS, not a prefill rate, so the rate is the delta over the poll interval.
-    let mut previous: HashMap<(usize, u64), u64> = HashMap::new();
-    let mut last = Instant::now();
     loop {
         tick.tick().await;
         launch::reap(&console);
-        let now = Instant::now();
-        let dt = now.duration_since(last).as_secs_f64().max(0.001);
-        last = now;
 
         let url = format!("{}/internal/stats", console.upstream());
         let mut request = console.http.get(&url).timeout(Duration::from_secs(3));
@@ -147,30 +142,25 @@ async fn poll_engine(console: Arc<Console>) {
         let mut decode = 0.0f64;
         let mut prefill = 0.0f64;
         if let Some(stats) = &stats {
-            let mut seen = HashMap::new();
             for slot in stats.get("slots").and_then(|v| v.as_array()).into_iter().flatten() {
                 let Some(req) = slot.get("request") else { continue };
-                let ordinal = slot.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let req_id = req.get("req_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                // `tokens_per_second` is phase-aware: the engine reports its smoothed prefill rate
+                // while Prefill/Starting and its decode rate while Decode. Route it by phase so the
+                // prefill rate never lands in the decode series. The engine already holds the prefill
+                // rate across chunk boundaries, so a continuous prefill reads as a flat line instead
+                // of a sawtooth that drops to zero whenever a 1 s poll misses a chunk completion.
                 let speed = req.get("tokens_per_second").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                decode = decode.max(speed);
-                let tokens = req.get("prefill_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                seen.insert((ordinal, req_id), tokens);
-                let phase = req.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-                if matches!(phase, "Starting" | "Prefill") {
-                    if let Some(before) = previous.get(&(ordinal, req_id)) {
-                        prefill = prefill.max(tokens.saturating_sub(*before) as f64 / dt);
-                    }
+                match req.get("phase").and_then(|v| v.as_str()).unwrap_or("") {
+                    "Decode" => decode = decode.max(speed),
+                    "Prefill" | "Starting" => prefill = prefill.max(speed),
+                    _ => {}
                 }
             }
-            previous = seen;
             let vector_loaded = stats
                 .pointer("/uncensor/vector_loaded")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             console.uncensor.lock().unwrap().vector_loaded = vector_loaded;
-        } else {
-            previous.clear();
         }
 
         {

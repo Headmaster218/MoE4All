@@ -20,6 +20,7 @@ clap.workspace = true
 getrandom.workspace = true
 dirs.workspace = true
 sha2.workspace = true
+toml.workspace = true
 futures-util = "0.3"
 
 [dev-dependencies]

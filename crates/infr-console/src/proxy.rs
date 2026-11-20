@@ -64,6 +64,7 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     let messages = message_strings(&json);
     let conv = conversation_key(&key_id, &messages);
     let reuse_est = console.estimate_reuse(&conv, &messages);
+    let session = session_key(&key_id, &json, &conv);
 
     let mut request_record = json.clone();
     redact_request(&mut request_record);
@@ -74,6 +75,7 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         id,
         key_id: key_id.clone(),
         key_label,
+        conv: conv_id(&session),
         model: json.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         api: if path == "/v1/responses" { "responses" } else { "chat" },
         started_at_ms: now_ms(),
@@ -291,6 +293,26 @@ fn conversation_key(key_id: &str, messages: &[String]) -> String {
     format!("{key_id}\u{1}{anchor}")
 }
 
+/// Session identity for grouping an agent's turns into one conversation window. An explicit
+/// `conversation` name (Responses API) is the strongest signal and wins; otherwise fall back to the
+/// prefix-reuse anchor, which two turns of one chat share. Kept separate from `conversation_key` so
+/// grouping never changes the reuse estimate.
+fn session_key(key_id: &str, json: &serde_json::Value, fallback: &str) -> String {
+    match json.get("conversation").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(c) => format!("{key_id}\u{1}conversation:{c}"),
+        None => fallback.to_string(),
+    }
+}
+
+/// Compact stable id for the session key, so the 1 Hz snapshot carries 16 hex chars per round rather
+/// than a whole system prompt. DefaultHasher is deterministic (fixed keys), stable across restarts.
+fn conv_id(conv: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    conv.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Api {
     Chat,
@@ -468,6 +490,16 @@ impl Tap {
         }
         self.console.with_round(self.round, |r| r.finish(status));
         self.console.fold_key(self.round);
+    }
+}
+
+/// A client that disconnects mid-stream (a browser tab closed, an agent that timed out) makes axum
+/// drop the response body — and with it this Tap — WITHOUT the unfold ever reaching `finish`. Left
+/// alone the round would sit on "填充中/输出中" forever. Close it out as cancelled on the way down;
+/// `finish` is idempotent, so a normal completion that already ran it is a no-op here.
+impl Drop for Tap {
+    fn drop(&mut self) {
+        self.finish(Status::Cancelled);
     }
 }
 

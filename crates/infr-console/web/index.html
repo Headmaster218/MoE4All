@@ -36,15 +36,20 @@
 
       <div class="card">
         <h2>速度<span class="spacer"></span><span class="frame-seq" id="chart-window"></span></h2>
-        <div class="chart-wrap"><svg class="chart" id="speed-chart" viewBox="0 0 600 150" preserveAspectRatio="none"></svg></div>
+        <div class="speed-readout" id="speed-readout"></div>
+        <div class="chart-wrap">
+          <div class="axis axis-left" id="axis-left"></div>
+          <svg class="chart" id="speed-chart" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+          <div class="axis axis-right" id="axis-right"></div>
+        </div>
         <div class="legend">
-          <span><i style="background:var(--decode)"></i>decode t/s</span>
-          <span><i style="background:var(--prefill)"></i>prefill t/s</span>
+          <span><i style="background:var(--decode)"></i>decode t/s（左轴）</span>
+          <span><i style="background:var(--prefill)"></i>prefill t/s（右轴）</span>
         </div>
       </div>
 
       <div class="card">
-        <h2>对话窗口<span class="spacer"></span><span class="frame-seq">点击一行查看流式 JSON</span></h2>
+        <h2>对话窗口<span class="spacer"></span><span class="frame-seq">一个 agent 会话一行 · 点击查看流式 JSON</span></h2>
         <table>
           <thead><tr>
             <th>时间</th><th>Key</th><th>状态</th><th>工具</th><th class="num">t/s</th>
@@ -213,6 +218,9 @@
           <button class="btn ghost" id="launch-save">保存设置</button>
           <button class="btn ghost" id="launch-reset">恢复默认</button>
           <button class="btn ghost" id="launch-copy">复制命令</button>
+          <button class="btn ghost" id="launch-export">导出配置</button>
+          <button class="btn ghost" id="launch-import">导入配置</button>
+          <input type="file" id="launch-import-file" accept=".toml,application/toml,text/plain" hidden>
           <span class="spacer"></span>
           <span class="frame-seq" id="launch-note"></span>
         </div>
@@ -243,6 +251,7 @@
         <button class="icon-btn" id="sb-follow" aria-pressed="true" title="自动滚到最新">跟随</button>
         <button class="icon-btn" id="sb-close">✕</button>
       </div>
+      <div class="sidebar-rounds" id="sb-rounds" hidden></div>
       <div class="sidebar-tabs" id="sb-tabs">
         <button class="tab" data-sb="frames" aria-selected="true">流式 JSON</button>
         <button class="tab" data-sb="output" aria-selected="false">输出</button>

@@ -19,6 +19,10 @@ const ROUND_CAP: usize = 500;
 pub(crate) const FRAME_CAP: usize = 4000;
 /// 1 Hz samples retained for the speed chart (3 minutes).
 const SERIES_CAP: usize = 180;
+/// Minimum decode window before publishing a live rate. A burst of SSE deltas can land in the same
+/// millisecond, so the first inter-token windows are tiny and would flash hundreds of t/s for a model
+/// that decodes at tens. The cumulative average is representative once this much time has elapsed.
+const LIVE_TPS_MIN_SPAN_MS: u64 = 250;
 /// Engine stdout lines retained for the log view.
 const LOG_CAP: usize = 400;
 
@@ -151,6 +155,9 @@ pub struct Round {
     pub id: u64,
     pub key_id: String,
     pub key_label: String,
+    /// Stable session id (a compact hash of the conversation anchor) so the dashboard can group an
+    /// agent's many turns into one conversation window instead of one window per request.
+    pub conv: String,
     pub model: String,
     pub api: &'static str,
     pub started_at_ms: u64,
@@ -195,7 +202,7 @@ impl Round {
         // rate by one token over a window that never contained it.
         let span = now.saturating_sub(self.first_delta_ms.unwrap_or(now));
         let counted = self.completion_tokens.saturating_sub(1);
-        if span > 0 && counted > 0 {
+        if span >= LIVE_TPS_MIN_SPAN_MS && counted > 0 {
             self.live_tps = Some(counted as f64 * 1000.0 / span as f64);
         }
         self.phase = match kind {
@@ -321,6 +328,9 @@ pub struct Console {
     pub schema: Mutex<Option<serde_json::Value>>,
     pub conversations: Mutex<HashMap<String, Vec<String>>>,
     pub events: broadcast::Sender<Arc<FrameEvent>>,
+    /// Pinged when a round finishes so the dashboard pushes a fresh snapshot at once instead of
+    /// waiting for the next tick — a completed turn must read 空闲 immediately, not a second later.
+    pub state_dirty: broadcast::Sender<()>,
     /// Live UI subscribers. Frame broadcasting is skipped entirely at zero, so a headless proxy
     /// pays nothing for a dashboard nobody is watching.
     pub subscribers: AtomicUsize,
@@ -347,10 +357,41 @@ impl Console {
     }
 
     pub fn engine_log_line(&self, line: String) {
+        // Durable copy first: the in-memory ring below only keeps the last LOG_CAP lines, so a
+        // crash that scrolls past them (or a restart) would otherwise lose the evidence entirely.
+        self.append_engine_log_file(&line);
         let mut log = self.engine_log.lock().unwrap();
         log.push_back(line);
         while log.len() > LOG_CAP {
             log.pop_front();
+        }
+    }
+
+    /// Engine log file beside the keys/settings file. Appended per line and rotated at a bounded
+    /// size (one backup kept) so a long-running serve can't fill the disk, yet a TDR/device-lost
+    /// crash stays readable after the fact instead of vanishing with the 400-line UI ring.
+    pub fn engine_log_path(&self) -> std::path::PathBuf {
+        self.state_path
+            .parent()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("engine.log")
+    }
+
+    fn append_engine_log_file(&self, line: &str) {
+        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+        let path = self.engine_log_path();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > ROTATE_BYTES {
+                let _ = std::fs::rename(&path, path.with_extension("log.1"));
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
         }
     }
 
@@ -418,6 +459,7 @@ impl Console {
         if let Some(key) = keys.iter_mut().find(|k| k.id == round.key_id) {
             key.fold(&round);
         }
+        let _ = self.state_dirty.send(());
     }
 
     pub fn save_keys(&self) -> anyhow::Result<()> {

@@ -14,6 +14,7 @@ use crate::ui;
 
 fn console() -> Arc<Console> {
     let (events, _) = tokio::sync::broadcast::channel(64);
+    let (state_dirty, _) = tokio::sync::broadcast::channel(8);
     Arc::new(Console {
         upstream: Mutex::new("http://127.0.0.1:1".into()),
         upstream_key: Mutex::new(None),
@@ -31,6 +32,7 @@ fn console() -> Arc<Console> {
         schema: Mutex::new(None),
         conversations: Mutex::new(HashMap::new()),
         events,
+        state_dirty,
         subscribers: AtomicUsize::new(0),
         next_round: AtomicU64::new(1),
         console_log: Mutex::new(Default::default()),
@@ -179,6 +181,112 @@ fn full_dump_writes_every_field_and_skips_presence_markers() {
     assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
 }
 
+/// A config file is the base layer: with `cli:config` set, the launch must emit only the touched
+/// deltas (a full dump would shadow every file value via `--set` precedence). Without it, the full
+/// explicit dump is unchanged.
+#[test]
+fn config_file_replaces_the_full_dump_with_touched_deltas() {
+    let shutdown = std::path::Path::new("/tmp/engine.shutdown");
+    let schema = vec![
+        cli("cli:config", "--config", ""),
+        cli("cli:model", "", ""),
+        cfg("device.ctx", "none"),
+        cfg("kv.paged", "false"),
+        cfg("kv.ring", "true"),
+    ];
+    let args = launch::build_args(
+        &request("conservative", &[("cli:config", "C:/infr.toml"), ("cli:model", "m.gguf"), ("device.ctx", "262144")]),
+        &schema,
+        shutdown,
+    )
+    .unwrap();
+    assert!(args.windows(2).any(|w| w == ["--config", "C:/infr.toml"]));
+    assert!(args.windows(2).any(|w| w == ["--set", "device.ctx=262144"]));
+    // Untouched knobs come from the file, not a shadowing full dump.
+    assert!(!args.iter().any(|a| a == "kv.paged=false"));
+    assert!(!args.iter().any(|a| a == "kv.ring=true"));
+    assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
+    // No config file → the full dump still writes every field at its default.
+    let full = launch::build_args(&request("conservative", &[("device.ctx", "262144")]), &schema, shutdown).unwrap();
+    assert!(full.iter().any(|a| a == "kv.paged=false"));
+    assert!(full.iter().any(|a| a == "kv.ring=true"));
+}
+
+/// The exported TOML speaks the engine's section-path grammar with correctly typed scalars, omits
+/// unset Options / CLI-only flags / the console-owned shutdown file / the API-key secret, and parses
+/// back losslessly — including a section that mixes scalars and sub-tables.
+#[test]
+fn export_toml_round_trips_through_the_toml_parser() {
+    let schema = vec![
+        serde_json::json!({"path":"device.ctx","ty":"Option<SizeSpec>","default":"none"}),
+        serde_json::json!({"path":"device.auto_profile","ty":"AutoProfile","default":"conservative"}),
+        serde_json::json!({"path":"kv.type_k","ty":"Option<DType>","default":"none"}),
+        serde_json::json!({"path":"kv.ring","ty":"bool","default":"true"}),
+        serde_json::json!({"path":"sampling.temp","ty":"f32","default":"0"}),
+        serde_json::json!({"path":"kernels.qkv_fuse","ty":"bool","default":"true"}),
+        serde_json::json!({"path":"kernels.vulkan.gemv.rm","ty":"u32","default":"2"}),
+        serde_json::json!({"path":"serve.api_key","ty":"Option<String>","default":"none"}),
+        serde_json::json!({"path":"serve.shutdown_file","ty":"Option<PathBuf>","default":"none"}),
+        serde_json::json!({"path":"device.ubatch_specified","ty":"bool","default":"false"}),
+        serde_json::json!({"path":"cli:model","ty":"String","default":"","flag":""}),
+    ];
+    let req = request("conservative", &[("device.ctx", "262144"), ("kv.type_k", "q8_0"), ("serve.api_key", "secret")]);
+    let text = launch::build_toml(&req, &schema).unwrap();
+    assert!(!text.contains("secret"));
+    assert!(!text.contains("api_key"));
+    assert!(!text.contains("shutdown_file"));
+    assert!(!text.contains("ubatch_specified"));
+    assert!(!text.contains("cli:model"));
+    let doc: toml::Table = toml::from_str(&text).unwrap();
+    assert_eq!(doc["device"]["ctx"].as_str(), Some("262144"));
+    assert_eq!(doc["device"]["auto_profile"].as_str(), Some("conservative"));
+    assert_eq!(doc["kv"]["type_k"].as_str(), Some("q8_0"));
+    assert_eq!(doc["kv"]["ring"].as_bool(), Some(true));
+    assert_eq!(doc["sampling"]["temp"].as_float(), Some(0.0));
+    // A parent section's scalar must stay in the parent, not leak into the sub-table below it.
+    assert_eq!(doc["kernels"]["qkv_fuse"].as_bool(), Some(true));
+    assert_eq!(doc["kernels"]["vulkan"]["gemv"]["rm"].as_integer(), Some(2));
+}
+
+/// Importing is the inverse of exporting: section paths flatten back to `--set` keys, scalars recover
+/// their string spelling, the preset returns from the header (`manual` included), and re-exporting the
+/// imported form is byte-identical. A knob the live schema no longer advertises is dropped, not launched.
+#[test]
+fn import_toml_recovers_the_exported_form() {
+    let schema = vec![
+        serde_json::json!({"path":"device.ctx","ty":"Option<SizeSpec>","default":"none"}),
+        serde_json::json!({"path":"device.auto_profile","ty":"AutoProfile","default":"conservative"}),
+        serde_json::json!({"path":"kv.type_k","ty":"Option<DType>","default":"none"}),
+        serde_json::json!({"path":"kv.ring","ty":"bool","default":"true"}),
+        serde_json::json!({"path":"sampling.temp","ty":"f32","default":"0"}),
+        serde_json::json!({"path":"kernels.vulkan.gemv.rm","ty":"u32","default":"2"}),
+        serde_json::json!({"path":"serve.api_key","ty":"Option<String>","default":"none"}),
+    ];
+    let req = request("conservative", &[("device.ctx", "262144"), ("kv.type_k", "q8_0"), ("sampling.temp", "0.95")]);
+    let text = launch::build_toml(&req, &schema).unwrap();
+    let back = launch::parse_toml(&text, &schema).unwrap();
+    assert_eq!(back.preset, "conservative");
+    assert_eq!(back.set.get("device.ctx").map(String::as_str), Some("262144"));
+    assert_eq!(back.set.get("kv.type_k").map(String::as_str), Some("q8_0"));
+    assert_eq!(back.set.get("kv.ring").map(String::as_str), Some("true"));
+    assert_eq!(back.set.get("sampling.temp").map(String::as_str), Some("0.95"));
+    assert_eq!(back.set.get("kernels.vulkan.gemv.rm").map(String::as_str), Some("2"));
+    // The secret never entered the file, so it cannot come back.
+    assert!(!back.set.contains_key("serve.api_key"));
+    // Re-exporting the imported form reproduces the file byte for byte.
+    assert_eq!(launch::build_toml(&back, &schema).unwrap(), text);
+
+    // 全手动 is recorded only in the header (auto_profile stays at its default), and must survive.
+    let manual = launch::build_toml(&request("manual", &[("device.ctx", "8192")]), &schema).unwrap();
+    assert_eq!(launch::parse_toml(&manual, &schema).unwrap().preset, "manual");
+
+    // A retired knob is dropped rather than passed to the engine as an unknown path.
+    let stale = "[device]\nctx = \"262144\"\nretired_knob = \"1\"\n";
+    let parsed = launch::parse_toml(stale, &schema).unwrap();
+    assert_eq!(parsed.set.get("device.ctx").map(String::as_str), Some("262144"));
+    assert!(!parsed.set.contains_key("device.retired_knob"));
+}
+
 /// Settings survive a save/load round-trip beside the keys file, so a console restart restores the
 /// form. Only the preset and touched knobs are kept; defaults are re-derived from the schema.
 #[test]
@@ -249,6 +357,7 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
         id: 1,
         key_id: "k".into(),
         key_label: "k".into(),
+        conv: "c".into(),
         model: "m".into(),
         api: "chat",
         started_at_ms: now_ms() - 500,
@@ -385,6 +494,7 @@ async fn per_key_counters_fold_finished_rounds_only() {
         id: 7,
         key_id: "k1".into(),
         key_label: "one".into(),
+        conv: "c".into(),
         model: "m".into(),
         api: "chat",
         started_at_ms: now_ms(),

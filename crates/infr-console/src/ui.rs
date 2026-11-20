@@ -54,6 +54,8 @@ pub fn router(console: Arc<Console>) -> axum::Router {
         .route("/ui/vector/status", get(vector_status))
         .route("/ui/launch", post(start_engine))
         .route("/ui/stop", post(stop_engine))
+        .route("/ui/config/export", post(export_config))
+        .route("/ui/config/import", post(import_config))
         .fallback(crate::proxy::handle)
         // A screenshot turn carries tens of megabytes of base64; axum's 2 MiB default would reject
         // it before the engine ever saw it. The engine applies its own limit downstream.
@@ -124,25 +126,37 @@ pub async fn events(
 ) -> Sse<impl Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
     console.subscribers.fetch_add(1, Ordering::Relaxed);
     let receiver = console.events.subscribe();
+    let dirty = console.state_dirty.subscribe();
     let guard = Subscriber(Arc::clone(&console));
     let stream = futures_util::stream::unfold(
-        (receiver, tokio::time::interval(Duration::from_secs(1)), guard, console),
-        |(mut receiver, mut tick, guard, console)| async move {
+        (receiver, dirty, tokio::time::interval(Duration::from_millis(500)), guard, console),
+        |(mut receiver, mut dirty, mut tick, guard, console)| async move {
             loop {
                 tokio::select! {
                     received = receiver.recv() => match received {
                         Ok(frame) => {
                             let data = serde_json::to_string(&*frame).unwrap_or_default();
                             let event = SseEvent::default().event("frame").data(data);
-                            return Some((Ok(event), (receiver, tick, guard, console)));
+                            return Some((Ok(event), (receiver, dirty, tick, guard, console)));
                         }
                         // A slow browser must not stall the proxy: drop the backlog and carry on.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     },
+                    // A round finished: push the new state at once so 空闲 shows immediately rather
+                    // than up to a tick later. A burst of finishes collapses into one snapshot.
+                    changed = dirty.recv() => match changed {
+                        Ok(()) => {
+                            while dirty.try_recv().is_ok() {}
+                            let event = SseEvent::default().event("state").data(snapshot(&console).to_string());
+                            return Some((Ok(event), (receiver, dirty, tick, guard, console)));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    },
                     _ = tick.tick() => {
                         let event = SseEvent::default().event("state").data(snapshot(&console).to_string());
-                        return Some((Ok(event), (receiver, tick, guard, console)));
+                        return Some((Ok(event), (receiver, dirty, tick, guard, console)));
                     }
                 }
             }
@@ -285,6 +299,41 @@ pub async fn start_engine(
 pub async fn stop_engine(State(console): State<Arc<Console>>) -> UiResult<Json<serde_json::Value>> {
     launch::stop(&console).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Download the current form as an engine TOML config file. The body is the same `{preset, set}` the
+/// launch uses, so the exported file is exactly what the previewed command would run (minus the
+/// CLI-only flags and secrets, which are not config-file knobs). Re-import it after an upgrade by
+/// pointing `cli:config` at it.
+pub async fn export_config(
+    State(console): State<Arc<Console>>,
+    Json(req): Json<launch::LaunchRequest>,
+) -> UiResult<Response> {
+    let payload = launch::schema(&console).await?;
+    let fields = payload.get("schema").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let text = launch::build_toml(&req, &fields)?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/toml; charset=utf-8"),
+            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"infr-config.toml\""),
+        ],
+        text,
+    )
+        .into_response())
+}
+
+/// Read an uploaded TOML config back into `{preset, set}` so the browser can restore the form. The
+/// body is the raw file text (the export downloads exactly this). Parsing is filtered against the
+/// live schema, so a file written for another engine version restores what it can and drops the rest
+/// instead of hard-erroring the next launch. The browser applies the result and saves it.
+pub async fn import_config(
+    State(console): State<Arc<Console>>,
+    body: String,
+) -> UiResult<Json<serde_json::Value>> {
+    let payload = launch::schema(&console).await?;
+    let fields = payload.get("schema").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let req = launch::parse_toml(&body, &fields)?;
+    Ok(Json(serde_json::json!({ "preset": req.preset, "set": req.set })))
 }
 
 /// The operator's saved launch form. Read on page load so a reload — or a console restart — restores

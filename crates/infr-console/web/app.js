@@ -34,12 +34,33 @@ const clock = (ms) => new Date(ms).toLocaleTimeString("zh-CN", { hour12: false }
 const dur = (ms) => (ms == null ? "—" : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
 
 const PHASE_LABEL = {
-  idle: "空闲", prefill: "填充中", thinking: "思考中", tool_call: "工具调用",
-  output: "输出中", done: "完成", error: "错误", cancelled: "已取消",
-  Starting: "启动中", Prefill: "填充中", Decode: "解码中", Embedding: "嵌入中",
+  idle: "空闲", prefill: "推理中", thinking: "推理中", tool_call: "工具调用",
+  output: "输出中", done: "空闲", error: "错误", cancelled: "空闲",
+  Starting: "启动中", Prefill: "推理中", Decode: "解码中", Embedding: "嵌入中",
 };
 const phaseBadge = (phase, extra) =>
   el("span", { class: `badge ${phase || "idle"}`, text: (PHASE_LABEL[phase] || phase || "空闲") + (extra ? ` · ${extra}` : "") });
+
+// 会话五态：完成/取消 → 空闲；活跃 → 推理中 / 输出中 / 工具调用：名 / 排队中。
+// 引擎槽位表仍用 phaseBadge（Starting/Prefill/Decode），这里是给"对话窗口"的操作者视角。
+function engineQueued() {
+  const t = S && S.engine && S.engine.stats && S.engine.stats.totals;
+  return !!(t && t.queued > 0);
+}
+function sessionState(r) {
+  if (r.status !== "streaming") {
+    return r.status === "error" ? { label: "错误", cls: "error" } : { label: "空闲", cls: "idle" };
+  }
+  if (r.phase === "prefill" && r.ttft_ms == null && engineQueued()) return { label: "排队中", cls: "queued" };
+  if (r.phase === "tool_call") return { label: "工具调用", cls: "tool_call", extra: r.tools.join(", ") };
+  if (r.phase === "output") return { label: "输出中", cls: "output" };
+  return { label: "推理中", cls: "prefill" }; // prefill 与 thinking 都归"推理中"
+}
+function sessionBadge(r, s = sessionState(r)) {
+  const node = el("span", { class: `badge ${s.cls}`, text: s.label + (s.extra ? `：${s.extra}` : "") });
+  if (r.status === "streaming") node.classList.add("live");
+  return node;
+}
 
 function toast(msg, kind = "") {
   const host = $("#toast-host");
@@ -83,6 +104,7 @@ $$("[data-goto]").forEach((b) => b.addEventListener("click", () => showView(b.da
 // ── Live state ─────────────────────────────────────────────────────────────
 let S = null;                 // latest /ui/state payload
 let selectedRound = null;     // id shown in the sidebar
+let selectedConv = null;      // conv of the open session, for the in-sidebar round navigator
 let sbTab = "frames";
 let sbFollow = true;
 const liveFrames = new Map(); // round id -> [{seq, data}] for the open sidebar
@@ -96,14 +118,17 @@ if (!FRAME_LIMITS.includes(frameLimit)) frameLimit = 50;
 
 function connect() {
   const es = new EventSource("ui/events");
-  es.addEventListener("state", (e) => { S = JSON.parse(e.data); render(); });
+  es.addEventListener("state", (e) => { S = JSON.parse(e.data); scheduleRender(); });
   es.addEventListener("frame", (e) => {
     const f = JSON.parse(e.data);
     let list = liveFrames.get(f.round);
     if (!list) { list = []; liveFrames.set(f.round, list); }
     list.push(f);
     if (list.length > 4000) list.splice(0, list.length - 4000);
-    if (f.round === selectedRound && sbTab === "frames") appendFrame(f);
+    if (f.round === selectedRound) {
+      if (sbTab === "frames") appendFrame(f);
+      else scheduleLivePane();
+    }
   });
   es.onerror = () => { setPill("bad", "控制台连接断开"); };
 }
@@ -113,10 +138,17 @@ function setPill(kind, text) {
   pill.replaceChildren(el("i", { class: `dot ${kind}` }), el("span", { text }));
 }
 
+let renderRaf = 0;
+function scheduleRender() {
+  if (renderRaf) return;
+  renderRaf = requestAnimationFrame(() => { renderRaf = 0; render(); });
+}
+
 function render() {
   if (!S) return;
   renderPill();
   renderUncensor();
+  trackExpertWindow();
   renderTiles();
   renderChart();
   renderLiveRounds();
@@ -151,6 +183,50 @@ function tile(label, value, sub, absent = false) {
     el("div", { class: "sub", text: sub || "" }));
 }
 
+// A tile with a usage bar and an explanatory tooltip — for the KV pool, where "how full" matters
+// as much as the raw number.
+function tileMeter(label, value, sub, frac, tip) {
+  const t = tile(label, value, sub);
+  if (tip) t.title = tip;
+  if (frac != null) t.append(el("div", { class: "tile-meter" },
+    el("i", { style: `width:${Math.min(100, Math.max(0, frac * 100)).toFixed(1)}%` })));
+  return t;
+}
+
+// Expert hit rate over a sliding window of the last ≤10 requests. The engine only exposes
+// CUMULATIVE lifetime hits/misses, so we snapshot them at each new round boundary and difference
+// against the oldest snapshot in the ring. gpu_owned defers the host counters to the last layout
+// handoff, so the window can lag until the next handoff — that is the engine's authority, not ours.
+const expertMarks = [];   // ring of {id, hits, misses} captured at request boundaries (cap 10)
+let expertLastId = 0;
+function expertCounters() {
+  const stats = S && S.engine && S.engine.stats;
+  const res = stats && (stats.models || []).map((m) => m.resources).find((r) => r && r.experts && r.experts.paged);
+  return res ? res.experts : null;
+}
+function trackExpertWindow() {
+  const ex = expertCounters();
+  if (!ex) return;
+  const maxId = (S.rounds || []).reduce((m, r) => Math.max(m, r.id), 0);
+  const last = expertMarks[expertMarks.length - 1];
+  // An engine restart zeroes the cumulative counters; drop stale marks so we never difference backwards.
+  if (last && ex.hits + ex.misses < last.hits + last.misses) expertMarks.length = 0;
+  if (maxId > expertLastId) {
+    expertLastId = maxId;
+    expertMarks.push({ id: maxId, hits: ex.hits, misses: ex.misses });
+    if (expertMarks.length > 10) expertMarks.shift();
+  }
+}
+function expertWindow() {
+  const ex = expertCounters();
+  if (!ex || !expertMarks.length) return null;
+  const base = expertMarks[0];
+  const hits = Math.max(0, ex.hits - base.hits);
+  const misses = Math.max(0, ex.misses - base.misses);
+  const total = hits + misses;
+  return { hits, misses, total, rate: total ? hits / total : null, requests: expertMarks.length };
+}
+
 function renderTiles() {
   const host = $("#tiles");
   const stats = S.engine.stats;
@@ -176,8 +252,10 @@ function renderTiles() {
     } else {
       out.push(tile("内存专家", num(ex.ram_resident), `/ ${num(ex.ram_slots)} 槽`));
     }
-    const total = ex.hits + ex.misses;
-    out.push(tile("专家命中率", total ? pct(ex.hits / total) : "—", `${num(ex.hits)} 命中 / ${num(ex.misses)} 未命中`));
+    const w = expertWindow();
+    const label = w ? `专家命中率 · 最近${w.requests}次` : "专家命中率 · 最近10次";
+    if (w && w.total) out.push(tile(label, pct(w.rate), `${num(w.hits)} 命中 / ${num(w.misses)} 未命中`));
+    else out.push(tile(label, "—", "窗口内暂无专家样本", true));
   } else {
     out.push(tile("显存专家", "全驻留", "无分页会话"));
   }
@@ -186,12 +264,24 @@ function renderTiles() {
   if (kv) {
     const vram = (kv.tiers || []).find((t) => t.tier === "vram");
     const ram = (kv.tiers || []).find((t) => t.tier === "ram");
-    const freeTok = vram ? vram.free_frames * kv.page_tokens : null;
-    out.push(tile("KV 池剩余", freeTok == null ? "—" : `${num(freeTok)} tok`,
-      vram ? `${num(vram.free_frames)}/${num(vram.capacity_frames)} 帧 · ${kv.page_tokens} tok/帧` : ""));
-    if (ram) out.push(tile("KV 内存层", `${num(ram.held_frames)}`, `/ ${num(ram.capacity_frames)} 帧 · ${bytes(ram.held_frames * kv.frame_bytes)}`));
+    if (vram) {
+      const freeTok = vram.free_frames * kv.page_tokens;
+      const used = vram.capacity_frames - vram.free_frames;
+      const frac = vram.capacity_frames ? used / vram.capacity_frames : 0;
+      out.push(tileMeter("KV 显存池 · 剩余", `${num(freeTok)} tok`,
+        `可缓存上下文 · 已用 ${num(used)}/${num(vram.capacity_frames)} 帧（${kv.page_tokens} tok/帧）`, frac,
+        `GPU 显存里还能驻留多少 token 的会话前缀。KV 缓存按页组织（每页 ${kv.page_tokens} token），空闲帧 × 每帧 token = 剩余可缓存上下文；池满后最冷前缀驱逐到内存层。剩余越多，多会话 / 长上下文越不易被驱逐，前缀复用命中越高。这与专家命中率是两回事：专家命中率管 MoE 权重块在不在显存，KV 池管会话前缀在不在显存。`));
+    } else {
+      out.push(tile("KV 显存池 · 剩余", "—", "无显存层", true));
+    }
+    if (ram) {
+      const rfrac = ram.capacity_frames ? ram.held_frames / ram.capacity_frames : 0;
+      out.push(tileMeter("KV 内存层", `${num(ram.held_frames)} 帧`,
+        `驱逐到内存的前缀 · 容量 ${num(ram.capacity_frames)} 帧 · ${bytes(ram.held_frames * kv.frame_bytes)}`, rfrac,
+        "显存池满后，最冷的会话前缀被驱逐到内存层暂存，再满则落磁盘。命中内存层比重新填充快，但比显存层慢。"));
+    }
   } else {
-    out.push(tile("KV 池剩余", "—", "kv.paged 未开启", true));
+    out.push(tile("KV 显存池 · 剩余", "—", "kv.paged 未开启", true));
   }
   host.replaceChildren(...out);
   $("#res-note").textContent = ex.gpu_owned ? "专家计数为 GPU 权威，主机侧为上次交接状态" : "";
@@ -200,67 +290,181 @@ function renderTiles() {
 // ── Speed chart ────────────────────────────────────────────────────────────
 // Two independent y scales: prefill runs at thousands of t/s while decode runs at tens, so a
 // shared axis would flatten decode to a line on the floor. Each axis is labelled with its own max.
+// The SVG is stretched horizontally (preserveAspectRatio=none), so axis NUMBERS live in HTML
+// overlays — text inside the SVG would be squished. The plot itself fills the padded content box.
 function renderChart() {
   const svg = $("#speed-chart");
   const s = S.series || { t: [], decode: [], prefill: [] };
-  const W = 600, H = 150, padL = 40, padR = 46, padT = 10, padB = 18;
+  const W = 600, H = 150, padT = 10, padB = 18;
   const n = s.t.length;
   svg.replaceChildren();
+  renderSpeedReadout(s);
   if (n < 2) {
-    svg.append(el("text", { x: W / 2 - 40, y: H / 2 }, "等待采样…"));
+    $("#axis-left").replaceChildren();
+    $("#axis-right").replaceChildren();
     $("#chart-window").textContent = "";
     return;
   }
   const maxD = Math.max(1, ...s.decode);
   const maxP = Math.max(1, ...s.prefill);
-  const x = (i) => padL + (i / (n - 1)) * (W - padL - padR);
-  const y = (v, max) => H - padB - (v / max) * (H - padT - padB);
+  // n intervals across the width (not n-1): the final interval is headroom for prefill to hold its
+  // last sample to the next second and drop to zero, so a burst reads as a rectangular pulse.
+  const x = (i) => (i / n) * W;
+  const base = H - padB;
+  const y = (v, max) => base - (v / max) * (H - padT - padB);
 
   for (let g = 0; g <= 4; g++) {
     const gy = padT + (g / 4) * (H - padT - padB);
-    svg.append(el("line", { class: "grid", x1: padL, y1: gy, x2: W - padR, y2: gy }));
+    svg.append(el("line", { class: "grid", x1: 0, y1: gy, x2: W, y2: gy }));
   }
-  const path = (vals, max) => vals.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(v, max).toFixed(1)}`).join("");
-  for (const [vals, max, cls] of [[s.prefill, maxP, "prefill"], [s.decode, maxD, "decode"]]) {
-    const d = path(vals, max);
-    svg.append(el("path", { class: `area series-${cls}`, d: `${d}L${x(n - 1).toFixed(1)} ${H - padB}L${padL} ${H - padB}Z`, fill: `var(--${cls})` }));
+  // decode: the actual sampled speeds, point to point (the chart shows the rate AT that time).
+  const dPath = s.decode.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(v, maxD).toFixed(1)}`).join("");
+  // prefill: step-after hold. Each sample's rate spans its whole 1 s interval as a horizontal line,
+  // then jumps to the next sample; the last sample holds to the next second and falls to zero.
+  let pPath = `M${x(0).toFixed(1)} ${y(s.prefill[0], maxP).toFixed(1)}`;
+  for (let i = 0; i < n; i++) {
+    const xe = x(i + 1).toFixed(1);
+    pPath += `L${xe} ${y(s.prefill[i], maxP).toFixed(1)}`;
+    if (i + 1 < n) pPath += `L${xe} ${y(s.prefill[i + 1], maxP).toFixed(1)}`;
+  }
+  pPath += `L${x(n).toFixed(1)} ${y(0, maxP).toFixed(1)}`;
+  const series = [
+    { cls: "prefill", d: pPath, area: `${pPath}L${x(0).toFixed(1)} ${base}Z` },
+    { cls: "decode", d: dPath, area: `${dPath}L${x(n - 1).toFixed(1)} ${base}L${x(0).toFixed(1)} ${base}Z` },
+  ];
+  for (const { cls, d, area } of series) {
+    svg.append(el("path", { class: `area series-${cls}`, d: area, fill: `var(--${cls})` }));
     svg.append(el("path", { class: `line series-${cls}`, d }));
   }
+  renderChartAxes(maxD, maxP, padT, base);
+  $("#chart-window").textContent = `${Math.round((s.t[n - 1] - s.t[0]) / 1000)} s 窗口`;
+}
+
+// Gridline rows map 1:1 to pixels (viewBox height = CSS height = 150), so a label at top=gy lines
+// up with its gridline. g=0 is the axis max (top), g=4 is zero (bottom).
+function renderChartAxes(maxD, maxP, top, bottom) {
+  const left = $("#axis-left"), right = $("#axis-right");
+  left.replaceChildren(); right.replaceChildren();
   for (let g = 0; g <= 4; g++) {
-    const gy = padT + (g / 4) * (H - padT - padB) + 3;
+    const y = top + (g / 4) * (bottom - top);
     const frac = 1 - g / 4;
-    svg.append(el("text", { x: 2, y: gy, fill: "var(--decode)" }, num(maxD * frac, maxD < 20 ? 1 : 0)));
-    svg.append(el("text", { x: W - padR + 4, y: gy, fill: "var(--prefill)" }, num(maxP * frac, 0)));
+    left.append(el("span", { style: `top:${y.toFixed(1)}px`, text: num(maxD * frac, maxD < 20 ? 1 : 0) }));
+    right.append(el("span", { style: `top:${y.toFixed(1)}px`, text: num(maxP * frac, 0) }));
   }
-  $("#chart-window").textContent = `${Math.round((s.t[n - 1] - s.t[0]) / 1000)} s · 左 decode / 右 prefill`;
+}
+
+// Glanceable numbers: the chart shows the trend, but an operator wants the current rate as a digit,
+// not a squint at the axis. Prefill and decode are mutually exclusive phases, so while one is active
+// the other reads "—" rather than a stale hold (decode cannot run during prefill). Only when BOTH are
+// idle do we HOLD the last obtained rate, so a digit does not disappear just because this second had
+// no traffic.
+let lastDecode = null, lastPrefill = null;
+function renderSpeedReadout(s) {
+  const host = $("#speed-readout");
+  const n = s.t.length;
+  const curD = n ? s.decode[n - 1] : null;
+  const curP = n ? s.prefill[n - 1] : null;
+  if (curD > 0) lastDecode = curD;
+  if (curP > 0) lastPrefill = curP;
+  const showD = curD > 0 ? curD : (curP > 0 ? null : lastDecode);
+  const showP = curP > 0 ? curP : (curD > 0 ? null : lastPrefill);
+  const cell = (label, cur, peak, cls) => el("div", { class: `speed-cell ${cls}` },
+    el("div", { class: "speed-label", text: label }),
+    el("div", { class: "speed-value" },
+      el("span", { class: "speed-num", text: rate(cur) }),
+      el("span", { class: "speed-unit", text: "t/s" })),
+    el("div", { class: "speed-peak", text: peak == null ? "等待采样" : `峰值 ${num(peak, peak < 20 ? 1 : 0)}` }));
+  host.replaceChildren(
+    cell("decode 解码", showD, n ? Math.max(...s.decode) : null, "decode"),
+    cell("prefill 填充", showP, n ? Math.max(...s.prefill) : null, "prefill"));
 }
 
 // ── Conversation windows ───────────────────────────────────────────────────
-// The clickable list is the console's OWN rounds: only they carry the captured SSE frames the
-// sidebar renders. Engine slots are a separate, non-clickable occupancy table — a slot is reused
-// across turns, so it cannot identify a conversation.
+// 一个 agent 会话的多次请求归为一个会话窗口：按 conv（后端会话锚点哈希）分组，活跃在前、
+// 完成显示空闲，新请求更新本会话行而不是另起一行。按 conv 复用 DOM 行，只有状态真正变化才
+// 重建徽章（避免 2 Hz 重绘打断 .live 脉冲动画造成闪烁），新会话淡入一次。
+const liveRowMap = new Map(); // conv -> <tr>
+
+// S.rounds is newest-first; grouping preserves that order, so each session's rounds[0] is its latest
+// turn and the group list is ordered by most recent activity.
+function sessionGroups() {
+  const map = new Map();
+  for (const r of (S.rounds || [])) {
+    const c = r.conv || `r${r.id}`;
+    let g = map.get(c);
+    if (!g) { g = { conv: c, rounds: [] }; map.set(c, g); }
+    g.rounds.push(r);
+  }
+  return [...map.values()];
+}
+
+function openSession(conv) {
+  const g = sessionGroups().find((g) => g.conv === conv);
+  if (!g) return;
+  const rep = g.rounds.find((r) => r.status === "streaming") || g.rounds[0];
+  openRound(rep.id);
+}
+
 function renderLiveRounds() {
   const body = $("#live-rounds");
-  const all = S.rounds || [];
-  const live = all.filter((r) => r.status === "streaming");
-  const rows = (live.length ? live : all.slice(0, 4));
+  const views = sessionGroups().map((g) => {
+    const rounds = g.rounds;
+    const latest = rounds[0];
+    const active = rounds.find((r) => r.status === "streaming") || null;
+    return {
+      conv: g.conv, rounds, latest, active, rep: active || latest, streaming: !!active,
+      tools: [...new Set(rounds.flatMap((r) => r.tools))],
+      gen: rounds.reduce((s, r) => s + (r.completion_tokens || 0), 0),
+    };
+  });
+  views.sort((a, b) => (Number(b.streaming) - Number(a.streaming)) || (b.latest.started_at_ms - a.latest.started_at_ms));
+  const rows = views.slice(0, 12);
   if (!rows.length) {
+    liveRowMap.clear();
     body.replaceChildren(el("tr", {}, el("td", { colspan: 8, class: "empty", text: "还没有请求经过控制台" })));
     return;
   }
-  body.replaceChildren(...rows.map((r) => {
-    const tr = el("tr", { class: `clickable${r.id === selectedRound ? " selected" : ""}` },
-      el("td", { text: clock(r.started_at_ms) }),
-      el("td", { text: r.key_label }),
-      el("td", {}, phaseBadge(r.status === "streaming" ? r.phase : r.status)),
-      el("td", { text: r.tools.length ? r.tools.join(", ") : "—" }),
-      el("td", { class: "num", text: rate(r.status === "streaming" ? r.live_tps : r.decode_tps) }),
-      el("td", { class: "num", text: num(r.completion_tokens) }),
-      el("td", { class: "num", text: pct(reuseRatio(r)) }),
-      el("td", { class: "num", text: num(r.ttft_ms) }));
-    tr.addEventListener("click", () => openRound(r.id));
-    return tr;
-  }));
+  const keep = new Set(rows.map((v) => v.conv));
+  for (const [conv, tr] of liveRowMap) if (!keep.has(conv)) { tr.remove(); liveRowMap.delete(conv); }
+  const placeholder = body.querySelector(".empty");
+  if (placeholder) placeholder.closest("tr").remove();
+  let prev = null;
+  for (const v of rows) {
+    let tr = liveRowMap.get(v.conv);
+    if (!tr) {
+      tr = el("tr", { class: "clickable row-enter" },
+        el("td", { class: "c-time" }), el("td", { class: "c-key" }), el("td", { class: "c-state" }),
+        el("td", { class: "c-tools" }), el("td", { class: "num c-tps" }), el("td", { class: "num c-gen" }),
+        el("td", { class: "num c-reuse" }), el("td", { class: "num c-ttft" }));
+      tr.addEventListener("click", () => openSession(v.conv));
+      // 入场动画只播一次；否则行被移动时重放 opacity 0→1，看起来整行在闪。
+      tr.addEventListener("animationend", (e) => {
+        if (e.target === tr && e.animationName === "row-enter") tr.classList.remove("row-enter");
+      });
+      liveRowMap.set(v.conv, tr);
+    }
+    tr.classList.toggle("selected", v.conv === selectedConv);
+    tr.classList.toggle("active", v.streaming);
+    $(".c-time", tr).textContent = clock(v.latest.started_at_ms);
+    $(".c-key", tr).textContent = v.latest.key_label;
+    const st = sessionState(v.rep);
+    const sig = `${v.rep.status}|${st.cls}|${st.label}|${st.extra || ""}|${v.rounds.length}`;
+    if (tr.dataset.state !== sig) {
+      tr.dataset.state = sig;
+      const cell = $(".c-state", tr);
+      cell.replaceChildren(sessionBadge(v.rep, st));
+      if (v.rounds.length > 1) cell.append(el("span", { class: "frame-seq round-count", text: `${v.rounds.length} 轮` }));
+    }
+    $(".c-tools", tr).textContent = v.tools.length ? v.tools.join(", ") : "—";
+    $(".c-tps", tr).textContent = rate(v.active ? v.active.live_tps : v.latest.decode_tps);
+    $(".c-gen", tr).textContent = num(v.gen);
+    $(".c-reuse", tr).textContent = pct(reuseRatio(v.latest));
+    $(".c-ttft", tr).textContent = num(v.latest.ttft_ms);
+    // 只在位置真正变化时移动节点；无条件 append 会重插入并重启入场动画造成闪烁。
+    const ref = prev ? prev.nextSibling : body.firstChild;
+    if (ref !== tr) body.insertBefore(tr, ref);
+    prev = tr;
+  }
 }
 
 function renderSlots() {
@@ -289,36 +493,55 @@ function reuseRatio(r) {
   return r.prompt_tokens ? r.cached_prompt_tokens / r.prompt_tokens : null;
 }
 
-function roundCells(r) {
-  return [
-    el("td", { class: "num", text: num(r.prompt_tokens) }),
-    el("td", { class: "num", text: num(r.cached_prompt_tokens) }),
-    el("td", { class: "num", text: num(r.prompt_tokens - r.cached_prompt_tokens) }),
-    el("td", { class: "num", text: pct(reuseRatio(r)) }),
-    el("td", { class: "num", text: r.reuse_est ? pct(r.reuse_est.ratio) : "—", title: r.reuse_est ? `代理侧前缀估计：${r.reuse_est.messages} 条消息 / ${num(r.reuse_est.chars)} 字符` : "" }),
-    el("td", { class: "num", text: num(r.completion_tokens) }),
-    el("td", { class: "num", text: num(r.ttft_ms) }),
-    el("td", { class: "num", text: rate(r.prefill_tps) }),
-    el("td", { class: "num", text: rate(r.decode_tps) }),
-  ];
-}
-
+// 按 id 复用行 + 徽章签名守卫：整表每 tick 重建会重启 .live 脉冲动画，看起来徽章在异常闪烁。
+const recentRowMap = new Map(); // round id -> <tr>
 function renderRecent() {
   const body = $("#recent");
   const rows = (S.rounds || []).slice(0, 8);
-  if (!rows.length) { body.replaceChildren(el("tr", {}, el("td", { colspan: 10, class: "empty", text: "还没有请求经过控制台" }))); return; }
-  body.replaceChildren(...rows.map((r) => {
-    const tr = el("tr", { class: "clickable" },
-      el("td", { text: clock(r.started_at_ms) }),
-      el("td", { text: r.key_label }),
-      el("td", {}, phaseBadge(r.status === "streaming" ? r.phase : r.status)),
-      el("td", {}, r.uncensor ? el("span", { class: "badge on", text: "开" }) : el("span", { class: "frame-seq", text: "关" })),
-      ...roundCells(r).filter((_, i) => [0, 1, 5, 6, 7, 8].includes(i)));
-    tr.addEventListener("click", () => openRound(r.id));
-    return tr;
-  }));
+  if (!rows.length) {
+    recentRowMap.clear();
+    body.replaceChildren(el("tr", {}, el("td", { colspan: 10, class: "empty", text: "还没有请求经过控制台" })));
+    return;
+  }
+  const keep = new Set(rows.map((r) => r.id));
+  for (const [id, tr] of recentRowMap) if (!keep.has(id)) { tr.remove(); recentRowMap.delete(id); }
+  const ph = body.querySelector(".empty");
+  if (ph) ph.closest("tr").remove();
+  let prev = null;
+  for (const r of rows) {
+    let tr = recentRowMap.get(r.id);
+    if (!tr) {
+      tr = el("tr", { class: "clickable" },
+        el("td", { class: "c-time" }), el("td", { class: "c-key" }), el("td", { class: "c-state" }),
+        el("td", { class: "c-unc" }), el("td", { class: "num c-prompt" }), el("td", { class: "num c-cached" }),
+        el("td", { class: "num c-gen" }), el("td", { class: "num c-ttft" }), el("td", { class: "num c-pf" }), el("td", { class: "num c-dec" }));
+      tr.addEventListener("click", () => openRound(r.id));
+      recentRowMap.set(r.id, tr);
+    }
+    $(".c-time", tr).textContent = clock(r.started_at_ms);
+    $(".c-key", tr).textContent = r.key_label;
+    const st = sessionState(r);
+    const sig = `${r.status}|${st.cls}|${st.label}|${st.extra || ""}`;
+    if (tr.dataset.state !== sig) { tr.dataset.state = sig; $(".c-state", tr).replaceChildren(sessionBadge(r, st)); }
+    const unc = $(".c-unc", tr);
+    const uncSig = r.uncensor ? "on" : "off";
+    if (unc.dataset.v !== uncSig) {
+      unc.dataset.v = uncSig;
+      unc.replaceChildren(r.uncensor ? el("span", { class: "badge on", text: "开" }) : el("span", { class: "frame-seq", text: "关" }));
+    }
+    $(".c-prompt", tr).textContent = num(r.prompt_tokens);
+    $(".c-cached", tr).textContent = num(r.cached_prompt_tokens);
+    $(".c-gen", tr).textContent = num(r.completion_tokens);
+    $(".c-ttft", tr).textContent = num(r.ttft_ms);
+    $(".c-pf", tr).textContent = rate(r.prefill_tps);
+    $(".c-dec", tr).textContent = rate(r.decode_tps);
+    const ref = prev ? prev.nextSibling : body.firstChild;
+    if (ref !== tr) body.insertBefore(tr, ref);
+    prev = tr;
+  }
 }
 
+const historyRowMap = new Map(); // round id -> <tr>
 function renderHistory() {
   const filter = $("#history-key").value;
   const body = $("#history");
@@ -330,20 +553,58 @@ function renderHistory() {
       ...(S.keys || []).map((k) => el("option", { value: k.id, text: k.label })));
     sel.value = filter;
   }
-  if (!rows.length) { body.replaceChildren(el("tr", {}, el("td", { colspan: 16, class: "empty", text: "无记录" }))); return; }
-  body.replaceChildren(...rows.map((r) => {
-    const tr = el("tr", { class: `clickable${r.id === selectedRound ? " selected" : ""}` },
-      el("td", { class: "num", text: r.id }),
-      el("td", { text: clock(r.started_at_ms) }),
-      el("td", { text: r.key_label }),
-      el("td", {}, phaseBadge(r.status === "streaming" ? r.phase : r.status)),
-      el("td", { text: r.tools.length ? r.tools.join(", ") : "—" }),
-      el("td", {}, r.uncensor ? el("span", { class: "badge on", text: "开" }) : el("span", { class: "frame-seq", text: "关" })),
-      ...roundCells(r),
-      el("td", { class: "num", text: dur(r.duration_ms) }));
-    tr.addEventListener("click", () => openRound(r.id));
-    return tr;
-  }));
+  if (!rows.length) {
+    historyRowMap.clear();
+    body.replaceChildren(el("tr", {}, el("td", { colspan: 16, class: "empty", text: "无记录" })));
+    return;
+  }
+  const keep = new Set(rows.map((r) => r.id));
+  for (const [id, tr] of historyRowMap) if (!keep.has(id)) { tr.remove(); historyRowMap.delete(id); }
+  const ph = body.querySelector(".empty");
+  if (ph) ph.closest("tr").remove();
+  let prev = null;
+  for (const r of rows) {
+    let tr = historyRowMap.get(r.id);
+    if (!tr) {
+      tr = el("tr", { class: "clickable" },
+        el("td", { class: "num c-id" }), el("td", { class: "c-time" }), el("td", { class: "c-key" }),
+        el("td", { class: "c-state" }), el("td", { class: "c-tools" }), el("td", { class: "c-unc" }),
+        el("td", { class: "num c-prompt" }), el("td", { class: "num c-cached" }), el("td", { class: "num c-miss" }),
+        el("td", { class: "num c-reuse" }), el("td", { class: "num c-est" }), el("td", { class: "num c-gen" }),
+        el("td", { class: "num c-ttft" }), el("td", { class: "num c-pf" }), el("td", { class: "num c-dec" }), el("td", { class: "num c-dur" }));
+      tr.addEventListener("click", () => openRound(r.id));
+      historyRowMap.set(r.id, tr);
+    }
+    tr.classList.toggle("selected", r.id === selectedRound);
+    $(".c-id", tr).textContent = r.id;
+    $(".c-time", tr).textContent = clock(r.started_at_ms);
+    $(".c-key", tr).textContent = r.key_label;
+    const st = sessionState(r);
+    const sig = `${r.status}|${st.cls}|${st.label}|${st.extra || ""}`;
+    if (tr.dataset.state !== sig) { tr.dataset.state = sig; $(".c-state", tr).replaceChildren(sessionBadge(r, st)); }
+    $(".c-tools", tr).textContent = r.tools.length ? r.tools.join(", ") : "—";
+    const unc = $(".c-unc", tr);
+    const uncSig = r.uncensor ? "on" : "off";
+    if (unc.dataset.v !== uncSig) {
+      unc.dataset.v = uncSig;
+      unc.replaceChildren(r.uncensor ? el("span", { class: "badge on", text: "开" }) : el("span", { class: "frame-seq", text: "关" }));
+    }
+    $(".c-prompt", tr).textContent = num(r.prompt_tokens);
+    $(".c-cached", tr).textContent = num(r.cached_prompt_tokens);
+    $(".c-miss", tr).textContent = num(r.prompt_tokens - r.cached_prompt_tokens);
+    $(".c-reuse", tr).textContent = pct(reuseRatio(r));
+    const est = $(".c-est", tr);
+    est.textContent = r.reuse_est ? pct(r.reuse_est.ratio) : "—";
+    est.title = r.reuse_est ? `代理侧前缀估计：${r.reuse_est.messages} 条消息 / ${num(r.reuse_est.chars)} 字符` : "";
+    $(".c-gen", tr).textContent = num(r.completion_tokens);
+    $(".c-ttft", tr).textContent = num(r.ttft_ms);
+    $(".c-pf", tr).textContent = rate(r.prefill_tps);
+    $(".c-dec", tr).textContent = rate(r.decode_tps);
+    $(".c-dur", tr).textContent = dur(r.duration_ms);
+    const ref = prev ? prev.nextSibling : body.firstChild;
+    if (ref !== tr) body.insertBefore(tr, ref);
+    prev = tr;
+  }
 }
 $("#history-clear").addEventListener("click", async () => {
   try { await api("ui/rounds", { method: "DELETE" }); liveFrames.clear(); roundRequests.clear(); toast("历史已清空", "ok"); }
@@ -351,13 +612,26 @@ $("#history-clear").addEventListener("click", async () => {
 });
 
 // ── Keys ───────────────────────────────────────────────────────────────────
+let keysSig = null;
 function renderKeys() {
   const body = $("#keys");
   const keys = S.keys || [];
+  // 计数不变时不重建表格：否则复制/删除按钮节点每次刷新都被替换，点击会落空。
+  const sig = keys.map((k) => [k.id, k.token, k.requests, k.prompt_tokens, k.completion_tokens, k.cached_tokens, k.ttft_avg_ms, k.prefill_avg_tps, k.decode_avg_tps].join(":")).join("|");
+  if (sig === keysSig) return;
+  keysSig = sig;
   if (!keys.length) { body.replaceChildren(el("tr", {}, el("td", { colspan: 12, class: "empty", text: "还没有 Key，先添加一个" }))); return; }
   body.replaceChildren(...keys.map((k) => el("tr", {},
     el("td", { text: k.label }),
-    el("td", {}, el("code", { class: "frame-seq", text: k.token })),
+    el("td", {}, el("div", { class: "token-cell" },
+      el("code", { class: "frame-seq", text: k.token }),
+      el("button", {
+        class: "icon-btn copy-btn", text: "复制", title: "复制令牌到剪贴板",
+        onclick: async () => {
+          try { await navigator.clipboard.writeText(k.token); toast("令牌已复制", "ok"); }
+          catch { toast("复制失败，请手动选择令牌", "bad"); }
+        },
+      }))),
     el("td", { class: "num", text: num(k.requests) }),
     el("td", { class: "num", text: num(k.prompt_tokens) }),
     el("td", { class: "num", text: num(k.completion_tokens) }),
@@ -462,6 +736,8 @@ function renderContext() {
 // ── Sidebar ────────────────────────────────────────────────────────────────
 function openRound(id) {
   selectedRound = id;
+  const r = (S && S.rounds || []).find((r) => r.id === id);
+  selectedConv = r ? (r.conv || `r${id}`) : null;
   $("#sidebar").classList.add("open");
   if (!liveFrames.has(id) || !roundRequests.has(id)) loadFrames(id);
   renderSidebar();
@@ -479,6 +755,7 @@ async function loadFrames(id) {
 $("#sb-close").addEventListener("click", () => {
   $("#sidebar").classList.remove("open");
   selectedRound = null;
+  selectedConv = null;
   renderHistory();
 });
 $("#sb-follow").addEventListener("click", (e) => {
@@ -496,9 +773,41 @@ function currentRound() { return (S && S.rounds || []).find((r) => r.id === sele
 function renderSidebarHead() {
   const r = currentRound();
   if (!r) return;
-  $("#sb-title").textContent = `#${r.id} · ${r.key_label}`;
-  $("#sb-phase").replaceWith(Object.assign(phaseBadge(r.status === "streaming" ? r.phase : r.status,
-    r.tools.length ? r.tools.join(",") : null), { id: "sb-phase" }));
+  const g = selectedConv ? sessionGroups().find((g) => g.conv === selectedConv) : null;
+  $("#sb-title").textContent = g && g.rounds.length > 1
+    ? `会话 · ${g.rounds.length} 轮 · ${r.key_label}`
+    : `#${r.id} · ${r.key_label}`;
+  // 徽章只在状态签名变化时重建：每 tick replaceWith 会重启 .live 脉冲动画，看起来异常闪烁。
+  const st = sessionState(r);
+  const sig = `${r.status}|${st.cls}|${st.label}|${st.extra || ""}`;
+  const badge = $("#sb-phase");
+  if (badge.dataset.sig !== sig) {
+    const node = sessionBadge(r, st);
+    node.id = "sb-phase";
+    node.dataset.sig = sig;
+    badge.replaceWith(node);
+  }
+  renderSessionRounds(g);
+}
+
+// 会话内轮次导航：一个 agent 会话归为一个窗口后，用这排 chip 在它的各轮之间切换（最新在前）。
+// 只在轮次列表或选中项变化时重建，避免每 tick 重绘打断点击/动画。
+function renderSessionRounds(g) {
+  const host = $("#sb-rounds");
+  if (!g || g.rounds.length < 2) { host.replaceChildren(); host.hidden = true; return; }
+  host.hidden = false;
+  const sig = g.rounds.map((r) => r.id).join(",") + "|" + selectedRound;
+  if (host.dataset.sig === sig) return;
+  host.dataset.sig = sig;
+  host.replaceChildren(...g.rounds.map((r) => {
+    const chip = el("button", {
+      class: `round-chip${r.id === selectedRound ? " selected" : ""}${r.status === "streaming" ? " live" : ""}`,
+      text: `#${r.id}`,
+      title: `${clock(r.started_at_ms)} · ${PHASE_LABEL[r.phase] || r.phase}`,
+    });
+    chip.addEventListener("click", () => openRound(r.id));
+    return chip;
+  }));
 }
 
 function highlight(json) {
@@ -565,6 +874,31 @@ function appendFrame(f) {
   }
   const count = $(".frame-count", body);
   if (count) count.textContent = `共 ${(liveFrames.get(f.round) || []).length} 帧`;
+  if (sbFollow) body.scrollTop = body.scrollHeight;
+}
+
+// The assembled views (output / thinking / tools) must re-fold as deltas stream in, not stay frozen
+// until the operator re-clicks the row. rAF-coalesced so a burst of frames folds once per paint.
+let livePaneRaf = 0;
+function scheduleLivePane() {
+  if (sbTab === "frames" || sbTab === "request" || livePaneRaf) return;
+  livePaneRaf = requestAnimationFrame(() => { livePaneRaf = 0; updateLivePane(); });
+}
+function updateLivePane() {
+  const r = currentRound();
+  if (!r) return;
+  const body = $("#sb-body");
+  const parts = assemble(liveFrames.get(r.id) || []);
+  if (sbTab === "tools") {
+    body.replaceChildren(...(parts.tools.length
+      ? parts.tools.map((t) => highlight(t))
+      : [el("div", { class: "empty", text: "本轮没有工具调用" })]));
+  } else {
+    const text = sbTab === "output" ? parts.content : parts.reasoning;
+    body.replaceChildren(text
+      ? el("div", { class: `prose${sbTab === "thinking" ? " thinking" : ""}`, text })
+      : el("div", { class: "empty", text: sbTab === "output" ? "无输出文本" : "无思考文本" }));
+  }
   if (sbFollow) body.scrollTop = body.scrollHeight;
 }
 
@@ -1316,6 +1650,63 @@ $("#launch-reset").addEventListener("click", () => { FORM = {}; renderLaunch(); 
 $("#launch-copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("#cmdline").textContent); toast("已复制", "ok"); }
   catch { toast("浏览器拒绝了剪贴板访问", "bad"); }
+});
+// 导出当前表单为引擎 TOML 配置文件：升级后在 cli:config 填它的路径即可复用，不必重填几百个旋钮。
+$("#launch-export").addEventListener("click", async () => {
+  if (!SCHEMA) { toast("配置表还没加载", "bad"); return; }
+  try {
+    const res = await fetch("ui/config/export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: PRESET, set: FORM }),
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      let msg = t; try { msg = JSON.parse(t).error || t; } catch { /* 非 JSON 错误体 */ }
+      throw new Error(msg || `HTTP ${res.status}`);
+    }
+    const text = await res.text();
+    const url = URL.createObjectURL(new Blob([text], { type: "application/toml" }));
+    const a = el("a", { href: url, download: "infr-config.toml" });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    toast("已导出 infr-config.toml；升级后在 cli:config 填它的路径即可复用", "ok");
+  } catch (e) { toast(`导出失败：${e.message}`, "bad"); }
+});
+// 导入配置文件：导出的逆操作。读本地 TOML，后端按当前 schema 解析回 {preset,set}，套用到表单并保存。
+// 升级后不必重填几百个旋钮——选回之前导出的 infr-config.toml 即可恢复整套配置。
+$("#launch-import").addEventListener("click", () => {
+  if (!SCHEMA) { toast("配置表还没加载", "bad"); return; }
+  $("#launch-import-file").click();
+});
+$("#launch-import-file").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = "";  // 清空以便重复选同一个文件也能再次触发 change
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const res = await fetch("ui/config/import", {
+      method: "POST",
+      headers: { "content-type": "application/toml" },
+      body: text,
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      let msg = t; try { msg = JSON.parse(t).error || t; } catch { /* 非 JSON 错误体 */ }
+      throw new Error(msg || `HTTP ${res.status}`);
+    }
+    const { preset, set } = await res.json();
+    const known = new Set((SCHEMA.schema || []).map((f) => f.path));
+    FORM = {};
+    let n = 0;
+    for (const [k, v] of Object.entries(set || {})) if (known.has(k)) { FORM[k] = v; n++; }
+    if (["conservative", "aggressive", "manual"].includes(preset)) PRESET = preset;
+    // 预设按钮拥有 auto_profile（全手动除外），与点预设按钮后的表单状态保持一致。
+    if (PRESET !== "manual") delete FORM["device.auto_profile"];
+    renderLaunch();
+    await api("ui/settings", { method: "POST", body: { preset: PRESET, set: FORM } });
+    toast(`已导入 ${file.name}：${n} 项配置（预设 ${PRESET}），并已保存`, "ok");
+  } catch (e) { toast(`导入失败：${e.message}`, "bad"); }
 });
 $("#launch-start").addEventListener("click", () => {
   const vector = FORM["uncensor.vector"];

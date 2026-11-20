@@ -374,21 +374,219 @@ pub fn build_args(
         args.push("--set".into());
         args.push(format!("device.auto_profile={}", req.preset));
     }
-    for f in fields {
-        let path = f["path"].as_str().unwrap_or("");
-        if path.starts_with("cli:") || path == "serve.shutdown_file" || path.ends_with("_specified") {
-            continue;
+    // A config file is the base layer and `--set` outranks it, so a full dump would shadow every
+    // value in the file. With `cli:config` set, emit only the operator's touched deltas and let the
+    // file supply the rest; without it, keep the full explicit dump.
+    let has_config = req.set.get("cli:config").is_some_and(|v| !v.trim().is_empty());
+    if has_config {
+        for (path, value) in &req.set {
+            if path.starts_with("cli:")
+                || path == "serve.shutdown_file"
+                || path.ends_with("_specified")
+                || (path == "device.auto_profile" && req.preset != "manual")
+            {
+                continue;
+            }
+            args.push("--set".into());
+            args.push(format!("{path}={value}"));
         }
-        if path == "device.auto_profile" && req.preset != "manual" {
-            continue;
+    } else {
+        for f in fields {
+            let path = f["path"].as_str().unwrap_or("");
+            if path.starts_with("cli:") || path == "serve.shutdown_file" || path.ends_with("_specified") {
+                continue;
+            }
+            if path == "device.auto_profile" && req.preset != "manual" {
+                continue;
+            }
+            let value = effective(path, f["default"].as_str().unwrap_or("none"));
+            args.push("--set".into());
+            args.push(format!("{path}={value}"));
         }
-        let value = effective(path, f["default"].as_str().unwrap_or("none"));
-        args.push("--set".into());
-        args.push(format!("{path}={value}"));
     }
     args.push("--set".into());
     args.push(format!("serve.shutdown_file={}", shutdown_file.display()));
     Ok(args)
+}
+
+/// Export the effective launch configuration as an engine TOML file (the `infr.toml` grammar:
+/// section path == dotted knob path, positive field names). This is the portable artifact an
+/// operator keeps across an upgrade: point `cli:config` at it, or `infr serve --config <file>`.
+///
+/// Left out, because they are not config-file knobs: CLI-only flags (model / addr / parallel /
+/// mmproj), the console-owned `serve.shutdown_file`, the engine-derived `*_specified` markers, and
+/// the `serve.api_key` secret. Unset Options (`none`) are omitted so the engine's own defaults stay
+/// in force. The engine ignores unknown keys, so a file written for one version loads on the next.
+pub fn build_toml(req: &LaunchRequest, fields: &[serde_json::Value]) -> anyhow::Result<String> {
+    if !matches!(req.preset.as_str(), "conservative" | "aggressive" | "manual") {
+        anyhow::bail!("未知的配置方式：{}", req.preset);
+    }
+    let mut root = toml::Table::new();
+    for f in fields {
+        let path = f["path"].as_str().unwrap_or("");
+        if path.starts_with("cli:")
+            || path == "serve.shutdown_file"
+            || path == "serve.api_key"
+            || path.ends_with("_specified")
+        {
+            continue;
+        }
+        let ty = f["ty"].as_str().unwrap_or("String");
+        let default = f["default"].as_str().unwrap_or("none");
+        let mut value = req.set.get(path).cloned().unwrap_or_else(|| default.to_string());
+        if path == "device.auto_profile" && req.preset != "manual" {
+            value = req.preset.clone();
+        }
+        if value.is_empty() || value == "none" {
+            continue;
+        }
+        let Some(scalar) = toml_scalar(ty, &value) else { continue };
+        let parts: Vec<&str> = path.split('.').collect();
+        insert_nested(&mut root, &parts, scalar);
+    }
+    let body = toml::to_string_pretty(&toml::Value::Table(root))?;
+    Ok(format!(
+        "# infr 配置 — 由控制台导出（预设：{}）。\n\
+         # 复用：infr serve --config 本文件 <模型> …，或在控制台 cli:config 填本文件路径后启动。\n\
+         # 模型 / 地址 / 并发 / mmproj 是 CLI 旗标，API key 是机密，均不在此文件；升级后未知键会被忽略。\n\n\
+         {}",
+        req.preset, body
+    ))
+}
+
+/// Insert a scalar at a dotted path, creating intermediate tables. `kernels.vulkan.gemv.rm` becomes
+/// `[kernels.vulkan.gemv] rm = …`, which is exactly how the engine's config-file walk reads it back.
+fn insert_nested(root: &mut toml::Table, parts: &[&str], value: toml::Value) {
+    let key = parts[0];
+    if parts.len() == 1 {
+        root.insert(key.to_string(), value);
+        return;
+    }
+    if !root.contains_key(key) {
+        root.insert(key.to_string(), toml::Value::Table(toml::Table::new()));
+    }
+    if let Some(toml::Value::Table(sub)) = root.get_mut(key) {
+        insert_nested(sub, &parts[1..], value);
+    }
+}
+
+/// Type a `--set` spelling into the TOML scalar the engine expects. A wrong TYPE for a known key is
+/// a hard error on load, so numeric/bool knobs must not be quoted and string grammars (SizeSpec,
+/// DType, paths) must be. `None` = a value this field cannot hold; the caller omits it.
+fn toml_scalar(ty: &str, raw: &str) -> Option<toml::Value> {
+    let inner = ty.strip_prefix("Option<").and_then(|s| s.strip_suffix('>')).unwrap_or(ty);
+    match inner {
+        "bool" => raw.parse::<bool>().ok().map(toml::Value::Boolean),
+        "f32" | "f64" => raw.parse::<f64>().ok().map(toml::Value::Float),
+        "usize" | "u64" | "u32" | "u16" | "u8" | "i64" | "i32" | "i16" | "i8" => {
+            raw.parse::<i64>().ok().map(toml::Value::Integer)
+        }
+        "Vec<usize>" => {
+            let cleaned = raw.trim().trim_start_matches('[').trim_end_matches(']');
+            let items: Option<Vec<toml::Value>> = cleaned
+                .split(',')
+                .map(|s| s.trim().parse::<i64>().ok().map(toml::Value::Integer))
+                .collect();
+            items.map(toml::Value::Array)
+        }
+        _ => Some(toml::Value::String(raw.to_string())),
+    }
+}
+
+/// Read an exported (or engine-written) TOML config back into a launch form — the inverse of
+/// `build_toml`. The section path is the dotted knob path, so flattening the tables recovers the
+/// `--set` keys; each scalar is spelled back the way `toml_scalar` typed it. Keys the live schema no
+/// longer knows are dropped (a file from a newer engine must not hard-error the next launch), and so
+/// are the same non-knobs `build_toml` omits. The preset is recovered from the export header, which
+/// records it exactly — `manual` included, since that one is not stored in `device.auto_profile`.
+pub fn parse_toml(text: &str, fields: &[serde_json::Value]) -> anyhow::Result<LaunchRequest> {
+    let root: toml::Value =
+        toml::from_str(text).map_err(|e| anyhow::anyhow!("配置文件不是合法的 TOML：{e}"))?;
+    let mut leaves = BTreeMap::new();
+    flatten_toml(&root, "", &mut leaves);
+
+    let known: std::collections::HashSet<&str> = fields
+        .iter()
+        .filter_map(|f| f.get("path").and_then(|p| p.as_str()))
+        .collect();
+    let mut set = BTreeMap::new();
+    for (path, value) in &leaves {
+        if path.starts_with("cli:")
+            || path == "serve.shutdown_file"
+            || path == "serve.api_key"
+            || path.ends_with("_specified")
+            || !known.contains(path.as_str())
+        {
+            continue;
+        }
+        if let Some(s) = scalar_to_set(value) {
+            if !s.is_empty() {
+                set.insert(path.clone(), s);
+            }
+        }
+    }
+
+    let preset = preset_from_header(text)
+        .or_else(|| {
+            leaves.get("device.auto_profile").and_then(|v| v.as_str()).and_then(|p| {
+                matches!(p, "conservative" | "aggressive" | "manual").then(|| p.to_string())
+            })
+        })
+        .unwrap_or_else(|| "conservative".to_string());
+    Ok(LaunchRequest { preset, set, consent: false })
+}
+
+/// Walk nested tables into `section.sub.key -> leaf`, the exact shape `insert_nested` wrote. A parent
+/// section's own scalars and its sub-tables both flatten, so `[kernels] qkv_fuse=… [kernels.vulkan]`
+/// recovers `kernels.qkv_fuse` and `kernels.vulkan.…` without one leaking into the other.
+fn flatten_toml(value: &toml::Value, prefix: &str, out: &mut BTreeMap<String, toml::Value>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (k, v) in table {
+                let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                flatten_toml(v, &path, out);
+            }
+        }
+        leaf if !prefix.is_empty() => {
+            out.insert(prefix.to_string(), leaf.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Spell a TOML scalar back into the `--set` string the form holds — the inverse of `toml_scalar`.
+/// `None` = a value with no knob spelling (a datetime), which the caller drops.
+fn scalar_to_set(value: &toml::Value) -> Option<String> {
+    match value {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Boolean(b) => Some(b.to_string()),
+        toml::Value::Integer(i) => Some(i.to_string()),
+        toml::Value::Float(f) => Some(format!("{f}")),
+        toml::Value::Array(items) => {
+            let parts: Option<Vec<String>> = items
+                .iter()
+                .map(|v| match v {
+                    toml::Value::Integer(i) => Some(i.to_string()),
+                    _ => None,
+                })
+                .collect();
+            parts.map(|p| format!("[{}]", p.join(", ")))
+        }
+        toml::Value::Datetime(_) | toml::Value::Table(_) => None,
+    }
+}
+
+/// The export header records the preset verbatim (`预设：manual）`), which is the only lossless source
+/// for `manual` — that preset leaves `device.auto_profile` at its default. An engine-written file has
+/// no header, so the caller falls back to `device.auto_profile`.
+fn preset_from_header(text: &str) -> Option<String> {
+    let idx = text.find("预设：")?;
+    let rest = &text[idx + "预设：".len()..];
+    let end = rest.find('）').unwrap_or(rest.len());
+    match rest[..end].trim() {
+        p @ ("conservative" | "aggressive" | "manual") => Some(p.to_string()),
+        _ => None,
+    }
 }
 
 pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result<serde_json::Value> {
