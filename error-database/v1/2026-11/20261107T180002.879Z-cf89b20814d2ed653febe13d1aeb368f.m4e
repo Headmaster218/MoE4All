@@ -1,0 +1,37 @@
+MOE4ALL-SUBMISSION/1
+kind: error
+schema: error/1
+id: 20261107T180002.879Z-cf89b20814d2ed653febe13d1aeb368f
+created-at: 2026-11-07T18:00:02.879170+00:00
+engine: 1.3.0
+encoding: gzip+base64
+decoded-bytes: 2820
+compressed-bytes: 1073
+sha256: c16728abec5f152bdd5c38fc459a344acf2426c3a66865ab3e6029ccdb0adbad
+summary-count: 4
+summary-001: failure: fatal
+summary-002: model: MiMo-V2.6-Distill-Qwen-9B-Abliterated-Q4_K_M.gguf
+summary-003: description: hi .
+summary-004: error: backend: dequant-cached f32 weight would exceed the GPU working set: 13.28 GiB allocated + 0.00 GiB for this F32 tensor > 12.70 GiB budget. F32 has no native Metal kernel, so its weights are cached at f32 (4-8x the quantized size) and the t...
+
+-----BEGIN MOE4ALL PAYLOAD-----
+H4sIAAAAAAAC/+1W3W7bNhR+FUJXCWKplGzLP5sLtGtTDIG7ZkiDYUUg0OSxRJgiWZJykhUB9hB7
+wj3JDmUvzeJgQC96lxtROufw8Px8Rx+/JJ430LJqC85Lo5N5PkikSOZJQYsyz+nkIp9SSotsOpn9
+nvL1dLYq6DQfiQJEOR6uYQX5UOQMVsNyuk4GCXfAAoiKhaoLfO8ozfO0dzWndL5zlk/oSfyguAd0
+LTV8jSHJs2H2QMFN28oQ5bTkq0lRCl7mo+FqMlzzCZvw8WhaAh2vylxQzsVshFvXTKrOQbWROqaz
+ZoEpFAvw3Ekbduc0kmT3xyTzL8lhCN9+9t0gaZgT18z1Lo3HzS3juA4S5ngjA/DQRWXC4ncZw+W2
+i8aatVH+yloFZBkVytSSM1WFBgsr0FdO8QDH2mgeDGZVrW4DoEJ3SqGqjp72760RoB74XcqlSS+L
+rEzfSB+kUun5Neh09jp9tVIYl4utS89H1Vm1zOq6iw31wThWw7+njMtiltNxMY1hKNZp3sQDYplY
+X2nX6T7RumtBB9zxaS9KUwFbXFvYtSJNPYS+JVvJIWNdMJV1Zi0VLLjRHtyWBbmFB6beAs/aYBdr
+pvxO0bKbVMM1vpfj8bDE9duTvBokeDAH76uI/bKYYG7gnHExtRblWABMbcX4BrSYEwGfO6ZDyhlO
+jyDrYUGuQdZNINemU4LADQeUhwbIuw8fUegQhjXBJOYkH2bFlLyTrwlTyvAYDDkhNKO0F66Nw33S
+k1N0GkB7/H5J8iKb7PSrTtQQsl7dME+0IbovE1nGupINOA1qQLwhMvh9WJ4gGMk+Whb6gI9G6fSm
+D7HPRf6BKo/PY4J97OU9uuIByugaHFlHh3//+RfpiwUiprTLlxvnOhtwv8Keq9uMfPRA2D4ydZv6
+zlrjYqr7w1icQHK06wL5MRZCpZaF5iU5L6uzR5JpRR9JxgeS0RM2+YHNI8nyt9MPo/+K3l8eiM6L
+x74vzvNDEVodE2wXwn3XQiw331gjdSBG9yX9CdGwRxE5+vn96a/Vm7eXCxz+4/gf4g2TOg7MM9Ce
+gfb9gHZ119OKjz83H5gLnY2guyfq6QXN5+PZfJhnOUWyz09oJG6Cbn4hUq/dnHzyrLUK+zJH6LR2
+kWMPbbVZFLR/sQuazcbk6DP+eIfj4x9ImkazF7gYm272q0VbYpBynRRwhfh/OoLhZEafiKCnkfsc
+I1oEghheLM3biG2kXxGLsaPSOBxbyfrSsFob5AWOYGptF4DUjtlmQGzkfo+TEMjZJY6QjzeBq0gO
+Ae8SzxX6vwoJZ6zFWx9sd5xPe65GAeIrRBbmSK2aq04AEmzP3neRdOWW8duIQ5z01obKuMqBt5H9
+H9sPkg6vBNWDC9wDi+A6iKCON6U4JR7dCMbDVx2zstrA7WEYd/8AGr4HnwQLAAA=
+-----END MOE4ALL PAYLOAD-----
