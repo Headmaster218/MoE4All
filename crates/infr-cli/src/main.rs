@@ -1222,6 +1222,37 @@ fn run_engine_command(
         );
     }
     let cfg = Arc::new(cfg);
+    // The memory circuit breaker: exit at the water line instead of letting a miss storm page the
+    // box or AV the driver. Percentages resolve against total physical RAM, like the host-budget
+    // knobs; `None` on either axis arms that axis at its hard default.
+    let resolve_headroom = |spec: Option<infr_core::SizeSpec>, fallback: u64| -> u64 {
+        match spec {
+            Some(infr_core::SizeSpec::Bytes(bytes))
+            | Some(infr_core::SizeSpec::FrozenAutomaticBytes(bytes)) => bytes,
+            Some(infr_core::SizeSpec::Percent(fraction)) => infr_core::hostmem::total_bytes()
+                .map_or(fallback, |total| (total as f64 * fraction) as u64),
+            None => fallback,
+        }
+    };
+    let guard_headroom = resolve_headroom(
+        cfg.device.mem_guard_headroom,
+        infr_core::memguard::DEFAULT_HEADROOM_BYTES,
+    );
+    // The physical-RAM axis is the sensitive one on big-budget boxes (a healthy boot keeps ~46 GiB
+    // of COMMIT headroom while the working set is what overruns RAM); its default (4 GiB) guards
+    // imminent death, testing raises it to 8-16 GiB.
+    let guard_ram_headroom = resolve_headroom(cfg.device.mem_guard_ram_headroom, 4u64 << 30);
+    // Declare the commit the PLANNER already authorized before arming the breaker: the frozen
+    // process RAM budget (or an explicit `device.ram_budget`) is a decision, not a leak. Measured
+    // on a 96 GiB box with a 6 GiB pagefile (commit ceiling 102 GiB), a Flash-Next load settles at
+    // ~4 GiB of remaining commit all by itself, so an absolute 8 GiB line killed legitimate startups.
+    // `None` leaves the guard on its plain absolute line.
+    infr_core::memguard::set_authorized_commit_bytes(resolve_headroom(cfg.device.ram_budget, 0));
+    infr_core::memguard::configure(
+        guard_headroom,
+        guard_ram_headroom,
+        cfg.device.mem_guard_poll_ms,
+    );
     install_shutdown_file_watcher(cfg.serve.shutdown_file.as_deref())?;
     publish_thread_count(&cfg);
     publish_profile_out(&cfg);

@@ -133,6 +133,12 @@ knobs! {
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
+    // The commit circuit breaker (#156-era work, 2026-10-19 memory-bomb conviction): two water
+    // lines and the poll interval. All three were plain `INFR_*` reads; they were never in this
+    // table because the breaker itself only lived on the paged-KV branch.
+    "INFR_MEM_GUARD_HEADROOM"     => "device.mem_guard_headroom",     Size, Ignored, "8GiB", migrated;
+    "INFR_MEM_GUARD_RAM_HEADROOM" => "device.mem_guard_ram_headroom", Size, Ignored, "4GiB",  migrated;
+    "INFR_MEM_GUARD_POLL_MS"      => "device.mem_guard_poll_ms",      Int,  Ignored, "500",   migrated;
 
     // ── sampling (§6.2) ──────────────────────────────────────────────────────
     "INFR_TEMP"                 => "sampling.temp",       Float,      Ignored, "0.6",  migrated;
