@@ -332,7 +332,7 @@ fn message_to_json(m: &ChatMessage) -> Value {
             .map(|c| {
                 serde_json::json!({
                     "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
+                    "function": { "name": c.name, "arguments": tool_arguments_object(&c.arguments) },
                 })
             })
             .collect();
@@ -345,6 +345,22 @@ fn message_to_json(m: &ChatMessage) -> Value {
         obj.insert("name".into(), name.clone().into());
     }
     Value::Object(obj)
+}
+
+/// HF/Qwen chat templates iterate a call's arguments as key/value pairs (`arguments|items`), so the
+/// value MUST be a mapping. A replayed `tool_calls[].function.arguments` can arrive as a JSON string
+/// (OpenAI's wire form), or — from a lenient client — an array/scalar; rendering those throws
+/// "cannot convert value into pairs" and fails the whole turn. Coerce to an object here: parse a
+/// string body, keep an object as-is, and fall back to `{}` for anything that is not a mapping.
+fn tool_arguments_object(arguments: &Value) -> Value {
+    match arguments {
+        Value::Object(_) => arguments.clone(),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+        _ => Value::Object(serde_json::Map::new()),
+    }
 }
 
 fn qwen35_reasoning_instruction(effort: ReasoningEffort) -> &'static str {
@@ -594,6 +610,51 @@ pub fn render_chat_user(
 #[cfg(test)]
 mod template_tests {
     use super::*;
+
+    /// The Qwen3.8 template renders a call's arguments with `arguments|items`; a non-object value
+    /// (a JSON string, array, or scalar replayed by a lenient client) used to abort the whole turn
+    /// with "cannot convert value into pairs" (measured on Qwen3.8-Flash-Next-AD, req 225/226).
+    /// `message_to_json` must hand the template a mapping regardless of the inbound shape.
+    #[test]
+    fn replayed_tool_arguments_are_coerced_to_an_object_for_items_templates() {
+        let template = "{% for m in messages %}{% if m.tool_calls %}{% for tc in m.tool_calls %}\
+{% for k, v in tc.function.arguments|items %}{{ k }}={{ v }};{% endfor %}{% endfor %}{% endif %}{% endfor %}";
+        let render = |arguments: Value| {
+            let msg = ChatMessage {
+                role: "assistant".into(),
+                tool_calls: Some(vec![crate::ToolCall {
+                    name: "tap".into(),
+                    arguments,
+                }]),
+                ..Default::default()
+            };
+            render_template(
+                template,
+                vec![message_to_json(&msg)],
+                Value::Null,
+                "",
+                "",
+                false,
+                true,
+            )
+        };
+        // Object arguments pass through unchanged.
+        assert_eq!(render(serde_json::json!({"x": 100})).unwrap(), "x=100;");
+        // A JSON-string body is parsed back into the object the template can iterate.
+        assert_eq!(
+            render(Value::String(r#"{"x":100}"#.into())).unwrap(),
+            "x=100;"
+        );
+        // Non-object shapes no longer crash the render; they degrade to an empty argument list.
+        for bad in [
+            Value::String("not json".into()),
+            serde_json::json!([1, 2]),
+            serde_json::json!(7),
+            Value::Null,
+        ] {
+            assert_eq!(render(bad).unwrap(), "");
+        }
+    }
 
     /// The Qwen3.8 template accepts only low/medium/xhigh; OpenAI's `high` and `max` must reach it
     /// as xhigh or every such request fails to render (measured: `reasoning.effort: "high"` on
