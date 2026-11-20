@@ -16799,9 +16799,14 @@ impl<'a> Recorder<'a> {
         if let Some(query) = self.timeline_query.borrow_mut().as_mut() {
             query.submitted();
         }
+        let submit_t0 = std::time::Instant::now();
         let submit = self.submit_commands(fence, "pipelined queue_submit");
         drop(submit_span);
         if let Err(e) = submit {
+            tracing::error!(
+                "[infr] pipelined submit failed: {e}; dispatches={dispatches} submit_call_ms={}",
+                submit_t0.elapsed().as_millis()
+            );
             self.be.shared.recorder_fences.lock().unwrap().push(fence);
             self.free_transient();
             return Err(be(format!("queue_submit: {e}")));

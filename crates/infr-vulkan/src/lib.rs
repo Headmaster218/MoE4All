@@ -1156,6 +1156,43 @@ impl VulkanShared {
                     .queue_submit(queue, &[*submit], vk::Fence::null())
             };
         }
+        // Parity with the main queue's submit recovery: once OOM retries are exhausted, retire idle
+        // imported-host tails in bounded steps and retry. On AMD proprietary Windows an over-commit
+        // usually TDRs (DEVICE_LOST) before this fires, so the proactive prefill headroom reclaim is
+        // the primary guard; this is the reactive safety net for drivers that do return OOM.
+        if let Err(error) = result {
+            if retryable_queue_submit_error(error) {
+                for delay_ms in MEMORY_OOM_POST_SHED_DELAYS_MS {
+                    if let Err(wait_error) = unsafe { self.device.queue_wait_idle(queue) } {
+                        let _ = self
+                            .make_queue_unusable(wait_error, "dedicated transfer queue drain");
+                        return Err(be(format!(
+                            "dedicated transfer queue drain failed: {wait_error}"
+                        )));
+                    }
+                    let released = self.shed_host_dma_imports(HOST_DMA_SHED_STEP_BYTES);
+                    if released == 0 {
+                        tracing::warn!(
+                            "[infr] dedicated transfer queue_submit still cannot submit and no idle Host DMA tail mapping can be released"
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        "[infr] dedicated transfer queue_submit still cannot submit; released {:.2} GiB of idle Host DMA mappings and will retry after {delay_ms} ms",
+                        released as f64 / (1u64 << 30) as f64,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    attempts += 1;
+                    result = unsafe {
+                        self.device
+                            .queue_submit(queue, &[*submit], vk::Fence::null())
+                    };
+                    if !matches!(result, Err(error) if retryable_queue_submit_error(error)) {
+                        break;
+                    }
+                }
+            }
+        }
         if let Some(t0) = started {
             let elapsed = t0.elapsed();
             infr_core::pager_profile::record_queue_submit(0, elapsed);
@@ -1389,19 +1426,44 @@ impl VulkanShared {
         (raw != vk::Result::SUCCESS.as_raw()).then(|| vk::Result::from_raw(raw))
     }
 
+    /// One-line live VRAM watermark for failure diagnostics. `vram_info` is a physical-device
+    /// query (no queue submit), so it still returns valid figures after the logical device is
+    /// lost. in-use ≈ total with ~0 free points at an over-commit device reset; ample free points
+    /// at a hang/TDR instead of memory pressure.
+    fn vram_snapshot_line(&self) -> String {
+        let v = vram_info(self);
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        format!(
+            "in_use={:.2}GiB total={:.2}GiB free={:.2}GiB ({}, uma={}) tracked_used={:.2}GiB",
+            gib(v.total.saturating_sub(v.available)),
+            gib(v.total),
+            gib(v.available),
+            if v.live { "live" } else { "tracked" },
+            v.uma,
+            gib(self.budget_used()),
+        )
+    }
+
     fn make_queue_unusable(&self, error: vk::Result, context: &str) -> vk::Result {
-        self.queue_submit_failure
+        let first = self
+            .queue_submit_failure
             .compare_exchange(
                 vk::Result::SUCCESS.as_raw(),
                 error.as_raw(),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .ok();
+            .is_ok();
         tracing::error!(
             "[infr] {context} could not be submitted after recovery ({error}); refusing later GPU \
              submissions because pager residency may describe copies that never executed"
         );
+        if first {
+            tracing::error!(
+                "[infr] GPU-failure VRAM snapshot: {} context={context} error={error}",
+                self.vram_snapshot_line()
+            );
+        }
         error
     }
 
@@ -1565,7 +1627,8 @@ impl VulkanShared {
 
         for delay_ms in MEMORY_OOM_RETRY_DELAYS_MS {
             tracing::warn!(
-                "[infr] {context} hit {last}; draining queued work and retrying submit after {delay_ms} ms"
+                "[infr] {context} hit {last}; draining queued work and retrying submit after {delay_ms} ms; vram: {}",
+                self.vram_snapshot_line()
             );
             if let Err(error) = self.drain_queue_for_submit_retry() {
                 return Err(self.make_queue_unusable(error, context));
