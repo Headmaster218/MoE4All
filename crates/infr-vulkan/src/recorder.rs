@@ -6031,7 +6031,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(gate), Self::vkb(dst)],
             1,
             &push,
-            total.div_ceil(64),
+            total.div_ceil(64 * 4),
         );
     }
 
