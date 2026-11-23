@@ -44,6 +44,13 @@ void main() {
 #else
     float scale = pc.scale;
 #endif
+    // The switch is a device-side scalar, so one workgroup owns the whole row and every
+    // invocation sees the SAME value: an early return is uniform and needs no barrier. With the
+    // projection off the residual is bit-identical, so the reduction and rewrite below would be
+    // pure bandwidth waste (two reads of x and dir plus one write of x per row).
+    if (scale == 0.0) {
+        return;
+    }
 
     float dp = 0.0;
     for (uint d = t; d < pc.n_embd; d += 256u) {

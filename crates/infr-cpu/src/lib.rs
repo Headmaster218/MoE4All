@@ -3207,19 +3207,27 @@ impl Backend for CpuBackend {
                         Some(sb) => vals[sb.0 as usize][0],
                         None => scale,
                     };
-                    let vs = &vals[dir.0 as usize];
-                    let off = dir_off as usize;
-                    let v = &vs[off..off + ne];
-                    let mut out = vals[x.0 as usize].clone();
-                    for rh in 0..rr * hc {
-                        let base = rh * ne;
-                        let row = &mut out[base..base + ne];
-                        let dot = row.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f32>();
-                        for (a, b) in row.iter_mut().zip(v.iter()) {
-                            *a -= (scale * dot) * *b;
+                    if scale == 0.0 {
+                        // Off is the identity: keep the residual bit-for-bit and skip the whole
+                        // clone/reduce/rewrite. Only an out-of-place caller still needs a copy.
+                        if x != dst {
+                            vals[dst.0 as usize] = vals[x.0 as usize].clone();
                         }
+                    } else {
+                        let vs = &vals[dir.0 as usize];
+                        let off = dir_off as usize;
+                        let v = &vs[off..off + ne];
+                        let mut out = vals[x.0 as usize].clone();
+                        for rh in 0..rr * hc {
+                            let base = rh * ne;
+                            let row = &mut out[base..base + ne];
+                            let dot = row.iter().zip(v.iter()).map(|(a, b)| a * b).sum::<f32>();
+                            for (a, b) in row.iter_mut().zip(v.iter()) {
+                                *a -= (scale * dot) * *b;
+                            }
+                        }
+                        vals[dst.0 as usize] = out;
                     }
-                    vals[dst.0 as usize] = out;
                 }
                 Op::QwenHcInject {
                     residual,
