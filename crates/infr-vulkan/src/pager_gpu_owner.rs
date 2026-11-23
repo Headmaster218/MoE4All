@@ -334,11 +334,16 @@ fn read_mapped_words(buffer: &dyn Buffer) -> Result<Vec<u32>> {
     read_mapped_range(buffer, 0, buffer.len_bytes() / 4)
 }
 
+/// `with_overlay = false` is the statistics path: it needs only the three counters per pool from
+/// `nodes`, so copying and mapping the whole block overlay is pure GPU->host traffic. The retained
+/// staging buffer keeps its immutable full-snapshot size for both paths so prepared command
+/// prefixes stay valid; we simply issue fewer copies against it.
 fn readback_owner_snapshot(
     backend: &VulkanBackend,
     nodes: &dyn Buffer,
     overlay: &dyn Buffer,
     retained: &std::sync::Mutex<Option<crate::VkBuffer>>,
+    with_overlay: bool,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     if !Arc::ptr_eq(&as_vk_buf(nodes)?.shared, &backend.shared)
         || !Arc::ptr_eq(&as_vk_buf(overlay)?.shared, &backend.shared)
@@ -389,14 +394,19 @@ fn readback_owner_snapshot(
     // Explicit COMPUTE/SHADER_WRITE -> TRANSFER_READ dependency, including BDA writes.
     recorder.arena_stream_barrier();
     recorder.copy(nodes, 0, staging, 0, node_bytes);
-    recorder.copy(overlay, 0, staging, node_bytes, overlay_bytes);
+    if with_overlay {
+        recorder.copy(overlay, 0, staging, node_bytes, overlay_bytes);
+    }
     // Explicit TRANSFER_WRITE -> HOST_READ publication before reading cacheable staging.
     recorder.publish_host_reads();
     recorder.finish_nowait()?.wait()?;
-    Ok((
-        read_mapped_range(staging, 0, node_bytes / 4)?,
-        read_mapped_range(staging, node_bytes / 4, overlay_bytes / 4)?,
-    ))
+    let nodes = read_mapped_range(staging, 0, node_bytes / 4)?;
+    let overlay = if with_overlay {
+        read_mapped_range(staging, node_bytes / 4, overlay_bytes / 4)?
+    } else {
+        Vec::new()
+    };
+    Ok((nodes, overlay))
 }
 
 fn validate_handoff_geometry(
@@ -785,6 +795,7 @@ impl super::gpu_copy::GpuCopyBuffers {
             self.candidates.as_ref(),
             self.overlay.as_ref(),
             &state.readback,
+            false,
         )?;
         let counts = session
             .pools
@@ -939,6 +950,7 @@ impl super::gpu_copy::GpuCopyBuffers {
             self.candidates.as_ref(),
             self.overlay.as_ref(),
             &state.readback,
+            true,
         )?;
         let counts = session
             .pools
