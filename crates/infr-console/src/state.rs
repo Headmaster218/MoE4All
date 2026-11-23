@@ -25,6 +25,180 @@ const SERIES_CAP: usize = 180;
 const LIVE_TPS_MIN_SPAN_MS: u64 = 250;
 /// Engine stdout lines retained for the log view.
 const LOG_CAP: usize = 400;
+/// Rounds that keep their full SSE frame log. Older, finished rounds are compacted into a few
+/// synthetic frames carrying the assembled reply, so a long history cannot pin millions of
+/// delta strings in memory. A currently streaming round is never compacted.
+const FRAME_ROUND_CAP: usize = 48;
+/// Distinct conversations kept in the prefix-reuse table. Beyond this the least-recently-written
+/// conversation is evicted. The table only needs the previous turn to estimate reuse, so an
+/// unbounded map (keyed by the full first message) was pure accumulation.
+const CONVERSATION_CAP: usize = 256;
+/// How many complete request messages are retained in each round's history record. Longer
+/// conversations are replaced by a compact marker so memory does not grow quadratically with
+/// context length (500 rounds each carrying the entire growing prompt).
+const REQUEST_KEEP_MESSAGES: usize = 8;
+/// Maximum characters of assembled reply text kept in a compacted frame. A pathological runaway
+/// generation must not pin an unbounded string in memory either.
+const COMPACT_REPLY_CAP: usize = 512 * 1024;
+
+/// Fold a finished round's raw SSE deltas into one synthetic chat chunk. The sidebar's `assemble()`
+/// reads `choices[].delta.{content,reasoning_content,tool_calls}`, so a single frame carrying the
+/// concatenated text renders identically while releasing thousands of small frame strings.
+fn compact_frames(frames: &[Frame]) -> Vec<Frame> {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tools: Vec<(u64, String, String)> = Vec::new(); // (index, name, arguments)
+    let mut seq = 0u64;
+
+    for frame in frames {
+        seq = seq.max(frame.seq);
+        if frame.data == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&frame.data) else {
+            continue;
+        };
+
+        // Chat Completions deltas: choices[].delta.{content,reasoning_content,tool_calls}.
+        for choice in chunk
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            if let Some(s) = delta.get("content").and_then(|v| v.as_str()) {
+                append_capped(&mut content, s);
+            }
+            if let Some(s) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                append_capped(&mut reasoning, s);
+            }
+            for call in delta
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let args = call
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                push_tool(&mut tools, index, name, args);
+            }
+        }
+
+        // Responses API events: fold their text/tool payloads into the same synthetic chat chunk
+        // so `assemble()` renders an aged Responses round identically to a live one.
+        match chunk.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "response.output_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_summary_text.delta" => {
+                let s = chunk.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                if ty_is_reasoning(&chunk) {
+                    append_capped(&mut reasoning, s);
+                } else {
+                    append_capped(&mut content, s);
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let idx = chunk.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                let index = stable_hash(idx) % 1024;
+                push_tool(
+                    &mut tools,
+                    index,
+                    "",
+                    chunk.get("delta").and_then(|v| v.as_str()).unwrap_or(""),
+                );
+            }
+            "response.output_item.done" => {
+                if let Some(item) = chunk.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let index = item
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| stable_hash(s) % 1024)
+                            .unwrap_or(0);
+                        push_tool(&mut tools, index, name, "");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if content.is_empty() && reasoning.is_empty() && tools.is_empty() {
+        return Vec::new();
+    }
+    let mut delta = serde_json::Map::new();
+    if !content.is_empty() {
+        delta.insert("content".into(), serde_json::Value::String(content));
+    }
+    if !reasoning.is_empty() {
+        delta.insert(
+            "reasoning_content".into(),
+            serde_json::Value::String(reasoning),
+        );
+    }
+    if !tools.is_empty() {
+        tools.sort_by_key(|(i, _, _)| *i);
+        let calls: Vec<serde_json::Value> = tools
+            .into_iter()
+            .map(|(index, name, args)| {
+                serde_json::json!({
+                    "index": index,
+                    "function": { "name": name, "arguments": args },
+                })
+            })
+            .collect();
+        delta.insert("tool_calls".into(), serde_json::Value::Array(calls));
+    }
+    let chunk = serde_json::json!({ "choices": [{ "delta": delta }] });
+    vec![Frame {
+        seq: seq.saturating_add(1),
+        data: chunk.to_string(),
+    }]
+}
+
+fn ty_is_reasoning(chunk: &serde_json::Value) -> bool {
+    matches!(
+        chunk.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta"
+    )
+}
+
+fn push_tool(tools: &mut Vec<(u64, String, String)>, index: u64, name: &str, args: &str) {
+    if let Some(slot) = tools.iter_mut().find(|(i, _, _)| *i == index) {
+        slot.1.push_str(name);
+        append_capped(&mut slot.2, args);
+    } else {
+        tools.push((index, name.to_string(), args.to_string()));
+    }
+}
+
+fn append_capped(dst: &mut String, src: &str) {
+    if dst.len() >= COMPACT_REPLY_CAP {
+        return;
+    }
+    let room = COMPACT_REPLY_CAP - dst.len();
+    if src.len() <= room {
+        dst.push_str(src);
+        return;
+    }
+    // Slice on a char boundary: a byte offset can land mid-codepoint for CJK text and panic.
+    let mut end = room;
+    while end > 0 && !src.is_char_boundary(end) {
+        end -= 1;
+    }
+    dst.push_str(&src[..end]);
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -144,6 +318,90 @@ pub struct ReuseEst {
     pub ratio: f64,
 }
 
+/// Compact stand-in for one message in the prefix-reuse table. Estimating reuse only needs to
+/// compare successive messages for equality and sum their lengths; keeping the full text (a
+/// growing system prompt plus the entire conversation history) was the reason memory climbed
+/// with context size. A 64-bit digest is plenty for a best-effort estimate.
+#[derive(Clone, Copy)]
+struct MsgFingerprint {
+    hash: u64,
+    chars: usize,
+}
+
+fn stable_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Bounded prefix-reuse table. One fingerprint list per conversation, evicting the
+/// least-recently-written conversation once [`CONVERSATION_CAP`] is reached. The map key is a
+/// digest of the conversation anchor (which itself embeds the full first message), so nothing
+/// here retains prompt text.
+#[derive(Default)]
+pub struct ConversationTable {
+    entries: HashMap<u64, Vec<MsgFingerprint>>,
+    /// Most-recently-written first; used only to pick the eviction victim.
+    lru: VecDeque<u64>,
+}
+
+impl ConversationTable {
+    fn estimate(&mut self, conv: &str, messages: &[String]) -> Option<ReuseEst> {
+        let key = stable_hash(conv);
+        let current: Vec<MsgFingerprint> = messages
+            .iter()
+            .map(|m| MsgFingerprint {
+                hash: stable_hash(m),
+                chars: m.chars().count(),
+            })
+            .collect();
+        let previous = self.entries.insert(key, current.clone());
+
+        // Refresh recency: drop any stale occurrence, then put this conversation at the front.
+        self.lru.retain(|&k| k != key);
+        self.lru.push_front(key);
+        while self.entries.len() > CONVERSATION_CAP {
+            match self.lru.pop_back() {
+                Some(old) => {
+                    self.entries.remove(&old);
+                }
+                None => break,
+            }
+        }
+
+        let previous = previous?;
+        let total: usize = current.iter().map(|f| f.chars).sum();
+        if total == 0 {
+            return None;
+        }
+        let mut matched = 0;
+        let mut chars = 0;
+        for (a, b) in previous.iter().zip(current.iter()) {
+            if a.hash != b.hash {
+                break;
+            }
+            matched += 1;
+            chars += b.chars;
+        }
+        Some(ReuseEst {
+            messages: matched,
+            chars,
+            ratio: chars as f64 / total as f64,
+        })
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Frame {
     pub seq: u64,
@@ -183,6 +441,9 @@ pub struct Round {
     pub request: serde_json::Value,
     #[serde(skip)]
     pub frames: Vec<Frame>,
+    /// Set when the raw delta frames of an aged round were folded into a single assembled frame.
+    #[serde(skip)]
+    pub frames_compacted: bool,
     #[serde(skip)]
     pub first_delta_ms: Option<u64>,
     #[serde(skip)]
@@ -286,7 +547,10 @@ fn default_settings_preset() -> String {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { preset: default_settings_preset(), set: BTreeMap::new() }
+        Self {
+            preset: default_settings_preset(),
+            set: BTreeMap::new(),
+        }
     }
 }
 
@@ -326,7 +590,7 @@ pub struct Console {
     pub child: Mutex<Option<tokio::process::Child>>,
     pub shutdown_file: Mutex<Option<std::path::PathBuf>>,
     pub schema: Mutex<Option<serde_json::Value>>,
-    pub conversations: Mutex<HashMap<String, Vec<String>>>,
+    pub conversations: Mutex<ConversationTable>,
     pub events: broadcast::Sender<Arc<FrameEvent>>,
     /// Pinged when a round finishes so the dashboard pushes a fresh snapshot at once instead of
     /// waiting for the next tick — a completed turn must read 空闲 immediately, not a second later.
@@ -389,7 +653,11 @@ impl Console {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             use std::io::Write;
             let _ = writeln!(file, "{line}");
         }
@@ -405,28 +673,15 @@ impl Console {
     /// Longest common message prefix with the previous turn of this conversation, in messages and
     /// characters. The conversation key is supplied by the caller (see `proxy::conversation_key`).
     pub fn estimate_reuse(&self, conv: &str, messages: &[String]) -> Option<ReuseEst> {
-        let mut convs = self.conversations.lock().unwrap();
-        let previous = convs.insert(conv.to_string(), messages.to_vec());
-        let previous = previous?;
-        let total: usize = messages.iter().map(|m| m.chars().count()).sum();
-        if total == 0 {
-            return None;
-        }
-        let mut matched = 0;
-        let mut chars = 0;
-        for (a, b) in previous.iter().zip(messages) {
-            if a != b {
-                break;
-            }
-            matched += 1;
-            chars += b.chars().count();
-        }
-        Some(ReuseEst { messages: matched, chars, ratio: chars as f64 / total as f64 })
+        self.conversations.lock().unwrap().estimate(conv, messages)
     }
 
     pub fn round_snapshot(&self, id: u64) -> Option<(Round, Vec<Frame>)> {
         let rounds = self.rounds.lock().unwrap();
-        rounds.iter().find(|r| r.id == id).map(|r| (r.clone(), r.frames.clone()))
+        rounds
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (r.clone(), r.frames.clone()))
     }
 
     pub fn push_round(&self, round: Round) {
@@ -434,6 +689,17 @@ impl Console {
         rounds.push_front(round);
         while rounds.len() > ROUND_CAP {
             rounds.pop_back();
+        }
+        // Newest rounds keep their raw delta stream so the 流式 JSON view stays useful. Finished
+        // rounds past the window are folded into one synthetic frame: the assembled reply is kept,
+        // the thousands of tiny delta strings are released.
+        for r in rounds.iter_mut().skip(FRAME_ROUND_CAP) {
+            if r.status != Status::Streaming && !r.frames_compacted && !r.frames.is_empty() {
+                r.frames = compact_frames(&r.frames);
+                r.frames_compacted = true;
+                // Keep the honest "capture was cut short" signal: the synthetic frame still only
+                // holds whatever prefix fit within FRAME_CAP at stream time.
+            }
         }
     }
 
@@ -526,6 +792,56 @@ pub fn new_token(prefix: &str) -> String {
     format!("{prefix}{hex}")
 }
 
+/// Maximum characters kept of any single string in a retained request body. One pasted
+/// transcript can be as large as a whole conversation on its own.
+const REQUEST_STRING_CAP: usize = 8192;
+
+/// Bound the request body retained for the sidebar's 请求 tab.
+///
+/// The dominant cost is not one request but 500 rounds each carrying the *entire* growing prompt:
+/// an agent conversation's messages array grows every turn, so storing it whole per round is
+/// quadratic in context length. Keep the opening message and the most recent turns intact and
+/// collapse the middle into a one-line marker. Base64 is elided first via [`redact_request`].
+pub fn compact_request(value: &mut serde_json::Value) {
+    redact_request(value);
+    if let Some(obj) = value.as_object_mut() {
+        for field in ["messages", "input"] {
+            let Some(items) = obj.get_mut(field).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            let n = items.len();
+            if n <= REQUEST_KEEP_MESSAGES {
+                continue;
+            }
+            let tail_from = n - (REQUEST_KEEP_MESSAGES - 1);
+            let omitted = tail_from - 1;
+            let mut compact = Vec::with_capacity(REQUEST_KEEP_MESSAGES + 1);
+            compact.push(items[0].clone());
+            compact.push(serde_json::json!({
+                "role": "system",
+                "content": format!("<{omitted} 条历史消息已省略，以控制控制台内存>"),
+            }));
+            compact.extend(items[tail_from..].iter().cloned());
+            *items = compact;
+        }
+    }
+    cap_strings(value, REQUEST_STRING_CAP);
+}
+
+fn cap_strings(v: &mut serde_json::Value, max: usize) {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.chars().count() > max {
+                let head: String = s.chars().take(max).collect();
+                *s = format!("{head}… <过长已截断>");
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|x| cap_strings(x, max)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|x| cap_strings(x, max)),
+        _ => {}
+    }
+}
+
 /// Elide base64 payloads (screenshots) from a request body before it is retained.
 pub fn redact_request(value: &mut serde_json::Value) {
     match value {
@@ -534,7 +850,10 @@ pub fn redact_request(value: &mut serde_json::Value) {
                 if key == "data" || key == "b64_json" {
                     if let serde_json::Value::String(s) = v {
                         if s.len() > 256 {
-                            *v = serde_json::Value::String(format!("<{} base64 bytes elided>", s.len()));
+                            *v = serde_json::Value::String(format!(
+                                "<{} base64 bytes elided>",
+                                s.len()
+                            ));
                             continue;
                         }
                     }

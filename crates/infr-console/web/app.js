@@ -107,26 +107,31 @@ let selectedRound = null;     // id shown in the sidebar
 let selectedConv = null;      // conv of the open session, for the in-sidebar round navigator
 let sbTab = "frames";
 let sbFollow = true;
+const DETAIL_CACHE_CAP = 32; // rounds whose raw frames / request body may be held in the browser
 const liveFrames = new Map(); // round id -> [{seq, data}] for the open sidebar
 const roundRequests = new Map(); // round id -> request body (stripped from the 1 Hz state payload)
-
-// Display cap for the raw frame list; storage keeps 4000 so the assembled reply stays complete.
-const FRAME_LIMITS = [20, 50, 100, 200, 500, 0]; // 0 = 全部
-const FRAME_LIMIT_KEY = "infr.console.frameLimit";
-let frameLimit = Number(localStorage.getItem(FRAME_LIMIT_KEY) || 50);
-if (!FRAME_LIMITS.includes(frameLimit)) frameLimit = 50;
-
+// Cache is bounded: clicking through hundreds of history rows otherwise pins every round's full
+// frame log and request body in the tab forever. Evict the least-recently-touched entry, but keep
+// the round currently open in the sidebar.
+function trimDetailCache() {
+  while (liveFrames.size > DETAIL_CACHE_CAP) {
+    const victim = [...liveFrames.keys()].find((id) => id !== selectedRound);
+    if (victim === undefined) break;
+    liveFrames.delete(victim);
+    roundRequests.delete(victim);
+  }
+}
 function connect() {
   const es = new EventSource("ui/events");
   es.addEventListener("state", (e) => { S = JSON.parse(e.data); scheduleRender(); });
   es.addEventListener("frame", (e) => {
     const f = JSON.parse(e.data);
     let list = liveFrames.get(f.round);
-    if (!list) { list = []; liveFrames.set(f.round, list); }
+    if (!list) { list = []; liveFrames.set(f.round, list); trimDetailCache(); }
     list.push(f);
     if (list.length > 4000) list.splice(0, list.length - 4000);
     if (f.round === selectedRound) {
-      if (sbTab === "frames") appendFrame(f);
+      if (sbTab === "frames") scheduleLiveFrames();
       else scheduleLivePane();
     }
   });
@@ -749,6 +754,7 @@ async function loadFrames(id) {
     // A live round's SSE capture is ahead of the server snapshot; only fill frames when absent.
     if (!liveFrames.has(id)) liveFrames.set(id, detail.frames || []);
     roundRequests.set(id, detail.round && detail.round.request);
+    trimDetailCache();
     if (selectedRound === id) renderSidebar();
   } catch (e) { toast(e.message, "bad"); }
 }
@@ -825,56 +831,113 @@ function highlight(json) {
   return pre;
 }
 
-function framesBar(total) {
-  const sel = el("select", { class: "icon-btn", title: "流式 JSON 列表只保留最近 N 条" },
-    ...FRAME_LIMITS.map((n) => el("option", { value: n, text: n === 0 ? "全部" : `${n} 条` })));
-  sel.value = String(frameLimit);
-  sel.addEventListener("change", () => {
-    frameLimit = Number(sel.value);
-    localStorage.setItem(FRAME_LIMIT_KEY, String(frameLimit));
-    renderSidebar();
-  });
-  return el("div", { class: "frames-bar" },
-    el("span", { text: "保留最近" }), sel,
-    el("span", { class: "frame-seq frame-count", text: `共 ${total} 帧` }));
+// Fold SSE frames back into the shape a non-streaming client receives. Responses API emits one
+// event per delta; rendering those raw produced a wall of six-line JSON snippets. The completed
+// event already carries the authoritative full object, so a finished round is exact; while streaming
+// we build the same shape incrementally from item / part / delta events.
+function deepCopy(v) {
+  return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
 }
 
-// The assembled reply, fully expanded by default; the summary line collapses it on demand.
-function replyPanel(frames) {
-  const parts = assemble(frames);
-  return el("details", { class: "reply", open: "open" },
-    el("summary", {}, el("span", { text: "回复内容" }), el("span", { class: "frame-seq", text: "点击折叠 / 展开" })),
-    el("div", { class: "prose reply-text", text: parts.content }));
-}
+function assembleResponse(frames) {
+  let response = null; // /v1/responses shape
+  let chat = null;     // /v1/chat/completions shape
+  const items = [];    // output_index -> output item
+  for (const f of frames) {
+    let e;
+    try { e = JSON.parse(f.data); } catch { continue; }
+    const t = e.type || "";
 
-function frameNode(f) {
-  let payload;
-  try { payload = JSON.parse(f.data); } catch { payload = f.data; }
-  return el("div", {}, el("div", { class: "frame-seq", text: `#${f.seq}` }), highlight(payload));
-}
-function appendFrame(f) {
-  const body = $("#sb-body");
-  const prose = $(".reply-text", body);
-  if (prose) {
-    try {
-      const chunk = JSON.parse(f.data);
-      for (const choice of chunk.choices || []) {
-        const d = choice.delta || {};
-        if (typeof d.content === "string" && d.content) prose.append(d.content);
+    if (t === "response.created" || t === "response.in_progress") {
+      const base = deepCopy(e.response || {});
+      response = response ? Object.assign(response, base) : base;
+      continue;
+    }
+    if (t === "response.completed") return deepCopy(e.response || response || {});
+    if (t.startsWith("response.")) {
+      const oi = e.output_index ?? 0;
+      if (t === "response.output_item.added") { items[oi] = deepCopy(e.item || {}); continue; }
+      if (t === "response.output_item.done") { items[oi] = deepCopy(e.item || items[oi] || {}); continue; }
+      let item = items[oi];
+      if (!item) {
+        item = { id: e.item_id, type: t.includes("reasoning") ? "reasoning" : "message",
+                 status: "in_progress", summary: [], content: [] };
+        items[oi] = item;
       }
-    } catch { /* non-JSON frame */ }
+      if (t === "response.reasoning_summary_part.added") {
+        if (!item.summary) item.summary = [];
+        item.summary[e.summary_index ?? 0] = deepCopy(e.part || { type: "summary_text", text: "" });
+      } else if (t === "response.reasoning_summary_text.delta") {
+        if (!item.summary) item.summary = [];
+        const si = e.summary_index ?? 0;
+        const part = item.summary[si] || (item.summary[si] = { type: "summary_text", text: "" });
+        part.text = (part.text || "") + (e.delta || "");
+      } else if (t === "response.reasoning_summary_text.done") {
+        const part = item.summary ? item.summary[e.summary_index ?? 0] : null;
+        if (part && typeof e.text === "string") part.text = e.text;
+      } else if (t === "response.content_part.added") {
+        if (!item.content) item.content = [];
+        item.content[e.content_index ?? 0] = deepCopy(e.part || { type: "output_text", text: "", annotations: [] });
+      } else if (t === "response.output_text.delta") {
+        if (!item.content) item.content = [];
+        const ci = e.content_index ?? 0;
+        const part = item.content[ci] || (item.content[ci] = { type: "output_text", text: "", annotations: [] });
+        part.text = (part.text || "") + (e.delta || "");
+      } else if (t === "response.output_text.done") {
+        const part = item.content ? item.content[e.content_index ?? 0] : null;
+        if (part && typeof e.text === "string") part.text = e.text;
+      }
+      continue;
+    }
+
+    // Chat Completions: each frame is a chunk with choices[].delta.
+    if (!e.choices) continue;
+    if (!chat) chat = { id: e.id || "", object: "chat.completion", created: e.created || 0,
+                        model: e.model || "", choices: [] };
+    if (e.usage) chat.usage = e.usage;
+    for (const ch of e.choices) {
+      const i = ch.index ?? 0;
+      const choice = chat.choices[i] || (chat.choices[i] = {
+        index: i, message: { role: "assistant", content: "" }, finish_reason: null,
+      });
+      const d = ch.delta || {};
+      if (typeof d.content === "string") choice.message.content += d.content;
+      if (typeof d.reasoning_content === "string") {
+        choice.message.reasoning_content = (choice.message.reasoning_content || "") + d.reasoning_content;
+      }
+      for (const tc of d.tool_calls || []) {
+        const ti = tc.index ?? 0;
+        if (!choice.message.tool_calls) choice.message.tool_calls = [];
+        const calls = choice.message.tool_calls;
+        const slot = calls[ti] || (calls[ti] = {
+          id: "", type: "function", function: { name: "", arguments: "" },
+        });
+        if (tc.id) slot.id += tc.id;
+        if (tc.function && tc.function.name) slot.function.name += tc.function.name;
+        if (tc.function && tc.function.arguments) slot.function.arguments += tc.function.arguments;
+      }
+      if (ch.finish_reason) choice.finish_reason = ch.finish_reason;
+    }
   }
-  const list = $(".frame-list", body);
-  if (list) {
-    const first = list.firstElementChild;
-    if (first && first.classList.contains("empty")) list.replaceChildren();
-    list.append(frameNode(f));
-    const cap = frameLimit > 0 ? frameLimit : 4000;
-    while (list.childElementCount > cap) list.firstElementChild.remove();
+  if (response) {
+    response.output = items.filter(Boolean);
+    return response;
   }
-  const count = $(".frame-count", body);
-  if (count) count.textContent = `共 ${(liveFrames.get(f.round) || []).length} 帧`;
-  if (sbFollow) body.scrollTop = body.scrollHeight;
+  return chat || { object: "response", status: "in_progress", output: [] };
+}
+
+// A burst of deltas folds once per paint instead of rebuilding the whole JSON on every frame.
+let liveFramesRaf = 0;
+function scheduleLiveFrames() {
+  if (sbTab !== "frames" || liveFramesRaf) return;
+  liveFramesRaf = requestAnimationFrame(() => {
+    liveFramesRaf = 0;
+    const r = currentRound();
+    if (!r || sbTab !== "frames") return;
+    const body = $("#sb-body");
+    body.replaceChildren(highlight(assembleResponse(liveFrames.get(r.id) || [])));
+    if (sbFollow) body.scrollTop = body.scrollHeight;
+  });
 }
 
 // The assembled views (output / thinking / tools) must re-fold as deltas stream in, not stay frozen
@@ -910,13 +973,13 @@ function renderSidebar() {
   if (!r) { body.append(el("div", { class: "empty", text: "该轮次已不在保留窗口内" })); return; }
   const frames = liveFrames.get(r.id) || [];
   if (sbTab === "frames") {
-    body.append(framesBar(frames.length));
-    body.append(replyPanel(frames));
-    const list = el("div", { class: "frame-list" });
-    const tail = frameLimit > 0 ? frames.slice(-frameLimit) : frames;
-    if (!tail.length) list.append(el("div", { class: "empty", text: "等待流式帧…" }));
-    else tail.forEach((f) => list.append(frameNode(f)));
-    body.append(list);
+    if (!frames.length) {
+      body.append(el("div", { class: "empty", text: "等待流式帧…" }));
+    } else {
+      body.append(el("div", { class: "frames-bar" },
+        el("span", { class: "frame-seq", text: `由 ${frames.length} 个流式帧聚合` })));
+      body.append(highlight(assembleResponse(frames)));
+    }
   } else if (sbTab === "request") {
     body.append(highlight(roundRequests.get(r.id) || { note: "请求体未保留" }));
   } else {
@@ -933,7 +996,8 @@ function renderSidebar() {
   if (sbFollow) body.scrollTop = body.scrollHeight;
 }
 
-// Fold the SSE deltas back into what the client saw. Tool arguments arrive one fragment at a
+// Fold the SSE deltas back into what the client saw. Both API families land here: Responses emits
+// typed events, Chat Completions emits choices[].delta. Tool arguments arrive one fragment at a
 // time, so they are concatenated per (index) rather than replaced.
 function assemble(frames) {
   let content = "", reasoning = "";
@@ -941,6 +1005,15 @@ function assemble(frames) {
   for (const f of frames) {
     let chunk;
     try { chunk = JSON.parse(f.data); } catch { continue; }
+    const t = chunk.type || "";
+    if (t === "response.reasoning_summary_text.delta") {
+      reasoning += chunk.delta || "";
+      continue;
+    }
+    if (t === "response.output_text.delta") {
+      content += chunk.delta || "";
+      continue;
+    }
     for (const choice of chunk.choices || []) {
       const d = choice.delta || {};
       if (typeof d.content === "string") content += d.content;

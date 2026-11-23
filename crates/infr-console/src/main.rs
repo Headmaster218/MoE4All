@@ -14,7 +14,6 @@ mod tests;
 mod ui;
 mod vector;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -27,7 +26,11 @@ use tokio::sync::broadcast;
 use state::{Console, EngineView, Series, UncensorState};
 
 #[derive(Parser)]
-#[command(name = "infr-console", version, about = "INFR 推理控制台：反向代理 + 仪表盘 + 图形化启动参数")]
+#[command(
+    name = "infr-console",
+    version,
+    about = "INFR 推理控制台：反向代理 + 仪表盘 + 图形化启动参数"
+)]
 struct Cli {
     /// Address the console listens on. Point your client here, not at the engine.
     #[arg(long, default_value = "127.0.0.1:8090")]
@@ -48,7 +51,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::WARN).init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
     let cli = Cli::parse();
 
     let binary = cli.binary.unwrap_or_else(default_binary);
@@ -73,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         child: Mutex::new(None),
         shutdown_file: Mutex::new(None),
         schema: Mutex::new(None),
-        conversations: Mutex::new(HashMap::new()),
+        conversations: Mutex::new(Default::default()),
         events,
         state_dirty,
         subscribers: AtomicUsize::new(0),
@@ -142,14 +147,24 @@ async fn poll_engine(console: Arc<Console>) {
         let mut decode = 0.0f64;
         let mut prefill = 0.0f64;
         if let Some(stats) = &stats {
-            for slot in stats.get("slots").and_then(|v| v.as_array()).into_iter().flatten() {
-                let Some(req) = slot.get("request") else { continue };
+            for slot in stats
+                .get("slots")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(req) = slot.get("request") else {
+                    continue;
+                };
                 // `tokens_per_second` is phase-aware: the engine reports its smoothed prefill rate
                 // while Prefill/Starting and its decode rate while Decode. Route it by phase so the
                 // prefill rate never lands in the decode series. The engine already holds the prefill
                 // rate across chunk boundaries, so a continuous prefill reads as a flat line instead
                 // of a sawtooth that drops to zero whenever a 1 s poll misses a chunk completion.
-                let speed = req.get("tokens_per_second").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let speed = req
+                    .get("tokens_per_second")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 match req.get("phase").and_then(|v| v.as_str()).unwrap_or("") {
                     "Decode" => decode = decode.max(speed),
                     "Prefill" | "Starting" => prefill = prefill.max(speed),
@@ -171,6 +186,10 @@ async fn poll_engine(console: Arc<Console>) {
                 engine.running = engine.reachable;
             }
         }
-        console.series.lock().unwrap().push(state::now_ms(), decode, prefill);
+        console
+            .series
+            .lock()
+            .unwrap()
+            .push(state::now_ms(), decode, prefill);
     }
 }

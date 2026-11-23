@@ -9,7 +9,14 @@
 <body>
 
 <header class="topbar">
-  <div class="brand">INFR<span>·</span>Console</div>
+  <div class="brand">
+    <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="1" y="1" width="22" height="22" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1"/>
+      <path d="M6 16.5 L10 7.5 L14 16.5 M7.4 13.3 H12.6" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="17.5" cy="8.5" r="1.6" fill="var(--ok)"/>
+    </svg>
+    INFR<span>·</span>Console
+  </div>
   <nav class="tabs" role="tablist">
     <button class="tab" role="tab" data-view="overview" aria-selected="true">总览</button>
     <button class="tab" role="tab" data-view="history" aria-selected="false">历史</button>
@@ -49,7 +56,7 @@
       </div>
 
       <div class="card">
-        <h2>对话窗口<span class="spacer"></span><span class="frame-seq">一个 agent 会话一行 · 点击查看流式 JSON</span></h2>
+        <h2>对话窗口<span class="spacer"></span><span class="frame-seq">一个 agent 会话一行 · 点击查看聚合响应 JSON</span></h2>
         <table>
           <thead><tr>
             <th>时间</th><th>Key</th><th>状态</th><th>工具</th><th class="num">t/s</th>
@@ -253,7 +260,7 @@
       </div>
       <div class="sidebar-rounds" id="sb-rounds" hidden></div>
       <div class="sidebar-tabs" id="sb-tabs">
-        <button class="tab" data-sb="frames" aria-selected="true">流式 JSON</button>
+        <button class="tab" data-sb="frames" aria-selected="true" title="SSE 帧实时聚合成非流式响应结构">响应 JSON</button>
         <button class="tab" data-sb="output" aria-selected="false">输出</button>
         <button class="tab" data-sb="thinking" aria-selected="false">思考</button>
         <button class="tab" data-sb="tools" aria-selected="false">工具</button>

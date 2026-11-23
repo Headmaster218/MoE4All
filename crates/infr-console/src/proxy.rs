@@ -12,7 +12,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::state::{now_ms, redact_request, Console, DeltaKind, Phase, Round, Status};
+use crate::state::{compact_request, now_ms, Console, DeltaKind, Phase, Round, Status};
 
 /// Headers that describe one hop and must not be copied across it.
 const HOP_BY_HOP: [&str; 8] = [
@@ -28,7 +28,11 @@ const HOP_BY_HOP: [&str; 8] = [
 
 pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> Response {
     let path = req.uri().path().to_string();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let method = req.method().clone();
     let headers = req.headers().clone();
 
@@ -52,7 +56,8 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         Err(e) => {
             // Not ours to interpret — hand it upstream and let the engine produce the error.
             console.log(format!("unparseable body on {path}: {e}"));
-            return forward_plain(&console, &method, &format!("{path}{query}"), &headers, body).await;
+            return forward_plain(&console, &method, &format!("{path}{query}"), &headers, body)
+                .await;
         }
     };
 
@@ -67,17 +72,30 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     let session = session_key(&key_id, &json, &conv);
 
     let mut request_record = json.clone();
-    redact_request(&mut request_record);
+    compact_request(&mut request_record);
 
-    let id = console.next_round.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let streaming = json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let id = console
+        .next_round
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let streaming = json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let round = Round {
         id,
         key_id: key_id.clone(),
         key_label,
         conv: conv_id(&session),
-        model: json.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        api: if path == "/v1/responses" { "responses" } else { "chat" },
+        model: json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        api: if path == "/v1/responses" {
+            "responses"
+        } else {
+            "chat"
+        },
         started_at_ms: now_ms(),
         ended_at_ms: None,
         status: Status::Streaming,
@@ -96,6 +114,7 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         frames_truncated: false,
         request: request_record,
         frames: Vec::new(),
+        frames_compacted: false,
         first_delta_ms: None,
         prefill_ms: None,
     };
@@ -106,7 +125,11 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     let mut builder = console.http.request(method.clone(), &url);
     for (name, value) in headers.iter() {
         let name = name.as_str();
-        if HOP_BY_HOP.contains(&name) || name == "authorization" || name == "content-length" || name == "host" {
+        if HOP_BY_HOP.contains(&name)
+            || name == "authorization"
+            || name == "content-length"
+            || name == "host"
+        {
             continue;
         }
         builder = builder.header(name, value);
@@ -114,7 +137,12 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     if let Some(key) = console.upstream_key() {
         builder = builder.bearer_auth(key);
     }
-    let upstream = match builder.header("content-type", "application/json").body(outbound).send().await {
+    let upstream = match builder
+        .header("content-type", "application/json")
+        .body(outbound)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             console.with_round(id, |r| r.finish(Status::Error));
@@ -137,7 +165,9 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
                 out = out.header(name, value);
             }
         }
-        return out.body(Body::from(bytes)).unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "response build"));
+        return out
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "response build"));
     }
 
     if !streaming {
@@ -148,7 +178,15 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         return passthrough_response(status, &resp_headers, Body::from(bytes));
     }
 
-    let tap = Tap::new(console, id, if path == "/v1/responses" { Api::Responses } else { Api::Chat });
+    let tap = Tap::new(
+        console,
+        id,
+        if path == "/v1/responses" {
+            Api::Responses
+        } else {
+            Api::Chat
+        },
+    );
     let stream = futures_util::stream::unfold(Some((upstream, tap)), |state| async move {
         let (mut resp, mut tap) = state?;
         match resp.chunk().await {
@@ -178,7 +216,8 @@ fn passthrough_response(status: StatusCode, headers: &HeaderMap, body: Body) -> 
         }
         out = out.header(name, value);
     }
-    out.body(body).unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "response build"))
+    out.body(body)
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "response build"))
 }
 
 /// Non-tracked routes: same key substitution, no record.
@@ -229,7 +268,10 @@ fn authenticate(
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
     match presented.and_then(|token| keys.iter().find(|k| k.token == token)) {
         Some(k) => Ok(Some(k.clone())),
-        None => Err(error_response(StatusCode::UNAUTHORIZED, "unknown console API key")),
+        None => Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "unknown console API key",
+        )),
     }
 }
 
@@ -298,7 +340,11 @@ fn conversation_key(key_id: &str, messages: &[String]) -> String {
 /// prefix-reuse anchor, which two turns of one chat share. Kept separate from `conversation_key` so
 /// grouping never changes the reuse estimate.
 fn session_key(key_id: &str, json: &serde_json::Value, fallback: &str) -> String {
-    match json.get("conversation").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    match json
+        .get("conversation")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         Some(c) => format!("{key_id}\u{1}conversation:{c}"),
         None => fallback.to_string(),
     }
@@ -331,7 +377,14 @@ struct Tap {
 
 impl Tap {
     fn new(console: Arc<Console>, round: u64, api: Api) -> Self {
-        Self { console, round, api, pending: Vec::new(), seq: 0, finished: false }
+        Self {
+            console,
+            round,
+            api,
+            pending: Vec::new(),
+            seq: 0,
+            finished: false,
+        }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -345,7 +398,9 @@ impl Tap {
     fn handle_event(&mut self, event: &[u8]) {
         for line in event.split(|b| *b == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let Some(data) = line.strip_prefix(b"data:") else { continue };
+            let Some(data) = line.strip_prefix(b"data:") else {
+                continue;
+            };
             let data = data.strip_prefix(b" ").unwrap_or(data);
             let text = String::from_utf8_lossy(data).into_owned();
             self.seq += 1;
@@ -353,7 +408,10 @@ impl Tap {
             self.console.broadcast_frame(self.round, seq, text.clone());
             self.console.with_round(self.round, |r| {
                 if r.frames.len() < crate::state::FRAME_CAP {
-                    r.frames.push(crate::state::Frame { seq, data: text.clone() });
+                    r.frames.push(crate::state::Frame {
+                        seq,
+                        data: text.clone(),
+                    });
                 } else {
                     r.frames_truncated = true;
                 }
@@ -361,7 +419,9 @@ impl Tap {
             if text == "[DONE]" {
                 continue;
             }
-            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
             self.absorb(&chunk);
         }
     }
@@ -377,7 +437,12 @@ impl Tap {
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
             self.apply_usage(usage);
         }
-        for choice in chunk.get("choices").and_then(|v| v.as_array()).into_iter().flatten() {
+        for choice in chunk
+            .get("choices")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
             let delta = choice.get("delta").unwrap_or(&serde_json::Value::Null);
             if let Some(s) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                 if !s.is_empty() {
@@ -389,7 +454,12 @@ impl Tap {
                     self.mark(DeltaKind::Content, None, 1);
                 }
             }
-            for call in delta.get("tool_calls").and_then(|v| v.as_array()).into_iter().flatten() {
+            for call in delta
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
                 let name = call.pointer("/function/name").and_then(|v| v.as_str());
                 let args = call.pointer("/function/arguments").and_then(|v| v.as_str());
                 if name.is_some_and(|n| !n.is_empty()) || args.is_some_and(|a| !a.is_empty()) {
@@ -398,7 +468,10 @@ impl Tap {
             }
         }
         // The engine's own final timings are authoritative for prompt accounting and prefill time.
-        if let Some(t) = chunk.pointer("/choices/0/timings").or_else(|| chunk.get("timings")) {
+        if let Some(t) = chunk
+            .pointer("/choices/0/timings")
+            .or_else(|| chunk.get("timings"))
+        {
             self.apply_timings(t);
         }
     }
@@ -431,7 +504,8 @@ impl Tap {
     }
 
     fn mark(&self, kind: DeltaKind, tool: Option<&str>, tokens: u64) {
-        self.console.with_round(self.round, |r| r.observe(kind, tool, tokens));
+        self.console
+            .with_round(self.round, |r| r.observe(kind, tool, tokens));
     }
 
     fn apply_usage(&self, usage: &serde_json::Value) {
@@ -509,12 +583,28 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 
 /// Non-streaming reply: usage plus the engine's timings, same fields as the streaming path.
 fn absorb_whole(console: &Arc<Console>, id: u64, bytes: &[u8]) {
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) else { return };
-    let usage = json.get("usage").or_else(|| json.pointer("/response/usage"));
-    let timings = json.pointer("/choices/0/timings").or_else(|| json.get("timings"));
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let usage = json
+        .get("usage")
+        .or_else(|| json.pointer("/response/usage"));
+    let timings = json
+        .pointer("/choices/0/timings")
+        .or_else(|| json.get("timings"));
     let mut tools = Vec::new();
-    for choice in json.get("choices").and_then(|v| v.as_array()).into_iter().flatten() {
-        for call in choice.pointer("/message/tool_calls").and_then(|v| v.as_array()).into_iter().flatten() {
+    for choice in json
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        for call in choice
+            .pointer("/message/tool_calls")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
             if let Some(name) = call.pointer("/function/name").and_then(|v| v.as_str()) {
                 tools.push(name.to_string());
             }
@@ -522,7 +612,11 @@ fn absorb_whole(console: &Arc<Console>, id: u64, bytes: &[u8]) {
     }
     console.with_round(id, |r| {
         if let Some(u) = usage {
-            let prompt = u.get("prompt_tokens").or_else(|| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let prompt = u
+                .get("prompt_tokens")
+                .or_else(|| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let cached = u
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .or_else(|| u.pointer("/input_tokens_details/cached_tokens"))
@@ -558,6 +652,7 @@ fn absorb_whole(console: &Arc<Console>, id: u64, bytes: &[u8]) {
 fn error_response(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "error": { "message": message, "type": "console_error" } });
     let mut resp = (status, axum::Json(body)).into_response();
-    resp.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+    resp.headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
     resp
 }

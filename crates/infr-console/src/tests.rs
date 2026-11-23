@@ -1,6 +1,6 @@
 //! Console behaviour that must hold without a GPU, a model or a running engine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
@@ -30,7 +30,7 @@ fn console() -> Arc<Console> {
         child: Mutex::new(None),
         shutdown_file: Mutex::new(None),
         schema: Mutex::new(None),
-        conversations: Mutex::new(HashMap::new()),
+        conversations: Mutex::new(Default::default()),
         events,
         state_dirty,
         subscribers: AtomicUsize::new(0),
@@ -58,7 +58,10 @@ fn fields(paths: &[&str]) -> Vec<serde_json::Value> {
 fn request(preset: &str, set: &[(&str, &str)]) -> LaunchRequest {
     LaunchRequest {
         preset: preset.into(),
-        set: set.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(),
+        set: set
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<BTreeMap<_, _>>(),
         consent: false,
     }
 }
@@ -66,10 +69,16 @@ fn request(preset: &str, set: &[(&str, &str)]) -> LaunchRequest {
 #[test]
 fn presets_map_to_the_wizards_auto_profile() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
-    let conservative = launch::build_args(&request("conservative", &[]), &fields(&[]), shutdown).unwrap();
-    assert!(conservative.windows(2).any(|w| w == ["--set", "device.auto_profile=conservative"]));
-    let aggressive = launch::build_args(&request("aggressive", &[]), &fields(&[]), shutdown).unwrap();
-    assert!(aggressive.windows(2).any(|w| w == ["--set", "device.auto_profile=aggressive"]));
+    let conservative =
+        launch::build_args(&request("conservative", &[]), &fields(&[]), shutdown).unwrap();
+    assert!(conservative
+        .windows(2)
+        .any(|w| w == ["--set", "device.auto_profile=conservative"]));
+    let aggressive =
+        launch::build_args(&request("aggressive", &[]), &fields(&[]), shutdown).unwrap();
+    assert!(aggressive
+        .windows(2)
+        .any(|w| w == ["--set", "device.auto_profile=aggressive"]));
     // 全手动 means the operator owns every value; an auto profile would silently override them.
     let manual = launch::build_args(&request("manual", &[]), &fields(&[]), shutdown).unwrap();
     assert!(!manual.iter().any(|a| a.starts_with("device.auto_profile=")));
@@ -80,8 +89,13 @@ fn presets_map_to_the_wizards_auto_profile() {
 fn every_launch_carries_the_graceful_shutdown_file() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
     let args = launch::build_args(&request("manual", &[]), &fields(&[]), shutdown).unwrap();
-    assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
-    assert!(args.iter().any(|a| a == "serve.shutdown_file=/tmp/engine.shutdown"));
+    assert!(args.ends_with(&[
+        "--set".to_string(),
+        format!("serve.shutdown_file={}", shutdown.display())
+    ]));
+    assert!(args
+        .iter()
+        .any(|a| a == "serve.shutdown_file=/tmp/engine.shutdown"));
     // The console owns this knob; a form value must not replace the path it knows how to write.
     let overridden = launch::build_args(
         &request("manual", &[("serve.shutdown_file", "/somewhere/else")]),
@@ -119,27 +133,44 @@ fn cli_only_options_become_flags_not_set_paths() {
     .unwrap();
     assert!(args.windows(2).any(|w| w == ["--addr", "127.0.0.1:9000"]));
     assert!(args.windows(2).any(|w| w == ["--parallel", "2"]));
-    assert!(args.windows(2).any(|w| w == ["--mmproj", "C:/models/mmproj.gguf"]));
+    assert!(args
+        .windows(2)
+        .any(|w| w == ["--mmproj", "C:/models/mmproj.gguf"]));
     assert!(args.iter().any(|a| a == "C:/models/ad.gguf"));
     assert!(args.windows(2).any(|w| w == ["--set", "device.ctx=262144"]));
     assert!(!args.iter().any(|a| a.starts_with("cli:")));
     // FULL DUMP: a non-empty CLI flag is explicit even when it equals the default; an empty one has
     // no flag spelling and is omitted, so the engine's own default stays in force for that knob.
     let defaults = launch::build_args(
-        &request("conservative", &[("cli:addr", "127.0.0.1:8080"), ("cli:parallel", "")]),
+        &request(
+            "conservative",
+            &[("cli:addr", "127.0.0.1:8080"), ("cli:parallel", "")],
+        ),
         &schema,
         shutdown,
     )
     .unwrap();
-    assert!(defaults.windows(2).any(|w| w == ["--addr", "127.0.0.1:8080"]));
+    assert!(defaults
+        .windows(2)
+        .any(|w| w == ["--addr", "127.0.0.1:8080"]));
     assert!(!defaults.iter().any(|a| a == "--parallel"));
 }
 
 #[test]
 fn unknown_paths_and_control_characters_are_refused_before_spawn() {
     let shutdown = std::path::Path::new("/tmp/engine.shutdown");
-    assert!(launch::build_args(&request("manual", &[("kv.not_a_knob", "1")]), &fields(&["kv.paged"]), shutdown).is_err());
-    assert!(launch::build_args(&request("manual", &[("device.ctx", "8192\n--dev")]), &fields(&["device.ctx"]), shutdown).is_err());
+    assert!(launch::build_args(
+        &request("manual", &[("kv.not_a_knob", "1")]),
+        &fields(&["kv.paged"]),
+        shutdown
+    )
+    .is_err());
+    assert!(launch::build_args(
+        &request("manual", &[("device.ctx", "8192\n--dev")]),
+        &fields(&["device.ctx"]),
+        shutdown
+    )
+    .is_err());
 }
 
 /// The operator asked for EVERY setting written explicitly into the launch command. An untouched
@@ -161,7 +192,10 @@ fn full_dump_writes_every_field_and_skips_presence_markers() {
     ];
     // Touch only ctx and the KV dtype; everything else must still be emitted at its default.
     let args = launch::build_args(
-        &request("conservative", &[("device.ctx", "262144"), ("kv.type_k", "q8_0")]),
+        &request(
+            "conservative",
+            &[("device.ctx", "262144"), ("kv.type_k", "q8_0")],
+        ),
         &schema,
         shutdown,
     )
@@ -170,15 +204,32 @@ fn full_dump_writes_every_field_and_skips_presence_markers() {
     assert!(args.windows(2).any(|w| w == ["--set", "kv.type_k=q8_0"]));
     // Untouched fields are present at their shipped default, not silently omitted.
     assert!(args.windows(2).any(|w| w == ["--set", "kv.paged=false"]));
-    assert!(args.windows(2).any(|w| w == ["--set", "kernels.vulkan.gemv.variant=none"]));
+    assert!(args
+        .windows(2)
+        .any(|w| w == ["--set", "kernels.vulkan.gemv.variant=none"]));
     // auto_profile comes from the preset, exactly once.
-    assert_eq!(args.iter().filter(|a| a.starts_with("device.auto_profile=")).count(), 1);
-    assert!(args.windows(2).any(|w| w == ["--set", "device.auto_profile=conservative"]));
+    assert_eq!(
+        args.iter()
+            .filter(|a| a.starts_with("device.auto_profile="))
+            .count(),
+        1
+    );
+    assert!(args
+        .windows(2)
+        .any(|w| w == ["--set", "device.auto_profile=conservative"]));
     // Presence markers are engine-derived and must never be pinned by the dump.
     assert!(!args.iter().any(|a| a.contains("_specified=")));
     // The shutdown file is the console's, appended once and last.
-    assert_eq!(args.iter().filter(|a| a.starts_with("serve.shutdown_file=")).count(), 1);
-    assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
+    assert_eq!(
+        args.iter()
+            .filter(|a| a.starts_with("serve.shutdown_file="))
+            .count(),
+        1
+    );
+    assert!(args.ends_with(&[
+        "--set".to_string(),
+        format!("serve.shutdown_file={}", shutdown.display())
+    ]));
 }
 
 /// A config file is the base layer: with `cli:config` set, the launch must emit only the touched
@@ -195,7 +246,14 @@ fn config_file_replaces_the_full_dump_with_touched_deltas() {
         cfg("kv.ring", "true"),
     ];
     let args = launch::build_args(
-        &request("conservative", &[("cli:config", "C:/infr.toml"), ("cli:model", "m.gguf"), ("device.ctx", "262144")]),
+        &request(
+            "conservative",
+            &[
+                ("cli:config", "C:/infr.toml"),
+                ("cli:model", "m.gguf"),
+                ("device.ctx", "262144"),
+            ],
+        ),
         &schema,
         shutdown,
     )
@@ -205,9 +263,17 @@ fn config_file_replaces_the_full_dump_with_touched_deltas() {
     // Untouched knobs come from the file, not a shadowing full dump.
     assert!(!args.iter().any(|a| a == "kv.paged=false"));
     assert!(!args.iter().any(|a| a == "kv.ring=true"));
-    assert!(args.ends_with(&["--set".to_string(), format!("serve.shutdown_file={}", shutdown.display())]));
+    assert!(args.ends_with(&[
+        "--set".to_string(),
+        format!("serve.shutdown_file={}", shutdown.display())
+    ]));
     // No config file → the full dump still writes every field at its default.
-    let full = launch::build_args(&request("conservative", &[("device.ctx", "262144")]), &schema, shutdown).unwrap();
+    let full = launch::build_args(
+        &request("conservative", &[("device.ctx", "262144")]),
+        &schema,
+        shutdown,
+    )
+    .unwrap();
     assert!(full.iter().any(|a| a == "kv.paged=false"));
     assert!(full.iter().any(|a| a == "kv.ring=true"));
 }
@@ -230,7 +296,14 @@ fn export_toml_round_trips_through_the_toml_parser() {
         serde_json::json!({"path":"device.ubatch_specified","ty":"bool","default":"false"}),
         serde_json::json!({"path":"cli:model","ty":"String","default":"","flag":""}),
     ];
-    let req = request("conservative", &[("device.ctx", "262144"), ("kv.type_k", "q8_0"), ("serve.api_key", "secret")]);
+    let req = request(
+        "conservative",
+        &[
+            ("device.ctx", "262144"),
+            ("kv.type_k", "q8_0"),
+            ("serve.api_key", "secret"),
+        ],
+    );
     let text = launch::build_toml(&req, &schema).unwrap();
     assert!(!text.contains("secret"));
     assert!(!text.contains("api_key"));
@@ -262,28 +335,51 @@ fn import_toml_recovers_the_exported_form() {
         serde_json::json!({"path":"kernels.vulkan.gemv.rm","ty":"u32","default":"2"}),
         serde_json::json!({"path":"serve.api_key","ty":"Option<String>","default":"none"}),
     ];
-    let req = request("conservative", &[("device.ctx", "262144"), ("kv.type_k", "q8_0"), ("sampling.temp", "0.95")]);
+    let req = request(
+        "conservative",
+        &[
+            ("device.ctx", "262144"),
+            ("kv.type_k", "q8_0"),
+            ("sampling.temp", "0.95"),
+        ],
+    );
     let text = launch::build_toml(&req, &schema).unwrap();
     let back = launch::parse_toml(&text, &schema).unwrap();
     assert_eq!(back.preset, "conservative");
-    assert_eq!(back.set.get("device.ctx").map(String::as_str), Some("262144"));
+    assert_eq!(
+        back.set.get("device.ctx").map(String::as_str),
+        Some("262144")
+    );
     assert_eq!(back.set.get("kv.type_k").map(String::as_str), Some("q8_0"));
     assert_eq!(back.set.get("kv.ring").map(String::as_str), Some("true"));
-    assert_eq!(back.set.get("sampling.temp").map(String::as_str), Some("0.95"));
-    assert_eq!(back.set.get("kernels.vulkan.gemv.rm").map(String::as_str), Some("2"));
+    assert_eq!(
+        back.set.get("sampling.temp").map(String::as_str),
+        Some("0.95")
+    );
+    assert_eq!(
+        back.set.get("kernels.vulkan.gemv.rm").map(String::as_str),
+        Some("2")
+    );
     // The secret never entered the file, so it cannot come back.
     assert!(!back.set.contains_key("serve.api_key"));
     // Re-exporting the imported form reproduces the file byte for byte.
     assert_eq!(launch::build_toml(&back, &schema).unwrap(), text);
 
     // 全手动 is recorded only in the header (auto_profile stays at its default), and must survive.
-    let manual = launch::build_toml(&request("manual", &[("device.ctx", "8192")]), &schema).unwrap();
-    assert_eq!(launch::parse_toml(&manual, &schema).unwrap().preset, "manual");
+    let manual =
+        launch::build_toml(&request("manual", &[("device.ctx", "8192")]), &schema).unwrap();
+    assert_eq!(
+        launch::parse_toml(&manual, &schema).unwrap().preset,
+        "manual"
+    );
 
     // A retired knob is dropped rather than passed to the engine as an unknown path.
     let stale = "[device]\nctx = \"262144\"\nretired_knob = \"1\"\n";
     let parsed = launch::parse_toml(stale, &schema).unwrap();
-    assert_eq!(parsed.set.get("device.ctx").map(String::as_str), Some("262144"));
+    assert_eq!(
+        parsed.set.get("device.ctx").map(String::as_str),
+        Some("262144")
+    );
     assert!(!parsed.set.contains_key("device.retired_knob"));
 }
 
@@ -301,8 +397,14 @@ fn settings_persist_and_restore() {
     console.save_settings(&settings).unwrap();
     let restored = console.load_settings();
     assert_eq!(restored.preset, "manual");
-    assert_eq!(restored.set.get("device.ctx").map(String::as_str), Some("262144"));
-    assert_eq!(restored.set.get("kv.type_k").map(String::as_str), Some("q8_0"));
+    assert_eq!(
+        restored.set.get("device.ctx").map(String::as_str),
+        Some("262144")
+    );
+    assert_eq!(
+        restored.set.get("kv.type_k").map(String::as_str),
+        Some("q8_0")
+    );
     let _ = std::fs::remove_file(console.settings_path());
     let _ = std::fs::remove_file(&console.state_path);
 }
@@ -335,8 +437,14 @@ async fn uncensor_toggle_injects_both_directions() {
 #[test]
 fn prefix_reuse_counts_the_shared_opening_messages() {
     let console = console();
-    let first = vec!["system\u{1}你是助手".to_string(), "user\u{1}你好".to_string()];
-    assert!(console.estimate_reuse("conv", &first).is_none(), "the first turn has nothing to reuse");
+    let first = vec![
+        "system\u{1}你是助手".to_string(),
+        "user\u{1}你好".to_string(),
+    ];
+    assert!(
+        console.estimate_reuse("conv", &first).is_none(),
+        "the first turn has nothing to reuse"
+    );
     let second = vec![
         "system\u{1}你是助手".to_string(),
         "user\u{1}你好".to_string(),
@@ -378,6 +486,7 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
         frames_truncated: false,
         request: serde_json::Value::Null,
         frames: Vec::new(),
+        frames_compacted: false,
         first_delta_ms: None,
         prefill_ms: Some(200),
     };
@@ -387,7 +496,11 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
     round.observe(DeltaKind::Tool, Some("tap"), 1);
     assert_eq!(round.phase, Phase::ToolCall);
     round.observe(DeltaKind::Tool, Some("tap"), 1);
-    assert_eq!(round.tools, vec!["tap".to_string()], "a tool is named once, not once per fragment");
+    assert_eq!(
+        round.tools,
+        vec!["tap".to_string()],
+        "a tool is named once, not once per fragment"
+    );
     round.observe(DeltaKind::Content, None, 1);
     assert_eq!(round.phase, Phase::Output);
     round.finish(Status::Done);
@@ -409,7 +522,9 @@ async fn key_lifecycle_and_the_consent_gate() {
                 .method("POST")
                 .uri("/ui/keys")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"label":"android","token":"sk-console-fixed"}"#))
+                .body(Body::from(
+                    r#"{"label":"android","token":"sk-console-fixed"}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -464,7 +579,13 @@ async fn key_lifecycle_and_the_consent_gate() {
 
     let id = console.keys.lock().unwrap()[0].id.clone();
     let deleted = app
-        .oneshot(Request::builder().method("DELETE").uri(format!("/ui/keys/{id}")).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/ui/keys/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::OK);
@@ -515,6 +636,7 @@ async fn per_key_counters_fold_finished_rounds_only() {
         frames_truncated: false,
         request: serde_json::Value::Null,
         frames: Vec::new(),
+        frames_compacted: false,
         first_delta_ms: None,
         prefill_ms: None,
     };
@@ -546,4 +668,123 @@ fn base64_payloads_are_elided_from_the_retained_request() {
     assert!(!text.contains(&"A".repeat(256)));
     assert!(text.contains("点哪里"));
     assert!(text.contains("elided"));
+}
+
+#[test]
+fn compact_request_keeps_only_the_opening_and_recent_messages() {
+    let mut body = serde_json::json!({
+        "model": "m",
+        "messages": (0..40)
+            .map(|i| serde_json::json!({ "role": "user", "content": format!("msg-{i}") }))
+            .collect::<Vec<_>>(),
+    });
+    crate::state::compact_request(&mut body);
+    let messages = body["messages"].as_array().unwrap();
+    // Opening message + one marker + the most recent (KEEP-1) messages, never the full history.
+    assert!(messages.len() <= 10, "retained {} messages", messages.len());
+    assert_eq!(messages[0]["content"], "msg-0");
+    let joined = body.to_string();
+    assert!(joined.contains("省略"));
+    assert!(!joined.contains("msg-15"), "middle history must be dropped");
+    assert!(joined.contains("msg-39"), "latest message must survive");
+}
+
+#[test]
+fn compact_request_caps_a_single_oversized_message() {
+    let mut body = serde_json::json!({
+        "messages": [{ "role": "user", "content": "x".repeat(20_000) }],
+    });
+    crate::state::compact_request(&mut body);
+    let text = body.to_string();
+    assert!(
+        text.len() < 12_000,
+        "retained body grew to {} bytes",
+        text.len()
+    );
+    assert!(text.contains("截断"));
+}
+
+#[test]
+fn reuse_table_is_bounded_and_stores_no_prompt_text() {
+    let console = console();
+    let msg = "system\u{1}你是一个有很长的系统提示的助手".repeat(20);
+    // Write far more distinct conversations than the cap; the table must stay bounded.
+    for i in 0..600 {
+        let conv = format!("key\u{1}{msg}\u{1}turn-{i}");
+        console.estimate_reuse(&conv, std::slice::from_ref(&msg));
+    }
+    let len = console.conversations.lock().unwrap().len();
+    assert!(len <= 256, "reuse table grew to {len} conversations");
+}
+
+#[test]
+fn reuse_estimate_survives_fingerprinting() {
+    let console = console();
+    let a = vec!["system\u{1}提示".to_string(), "user\u{1}一".to_string()];
+    assert!(console.estimate_reuse("c", &a).is_none());
+    let b = vec![a[0].clone(), a[1].clone(), "assistant\u{1}答".to_string()];
+    let est = console.estimate_reuse("c", &b).unwrap();
+    assert_eq!(est.messages, 2);
+    assert!(est.ratio > 0.0 && est.ratio < 1.0);
+}
+
+#[test]
+fn aged_rounds_compact_frames_but_keep_the_assembled_reply() {
+    let console = console();
+    let frame = |seq: u64, text: &str| crate::state::Frame {
+        seq,
+        data: serde_json::json!({
+            "choices": [{ "delta": { "content": text } }]
+        })
+        .to_string(),
+    };
+    // One extra round past FRAME_ROUND_CAP gets pushed; a mid-list round should compact.
+    for i in 0..50 {
+        console.push_round(Round {
+            id: i,
+            key_id: "k".into(),
+            key_label: "k".into(),
+            conv: "c".into(),
+            model: "m".into(),
+            api: "chat",
+            started_at_ms: now_ms(),
+            ended_at_ms: None,
+            status: Status::Done,
+            phase: Phase::Output,
+            tools: Vec::new(),
+            uncensor: false,
+            prompt_tokens: 0,
+            cached_prompt_tokens: 0,
+            completion_tokens: 0,
+            reuse_est: None,
+            ttft_ms: None,
+            live_tps: None,
+            prefill_tps: None,
+            decode_tps: None,
+            duration_ms: None,
+            frames_truncated: false,
+            request: serde_json::Value::Null,
+            frames: vec![frame(1, "你好"), frame(2, "世界")],
+            frames_compacted: false,
+            first_delta_ms: None,
+            prefill_ms: None,
+        });
+    }
+    let rounds = console.rounds.lock().unwrap();
+    // The newest 48 keep raw frames; the two oldest are folded into one frame each.
+    let compacted: Vec<_> = rounds.iter().filter(|r| r.frames_compacted).collect();
+    assert_eq!(compacted.len(), 2, "expected 2 compacted rounds");
+    for r in compacted {
+        assert_eq!(
+            r.frames.len(),
+            1,
+            "compacted round should hold a single synthetic frame"
+        );
+        let chunk: serde_json::Value = serde_json::from_str(&r.frames[0].data).unwrap();
+        assert_eq!(chunk["choices"][0]["delta"]["content"], "你好世界");
+    }
+    assert!(
+        rounds.front().unwrap().frames.len() == 2,
+        "newest round keeps raw frames"
+    );
 }
