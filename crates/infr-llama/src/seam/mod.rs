@@ -16,6 +16,7 @@ use infr_core::tensor::DType;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
+use std::borrow::Cow;
 
 const MIB_F64: f64 = (1u64 << 20) as f64;
 const GIB_F64: f64 = (1u64 << 30) as f64;
@@ -867,9 +868,9 @@ pub struct ImageCacheSpan {
 /// `tokens.len()` are ignored, so a partial conversation — truncated, or attached mid-prompt —
 /// keys itself without any clipping by the caller. Spans are ordered and disjoint, the way
 /// `expand_multimodal_prompt` builds them.
-pub(crate) fn image_cache_view(tokens: &[u32], spans: &[ImageCacheSpan]) -> Vec<u32> {
+pub(crate) fn image_cache_view<'a>(tokens: &'a [u32], spans: &[ImageCacheSpan]) -> Cow<'a, [u32]> {
     if spans.is_empty() {
-        return tokens.to_vec();
+        return Cow::Borrowed(tokens);
     }
     let mut view = Vec::with_capacity(tokens.len());
     let mut next = 0usize;
@@ -883,7 +884,7 @@ pub(crate) fn image_cache_view(tokens: &[u32], spans: &[ImageCacheSpan]) -> Vec<
         next = span.start + keep;
     }
     view.extend_from_slice(&tokens[next..]);
-    view
+    Cow::Owned(view)
 }
 
 /// Qwen multimodal RoPE data for one request. Text-only callers pass `None` and retain the
@@ -902,7 +903,7 @@ pub struct MropePlan {
 impl MropePlan {
     /// The tree key of this request's expanded prompt: what its chain is published under, and
     /// what the slot keeps materializing under afterwards.
-    pub fn cache_view(&self, tokens: &[u32]) -> Vec<u32> {
+    pub fn cache_view<'a>(&self, tokens: &'a [u32]) -> Cow<'a, [u32]> {
         image_cache_view(tokens, &self.cache_spans)
     }
 }

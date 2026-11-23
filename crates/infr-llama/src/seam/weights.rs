@@ -1768,7 +1768,7 @@ impl SeamKv {
     /// The projection setting is NOT folded in here — it selects which tree the key addresses
     /// ([`crate::paged_cache::PagedKv::best_match`]'s `projection`), because overwriting a key
     /// position with a setting tag would erase the first token's identity.
-    pub(crate) fn paged_cache_view(&self) -> Vec<u32> {
+    pub(crate) fn paged_cache_view(&self) -> std::borrow::Cow<'_, [u32]> {
         crate::seam::image_cache_view(&self.cached, &self.image_cache_spans)
     }
 
