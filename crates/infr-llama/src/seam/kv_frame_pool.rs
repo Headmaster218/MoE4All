@@ -73,10 +73,12 @@ impl FrameId {
     }
 
     /// Wire form for later serialization (page chains in telemetry dumps).
+    #[cfg(test)]
     pub(crate) fn raw(self) -> u64 {
         self.0
     }
 
+    #[cfg(test)]
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
@@ -402,6 +404,7 @@ impl FramePool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn refcount(&self, id: FrameId) -> u32 {
         self.slot(id).refcount
     }
@@ -411,7 +414,7 @@ impl FramePool {
     }
 
     /// Mark the frame as backing the running session's page table (pinned to
-    /// its tier, excluded from [`cold_candidates`](Self::cold_candidates)).
+    /// its tier, excluded from `cold_candidates`).
     pub(crate) fn set_active(&mut self, id: FrameId, active: bool) {
         self.slot_mut(id).active = active;
     }
@@ -421,6 +424,7 @@ impl FramePool {
     /// prefix survives while a cold branch's tail pages are pruned; the caller
     /// then `transfer`s each candidate to the other tier (DMA under the baton)
     /// or drops it when even RAM is full.
+    #[cfg(test)]
     pub(crate) fn cold_candidates(&self, tier: Tier, want: usize) -> Vec<FrameId> {
         let t = &self.tiers[Self::idx(tier)];
         let mut picked: Vec<(u64, usize)> = t
@@ -442,7 +446,7 @@ impl FramePool {
     /// slot of the other tier (Phase C: the host-side bookkeeper needs the destination address —
     /// `frame_addr(fresh)` on the RAM tier is its offset into the host backing — BEFORE the bytes
     /// move, which `transfer`'s atomic alloc cannot offer). Owners and the cold LRU stamp carry
-    /// over exactly as in [`Self::transfer`], and the source slot returns to its tier's free list.
+    /// over exactly as in `transfer`, and the source slot returns to its tier's free list.
     /// `fresh` must be a freshly allocated (single-owner, inactive) slot of the opposite tier.
     pub(crate) fn migrate_into(&mut self, id: FrameId, fresh: FrameId) {
         let source = id.tier();
@@ -469,6 +473,7 @@ impl FramePool {
         t.held -= 1;
     }
 
+    #[cfg(test)]
     pub(crate) fn transfer(&mut self, id: FrameId, target: Tier) -> Option<FrameId> {
         let source = id.tier();
         assert_ne!(source, target, "transfer between the same tier");

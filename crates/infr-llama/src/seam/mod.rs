@@ -22,9 +22,7 @@ const MIB_F64: f64 = (1u64 << 20) as f64;
 const GIB_F64: f64 = (1u64 << 30) as f64;
 
 pub mod model;
-// Pure two-tier frame bookkeeping for the paged KV cache; the Vulkan wiring
-// lands in Phase B/C, so nothing consumes it yet.
-#[allow(dead_code)]
+// Pure two-tier frame bookkeeping for the paged KV cache, consumed by `PagedKv`.
 pub(crate) mod kv_frame_pool;
 mod ple;
 mod runner;
