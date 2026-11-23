@@ -1211,7 +1211,7 @@ const KNOB_ZH = {
   "kernels.vulkan.gemv.id_grid_nr": ["IQ id-GEMV 行/组", "64 线程分页 IQ id-GEMV 每工作组处理的输出行数。"],
   "kernels.vulkan.gemv.id_grid_buffer_nr": ["IQ 码本 GEMV 行/组", "不可变码本 IQ2_S / IQ3_S / IQ3_XXS 每工作组输出行数；留空按实测设备策略，1/2/4/8 显式覆盖。"],
   "kernels.vulkan.gemv.id_grid_buffer": ["IQ 不可变码本", "IQ2_S / IQ3_S / IQ3_XXS 不可变码本路径；留空仅启用实测过的 Windows/RDNA3 decode 形状。"],
-  "kernels.vulkan.gemv.id_sg_q51": ["Q5_1 子组 id-GEMV", "把 Q5_1 专家 down 纳入子组 id-GEMV 的 A/B 门；默认关，等模型级 A/B。"],
+  "kernels.vulkan.gemv.id_sg_q51": ["Q5_1 子组 id-GEMV", "把 Q5_1 专家 down 纳入子组 id-GEMV；默认开，关闭可回退树形 id-GEMV。"],
   "kernels.vulkan.gemv.q8_wave32": ["Q8 Wave32 GEMV", "位精确的 Wave32 大 K Q8_0 decode GEMV；留空仅实测形状，显式 true/false 覆盖。"],
   "kernels.vulkan.gemv.variant": ["GEMV 变体", "由其它开关推导的 GEMV 变体选择（reg 等），不建议手填。"],
   "kernels.vulkan.coopmat": ["协作矩阵", "Vulkan cooperative matrix 总开关（与 f16 相与）。"],

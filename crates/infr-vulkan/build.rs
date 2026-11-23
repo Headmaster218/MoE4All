@@ -2816,9 +2816,9 @@ fn main() {
         ),
         // Q5_1 SG id variant (2026-10-19): the UD-Q4_K_XL Qwen3.8-Flash-Next stores 43 of 48
         // expert DOWN projections as Q5_1 at the 640x2560 shape the Q5_K down band was cut for
-        // (24B/32-elem blocks, y = d*q5 + m). Same wave32 + subgroupAdd tier; enrollment is
-        // A/B-gated by `kernels.vulkan.gemv.id_sg_q51` (default OFF keeps the tree) until the
-        // UD-Q4_K_XL decode A/B lands. NR ∈ {2,4,8}.
+        // (24B/32-elem blocks, y = d*q5 + m). Same wave32 + subgroupAdd tier; enrollment default ON
+        // after the UD-Q4_K_XL decode A/B (Q5_1 114.7→63.7 ms/32 tok, total 929→878 ms).
+        // `kernels.vulkan.gemv.id_sg_q51=false` keeps the tree escape hatch. NR ∈ {2,4,8}.
         (
             "native_gemv_id_multi_sg",
             "native_idm_q51_sg2",

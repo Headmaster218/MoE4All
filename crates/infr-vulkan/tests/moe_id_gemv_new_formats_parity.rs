@@ -956,9 +956,9 @@ fn paged_grid_buffer_idm_matches_host() {
 }
 
 /// The Q5_1 expert-down SG enrollment (UD-Q4_K_XL: 43/48 downs are Q5_1 at 640x2560, the exact
-/// shape the Q5_K down band was cut for). Enrollment is gated by `id_sg_q51` (default OFF keeps
-/// the tree), so the backend must be built with the gate ON for the route to be live — same
-/// forced-config pattern as the grid-buffer test. The shape here is the PRODUCTION one, not the
+/// shape the Q5_K down band was cut for). Enrollment is ON by default after the model A/B; this
+/// test still pins `id_sg_q51` explicitly so it remains valid if that default is flipped back for
+/// an A/B. The shape here is the PRODUCTION one, not the
 /// 2048-band stand-in `paged_sg_id_gemv_matches_host` uses; scrambled ids + a load order that
 /// differs from logical order keep the LUT-resolution path honest.
 #[test]

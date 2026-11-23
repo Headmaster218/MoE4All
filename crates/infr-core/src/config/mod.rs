@@ -410,10 +410,11 @@ cfg_struct! {
         /// Immutable IQ codebooks (IQ2_S/IQ3_S/IQ3_XXS). None selects measured Windows/RDNA3 Decode
         /// shapes only (the Qwen3.8-Flash-Next GSQ mixed-quant banks hit 2560x640 gate/up).
         id_grid_buffer: Option<bool> = None,
-        /// A/B gate for enrolling Q5_1 expert-down banks (the UD-Q4_K_XL Qwen3.8-Flash-Next stores
-        /// 43 of 48 downs as Q5_1 at the 640x2560 SG band shape) into the subgroup id-GEMV. False
-        /// keeps the tree id kernel until the model A/B lands. `--set kernels.vulkan.gemv.id_sg_q51`.
-        id_sg_q51: bool = false,
+        /// Enroll Q5_1 expert-down banks (UD-Q4_K_XL: 43/48 downs at 640x2560) into subgroup
+        /// id-GEMV. Default ON after the model A/B: `native_idm_q51_sg2_paged` cut Q5_1 device time
+        /// 114.7→63.7 ms/32 tok (−44%) and total device time 929→878 ms (−5.5%). Set false via
+        /// `--set kernels.vulkan.gemv.id_sg_q51=false` to restore the tree kernel.
+        id_sg_q51: bool = true,
         /// Bit-identical Wave32 large-K Q8_0 Decode GEMV. None selects measured Windows/RDNA3
         /// Decode shapes only; Some(false/true) is an explicit A/B override.
         q8_wave32: Option<bool> = None,

@@ -470,8 +470,8 @@ fn native_id_sg_choice(
         return (in_f == 2560 && out_f == 640).then_some(8);
     }
     // Q5_1 (UD-Q4_K_XL's 43/48 expert downs, 640x2560) fits this band and the same heavy-unpack
-    // rationale, but enrollment is A/B-gated: until the model-level decode A/B lands, the default
-    // keeps every Q5_1 bank on the tree id kernel.
+    // rationale. The model A/B landed: SG NR=2 cut Q5_1 device time 114.7→63.7 ms/32 tok (−44%),
+    // total 929→878 ms (−5.5%). `id_sg_q51=false` remains the tree-kernel escape hatch.
     if dtype == Q5_1 && !k.id_sg_q51 {
         return None;
     }
@@ -20189,13 +20189,13 @@ mod tests {
         }
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 1024, k), None);
         assert_eq!(native_id_sg_choice(D::Q6K, 512, 8193, k), None);
-        // Q5_1 rides the same band but stays gated OFF by default (A/B switch `id_sg_q51`).
-        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, k), None);
-        let mut cfg_on = infr_core::config::Config::default();
-        cfg_on.kernels.vulkan.gemv.id_sg_q51 = true;
-        let kon = &cfg_on.kernels.vulkan.gemv;
-        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, kon), Some(2));
-        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 1024, kon), None);
+        // Q5_1 is enabled by default after the model A/B (114.7→63.7 ms Q5_1, 929→878 ms total).
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, k), Some(2));
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 1024, k), None);
+        let mut cfg_off = infr_core::config::Config::default();
+        cfg_off.kernels.vulkan.gemv.id_sg_q51 = false;
+        let koff = &cfg_off.kernels.vulkan.gemv;
+        assert_eq!(native_id_sg_choice(D::Q5_1, 640, 2560, koff), None);
     }
 
     /// #4 drift guard: the ONE unified [`moe_mmq_desc`] table must produce, for every dtype in
