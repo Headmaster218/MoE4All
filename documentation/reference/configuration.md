@@ -182,6 +182,8 @@ infr run "$M" "hi" --set kv.type_k=q8_0 --set kv.type_v=q8_0
 
 `device.vram_budget` / `INFR_VRAM_BUDGET` 限制后端的总设备内存占用：常驻权重、KV、运行时分配以及专家/稠密分页器都计入其中。`device.vram_reserve` / `INFR_VRAM_RESERVE` 还会在 Vulkan 内置的 256 MiB 安全保护之上额外保留相应的物理 VRAM。例如，`INFR_VRAM_BUDGET=23g` 和 `INFR_VRAM_RESERVE=512m` 表示严格的 23 GiB 进程上限加 512 MiB 额外物理余量。两者都未显式指定时，保守自动档在分配器 guard 外再留 768 MiB（合计约 1 GiB），激进档直接使用扣除 guard 后的设备当前可用量。任一显式值出现时走显式约束路径；统一 arena 仍以固定资源落地后的真实余量定容，物理分配失败时会缩小 arena 或下调 Ubatch 后重新探测。
 
+`device.mem_guard_headroom` / `device.mem_guard_ram_headroom`（`INFR_MEM_GUARD_*`）是 commit 熔断的两条水位线：命中时进程以退出码 87 主动结束，而不是滑进换页风暴或显示驱动 AV。commit 轴的判据是**超出已授权主机预算的增量**：`device.ram_budget`（未显式给出时即启动阶段冻结的自动预算）之内的消耗属于计划，不算异常，水位线最低收到 512 MiB 硬底。这条标定来自实测——96 GiB 内存 + 6 GiB 页面文件（commit 上限 102 GiB）的机器上，47.17 GiB 的 MoE 主机 store 加 host-DMA 导入与 WDDM 设备账之后，剩余 commit 只有约 4.06 GiB，旧的 8 GiB 绝对线会把两次合法启动直接打死。物理-RAM 轴（默认 4 GiB）仍是抓失控泄漏的主探针；做 miss-storm 测试时应把它拉高（例如 `50%`），让熔断在 RAM 耗尽之前落地。任一轴设为 `0` 即关闭该轴；`device.mem_guard_poll_ms`（默认 500）是轮询间隔，主机 staging 的两个闸门另有内联检查覆盖轮询之间的陡增。
+
 **`[sampling]`** — `temp`（0 = 贪心）、`top_k`、`top_p`、`seed`、`max_new`、`ignore_eos`、`no_think`、`reasoning_effort`、`preserve_thinking`。`reasoning_effort` 和 `preserve_thinking` 没有 `INFR_*` 环境变量别名；省略它们即可保留内嵌聊天模板的默认值。
 
 **来源很重要**：`infr run` / `infr serve` 仅为**没有任何层指定**的调节项，从模型自身的推荐采样值（架构家族表及模型旁的任意 `generation_config.json`）填充 `temp` / `top_k` / `top_p` / `max_new`。在配置文件中填写 `temp` 会将它固定，并禁止该回退。库调用方得到的 `Config` 默认值是贪心：`temp = 0.0`、`top_k = 20`、`top_p = 0.95`、`max_new = 2048`。在 `serve` 中，这些是服务器默认值；单个请求的 OpenAI `temperature`/`top_p` 仍会覆盖它们。
