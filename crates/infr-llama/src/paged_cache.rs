@@ -796,6 +796,32 @@ impl PagedKv {
         }
     }
 
+    /// Commit a batch of tier moves collected by a tail migration: rewrite every entry-chain
+    /// occurrence of each `source` to its `fresh` id in ONE scan, then transfer pool ownership.
+    /// Calling [`Self::rewrite_frame_in_entries`] once per frame made a multi-frame move pay one
+    /// full tree scan per frame (O(entries × chain × frames)). The map keeps each check O(1);
+    /// sources and fresh ids in one batch always occupy different tiers, so no pair can feed
+    /// into another and a single simultaneous pass is safe. Ownership transfer is deferred until
+    /// after the scan, so no chain ever names a slot the pool has already freed mid-batch.
+    fn commit_frame_migrations(&mut self, migrations: &[(FrameId, FrameId)]) {
+        if migrations.is_empty() {
+            return;
+        }
+        let fresh_by_source: HashMap<FrameId, FrameId> = migrations.iter().copied().collect();
+        for node in &mut self.nodes {
+            if let Some(entry) = node.entry.as_mut() {
+                for frame in entry.chain.iter_mut() {
+                    if let Some(&fresh) = fresh_by_source.get(frame) {
+                        *frame = fresh;
+                    }
+                }
+            }
+        }
+        for &(source, fresh) in migrations {
+            self.pool.migrate_into(source, fresh);
+        }
+    }
+
     /// The suffix of an entry's `tier` run that may move one tier down, as `[keep, end)`.
     ///
     /// Two rules shape it. A chain stays a monotone gradient — device prefix, then RAM, then disk —
@@ -899,6 +925,7 @@ impl PagedKv {
     ) -> usize {
         let take = (end - keep).min(self.pool.free_frames(Tier::Ram));
         let frame_bytes = self.pool.frame_bytes() as usize;
+        let mut migrations = Vec::with_capacity(take);
         let mut moved = 0usize;
         for i in (end - take)..end {
             let source = self.nodes[node].entry.as_ref().unwrap().chain[i];
@@ -920,11 +947,13 @@ impl PagedKv {
                 );
                 break;
             }
-            self.rewrite_frame_in_entries(source, fresh);
-            self.pool.migrate_into(source, fresh);
+            migrations.push((source, fresh));
             self.tier_demotions += 1;
             moved += 1;
         }
+        // One scan rewrites the whole batch; source VRAM slots stay allocated until after it, so
+        // no chain ever names a freed slot. A DMA failure above simply shortens the batch.
+        self.commit_frame_migrations(&migrations);
         moved
     }
 
@@ -1009,6 +1038,7 @@ impl PagedKv {
         };
         let take = (end - keep).min(self.pool.free_frames(Tier::Disk));
         let frame_bytes = self.pool.frame_bytes() as usize;
+        let mut migrations = Vec::with_capacity(take);
         let mut moved = 0usize;
         for i in (end - take)..end {
             let source = self.nodes[node].entry.as_ref().unwrap().chain[i];
@@ -1042,11 +1072,11 @@ impl PagedKv {
                 );
                 break;
             }
-            self.rewrite_frame_in_entries(source, fresh);
-            self.pool.migrate_into(source, fresh);
+            migrations.push((source, fresh));
             self.disk_demotions += 1;
             moved += 1;
         }
+        self.commit_frame_migrations(&migrations);
         moved > 0
     }
 
@@ -1269,6 +1299,11 @@ impl PagedKv {
             .warm_frames = pages;
         let frame_bytes = self.pool.frame_bytes() as usize;
         let mut out = Vec::with_capacity(pages);
+        // One reused protect buffer instead of `out.clone()` per promoted frame. `protect` mirrors
+        // `out` between iterations; the in-flight RAM id is appended for the claim and popped after
+        // the commit. This removes both the per-frame allocation and the O(pages^2) copying the
+        // clone entailed.
+        let mut protect: Vec<FrameId> = Vec::with_capacity(pages + 1);
         for i in 0..pages {
             // A cascading sink can evict this very entry mid-promotion; the frames already handed
             // out stay valid, the rest of the reuse is dropped.
@@ -1278,6 +1313,7 @@ impl PagedKv {
             let frame = entry.chain[i];
             if matches!(frame.tier(), Tier::Vram) {
                 out.push(frame);
+                protect.push(frame);
                 continue;
             }
             // Phase D: a disk frame must first land in a RAM slot — the upload below reads from
@@ -1306,7 +1342,7 @@ impl PagedKv {
             // The in-flight RAM frame is protected alongside the already-promoted VRAM ids: the
             // VRAM claim below can cascade a RAM->disk sink, and if that sink moved an entry
             // sharing THIS frame, `rewrite_frame_in_entries` would strand `backing_off`'s owner.
-            let mut protect = out.clone();
+            // `protect` currently mirrors `out`; add the in-flight RAM id for the claim.
             protect.push(ram);
             let Some(fresh) = self.claim_frame(be, false, &protect) else {
                 break; // corridor cannot yield: truncate the reuse here
@@ -1325,7 +1361,9 @@ impl PagedKv {
             self.rewrite_frame_in_entries(ram, fresh);
             self.pool.migrate_into(ram, fresh);
             self.tier_promotions += 1;
+            protect.pop(); // remove the in-flight RAM id, restoring the mirror of `out`
             out.push(fresh);
+            protect.push(fresh);
         }
         out
     }
