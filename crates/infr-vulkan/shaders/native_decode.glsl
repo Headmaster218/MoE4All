@@ -646,12 +646,17 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 32u) * 18u;
     float d = f16tof32(ru16(bd));
-    for (uint w8 = 0u; w8 < 4u; w8++) {
-        uint q = ru32u(bd + 2u + w8 * 4u);
+    // IQ4_NL's 18-byte stride flips the qs base between word-aligned (+2 on odd blocks) and
+    // +2-misaligned (even blocks). rw4() funnels those four words through ONE b128 read on both
+    // parities, replacing four ru32u() word loads per 32-elem block in the arena path. Same four
+    // integers — bit-identical to the old loop.
+    uvec4 qv = rw4(bd + 2u);
+    for (uint w4 = 0u; w4 < 4u; w4++) {
+        uint q = qv[w4];
         for (uint b = 0u; b < 4u; b++) {
             uint byteq = (q >> (8u * b)) & 0xFFu;
-            v[w8 * 4u + b] = d * float(kv_iq4nl(byteq & 0xFu));
-            v[w8 * 4u + b + 16u] = d * float(kv_iq4nl(byteq >> 4u));
+            v[w4 * 4u + b] = d * float(kv_iq4nl(byteq & 0xFu));
+            v[w4 * 4u + b + 16u] = d * float(kv_iq4nl(byteq >> 4u));
         }
     }
 }
