@@ -654,6 +654,10 @@ fn rebuild_row_groups(
 fn dequant_ple_row_into(dtype: DType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
     match dtype {
         DType::Q5_1 => dequant_q5_1_into(bytes, out),
+        // PLE's shipped table is IQ4_NL (26.8 GiB, host-mmap). The generic dequantizer allocates a
+        // temporary Vec for every unique row; decode into the pooled output slice directly. Same
+        // codebook and multiply order as `infr_gguf::dequant::dequant_codebook(Iq4Nl)`.
+        DType::Iq4Nl => dequant_iq4_nl_into(bytes, out),
         _ => {
             let values = infr_gguf::dequant::dequant_block(dtype, bytes)?;
             if values.len() != out.len() {
@@ -698,6 +702,34 @@ fn dequant_q5_1_into(bytes: &[u8], out: &mut [f32]) -> Result<()> {
             let q1 = (qs[j] as u32 >> 4) | high1;
             values[j] = d * q0 as f32 + m;
             values[j + 16] = d * q1 as f32 + m;
+        }
+    }
+    Ok(())
+}
+
+fn dequant_iq4_nl_into(bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    const BLOCK_BYTES: usize = 18;
+    const BLOCK_ELEMS: usize = 32;
+    if !out.len().is_multiple_of(BLOCK_ELEMS)
+        || bytes.len() != out.len() / BLOCK_ELEMS * BLOCK_BYTES
+    {
+        bail!(
+            "invalid IQ4_NL PLE row geometry: {} bytes for {} values",
+            bytes.len(),
+            out.len()
+        );
+    }
+    use infr_gguf::dequant::KVALUES_IQ4NL;
+    for (block, values) in bytes
+        .as_chunks::<BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<BLOCK_ELEMS>().0.iter_mut())
+    {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        for j in 0..16 {
+            values[j] = d * KVALUES_IQ4NL[(block[2 + j] & 0x0F) as usize] as f32;
+            values[j + 16] = d * KVALUES_IQ4NL[(block[2 + j] >> 4) as usize] as f32;
         }
     }
     Ok(())
@@ -905,6 +937,21 @@ mod tests {
         let expected = infr_gguf::dequant::dequant_block(DType::Q5_1, &bytes).unwrap();
         let mut actual = vec![0.0; expected.len()];
         dequant_q5_1_into(&bytes, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn iq4_nl_into_matches_the_general_dequantizer() {
+        let mut bytes = vec![0u8; 5 * 18];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i.wrapping_mul(31).wrapping_add(7) as u8;
+        }
+        for block in bytes.as_chunks_mut::<18>().0 {
+            block[0..2].copy_from_slice(&half::f16::from_f32(0.0625).to_le_bytes());
+        }
+        let expected = infr_gguf::dequant::dequant_block(DType::Iq4Nl, &bytes).unwrap();
+        let mut actual = vec![0.0; expected.len()];
+        dequant_iq4_nl_into(&bytes, &mut actual).unwrap();
         assert_eq!(actual, expected);
     }
 
