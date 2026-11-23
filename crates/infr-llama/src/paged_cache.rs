@@ -1109,30 +1109,12 @@ impl PagedKv {
         }
         let depth = pages * self.page_tokens;
         let n_candidates = candidates.len();
-        let detail = candidates
-            .iter()
-            .map(|&node| {
-                let entry = self.nodes[node].entry.as_ref();
-                (
-                    node,
-                    self.nodes[node].path_len,
-                    entry.map(|entry| entry.chain.len()),
-                    entry.map(|entry| {
-                        entry
-                            .ckpts
-                            .iter()
-                            .map(|ckpt| ckpt.boundary_tokens)
-                            .collect::<Vec<_>>()
-                    }),
-                )
-            })
-            .collect::<Vec<_>>();
         // A recurrent entry resumes only at a snapshot boundary, so the longest chain is not the
         // best candidate: one whose snapshots all sit above `depth` matches and then hands back
         // zero tokens. Rank by the depth actually resumable, first-wins on ties, stop at a full one.
         let mut chosen = None;
         let mut best_resumable = 0usize;
-        for node in candidates {
+        for &node in &candidates {
             let Some(entry) = self.nodes[node].entry.as_ref() else {
                 continue;
             };
@@ -1160,6 +1142,26 @@ impl PagedKv {
         }
         let Some(node) = chosen else {
             self.misses += 1;
+            // Diagnostic detail is miss-only: building it unconditionally allocated one Vec per
+            // candidate plus a ckpt-boundary Vec per entry on every (far more common) hit.
+            let detail = candidates
+                .iter()
+                .map(|&node| {
+                    let entry = self.nodes[node].entry.as_ref();
+                    (
+                        node,
+                        self.nodes[node].path_len,
+                        entry.map(|entry| entry.chain.len()),
+                        entry.map(|entry| {
+                            entry
+                                .ckpts
+                                .iter()
+                                .map(|ckpt| ckpt.boundary_tokens)
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
             tracing::debug!(
                 query = prompt.len(),
                 consumed,
