@@ -684,18 +684,19 @@ pub(crate) fn capture(
         .sync()
         .map_err(|error| anyhow!("sync before RAM KV capture: {error}"))?;
     let mut payloads = Vec::with_capacity(buffers.len());
-    let mut scratch = vec![0u8; CHUNK_BYTES];
     for buffer in buffers {
         let mut payload = vec![0u8; buffer.committed_bytes];
         let mut offset = 0usize;
         while offset < buffer.committed_bytes {
-            let count = (buffer.committed_bytes - offset).min(scratch.len());
+            let count = (buffer.committed_bytes - offset).min(CHUNK_BYTES);
+            // download_range accepts any destination slice and the backend already stages the
+            // copy internally; a separate scratch buffer would just add a full extra memcpy of
+            // every KV byte we spill to host RAM.
             backend
-                .download_range(buffer.buffer, offset, &mut scratch[..count])
+                .download_range(buffer.buffer, offset, &mut payload[offset..offset + count])
                 .map_err(|error| {
                     anyhow!("download RAM KV {:?} at {offset}: {error}", buffer.key)
                 })?;
-            payload[offset..offset + count].copy_from_slice(&scratch[..count]);
             offset += count;
         }
         payloads.push((buffer.key, payload));
