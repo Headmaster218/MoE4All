@@ -364,7 +364,8 @@ function Invoke-WizardDryRun {
     if ($process.ExitCode -ne 0) {
         throw "Wizard $Mode DryRun failed with exit code $($process.ExitCode)`n$stdout`n$stderr"
     }
-    if ($stdout -notmatch 'DryRun: command was not started\.') {
+    # Localized wizard output may print a translated sentinel before the English one.
+    if ($stdout -notmatch 'DryRun[\s\S]{0,80}command was not started\.') {
         throw "Wizard $Mode did not reach DryRun completion.`n$stdout`n$stderr"
     }
     if ($stdout -notmatch [regex]::Escape("MoE4All v$ExpectedVersion")) {
