@@ -142,6 +142,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build portable MoE4All engine (infr.exe)
         run: cargo build --release --locked -p infr-cli --features tts
+      - name: Build standalone console client (infr-console.exe)
+        run: cargo build --release --locked -p infr-console
       - name: Show sccache statistics
         if: always()
         run: sccache --show-stats

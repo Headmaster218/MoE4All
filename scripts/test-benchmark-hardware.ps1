@@ -183,7 +183,7 @@ Assert-True ($result.collection.probes['model_storage.sequential'].status -eq 'f
 $checks++
 # Package a fixture payload, never execute a binary or compile the engine.
 $packageOutput = Join-Path $fixture 'package'
-$null = & (Join-Path $PSScriptRoot 'package-windows.ps1') -BinaryPath $model -OutputDirectory $packageOutput -Version '1.0.0-collector-test' -WithoutImageCodecs 6>&1
+$null = & (Join-Path $PSScriptRoot 'package-windows.ps1') -BinaryPath $model -OutputDirectory $packageOutput -Version '1.0.0-collector-test' -WithoutConsole -WithoutImageCodecs 6>&1
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zipPath = Join-Path $packageOutput 'MoE4All-Windows-x86_64-v1.0.0-collector-test.zip'
 $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)

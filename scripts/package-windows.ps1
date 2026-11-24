@@ -1,10 +1,12 @@
 [CmdletBinding()]
 param(
     [string]$BinaryPath = 'target\release\infr.exe',
+    [string]$ConsoleBinaryPath = 'target\release\infr-console.exe',
     [string]$OutputDirectory = 'dist',
     [string]$Version = '',
     [string]$CodecDirectory = 'target\image-codecs',
     [string]$LauncherBuildDirectory = '',
+    [switch]$WithoutConsole,
     [switch]$WithoutImageCodecs
 )
 
@@ -24,6 +26,11 @@ function Resolve-RepoPath {
 $binaryFullPath = Resolve-RepoPath $BinaryPath
 if (-not (Test-Path -LiteralPath $binaryFullPath -PathType Leaf)) {
     throw "Release executable not found: $binaryFullPath"
+}
+
+$consoleBinaryFullPath = Resolve-RepoPath $ConsoleBinaryPath
+if (-not $WithoutConsole -and -not (Test-Path -LiteralPath $consoleBinaryFullPath -PathType Leaf)) {
+    throw "Console executable not found: $consoleBinaryFullPath"
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
@@ -58,6 +65,9 @@ if (Test-Path -LiteralPath $stagingPath) {
 
 New-Item -ItemType Directory -Path (Join-Path $stagingPath 'scripts') -Force | Out-Null
 Copy-Item -LiteralPath $binaryFullPath -Destination (Join-Path $stagingPath 'infr.exe')
+if (-not $WithoutConsole) {
+    Copy-Item -LiteralPath $consoleBinaryFullPath -Destination (Join-Path $stagingPath 'infr-console.exe')
+}
 
 $rootFiles = @(
     'Start-INFR-Wizard.cmd'
