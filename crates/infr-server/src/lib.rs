@@ -903,6 +903,14 @@ fn next_req_id() -> u64 {
     REQ_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Display-only label for a request id. `REQ_SEQ` keeps counting up forever because logs need a
+/// monotonic key, but printing the raw value in the dashboard makes the slot label grow without
+/// bound over a long-lived server. Wrap it at 1000 and pad to three digits so the visible label
+/// stays fixed width; the full id is still in every log line for correlation.
+fn display_req_id(req_id: u64) -> u64 {
+    req_id % 1000
+}
+
 /// The server-wide counters behind the periodic throughput line, and the two gauges behind
 /// `active`/`queued`.
 ///
@@ -1660,7 +1668,11 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
                     _ => "-".to_owned(),
                 };
                 (
-                    format!("#{req_id} {}", abbreviated(slot.model.as_ref(), 22)),
+                    format!(
+                        "#{:03} {}",
+                        display_req_id(*req_id),
+                        abbreviated(slot.model.as_ref(), 22)
+                    ),
                     live.phase.to_owned(),
                     speed,
                     context,
@@ -1671,7 +1683,7 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
                 inputs,
                 started,
             }) => (
-                format!("#{req_id} {inputs} input(s)"),
+                format!("#{:03} {inputs} input(s)", display_req_id(*req_id)),
                 "Embedding".to_owned(),
                 format!("{:.1}s", started.elapsed().as_secs_f64()),
                 "-".to_owned(),
@@ -3849,12 +3861,12 @@ mod tests {
         assert!(frame.contains("KV 1/2"));
         assert!(frame.contains("KV 2/2"));
         assert!(frame.contains("Embedding"));
-        assert!(frame.contains("#17 Qwen3.8-Flash-Next"));
+        assert!(frame.contains("#017 Qwen3.8-Flash-Next"));
         assert!(frame.contains("Decode"));
         assert!(frame.contains("Speed (now)"));
         assert!(frame.contains("40.0 tok/s"));
         assert!(frame.contains("50,057 / 160,000"));
-        assert!(frame.contains("#18 3 input(s)"));
+        assert!(frame.contains("#018 3 input(s)"));
         assert!(frame.contains("decode 40.0 tok/s"));
 
         let stalled = dashboard.render(&StatsWindow {
@@ -3869,8 +3881,8 @@ mod tests {
         drop(embedding);
         let idle = dashboard.render(&StatsWindow::default());
         assert_eq!(idle.matches("Idle").count(), 3);
-        assert!(!idle.contains("#17"));
-        assert!(!idle.contains("#18"));
+        assert!(!idle.contains("#017"));
+        assert!(!idle.contains("#018"));
     }
 
     fn live_progress_snapshot(
@@ -6517,6 +6529,17 @@ mod tests {
         );
         let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "ids must never repeat");
+    }
+
+    /// The dashboard label wraps at 1000 and stays three digits. The log id itself stays
+    /// monotonic — only this presentation helper wraps, so logs remain joinable.
+    #[test]
+    fn display_request_id_wraps_at_three_digits() {
+        assert_eq!(display_req_id(0), 0);
+        assert_eq!(display_req_id(999), 999);
+        assert_eq!(display_req_id(1000), 0);
+        assert_eq!(display_req_id(12345), 345);
+        assert_eq!(format!("#{:03}", display_req_id(7)), "#007");
     }
 
     /// End to end through the real non-streaming path: the request's tallies reach the shared
