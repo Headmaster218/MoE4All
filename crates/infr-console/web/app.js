@@ -105,6 +105,7 @@ $$("[data-goto]").forEach((b) => b.addEventListener("click", () => showView(b.da
 let S = null;                 // latest /ui/state payload
 let selectedRound = null;     // id shown in the sidebar
 let selectedConv = null;      // conv of the open session, for the in-sidebar round navigator
+let sbPinned = false;         // operator clicked an older round: stop auto-following the newest
 let sbTab = "frames";
 let sbFollow = true;
 let jsonFollowText = "";      // last assembled JSON rendered in the sidebar, for diff-based following
@@ -189,6 +190,7 @@ function render() {
   renderUsers();
   renderLogs();
   renderContext();
+  followNewestRound();
   if (selectedRound != null) renderSidebarHead();
 }
 
@@ -432,6 +434,9 @@ function sessionGroups() {
 function openSession(conv) {
   const g = sessionGroups().find((g) => g.conv === conv);
   if (!g) return;
+  // Opening a session from the list is an explicit "show me this conversation", so follow its
+  // newest turn. A pin from a previously open conversation must not carry over.
+  sbPinned = false;
   const rep = g.rounds.find((r) => r.status === "streaming") || g.rounds[0];
   openRound(rep.id);
 }
@@ -546,7 +551,7 @@ function renderRecent() {
         el("td", { class: "c-time" }), el("td", { class: "c-key" }), el("td", { class: "c-state" }),
         el("td", { class: "c-unc" }), el("td", { class: "num c-prompt" }), el("td", { class: "num c-cached" }),
         el("td", { class: "num c-gen" }), el("td", { class: "num c-ttft" }), el("td", { class: "num c-pf" }), el("td", { class: "num c-dec" }));
-      tr.addEventListener("click", () => openRound(r.id));
+      tr.addEventListener("click", () => openRound(r.id, true));
       recentRowMap.set(r.id, tr);
     }
     $(".c-time", tr).textContent = clock(r.started_at_ms);
@@ -603,11 +608,12 @@ function renderHistory() {
         el("td", { class: "num c-prompt" }), el("td", { class: "num c-cached" }), el("td", { class: "num c-miss" }),
         el("td", { class: "num c-reuse" }), el("td", { class: "num c-est" }), el("td", { class: "num c-gen" }),
         el("td", { class: "num c-ttft" }), el("td", { class: "num c-pf" }), el("td", { class: "num c-dec" }), el("td", { class: "num c-dur" }));
-      tr.addEventListener("click", () => openRound(r.id));
+      tr.addEventListener("click", () => openRound(r.id, true));
       historyRowMap.set(r.id, tr);
     }
     tr.classList.toggle("selected", r.id === selectedRound);
-    $(".c-id", tr).textContent = r.id;
+    $(".c-id", tr).textContent = roundLabel(r.id);
+    tr.title = `round #${r.id}`;
     $(".c-time", tr).textContent = clock(r.started_at_ms);
     $(".c-key", tr).textContent = r.key_label;
     const st = sessionState(r);
@@ -765,11 +771,21 @@ function renderContext() {
 }
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
-function openRound(id) {
+// `userPinned` is true only for an explicit click on a round chip / history / recent row, so an
+// automatic follow never locks the view. The chip click passes whether the clicked round is the
+// newest one; clicking the newest is treated as resuming follow.
+function openRound(id, userPinned = false) {
   if (selectedRound !== id) jsonFollowText = "";
   selectedRound = id;
   const r = (S && S.rounds || []).find((r) => r.id === id);
-  selectedConv = r ? (r.conv || `r${id}`) : null;
+  const conv = r ? (r.conv || `r${id}`) : null;
+  if (userPinned) {
+    // Pin only when the operator picked a round that is NOT the newest of its conversation.
+    const g = conv ? sessionGroups().find((g) => g.conv === conv) : null;
+    const newest = g && g.rounds[0];
+    sbPinned = !(newest && newest.id === id);
+  }
+  selectedConv = conv;
   $("#sidebar").classList.add("open");
   if (!liveFrames.has(id) || !roundRequests.has(id)) loadFrames(id);
   renderSidebar();
@@ -789,6 +805,7 @@ $("#sb-close").addEventListener("click", () => {
   $("#sidebar").classList.remove("open");
   selectedRound = null;
   selectedConv = null;
+  sbPinned = false;
   jsonFollowText = "";
   renderHistory();
 });
@@ -805,13 +822,32 @@ $$("#sb-tabs .tab").forEach((b) => b.addEventListener("click", () => {
 
 function currentRound() { return (S && S.rounds || []).find((r) => r.id === selectedRound); }
 
+// Short display label for a round. The internal id keeps growing for the lifetime of the process,
+// which makes a chip like #18432 useless in a narrow tab and unbounded over a long session. Wrap
+// it at 1000 with fixed width so the label stays three characters. The full id remains in the
+// tooltip and in the engine log, so wrapping never loses the ability to correlate a request.
+const ROUND_LABEL_MOD = 1000;
+function roundLabel(id) { return `#${String(id % ROUND_LABEL_MOD).padStart(3, "0")}`; }
+
+// Auto-follow: while the operator has not clicked an older round, keep the sidebar on the newest
+// turn of the open conversation. sbTab is deliberately untouched — the operator's choice of
+// 响应 JSON / 输出 / 工具 etc. survives every automatic switch.
+function followNewestRound() {
+  if (!selectedConv || sbPinned || !S) return;
+  const g = sessionGroups().find((g) => g.conv === selectedConv);
+  if (!g || !g.rounds.length) return;
+  const newest = g.rounds[0];
+  if (newest.id === selectedRound) return;
+  openRound(newest.id);
+}
+
 function renderSidebarHead() {
   const r = currentRound();
   if (!r) return;
   const g = selectedConv ? sessionGroups().find((g) => g.conv === selectedConv) : null;
   $("#sb-title").textContent = g && g.rounds.length > 1
     ? `会话 · ${g.rounds.length} 轮 · ${r.key_label}`
-    : `#${r.id} · ${r.key_label}`;
+    : `${roundLabel(r.id)} · ${r.key_label}`;
   // 徽章只在状态签名变化时重建：每 tick replaceWith 会重启 .live 脉冲动画，看起来异常闪烁。
   const st = sessionState(r);
   const sig = `${r.status}|${st.cls}|${st.label}|${st.extra || ""}`;
@@ -845,10 +881,10 @@ function renderSessionRounds(g) {
   for (const r of shown) {
     const chip = el("button", {
       class: `round-chip${r.id === selectedRound ? " selected" : ""}${r.status === "streaming" ? " live" : ""}`,
-      text: `#${r.id}`,
-      title: `${clock(r.started_at_ms)} · ${PHASE_LABEL[r.phase] || r.phase}`,
+      text: roundLabel(r.id),
+      title: `round #${r.id} · ${clock(r.started_at_ms)} · ${PHASE_LABEL[r.phase] || r.phase}`,
     });
-    chip.addEventListener("click", () => openRound(r.id));
+    chip.addEventListener("click", () => openRound(r.id, true));
     chips.push(chip);
   }
   host.replaceChildren(...chips);
