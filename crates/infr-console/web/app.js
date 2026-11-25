@@ -149,6 +149,30 @@ function scheduleRender() {
   renderRaf = requestAnimationFrame(() => { renderRaf = 0; render(); });
 }
 
+function renderUsers() {
+  const tbody = $("#users");
+  if (!tbody || !S) return;
+  const rows = (S.users || []).map((u) => {
+    const tr = el("tr");
+    tr.append(el("td", { text: u.username }));
+    const action = el("td");
+    const del = el("button", { class: "btn danger", text: "删除" });
+    del.addEventListener("click", async () => {
+      if (!confirm(`删除用户 ${u.username}？`)) return;
+      try {
+        await api(`ui/users/${encodeURIComponent(u.username)}`, { method: "DELETE" });
+        toast(`已删除用户 ${u.username}`, "ok");
+        location.reload();
+      } catch (e) { toast(e.message, "bad"); }
+    });
+    action.append(del);
+    tr.append(action);
+    return tr;
+  });
+  tbody.replaceChildren(...rows);
+  if (!rows.length) tbody.append(el("tr", {}, el("td", { text: "暂无用户账号" }), el("td")));
+}
+
 function render() {
   if (!S) return;
   renderPill();
@@ -161,6 +185,7 @@ function render() {
   renderRecent();
   renderHistory();
   renderKeys();
+  renderUsers();
   renderLogs();
   renderContext();
   if (selectedRound != null) renderSidebarHead();
@@ -1884,6 +1909,36 @@ $("#vector-download").addEventListener("click", () => {
       refreshVectorStatus();
     }
   });
+});
+
+// ── Login / user accounts ──────────────────────────────────────────────────
+$("#admin-logout").addEventListener("click", async () => {
+  try { await api("ui/logout", { method: "POST" }); } finally { location.href = "/login"; }
+});
+$("#new-user-add").addEventListener("click", async () => {
+  const username = $("#new-user-name").value.trim();
+  const password = $("#new-user-password").value;
+  try {
+    await api("ui/users", { method: "POST", body: { username, password } });
+    $("#new-user-name").value = "";
+    $("#new-user-password").value = "";
+    toast(`已添加用户 ${username}`, "ok");
+    location.reload();
+  } catch (e) { toast(e.message, "bad"); }
+});
+$("#admin-password-save").addEventListener("click", async () => {
+  try {
+    await api("ui/admin/password", {
+      method: "POST",
+      body: {
+        current: $("#admin-current-password").value,
+        new_password: $("#admin-new-password").value,
+      },
+    });
+    $("#admin-current-password").value = "";
+    $("#admin-new-password").value = "";
+    toast("管理口令已更新", "ok");
+  } catch (e) { toast(e.message, "bad"); }
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────

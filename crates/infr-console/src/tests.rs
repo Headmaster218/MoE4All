@@ -8,18 +8,39 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use crate::auth::{AuthState, PasswordRecord, PersistentAuth};
+use crate::crypto::SecureStore;
 use crate::launch::{self, LaunchRequest};
 use crate::state::{now_ms, Console, DeltaKind, Phase, Round, Status};
 use crate::ui;
 
 fn console() -> Arc<Console> {
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
     let (events, _) = tokio::sync::broadcast::channel(64);
     let (state_dirty, _) = tokio::sync::broadcast::channel(8);
+    // One directory per console: the secure store keeps fixed sibling names (`auth.json`,
+    // `keys.json`, `state.key`), so sharing the temp root would let parallel tests clobber
+    // each other's state.
+    let dir = std::env::temp_dir().join(format!(
+        "infr-console-test-{}-{}-{}",
+        now_ms(),
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state_path = dir.join("state.json");
+    let store = Arc::new(SecureStore::new(&state_path).unwrap());
+    let auth = AuthState::from_persistent(PersistentAuth {
+        admin: Some(PasswordRecord::new("test-admin")),
+        users: Vec::new(),
+    });
     Arc::new(Console {
         upstream: Mutex::new("http://127.0.0.1:1".into()),
         upstream_key: Mutex::new(None),
         binary: std::path::PathBuf::from("infr-test-does-not-exist"),
-        state_path: std::env::temp_dir().join(format!("infr-console-test-{}.json", now_ms())),
+        state_path: state_path.clone(),
+        store,
+        auth: Mutex::new(auth),
         http: reqwest::Client::new(),
         keys: Mutex::new(Vec::new()),
         rounds: Mutex::new(Default::default()),
@@ -405,7 +426,7 @@ fn settings_persist_and_restore() {
         restored.set.get("kv.type_k").map(String::as_str),
         Some("q8_0")
     );
-    let _ = std::fs::remove_file(console.settings_path());
+    let _ = std::fs::remove_dir_all(console.state_path.parent().unwrap());
     let _ = std::fs::remove_file(&console.state_path);
 }
 
@@ -514,6 +535,40 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
 async fn key_lifecycle_and_the_consent_gate() {
     let console = console();
     let app = ui::router(Arc::clone(&console));
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ui/state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"password":"test-admin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
 
     let added = app
         .clone()
@@ -521,6 +576,7 @@ async fn key_lifecycle_and_the_consent_gate() {
             Request::builder()
                 .method("POST")
                 .uri("/ui/keys")
+                .header("cookie", &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"label":"android","token":"sk-console-fixed"}"#,
@@ -540,6 +596,7 @@ async fn key_lifecycle_and_the_consent_gate() {
                 Request::builder()
                     .method("POST")
                     .uri("/ui/uncensor")
+                    .header("cookie", &cookie)
                     .header("content-type", "application/json")
                     .body(Body::from(body))
                     .unwrap(),
@@ -555,6 +612,7 @@ async fn key_lifecycle_and_the_consent_gate() {
             Request::builder()
                 .method("POST")
                 .uri("/ui/uncensor")
+                .header("cookie", &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"on":true,"consent":false}"#))
                 .unwrap(),
@@ -568,6 +626,7 @@ async fn key_lifecycle_and_the_consent_gate() {
             Request::builder()
                 .method("POST")
                 .uri("/ui/uncensor")
+                .header("cookie", &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"on":true,"consent":true}"#))
                 .unwrap(),
@@ -583,6 +642,7 @@ async fn key_lifecycle_and_the_consent_gate() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/ui/keys/{id}"))
+                .header("cookie", &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -590,7 +650,103 @@ async fn key_lifecycle_and_the_consent_gate() {
         .unwrap();
     assert_eq!(deleted.status(), StatusCode::OK);
     assert!(console.keys.lock().unwrap().is_empty());
-    let _ = std::fs::remove_file(&console.state_path);
+    let _ = std::fs::remove_dir_all(console.state_path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn user_session_is_independent_from_admin() {
+    let console = console();
+    let app = ui::router(Arc::clone(&console));
+    let admin_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"password":"test-admin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let admin_cookie = admin_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/users")
+                .header("cookie", &admin_cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":"alice","password":"password123"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let user_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/user/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":"alice","password":"password123"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_login.status(), StatusCode::OK);
+    let user_cookie = user_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let me = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ui/user/me")
+                .header("cookie", &user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+
+    let admin_route = app
+        .oneshot(
+            Request::builder()
+                .uri("/ui/state")
+                .header("cookie", &user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_route.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

@@ -246,7 +246,9 @@ pub async fn schema(console: &Arc<Console>) -> anyhow::Result<serde_json::Value>
     }
     let binary = console.binary.clone();
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&binary).arg("config-schema").output()
+        std::process::Command::new(&binary)
+            .arg("config-schema")
+            .output()
     })
     .await??;
     if !output.status.success() {
@@ -323,7 +325,10 @@ pub fn build_args(
     fields: &[serde_json::Value],
     shutdown_file: &std::path::Path,
 ) -> anyhow::Result<Vec<String>> {
-    if !matches!(req.preset.as_str(), "conservative" | "aggressive" | "manual") {
+    if !matches!(
+        req.preset.as_str(),
+        "conservative" | "aggressive" | "manual"
+    ) {
         anyhow::bail!("未知的配置方式：{}", req.preset);
     }
     let known: std::collections::HashSet<&str> = fields
@@ -342,7 +347,10 @@ pub fn build_args(
         }
     }
     let effective = |path: &str, default: &str| -> String {
-        req.set.get(path).cloned().unwrap_or_else(|| default.to_string())
+        req.set
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
     };
 
     let mut args = vec!["serve".to_string()];
@@ -377,7 +385,10 @@ pub fn build_args(
     // A config file is the base layer and `--set` outranks it, so a full dump would shadow every
     // value in the file. With `cli:config` set, emit only the operator's touched deltas and let the
     // file supply the rest; without it, keep the full explicit dump.
-    let has_config = req.set.get("cli:config").is_some_and(|v| !v.trim().is_empty());
+    let has_config = req
+        .set
+        .get("cli:config")
+        .is_some_and(|v| !v.trim().is_empty());
     if has_config {
         for (path, value) in &req.set {
             if path.starts_with("cli:")
@@ -393,7 +404,10 @@ pub fn build_args(
     } else {
         for f in fields {
             let path = f["path"].as_str().unwrap_or("");
-            if path.starts_with("cli:") || path == "serve.shutdown_file" || path.ends_with("_specified") {
+            if path.starts_with("cli:")
+                || path == "serve.shutdown_file"
+                || path.ends_with("_specified")
+            {
                 continue;
             }
             if path == "device.auto_profile" && req.preset != "manual" {
@@ -418,7 +432,10 @@ pub fn build_args(
 /// the `serve.api_key` secret. Unset Options (`none`) are omitted so the engine's own defaults stay
 /// in force. The engine ignores unknown keys, so a file written for one version loads on the next.
 pub fn build_toml(req: &LaunchRequest, fields: &[serde_json::Value]) -> anyhow::Result<String> {
-    if !matches!(req.preset.as_str(), "conservative" | "aggressive" | "manual") {
+    if !matches!(
+        req.preset.as_str(),
+        "conservative" | "aggressive" | "manual"
+    ) {
         anyhow::bail!("未知的配置方式：{}", req.preset);
     }
     let mut root = toml::Table::new();
@@ -433,14 +450,20 @@ pub fn build_toml(req: &LaunchRequest, fields: &[serde_json::Value]) -> anyhow::
         }
         let ty = f["ty"].as_str().unwrap_or("String");
         let default = f["default"].as_str().unwrap_or("none");
-        let mut value = req.set.get(path).cloned().unwrap_or_else(|| default.to_string());
+        let mut value = req
+            .set
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| default.to_string());
         if path == "device.auto_profile" && req.preset != "manual" {
             value = req.preset.clone();
         }
         if value.is_empty() || value == "none" {
             continue;
         }
-        let Some(scalar) = toml_scalar(ty, &value) else { continue };
+        let Some(scalar) = toml_scalar(ty, &value) else {
+            continue;
+        };
         let parts: Vec<&str> = path.split('.').collect();
         insert_nested(&mut root, &parts, scalar);
     }
@@ -474,7 +497,10 @@ fn insert_nested(root: &mut toml::Table, parts: &[&str], value: toml::Value) {
 /// a hard error on load, so numeric/bool knobs must not be quoted and string grammars (SizeSpec,
 /// DType, paths) must be. `None` = a value this field cannot hold; the caller omits it.
 fn toml_scalar(ty: &str, raw: &str) -> Option<toml::Value> {
-    let inner = ty.strip_prefix("Option<").and_then(|s| s.strip_suffix('>')).unwrap_or(ty);
+    let inner = ty
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(ty);
     match inner {
         "bool" => raw.parse::<bool>().ok().map(toml::Value::Boolean),
         "f32" | "f64" => raw.parse::<f64>().ok().map(toml::Value::Float),
@@ -528,12 +554,19 @@ pub fn parse_toml(text: &str, fields: &[serde_json::Value]) -> anyhow::Result<La
 
     let preset = preset_from_header(text)
         .or_else(|| {
-            leaves.get("device.auto_profile").and_then(|v| v.as_str()).and_then(|p| {
-                matches!(p, "conservative" | "aggressive" | "manual").then(|| p.to_string())
-            })
+            leaves
+                .get("device.auto_profile")
+                .and_then(|v| v.as_str())
+                .and_then(|p| {
+                    matches!(p, "conservative" | "aggressive" | "manual").then(|| p.to_string())
+                })
         })
         .unwrap_or_else(|| "conservative".to_string());
-    Ok(LaunchRequest { preset, set, consent: false })
+    Ok(LaunchRequest {
+        preset,
+        set,
+        consent: false,
+    })
 }
 
 /// Walk nested tables into `section.sub.key -> leaf`, the exact shape `insert_nested` wrote. A parent
@@ -543,7 +576,11 @@ fn flatten_toml(value: &toml::Value, prefix: &str, out: &mut BTreeMap<String, to
     match value {
         toml::Value::Table(table) => {
             for (k, v) in table {
-                let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                let path = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
                 flatten_toml(v, &path, out);
             }
         }
@@ -589,11 +626,19 @@ fn preset_from_header(text: &str) -> Option<String> {
     }
 }
 
-pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result<serde_json::Value> {
+pub async fn start(
+    console: &Arc<Console>,
+    req: LaunchRequest,
+) -> anyhow::Result<serde_json::Value> {
     if console.child.lock().unwrap().is_some() {
         anyhow::bail!("引擎已由控制台启动，先停止再改参数");
     }
-    if req.set.get("uncensor.vector").is_some_and(|v| !v.is_empty()) && !req.consent {
+    if req
+        .set
+        .get("uncensor.vector")
+        .is_some_and(|v| !v.is_empty())
+        && !req.consent
+    {
         anyhow::bail!("开启去审查投影需要先勾选风险同意");
     }
     let payload = schema(console).await?;
@@ -619,7 +664,9 @@ pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|e| anyhow::anyhow!("启动 {} 失败：{e}", console.binary.display()))?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("启动 {} 失败：{e}", console.binary.display()))?;
     let pid = child.id();
 
     if let Some(stdout) = child.stdout.take() {
@@ -637,7 +684,11 @@ pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result
         .cloned()
         .unwrap_or_else(|| "127.0.0.1:8080".into());
     *console.upstream.lock().unwrap() = format!("http://{addr}");
-    let key = req.set.get("serve.api_key").filter(|v| !v.is_empty()).cloned();
+    let key = req
+        .set
+        .get("serve.api_key")
+        .filter(|v| !v.is_empty())
+        .cloned();
     *console.upstream_key.lock().unwrap() = key;
     *console.shutdown_file.lock().unwrap() = Some(shutdown_file);
     *console.child.lock().unwrap() = Some(child);
@@ -654,7 +705,11 @@ pub async fn start(console: &Arc<Console>, req: LaunchRequest) -> anyhow::Result
         engine.running = true;
         engine.pid = pid;
     }
-    console.log(format!("引擎已启动 pid={pid:?}：{} {}", console.binary.display(), args.join(" ")));
+    console.log(format!(
+        "引擎已启动 pid={pid:?}：{} {}",
+        console.binary.display(),
+        args.join(" ")
+    ));
     Ok(serde_json::json!({ "pid": pid, "args": args }))
 }
 

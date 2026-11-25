@@ -6,6 +6,8 @@
 //! knows about resources comes from the engine's `/internal/stats`, so it builds and runs on a box
 //! with no GPU, no Vulkan SDK and no model.
 
+mod auth;
+mod crypto;
 mod launch;
 mod proxy;
 mod state;
@@ -47,6 +49,10 @@ struct Cli {
     /// Where client API keys and their counters are persisted.
     #[arg(long)]
     state: Option<PathBuf>,
+    /// Initial admin web password. Only used when no console has been bootstrapped yet;
+    /// otherwise generate one at startup and print it once.
+    #[arg(long)]
+    admin_password: Option<String>,
 }
 
 #[tokio::main]
@@ -58,14 +64,26 @@ async fn main() -> anyhow::Result<()> {
 
     let binary = cli.binary.unwrap_or_else(default_binary);
     let state_path = cli.state.unwrap_or_else(default_state_path);
-    let keys = load_keys(&state_path);
+    let store = Arc::new(crypto::SecureStore::new(&state_path)?);
+    let keys = store.load("keys.json").unwrap_or_default();
+    let mut persisted_auth: auth::PersistentAuth = store.load("auth.json").unwrap_or_default();
+    let generated_password = if persisted_auth.admin.is_none() {
+        let password = auth::bootstrap_password(cli.admin_password);
+        persisted_auth.admin = Some(auth::PasswordRecord::new(&password));
+        store.save("auth.json", &persisted_auth)?;
+        Some(password)
+    } else {
+        None
+    };
     let (events, _) = broadcast::channel(4096);
     let (state_dirty, _) = broadcast::channel(8);
     let console = Arc::new(Console {
         upstream: Mutex::new(cli.upstream.trim_end_matches('/').to_string()),
         upstream_key: Mutex::new(cli.upstream_key),
         binary,
-        state_path,
+        state_path: state_path.clone(),
+        store: Arc::clone(&store),
+        auth: Mutex::new(auth::AuthState::from_persistent(persisted_auth)),
         http: reqwest::Client::builder()
             .pool_max_idle_per_host(8)
             .build()?,
@@ -93,6 +111,10 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("INFR Console  http://{}", listener.local_addr()?);
+    println!("用户端入口    http://{}/user", listener.local_addr()?);
+    if let Some(password) = generated_password {
+        println!("管理端初始口令（仅此次显示）：{password}");
+    }
     println!("上游引擎      {}", console.upstream());
     println!("引擎二进制    {}", console.binary.display());
     axum::serve(listener, app).await?;
@@ -117,13 +139,6 @@ fn default_state_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("infr-console")
         .join("keys.json")
-}
-
-fn load_keys(path: &std::path::Path) -> Vec<state::ApiKey> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
 }
 
 /// 1 Hz engine poll. Reads `/internal/stats`, which is non-consuming: it must not steal the terminal

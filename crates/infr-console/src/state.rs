@@ -12,6 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::auth::AuthState;
+use crate::crypto::SecureStore;
+
 /// Rounds kept for the history list. Older ones are dropped whole, frames and all.
 const ROUND_CAP: usize = 500;
 /// SSE frames kept per round. A long generation exceeds this; the record says so rather than
@@ -580,6 +583,10 @@ pub struct Console {
     pub upstream_key: Mutex<Option<String>>,
     pub binary: std::path::PathBuf,
     pub state_path: std::path::PathBuf,
+    /// Encrypted local state store for keys, settings and login records.
+    pub store: std::sync::Arc<SecureStore>,
+    /// Login records and in-memory sessions. Never serialized directly.
+    pub auth: Mutex<AuthState>,
     pub http: reqwest::Client,
     pub keys: Mutex<Vec<ApiKey>>,
     pub rounds: Mutex<VecDeque<Round>>,
@@ -730,39 +737,18 @@ impl Console {
 
     pub fn save_keys(&self) -> anyhow::Result<()> {
         let keys = self.keys.lock().unwrap().clone();
-        let json = serde_json::to_string_pretty(&keys)?;
-        if let Some(parent) = self.state_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.state_path, json)?;
-        Ok(())
+        self.store.save("keys.json", &keys)
     }
 
     /// Launch settings live beside the keys file, in the same console state directory. A separate
-    /// file keeps the keys payload (which the proxy rewrites on every counter fold) from carrying
+    /// entry keeps the keys payload (which the proxy rewrites on every counter fold) from carrying
     /// the whole knob tree, and lets settings survive even when no key has been created yet.
-    pub fn settings_path(&self) -> std::path::PathBuf {
-        self.state_path
-            .parent()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("settings.json")
-    }
-
     pub fn load_settings(&self) -> Settings {
-        std::fs::read_to_string(self.settings_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        self.store.load("settings.json").unwrap_or_default()
     }
 
     pub fn save_settings(&self, settings: &Settings) -> anyhow::Result<()> {
-        let path = self.settings_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(settings)?)?;
-        Ok(())
+        self.store.save("settings.json", settings)
     }
 
     /// Close out rounds whose stream will never end because the engine process is gone. A history

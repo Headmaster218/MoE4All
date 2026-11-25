@@ -80,7 +80,11 @@ pub async fn download(console: &Arc<Console>, dest: Option<PathBuf>) -> anyhow::
         let url = format!("{origin}/{REPO}/resolve/main/{FILE}");
         // The origin can be a black hole on some machines; give it a short attempt and the mirror a
         // longer one — the wizard's 1×8 s / 3×30 s ladder, collapsed to one try per endpoint.
-        let timeout = if *origin == "https://huggingface.co" { Duration::from_secs(20) } else { Duration::from_secs(120) };
+        let timeout = if *origin == "https://huggingface.co" {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(120)
+        };
         console.log(format!("获取去审查向量：{url}"));
         let resp = match client.get(&url).timeout(timeout).send().await {
             Ok(resp) => resp,

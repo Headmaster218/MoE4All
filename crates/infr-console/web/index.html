@@ -22,6 +22,7 @@
     <button class="tab" role="tab" data-view="history" aria-selected="false">历史</button>
     <button class="tab" role="tab" data-view="context" aria-selected="false">上下文</button>
     <button class="tab" role="tab" data-view="keys" aria-selected="false">API Keys</button>
+    <button class="tab" role="tab" data-view="users" aria-selected="false">用户</button>
     <button class="tab" role="tab" data-view="launch" aria-selected="false">启动参数</button>
     <button class="tab" role="tab" data-view="logs" aria-selected="false">日志</button>
   </nav>
@@ -29,6 +30,7 @@
   <span class="pill" id="engine-pill"><i class="dot"></i><span>连接中…</span></span>
   <button class="icon-btn" id="uncensor-toggle" title="逐请求注入去审查投影">去审查：关</button>
   <button class="icon-btn" id="theme-toggle" title="深色 / 浅色">◐</button>
+  <button class="icon-btn" id="admin-logout" title="退出管理端">退出</button>
 </header>
 
 <div class="layout">
@@ -169,6 +171,48 @@
           </tr></thead>
           <tbody id="keys"></tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- ── 用户端账号 ───────────────────────────────────────────────── -->
+    <section data-pane="users" hidden>
+      <div class="card">
+        <h2>用户端账号</h2>
+        <div class="row">
+          <div class="field" style="flex:1;min-width:160px;margin:0">
+            <label for="new-user-name">用户名</label>
+            <input type="text" id="new-user-name" placeholder="alice">
+          </div>
+          <div class="field" style="flex:2;min-width:220px;margin:0">
+            <label for="new-user-password">密码（至少 8 字符）</label>
+            <input type="password" id="new-user-password" autocomplete="new-password">
+          </div>
+          <button class="btn" id="new-user-add" style="align-self:flex-end">添加用户</button>
+        </div>
+        <p class="doc" style="color:var(--text-faint);font-size:12px;margin:10px 0 0">
+          用户账号只用于 <a href="/user" style="color:var(--accent)">/user 用户端入口</a>，与 API Key、管理口令互相独立。
+        </p>
+      </div>
+      <div class="card">
+        <h2>用户列表</h2>
+        <table>
+          <thead><tr><th>用户名</th><th></th></tr></thead>
+          <tbody id="users"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>修改管理口令</h2>
+        <div class="row">
+          <div class="field" style="flex:1;min-width:180px;margin:0">
+            <label for="admin-current-password">当前口令</label>
+            <input type="password" id="admin-current-password" autocomplete="current-password">
+          </div>
+          <div class="field" style="flex:1;min-width:180px;margin:0">
+            <label for="admin-new-password">新口令（至少 8 字符）</label>
+            <input type="password" id="admin-new-password" autocomplete="new-password">
+          </div>
+          <button class="btn" id="admin-password-save" style="align-self:flex-end">保存</button>
+        </div>
       </div>
     </section>
 
