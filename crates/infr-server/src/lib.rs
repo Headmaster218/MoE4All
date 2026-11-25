@@ -4556,12 +4556,12 @@ mod tests {
         assert!(frame.contains("KV 1/2"));
         assert!(frame.contains("KV 2/2"));
         assert!(frame.contains("Embedding"));
-        assert!(frame.contains("#17 Qwen3.8-Flash-Next"));
+        assert!(frame.contains("#017 Qwen3.8-Flash-Next"));
         assert!(frame.contains("Decode"));
         assert!(frame.contains("Speed (now)"));
         assert!(frame.contains("40.0 tok/s"));
         assert!(frame.contains("50,057 / 160,000"));
-        assert!(frame.contains("#18 3 input(s)"));
+        assert!(frame.contains("#018 3 input(s)"));
         assert!(frame.contains("decode 40.0 tok/s"));
 
         let stalled = dashboard.render(&StatsWindow {
@@ -4576,8 +4576,8 @@ mod tests {
         drop(embedding);
         let idle = dashboard.render(&StatsWindow::default());
         assert_eq!(idle.matches("Idle").count(), 3);
-        assert!(!idle.contains("#17"));
-        assert!(!idle.contains("#18"));
+        assert!(!idle.contains("#017"));
+        assert!(!idle.contains("#018"));
     }
 
     fn live_progress_snapshot(
