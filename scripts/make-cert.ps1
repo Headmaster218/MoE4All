@@ -34,7 +34,11 @@ if ($IpAddresses.Count -eq 0) {
     $IpAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
         Select-Object -ExpandProperty IPAddress -Unique)
-    if ($IpAddresses.Count -eq 0) { $IpAddresses = @('127.0.0.1') }
+}
+# Loopback is always kept: scripts and health probes that talk to 127.0.0.1 must not fail
+# hostname verification just because the machine also has LAN addresses.
+if ($IpAddresses -notcontains '127.0.0.1') {
+    $IpAddresses = @('127.0.0.1') + $IpAddresses
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
