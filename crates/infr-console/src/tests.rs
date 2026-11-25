@@ -41,6 +41,7 @@ fn console() -> Arc<Console> {
         state_path: state_path.clone(),
         store,
         auth: Mutex::new(auth),
+        tls: false,
         http: reqwest::Client::new(),
         keys: Mutex::new(Vec::new()),
         rounds: Mutex::new(Default::default()),

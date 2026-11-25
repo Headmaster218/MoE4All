@@ -255,8 +255,9 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-pub fn cookie_header(name: &str, token: &str, max_age: u64) -> String {
-    // `Secure` is intentionally absent: the console listens on plain HTTP by default. `HttpOnly`
-    // and `SameSite=Strict` still stop scripts and cross-site requests from using the session.
-    format!("{name}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}")
+pub fn cookie_header(name: &str, token: &str, max_age: u64, secure: bool) -> String {
+    // `Secure` is only set when the listener terminates TLS itself; on plain HTTP the browser would
+    // drop the cookie and logins would silently fail. `HttpOnly` and `SameSite=Strict` always apply.
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{name}={token}; Path=/; HttpOnly{secure}; SameSite=Strict; Max-Age={max_age}")
 }

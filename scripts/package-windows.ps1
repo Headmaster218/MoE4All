@@ -72,6 +72,7 @@ if (-not $WithoutConsole) {
 $rootFiles = @(
     'Start-INFR-Wizard.cmd'
     'enable-lan-access.cmd'
+    'make-cert.cmd'
     'README.md'
     'README_EN.md'
     'CHANGELOG.md'
@@ -105,6 +106,7 @@ if (-not (Test-Path -LiteralPath $windowLauncherPath -PathType Leaf)) {
 $packagedScripts = @(
     'moe4all.ico'
     'benchmark-hardware.ps1'
+    'make-cert.ps1'
     'infr-wizard.ps1'
     'infr-dashboard.ps1'
     'infr-dashboard-state.ps1'

@@ -23,6 +23,7 @@ $requiredPaths = @(
     $binaryPath
     (Join-Path $PackageRoot 'infr-console.exe')
     (Join-Path $PackageRoot 'enable-lan-access.cmd')
+    (Join-Path $PackageRoot 'make-cert.cmd')
     $wizardPath
     $updateCommonPath
     $updateHelperPath
@@ -50,6 +51,8 @@ $requiredManagedPaths = @(
     'infr.exe'
     'infr-console.exe'
     'enable-lan-access.cmd'
+    'make-cert.cmd'
+    'scripts/make-cert.ps1'
     'Start-INFR-Wizard.cmd'
     'MoE4All Engine.exe'
     'scripts/moe4all.ico'

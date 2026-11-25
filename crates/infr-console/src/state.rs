@@ -587,6 +587,8 @@ pub struct Console {
     pub store: std::sync::Arc<SecureStore>,
     /// Login records and in-memory sessions. Never serialized directly.
     pub auth: Mutex<AuthState>,
+    /// True when the listener terminates TLS, which adds `Secure` to session cookies and HSTS.
+    pub tls: bool,
     pub http: reqwest::Client,
     pub keys: Mutex<Vec<ApiKey>>,
     pub rounds: Mutex<VecDeque<Round>>,

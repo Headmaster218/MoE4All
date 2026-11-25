@@ -13,6 +13,7 @@ mod proxy;
 mod state;
 #[cfg(test)]
 mod tests;
+mod tls;
 mod ui;
 mod vector;
 
@@ -56,6 +57,49 @@ struct Cli {
     /// otherwise generate one at startup and print it once.
     #[arg(long)]
     admin_password: Option<String>,
+    /// PEM certificate chain for serving HTTPS on `--listen`.
+    #[arg(long, value_name = "FILE")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key matching `--tls-cert`.
+    #[arg(long, value_name = "FILE")]
+    tls_key: Option<PathBuf>,
+    /// Serve HTTPS with `certs/console-cert.pem` and `certs/console-key.pem` beside the state file.
+    #[arg(long)]
+    tls: bool,
+}
+
+impl Cli {
+    /// Resolve the TLS key pair. `--tls` is a shortcut for the conventional paths written by
+    /// `scripts/make-cert.ps1`, so the packaged launcher only needs one flag.
+    fn tls_files(
+        &self,
+        state_path: &std::path::Path,
+    ) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => return Ok(Some((cert.clone(), key.clone()))),
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("--tls-cert 与 --tls-key 必须同时提供")
+            }
+            (None, None) => {}
+        }
+        if !self.tls {
+            return Ok(None);
+        }
+        let dir = state_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let cert = dir.join("certs").join("console-cert.pem");
+        let key = dir.join("certs").join("console-key.pem");
+        if !cert.is_file() || !key.is_file() {
+            anyhow::bail!(
+                "未找到 {} 或 {}；先运行 scripts/make-cert.ps1 生成自签证书",
+                cert.display(),
+                key.display()
+            );
+        }
+        Ok(Some((cert, key)))
+    }
 }
 
 #[tokio::main]
@@ -65,8 +109,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
 
+    let state_path = cli.state.clone().unwrap_or_else(default_state_path);
+    let tls_files = cli.tls_files(&state_path)?;
     let binary = cli.binary.unwrap_or_else(default_binary);
-    let state_path = cli.state.unwrap_or_else(default_state_path);
     let store = Arc::new(crypto::SecureStore::new(&state_path)?);
     let keys = store.load("keys.json").unwrap_or_default();
     let mut persisted_auth: auth::PersistentAuth = store.load("auth.json").unwrap_or_default();
@@ -87,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         state_path: state_path.clone(),
         store: Arc::clone(&store),
         auth: Mutex::new(auth::AuthState::from_persistent(persisted_auth)),
+        tls: tls_files.is_some(),
         http: reqwest::Client::builder()
             .pool_max_idle_per_host(8)
             .build()?,
@@ -122,12 +168,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(addr.ip())
     };
+    let scheme = if tls_files.is_some() { "https" } else { "http" };
     match advertised {
-        Some(ip) => println!("INFR Console  http://{ip}:{port}"),
+        Some(ip) => println!("INFR Console  {scheme}://{ip}:{port}"),
         None => println!("INFR Console  监听 {}，未检测到局域网地址", cli.listen),
     }
     println!(
-        "用户端入口    http://{}:{port}/user",
+        "用户端入口    {scheme}://{}:{port}/user",
         advertised
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into())
@@ -142,12 +189,28 @@ async fn main() -> anyhow::Result<()> {
                 "其他网卡地址  {}",
                 hosts
                     .iter()
-                    .map(|ip| format!("http://{ip}:{port}"))
+                    .map(|ip| format!("{scheme}://{ip}:{port}"))
                     .collect::<Vec<_>>()
                     .join("  ")
             );
         }
-        println!("安全提示      管理端与用户端都需要登录；HTTP 为明文传输，跨不可信网络请在前面加 TLS 反向代理。");
+        if tls_files.is_some() {
+            println!("安全提示      已启用 HTTPS；自签证书首次访问需在浏览器里手动信任。");
+        } else {
+            let helper = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("make-cert.cmd")))
+                .filter(|path| path.is_file());
+            match helper {
+                Some(path) => println!(
+                    "安全提示      管理端与用户端都需要登录；需要 HTTPS 时先运行 {}，再加 --tls 启动。",
+                    path.display()
+                ),
+                None => println!(
+                    "安全提示      管理端与用户端都需要登录；HTTP 为明文传输，公网访问请加 --tls-cert/--tls-key。"
+                ),
+            }
+        }
         #[cfg(windows)]
         {
             let helper = std::env::current_exe()
@@ -167,7 +230,14 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("上游引擎      {}", console.upstream());
     println!("引擎二进制    {}", console.binary.display());
-    axum::serve(listener, app).await?;
+    match tls_files {
+        Some((cert, key)) => {
+            let config = tls::server_config(&cert, &key)?;
+            println!("TLS 证书      {}（{}）", cert.display(), key.display());
+            tls::serve(app, listener, config).await?;
+        }
+        None => axum::serve(listener, app).await?,
+    }
     Ok(())
 }
 

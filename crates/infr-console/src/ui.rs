@@ -87,7 +87,24 @@ pub fn router(console: Arc<Console>) -> axum::Router {
         // A screenshot turn carries tens of megabytes of base64; axum's 2 MiB default would reject
         // it before the engine ever saw it. The engine applies its own limit downstream.
         .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(from_fn_with_state(Arc::clone(&console), security_headers))
         .with_state(console)
+}
+
+/// Only meaningful on the TLS listener: tells the browser to keep using HTTPS for this host.
+async fn security_headers(
+    State(console): State<Arc<Console>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if console.tls {
+        response.headers_mut().insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    response
 }
 
 async fn require_admin(
@@ -195,7 +212,7 @@ async fn admin_login(
     let token = console.auth.lock().unwrap().issue_admin();
     with_cookie(
         Json(serde_json::json!({ "ok": true })).into_response(),
-        auth::cookie_header(ADMIN_COOKIE, &token, 12 * 60 * 60),
+        auth::cookie_header(ADMIN_COOKIE, &token, 12 * 60 * 60, console.tls),
     )
 }
 
@@ -204,7 +221,7 @@ async fn admin_logout(State(console): State<Arc<Console>>, request: Request) -> 
     console.auth.lock().unwrap().revoke_admin(token.as_deref());
     with_cookie(
         Json(serde_json::json!({ "ok": true })).into_response(),
-        auth::cookie_header(ADMIN_COOKIE, "", 0),
+        auth::cookie_header(ADMIN_COOKIE, "", 0, console.tls),
     )
 }
 
@@ -233,7 +250,7 @@ async fn user_login(
     };
     with_cookie(
         Json(serde_json::json!({ "ok": true, "username": body.username })).into_response(),
-        auth::cookie_header(USER_COOKIE, &token, 12 * 60 * 60),
+        auth::cookie_header(USER_COOKIE, &token, 12 * 60 * 60, console.tls),
     )
 }
 
@@ -242,7 +259,7 @@ async fn user_logout(State(console): State<Arc<Console>>, request: Request) -> R
     console.auth.lock().unwrap().revoke_user(token.as_deref());
     with_cookie(
         Json(serde_json::json!({ "ok": true })).into_response(),
-        auth::cookie_header(USER_COOKIE, "", 0),
+        auth::cookie_header(USER_COOKIE, "", 0, console.tls),
     )
 }
 
