@@ -1670,7 +1670,7 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
                 (
                     format!(
                         "#{:03} {}",
-                        display_req_id(req_id),
+                        display_req_id(*req_id),
                         abbreviated(slot.model.as_ref(), 22)
                     ),
                     live.phase.to_owned(),
@@ -1683,7 +1683,7 @@ fn render_activity_table(slots: &[DashboardSlot], window: &StatsWindow) -> Strin
                 inputs,
                 started,
             }) => (
-                format!("#{:03} {inputs} input(s)", display_req_id(req_id)),
+                format!("#{:03} {inputs} input(s)", display_req_id(*req_id)),
                 "Embedding".to_owned(),
                 format!("{:.1}s", started.elapsed().as_secs_f64()),
                 "-".to_owned(),
