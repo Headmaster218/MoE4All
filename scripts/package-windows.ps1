@@ -71,6 +71,7 @@ if (-not $WithoutConsole) {
 
 $rootFiles = @(
     'Start-INFR-Wizard.cmd'
+    'start-webui.cmd'
     'enable-lan-access.cmd'
     'make-cert.cmd'
     'README.md'

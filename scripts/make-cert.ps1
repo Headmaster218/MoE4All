@@ -112,4 +112,5 @@ if ($Trust) {
 }
 
 Write-Output ''
-Write-Output 'Next: start the console with --tls, or pass these two files with --tls-cert / --tls-key.'
+Write-Output 'Done. Restart the console (start-webui.cmd or infr-console.exe) and it will use HTTPS automatically.'
+Write-Output 'Pass --no-tls to force plain HTTP when a certificate is present.'

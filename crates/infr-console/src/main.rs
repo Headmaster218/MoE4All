@@ -63,14 +63,19 @@ struct Cli {
     /// PEM private key matching `--tls-cert`.
     #[arg(long, value_name = "FILE")]
     tls_key: Option<PathBuf>,
-    /// Serve HTTPS with `certs/console-cert.pem` and `certs/console-key.pem` beside the state file.
+    /// Require HTTPS. Certificates are picked up automatically; this only turns a missing
+    /// certificate into a startup error instead of a silent fallback to HTTP.
     #[arg(long)]
     tls: bool,
+    /// Never serve HTTPS, even when a certificate is present.
+    #[arg(long, conflicts_with_all = ["tls", "tls_cert", "tls_key"])]
+    no_tls: bool,
 }
 
 impl Cli {
-    /// Resolve the TLS key pair. `--tls` is a shortcut for the conventional paths written by
-    /// `scripts/make-cert.ps1`, so the packaged launcher only needs one flag.
+    /// Resolve the TLS key pair. Certificates are found automatically in `<state dir>/certs` (where
+    /// `make-cert.cmd` writes them) or in `certs` beside the executable, so generating one is all it
+    /// takes to switch the console to HTTPS. `--no-tls` opts out.
     fn tls_files(
         &self,
         state_path: &std::path::Path,
@@ -82,23 +87,40 @@ impl Cli {
             }
             (None, None) => {}
         }
-        if !self.tls {
+        if self.no_tls {
             return Ok(None);
         }
-        let dir = state_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let cert = dir.join("certs").join("console-cert.pem");
-        let key = dir.join("certs").join("console-key.pem");
-        if !cert.is_file() || !key.is_file() {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = state_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            dirs.push(parent.join("certs"));
+        }
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        {
+            let portable = exe_dir.join("certs");
+            if !dirs.contains(&portable) {
+                dirs.push(portable);
+            }
+        }
+        for dir in &dirs {
+            let cert = dir.join("console-cert.pem");
+            let key = dir.join("console-key.pem");
+            if cert.is_file() && key.is_file() {
+                return Ok(Some((cert, key)));
+            }
+        }
+        if self.tls {
+            let first = dirs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("certs"));
             anyhow::bail!(
-                "未找到 {} 或 {}；先运行 scripts/make-cert.ps1 生成自签证书",
-                cert.display(),
-                key.display()
+                "已指定 --tls，但 {} 下没有 console-cert.pem / console-key.pem；先运行 make-cert.cmd",
+                first.display()
             );
         }
-        Ok(Some((cert, key)))
+        Ok(None)
     }
 }
 
@@ -111,6 +133,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state_path = cli.state.clone().unwrap_or_else(default_state_path);
     let tls_files = cli.tls_files(&state_path)?;
+    let auto_tls =
+        tls_files.is_some() && cli.tls_cert.is_none() && cli.tls_key.is_none() && !cli.tls;
     let binary = cli.binary.unwrap_or_else(default_binary);
     let store = Arc::new(crypto::SecureStore::new(&state_path)?);
     let keys = store.load("keys.json").unwrap_or_default();
@@ -208,7 +232,11 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         if tls_files.is_some() {
-            println!("安全提示      已启用 HTTPS；自签证书首次访问需在浏览器里手动信任。");
+            if auto_tls {
+                println!("安全提示      检测到证书，已自动启用 HTTPS；自签证书首次访问需在浏览器里手动信任。");
+            } else {
+                println!("安全提示      已启用 HTTPS；自签证书首次访问需在浏览器里手动信任。");
+            }
         } else {
             let helper = std::env::current_exe()
                 .ok()
@@ -216,11 +244,11 @@ async fn main() -> anyhow::Result<()> {
                 .filter(|path| path.is_file());
             match helper {
                 Some(path) => println!(
-                    "安全提示      管理端与用户端都需要登录；需要 HTTPS 时先运行 {}，再加 --tls 启动。",
+                    "安全提示      管理端与用户端都需要登录；需要 HTTPS 时运行 {}，之后每次启动自动使用。",
                     path.display()
                 ),
                 None => println!(
-                    "安全提示      管理端与用户端都需要登录；HTTP 为明文传输，公网访问请加 --tls-cert/--tls-key。"
+                    "安全提示      管理端与用户端都需要登录；HTTP 为明文传输，公网访问请配置证书或 --tls-cert/--tls-key。"
                 ),
             }
         }
