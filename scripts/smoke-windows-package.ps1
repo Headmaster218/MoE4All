@@ -24,6 +24,7 @@ $requiredPaths = @(
     (Join-Path $PackageRoot 'infr-console.exe')
     (Join-Path $PackageRoot 'enable-lan-access.cmd')
     (Join-Path $PackageRoot 'make-cert.cmd')
+    (Join-Path $PackageRoot 'use-tailscale-cert.cmd')
     (Join-Path $PackageRoot 'start-webui.cmd')
     $wizardPath
     $updateCommonPath
@@ -53,8 +54,10 @@ $requiredManagedPaths = @(
     'infr-console.exe'
     'enable-lan-access.cmd'
     'make-cert.cmd'
+    'use-tailscale-cert.cmd'
     'start-webui.cmd'
     'scripts/make-cert.ps1'
+    'scripts/use-tailscale-cert.ps1'
     'Start-INFR-Wizard.cmd'
     'MoE4All Engine.exe'
     'scripts/moe4all.ico'
