@@ -1,0 +1,55 @@
+MOE4ALL-SUBMISSION/1
+kind: error
+schema: error/1
+id: 20261125T123306.332Z-5cbeb1dcb76c971010d2e81465831bd0
+created-at: 2026-11-25T12:33:06.332081300+00:00
+engine: 1.3.0
+encoding: gzip+base64
+decoded-bytes: 7113
+compressed-bytes: 2008
+sha256: 7ae212ef47ffe69b0caaab8e26c6de2f89b6b118d7f59fccd2394e6b15a35944
+summary-count: 5
+summary-001: failure: fatal
+summary-002: model: Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf
+summary-003: device: NVIDIA GeForce RTX 4060 Laptop GPU
+summary-004: description: give me a recursive function in python give me a recursive function in python.
+summary-005: error: after every fixed allocation, 3078.77 MiB is available for the MoE unified arena, but no Prefill chunk from [4096, 3584, 3072, 2560, 2048, 1536, 1024, 512, 256] could be placed physically while retaining dynamic state, one complete Expert l...
+
+-----BEGIN MOE4ALL PAYLOAD-----
+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
+PDTj+j8vmPH+yRsAAA==
+-----END MOE4ALL PAYLOAD-----
