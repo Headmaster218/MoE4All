@@ -71,6 +71,7 @@ if (-not $WithoutConsole) {
 
 $rootFiles = @(
     'Start-INFR-Wizard.cmd'
+    'enable-lan-access.cmd'
     'README.md'
     'README_EN.md'
     'CHANGELOG.md'

@@ -22,6 +22,7 @@ $launcherPath = Join-Path $PackageRoot 'Start-INFR-Wizard.cmd'
 $requiredPaths = @(
     $binaryPath
     (Join-Path $PackageRoot 'infr-console.exe')
+    (Join-Path $PackageRoot 'enable-lan-access.cmd')
     $wizardPath
     $updateCommonPath
     $updateHelperPath
@@ -48,6 +49,7 @@ if ($ExpectedVersion -and [string]$manifest.version -ne $ExpectedVersion) {
 $requiredManagedPaths = @(
     'infr.exe'
     'infr-console.exe'
+    'enable-lan-access.cmd'
     'Start-INFR-Wizard.cmd'
     'MoE4All Engine.exe'
     'scripts/moe4all.ico'

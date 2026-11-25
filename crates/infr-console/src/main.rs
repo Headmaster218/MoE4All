@@ -25,6 +25,8 @@ use std::time::Duration;
 use clap::Parser;
 use tokio::sync::broadcast;
 
+use anyhow::Context;
+
 use state::{Console, EngineView, Series, UncensorState};
 
 #[derive(Parser)]
@@ -34,8 +36,9 @@ use state::{Console, EngineView, Series, UncensorState};
     about = "INFR 推理控制台：反向代理 + 仪表盘 + 图形化启动参数"
 )]
 struct Cli {
-    /// Address the console listens on. Point your client here, not at the engine.
-    #[arg(long, default_value = "127.0.0.1:8090")]
+    /// Address the console listens on. The default accepts connections from other devices on the
+    /// LAN; pass `127.0.0.1:8090` to keep it loopback-only.
+    #[arg(long, default_value = "0.0.0.0:8090")]
     listen: String,
     /// The engine's OpenAI-compatible base URL.
     #[arg(long, default_value = "http://127.0.0.1:8080")]
@@ -109,16 +112,79 @@ async fn main() -> anyhow::Result<()> {
 
     let app = ui::router(Arc::clone(&console));
 
-    let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
-    println!("INFR Console  http://{}", listener.local_addr()?);
-    println!("用户端入口    http://{}/user", listener.local_addr()?);
+    let listener = tokio::net::TcpListener::bind(&cli.listen)
+        .await
+        .with_context(|| format!("无法监听 {}（端口被占用或权限不足）", cli.listen))?;
+    let addr = listener.local_addr()?;
+    let port = addr.port();
+    let advertised = if addr.ip().is_unspecified() {
+        lan_ipv4().into_iter().next()
+    } else {
+        Some(addr.ip())
+    };
+    match advertised {
+        Some(ip) => println!("INFR Console  http://{ip}:{port}"),
+        None => println!("INFR Console  监听 {}，未检测到局域网地址", cli.listen),
+    }
+    println!(
+        "用户端入口    http://{}:{port}/user",
+        advertised
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into())
+    );
     if let Some(password) = generated_password {
         println!("管理端初始口令（仅此次显示）：{password}");
+    }
+    if addr.ip().is_unspecified() {
+        let hosts = lan_ipv4();
+        if hosts.len() > 1 {
+            println!(
+                "其他网卡地址  {}",
+                hosts
+                    .iter()
+                    .map(|ip| format!("http://{ip}:{port}"))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+        }
+        println!("安全提示      管理端与用户端都需要登录；HTTP 为明文传输，跨不可信网络请在前面加 TLS 反向代理。");
+        #[cfg(windows)]
+        {
+            let helper = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("enable-lan-access.cmd")))
+                .filter(|path| path.is_file());
+            match helper {
+                Some(path) => println!(
+                    "Windows 防火墙 其他设备连不上时，右键以管理员身份运行：{}",
+                    path.display()
+                ),
+                None => println!(
+                    "Windows 防火墙 其他设备连不上时，以管理员身份执行：netsh advfirewall firewall add rule name=\"INFR Console\" dir=in action=allow protocol=TCP localport={port}"
+                ),
+            }
+        }
     }
     println!("上游引擎      {}", console.upstream());
     println!("引擎二进制    {}", console.binary.display());
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Best-effort IPv4 address of the interface that carries the default route. UDP `connect` does
+/// not send a packet; it only asks the routing table which local address would be used.
+fn lan_ipv4() -> Vec<std::net::IpAddr> {
+    let mut found = Vec::new();
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = socket.local_addr() {
+                if !local.ip().is_loopback() && !local.ip().is_unspecified() {
+                    found.push(local.ip());
+                }
+            }
+        }
+    }
+    found
 }
 
 fn default_binary() -> PathBuf {
