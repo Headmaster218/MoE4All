@@ -1016,3 +1016,56 @@ async fn health_probe_needs_no_console_api_key() {
     assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
     let _ = std::fs::remove_dir_all(console.state_path.parent().unwrap());
 }
+
+fn test_round(id: u64, conv: &str) -> Round {
+    Round {
+        id,
+        key_id: "k".into(),
+        key_label: "k".into(),
+        conv: conv.into(),
+        model: "m".into(),
+        api: "chat",
+        started_at_ms: now_ms(),
+        ended_at_ms: None,
+        status: Status::Done,
+        phase: Phase::Output,
+        tools: Vec::new(),
+        uncensor: false,
+        prompt_tokens: 0,
+        cached_prompt_tokens: 0,
+        completion_tokens: 0,
+        reuse_est: None,
+        ttft_ms: None,
+        live_tps: None,
+        prefill_tps: None,
+        decode_tps: None,
+        duration_ms: None,
+        frames_truncated: false,
+        request: serde_json::Value::Null,
+        frames: Vec::new(),
+        frames_compacted: false,
+        first_delta_ms: None,
+        prefill_ms: None,
+    }
+}
+
+#[test]
+fn rounds_are_capped_per_conversation_not_globally() {
+    let console = console();
+    // One long-running agent conversation beyond the per-conversation cap, plus a short one.
+    for i in 0..140 {
+        console.push_round(test_round(i, "long"));
+    }
+    for i in 140..146 {
+        console.push_round(test_round(i, "short"));
+    }
+    let rounds = console.rounds.lock().unwrap();
+    let long: Vec<_> = rounds.iter().filter(|r| r.conv == "long").collect();
+    let short: Vec<_> = rounds.iter().filter(|r| r.conv == "short").collect();
+    assert_eq!(long.len(), 100, "a single conv must keep only 100 rounds");
+    assert_eq!(short.len(), 6, "a short conv must not be evicted by a long one");
+    // Newest-first: the retained long rounds are ids 40..139, not the first 100.
+    assert_eq!(long.first().unwrap().id, 139);
+    assert_eq!(long.last().unwrap().id, 40);
+    assert_eq!(rounds.front().unwrap().id, 145);
+}

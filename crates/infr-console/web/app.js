@@ -107,6 +107,7 @@ let selectedRound = null;     // id shown in the sidebar
 let selectedConv = null;      // conv of the open session, for the in-sidebar round navigator
 let sbTab = "frames";
 let sbFollow = true;
+let jsonFollowText = "";      // last assembled JSON rendered in the sidebar, for diff-based following
 const DETAIL_CACHE_CAP = 32; // rounds whose raw frames / request body may be held in the browser
 const liveFrames = new Map(); // round id -> [{seq, data}] for the open sidebar
 const roundRequests = new Map(); // round id -> request body (stripped from the 1 Hz state payload)
@@ -765,6 +766,7 @@ function renderContext() {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 function openRound(id) {
+  if (selectedRound !== id) jsonFollowText = "";
   selectedRound = id;
   const r = (S && S.rounds || []).find((r) => r.id === id);
   selectedConv = r ? (r.conv || `r${id}`) : null;
@@ -787,6 +789,7 @@ $("#sb-close").addEventListener("click", () => {
   $("#sidebar").classList.remove("open");
   selectedRound = null;
   selectedConv = null;
+  jsonFollowText = "";
   renderHistory();
 });
 $("#sb-follow").addEventListener("click", (e) => {
@@ -794,6 +797,7 @@ $("#sb-follow").addEventListener("click", (e) => {
   e.currentTarget.setAttribute("aria-pressed", String(sbFollow));
 });
 $$("#sb-tabs .tab").forEach((b) => b.addEventListener("click", () => {
+  jsonFollowText = "";
   sbTab = b.dataset.sb;
   $$("#sb-tabs .tab").forEach((o) => o.setAttribute("aria-selected", String(o === b)));
   renderSidebar();
@@ -822,23 +826,64 @@ function renderSidebarHead() {
 }
 
 // 会话内轮次导航：一个 agent 会话归为一个窗口后，用这排 chip 在它的各轮之间切换（最新在前）。
-// 只在轮次列表或选中项变化时重建，避免每 tick 重绘打断点击/动画。
+// 只保留最近若干轮——长会话每轮一个 chip 会无限换行、把下面的侧栏内容挤没。更多历史仍可从
+// 历史表格点开，这里不负责全量索引。只在轮次列表或选中项变化时重建，避免每 tick 重绘打断点击。
+const ROUND_CHIP_CAP = 16;
 function renderSessionRounds(g) {
   const host = $("#sb-rounds");
   if (!g || g.rounds.length < 2) { host.replaceChildren(); host.hidden = true; return; }
   host.hidden = false;
-  const sig = g.rounds.map((r) => r.id).join(",") + "|" + selectedRound;
+  const shown = g.rounds.slice(0, ROUND_CHIP_CAP);
+  const sig = shown.map((r) => r.id).join(",") + "|" + selectedRound + "|" + g.rounds.length;
   if (host.dataset.sig === sig) return;
   host.dataset.sig = sig;
-  host.replaceChildren(...g.rounds.map((r) => {
+  const chips = [];
+  const hidden = g.rounds.length - shown.length;
+  if (hidden > 0) {
+    chips.push(el("span", { class: "frame-seq round-chip-more", text: `更早 ${hidden} 轮` }));
+  }
+  for (const r of shown) {
     const chip = el("button", {
       class: `round-chip${r.id === selectedRound ? " selected" : ""}${r.status === "streaming" ? " live" : ""}`,
       text: `#${r.id}`,
       title: `${clock(r.started_at_ms)} · ${PHASE_LABEL[r.phase] || r.phase}`,
     });
     chip.addEventListener("click", () => openRound(r.id));
-    return chip;
-  }));
+    chips.push(chip);
+  }
+  host.replaceChildren(...chips);
+}
+
+// Pin the view to the place where new content actually landed, not to the bottom of the object:
+// in an assembled response the growing `text` field sits in the middle, while usage / status
+// fields tail the JSON. Diff the last render against this one, map the first changed character
+// back to a DOM text node, and scroll that node into view with some context above it.
+function followJson(body, text) {
+  if (!sbFollow) return;
+  const prev = jsonFollowText;
+  jsonFollowText = text;
+  const pre = body.querySelector("pre.json");
+  if (!pre) return;
+  if (!prev) { body.scrollTop = body.scrollHeight; return; }
+  let at = 0;
+  const n = Math.min(prev.length, text.length);
+  while (at < n && prev[at] === text[at]) at++;
+  if (at >= text.length) { body.scrollTop = body.scrollHeight; return; }
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+  let node = null, seen = 0;
+  while (walker.nextNode()) {
+    const cur = walker.currentNode;
+    if (seen + cur.nodeValue.length > at) { node = cur; break; }
+    seen += cur.nodeValue.length;
+  }
+  if (!node) { body.scrollTop = body.scrollHeight; return; }
+  const range = document.createRange();
+  const off = Math.min(Math.max(at - seen, 0), Math.max(node.nodeValue.length - 1, 0));
+  range.setStart(node, off);
+  range.setEnd(node, off + 1);
+  const rect = range.getBoundingClientRect();
+  const view = body.getBoundingClientRect();
+  body.scrollTop += rect.top - view.top - view.height * 0.7;
 }
 
 function highlight(json) {
@@ -911,6 +956,12 @@ function assembleResponse(frames) {
       } else if (t === "response.output_text.done") {
         const part = item.content ? item.content[e.content_index ?? 0] : null;
         if (part && typeof e.text === "string") part.text = e.text;
+      } else if (t === "response.function_call_arguments.delta") {
+        // The function_call item was opened by output_item.added; grow its arguments in place so
+        // the JSON tab shows them while streaming instead of only at output_item.done.
+        if (typeof e.delta === "string") item.arguments = (item.arguments || "") + e.delta;
+      } else if (t === "response.function_call_arguments.done") {
+        if (typeof e.arguments === "string") item.arguments = e.arguments;
       }
       continue;
     }
@@ -961,7 +1012,7 @@ function scheduleLiveFrames() {
     if (!r || sbTab !== "frames") return;
     const body = $("#sb-body");
     body.replaceChildren(highlight(assembleResponse(liveFrames.get(r.id) || [])));
-    if (sbFollow) body.scrollTop = body.scrollHeight;
+    followJson(body, body.querySelector("pre.json")?.textContent || "");
   });
 }
 
@@ -1004,6 +1055,7 @@ function renderSidebar() {
       body.append(el("div", { class: "frames-bar" },
         el("span", { class: "frame-seq", text: `由 ${frames.length} 个流式帧聚合` })));
       body.append(highlight(assembleResponse(frames)));
+      followJson(body, body.querySelector("pre.json")?.textContent || "");
     }
   } else if (sbTab === "request") {
     body.append(highlight(roundRequests.get(r.id) || { note: "请求体未保留" }));
@@ -1023,10 +1075,21 @@ function renderSidebar() {
 
 // Fold the SSE deltas back into what the client saw. Both API families land here: Responses emits
 // typed events, Chat Completions emits choices[].delta. Tool arguments arrive one fragment at a
-// time, so they are concatenated per (index) rather than replaced.
+// time, so they are concatenated per call rather than replaced.
+//
+// Responses API tool calls use a different event family entirely — output_item.added(done) carries
+// the name and function_call_arguments.delta(done) carries the arguments. The old version only
+// read choices[].delta.tool_calls, so every Responses round showed "本轮没有工具调用" in the 工具
+// tab even when the model called tools. Key the slots by output_index/call_id so parallel calls
+// do not merge into one.
 function assemble(frames) {
   let content = "", reasoning = "";
   const tools = new Map();
+  const toolSlot = (key) => {
+    const k = String(key ?? 0);
+    if (!tools.has(k)) tools.set(k, { name: "", arguments: "" });
+    return tools.get(k);
+  };
   for (const f of frames) {
     let chunk;
     try { chunk = JSON.parse(f.data); } catch { continue; }
@@ -1039,20 +1102,36 @@ function assemble(frames) {
       content += chunk.delta || "";
       continue;
     }
+    // Responses API: item added/done names the call, arguments arrive as deltas.
+    if (t === "response.output_item.added" || t === "response.output_item.done") {
+      const item = chunk.item;
+      if (item && item.type === "function_call") {
+        // item.id === the item_id carried by function_call_arguments.* — that is the join key.
+        // call_id is client-facing only and never appears on the argument events.
+        const slot = toolSlot(item.id || chunk.output_index || item.call_id);
+        if (typeof item.name === "string" && item.name) slot.name = item.name;
+        if (typeof item.arguments === "string" && item.arguments) slot.arguments = item.arguments;
+      }
+      continue;
+    }
+    if (t === "response.function_call_arguments.delta" || t === "response.function_call_arguments.done") {
+      const slot = toolSlot(chunk.item_id ?? chunk.output_index);
+      if (typeof chunk.delta === "string") slot.arguments += chunk.delta;
+      if (typeof chunk.arguments === "string" && chunk.arguments) slot.arguments = chunk.arguments;
+      continue;
+    }
     for (const choice of chunk.choices || []) {
       const d = choice.delta || {};
       if (typeof d.content === "string") content += d.content;
       if (typeof d.reasoning_content === "string") reasoning += d.reasoning_content;
       for (const tc of d.tool_calls || []) {
-        const i = tc.index ?? 0;
-        const slot = tools.get(i) || { name: "", arguments: "" };
+        const slot = toolSlot(tc.index ?? 0);
         if (tc.function && tc.function.name) slot.name += tc.function.name;
         if (tc.function && tc.function.arguments) slot.arguments += tc.function.arguments;
-        tools.set(i, slot);
       }
     }
   }
-  return { content, reasoning, tools: Array.from(tools.values()) };
+  return { content, reasoning, tools: Array.from(tools.values()).filter((t) => t.name || t.arguments) };
 }
 
 // ── Uncensor hot toggle ────────────────────────────────────────────────────

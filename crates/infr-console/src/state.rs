@@ -15,8 +15,13 @@ use tokio::sync::broadcast;
 use crate::auth::AuthState;
 use crate::crypto::SecureStore;
 
-/// Rounds kept for the history list. Older ones are dropped whole, frames and all.
-const ROUND_CAP: usize = 500;
+/// Hard safety ceiling across every conversation. The per-conversation cap below is what
+/// normally decides what stays; this only bounds the table if a client opens thousands of
+/// distinct conversations.
+const ROUND_CAP: usize = 1000;
+/// Rounds kept for each conversation. Rounds past this are removed from the list outright —
+/// not merely compacted — so an agent loop running for hundreds of turns cannot pile up.
+const ROUNDS_PER_CONVERSATION: usize = 100;
 /// SSE frames kept per round. A long generation exceeds this; the record says so rather than
 /// silently pretending the captured prefix is the whole reply.
 pub(crate) const FRAME_CAP: usize = 4000;
@@ -695,9 +700,27 @@ impl Console {
 
     pub fn push_round(&self, round: Round) {
         let mut rounds = self.rounds.lock().unwrap();
+        let conv = round.conv.clone();
         rounds.push_front(round);
         while rounds.len() > ROUND_CAP {
             rounds.pop_back();
+        }
+        // Per-conversation cap: drop this conversation's oldest turns from the list entirely.
+        // `rounds` is newest-first, so once a conv has more than the cap, delete every later
+        // entry belonging to it. Other conversations must not be disturbed.
+        let mut seen = 0usize;
+        let mut stale = Vec::new();
+        for (i, r) in rounds.iter().enumerate() {
+            if r.conv != conv {
+                continue;
+            }
+            seen += 1;
+            if seen > ROUNDS_PER_CONVERSATION {
+                stale.push(i);
+            }
+        }
+        for i in stale.into_iter().rev() {
+            rounds.remove(i);
         }
         // Newest rounds keep their raw delta stream so the 流式 JSON view stays useful. Finished
         // rounds past the window are folded into one synthetic frame: the assembled reply is kept,
