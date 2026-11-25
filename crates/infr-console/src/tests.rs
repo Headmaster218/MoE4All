@@ -945,3 +945,74 @@ fn aged_rounds_compact_frames_but_keep_the_assembled_reply() {
         "newest round keeps raw frames"
     );
 }
+
+#[tokio::test]
+async fn health_probe_needs_no_console_api_key() {
+    let console = console();
+    let app = ui::router(Arc::clone(&console));
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"password":"test-admin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let added = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ui/keys")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"label":"probe","token":"sk-console-probe"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::OK);
+
+    // The upstream in these tests is a dead port, so a forwarded probe ends as 502. The assertion
+    // that matters is that the console did not reject it for lacking a key.
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(health.status(), StatusCode::UNAUTHORIZED);
+
+    // Every other proxied route still requires a key once one exists.
+    let models = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(console.state_path.parent().unwrap());
+}

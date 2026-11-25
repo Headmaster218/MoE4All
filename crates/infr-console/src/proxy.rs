@@ -41,9 +41,17 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
     };
 
-    let key = match authenticate(&console, &headers) {
-        Ok(k) => k,
-        Err(resp) => return resp,
+    // Liveness stays open end to end. The engine deliberately keeps GET /health unauthenticated
+    // however `serve.api_key` is set, and a probe that has to carry an API key is useless to
+    // load balancers, container healthchecks and uptime monitors.
+    let probe = method == axum::http::Method::GET && path == "/health";
+    let key = if probe {
+        None
+    } else {
+        match authenticate(&console, &headers) {
+            Ok(k) => k,
+            Err(resp) => return resp,
+        }
     };
 
     let tracked = matches!(path.as_str(), "/v1/chat/completions" | "/v1/responses");
