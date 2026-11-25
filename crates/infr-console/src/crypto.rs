@@ -217,6 +217,11 @@ impl SecureStore {
         }
     }
 
+    /// True when the file exists on disk, even if it cannot be decrypted with the current key.
+    pub fn exists(&self, name: &str) -> bool {
+        self.path(name).is_file()
+    }
+
     pub fn save<T: Serialize>(&self, name: &str, value: &T) -> anyhow::Result<()> {
         let bytes = encrypt_json(&self.key, value)?;
         fs::write(self.path(name), bytes)

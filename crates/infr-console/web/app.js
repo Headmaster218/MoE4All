@@ -1937,7 +1937,9 @@ $("#admin-password-save").addEventListener("click", async () => {
     });
     $("#admin-current-password").value = "";
     $("#admin-new-password").value = "";
-    toast("管理口令已更新", "ok");
+    // Changing the password revokes every admin session, this tab included.
+    toast("管理口令已更新，请重新登录", "ok");
+    setTimeout(() => { location.href = "/login"; }, 900);
   } catch (e) { toast(e.message, "bad"); }
 });
 

@@ -53,8 +53,8 @@ struct Cli {
     /// Where client API keys and their counters are persisted.
     #[arg(long)]
     state: Option<PathBuf>,
-    /// Initial admin web password. Only used when no console has been bootstrapped yet;
-    /// otherwise generate one at startup and print it once.
+    /// Pin the admin web password. Without it a random password is generated and printed on every
+    /// start, so a forgotten password only costs a restart.
     #[arg(long)]
     admin_password: Option<String>,
     /// PEM certificate chain for serving HTTPS on `--listen`.
@@ -114,15 +114,27 @@ async fn main() -> anyhow::Result<()> {
     let binary = cli.binary.unwrap_or_else(default_binary);
     let store = Arc::new(crypto::SecureStore::new(&state_path)?);
     let keys = store.load("keys.json").unwrap_or_default();
-    let mut persisted_auth: auth::PersistentAuth = store.load("auth.json").unwrap_or_default();
-    let generated_password = if persisted_auth.admin.is_none() {
-        let password = auth::bootstrap_password(cli.admin_password);
-        persisted_auth.admin = Some(auth::PasswordRecord::new(&password));
-        store.save("auth.json", &persisted_auth)?;
-        Some(password)
-    } else {
-        None
+    let mut persisted_auth: auth::PersistentAuth = match store.load("auth.json") {
+        Some(auth) => auth,
+        // A file that exists but will not decrypt means the key changed or the file was edited.
+        // Refusing is better than silently rewriting it and wiping every user account.
+        None if store.exists("auth.json") => anyhow::bail!(
+            "{} 无法解密（state.key 可能已更换）；为避免清空用户账号，控制台拒绝启动。删除该文件可重新初始化。",
+            state_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("auth.json")
+                .display()
+        ),
+        None => Default::default(),
     };
+    // A fresh admin password every start. The console is normally started from a shortcut and the
+    // printed-once password is exactly the thing people lose; `--admin-password` pins a fixed value
+    // for unattended installs. Only the hash is written, so the old password dies with this process.
+    let pinned = cli.admin_password.clone().filter(|p| !p.is_empty());
+    let password = auth::bootstrap_password(pinned.clone());
+    persisted_auth.admin = Some(auth::PasswordRecord::new(&password));
+    store.save("auth.json", &persisted_auth)?;
     let (events, _) = broadcast::channel(4096);
     let (state_dirty, _) = broadcast::channel(8);
     let console = Arc::new(Console {
@@ -179,8 +191,9 @@ async fn main() -> anyhow::Result<()> {
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into())
     );
-    if let Some(password) = generated_password {
-        println!("管理端初始口令（仅此次显示）：{password}");
+    match &pinned {
+        Some(_) => println!("管理端口令    使用 --admin-password 指定（不在终端显示）"),
+        None => println!("管理端口令    本次启动随机生成：{password}（重启会重新生成）"),
     }
     if addr.ip().is_unspecified() {
         let hosts = lan_ipv4();
