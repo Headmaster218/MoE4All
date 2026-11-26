@@ -26,10 +26,7 @@ pub fn load_certificates(path: &Path) -> anyhow::Result<Vec<CertificateDer<'stat
     if blocks.is_empty() {
         bail!("{} 中没有 CERTIFICATE 块", path.display());
     }
-    Ok(blocks
-        .into_iter()
-        .map(|der| CertificateDer::from(der))
-        .collect())
+    Ok(blocks.into_iter().map(CertificateDer::from).collect())
 }
 
 /// Parse a PEM private key. PKCS#8, PKCS#1 (RSA) and SEC1 (EC) are all accepted because the file

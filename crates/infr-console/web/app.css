@@ -383,6 +383,8 @@ tr.row-enter { animation: row-enter 0.28s ease; }
 .round-chip:hover { color: var(--text); border-color: var(--border-strong); }
 .round-chip.selected { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 .round-chip.live { border-color: var(--output); color: var(--output); background: var(--ok-soft); }
+/* 排队中的轮次不该和正在输出的轮次一样显示为绿色实线 live；虚线表示“还没开始解码”。 */
+.round-chip.queued { border-style: dashed; color: var(--text-dim); background: transparent; }
 .round-chip-more { padding: 3px 6px; white-space: nowrap; }
 .round-count { margin-left: 6px; }
 

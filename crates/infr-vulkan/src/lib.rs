@@ -1164,8 +1164,8 @@ impl VulkanShared {
             if retryable_queue_submit_error(error) {
                 for delay_ms in MEMORY_OOM_POST_SHED_DELAYS_MS {
                     if let Err(wait_error) = unsafe { self.device.queue_wait_idle(queue) } {
-                        let _ = self
-                            .make_queue_unusable(wait_error, "dedicated transfer queue drain");
+                        let _ =
+                            self.make_queue_unusable(wait_error, "dedicated transfer queue drain");
                         return Err(be(format!(
                             "dedicated transfer queue drain failed: {wait_error}"
                         )));

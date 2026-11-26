@@ -493,6 +493,7 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
         started_at_ms: now_ms() - 500,
         ended_at_ms: None,
         status: Status::Streaming,
+        queued: true,
         phase: Phase::Prefill,
         tools: Vec::new(),
         uncensor: false,
@@ -513,6 +514,10 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
         prefill_ms: Some(200),
     };
     round.observe(DeltaKind::Reasoning, None, 1);
+    assert!(
+        !round.queued,
+        "the first delta means the engine admitted the round"
+    );
     assert_eq!(round.phase, Phase::Thinking);
     assert!(round.ttft_ms.unwrap() >= 500);
     round.observe(DeltaKind::Tool, Some("tap"), 1);
@@ -530,6 +535,19 @@ fn decode_tri_state_and_ttft_come_from_the_deltas() {
     // 60 of 100 prompt tokens were evaluated in 200 ms.
     assert_eq!(round.prefill_tps, Some(300.0));
     assert!(round.duration_ms.unwrap() >= 500);
+}
+
+#[test]
+fn a_round_that_fails_before_any_delta_is_not_left_queued() {
+    let mut round = test_round(2, "c");
+    round.status = Status::Streaming;
+    round.queued = true;
+    round.finish(Status::Error);
+    assert_eq!(round.status, Status::Error);
+    assert!(
+        !round.queued,
+        "a finished round can never keep the waiting badge"
+    );
 }
 
 #[tokio::test]
@@ -778,6 +796,7 @@ async fn per_key_counters_fold_finished_rounds_only() {
         started_at_ms: now_ms(),
         ended_at_ms: None,
         status: Status::Streaming,
+        queued: false,
         phase: Phase::Output,
         tools: Vec::new(),
         uncensor: true,
@@ -907,6 +926,7 @@ fn aged_rounds_compact_frames_but_keep_the_assembled_reply() {
             started_at_ms: now_ms(),
             ended_at_ms: None,
             status: Status::Done,
+            queued: false,
             phase: Phase::Output,
             tools: Vec::new(),
             uncensor: false,
@@ -1028,6 +1048,7 @@ fn test_round(id: u64, conv: &str) -> Round {
         started_at_ms: now_ms(),
         ended_at_ms: None,
         status: Status::Done,
+        queued: false,
         phase: Phase::Output,
         tools: Vec::new(),
         uncensor: false,
@@ -1063,7 +1084,11 @@ fn rounds_are_capped_per_conversation_not_globally() {
     let long: Vec<_> = rounds.iter().filter(|r| r.conv == "long").collect();
     let short: Vec<_> = rounds.iter().filter(|r| r.conv == "short").collect();
     assert_eq!(long.len(), 100, "a single conv must keep only 100 rounds");
-    assert_eq!(short.len(), 6, "a short conv must not be evicted by a long one");
+    assert_eq!(
+        short.len(),
+        6,
+        "a short conv must not be evicted by a long one"
+    );
     // Newest-first: the retained long rounds are ids 40..139, not the first 100.
     assert_eq!(long.first().unwrap().id, 139);
     assert_eq!(long.last().unwrap().id, 40);

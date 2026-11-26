@@ -1487,7 +1487,9 @@ fn schema_covers_every_path_with_a_real_default_and_doc() {
         );
         assert_eq!(
             field.default,
-            defaults.get_path(&field.path).expect("schema path resolves"),
+            defaults
+                .get_path(&field.path)
+                .expect("schema path resolves"),
             "{} default is not the shipped default",
             field.path
         );

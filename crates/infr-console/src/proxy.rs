@@ -50,7 +50,7 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     } else {
         match authenticate(&console, &headers) {
             Ok(k) => k,
-            Err(resp) => return resp,
+            Err(resp) => return *resp,
         }
     };
 
@@ -107,6 +107,9 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         started_at_ms: now_ms(),
         ended_at_ms: None,
         status: Status::Streaming,
+        // Accepted by the console, but the engine has not produced anything yet — it may still
+        // be waiting for a slot. The first delta / usage frame flips this to active.
+        queued: true,
         phase: Phase::Prefill,
         tools: Vec::new(),
         uncensor,
@@ -264,7 +267,7 @@ async fn forward_plain(
 fn authenticate(
     console: &Arc<Console>,
     headers: &HeaderMap,
-) -> Result<Option<crate::state::ApiKey>, Response> {
+) -> Result<Option<crate::state::ApiKey>, Box<Response>> {
     let keys = console.keys.lock().unwrap();
     if keys.is_empty() {
         return Ok(None);
@@ -276,10 +279,10 @@ fn authenticate(
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
     match presented.and_then(|token| keys.iter().find(|k| k.token == token)) {
         Some(k) => Ok(Some(k.clone())),
-        None => Err(error_response(
+        None => Err(Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "unknown console API key",
-        )),
+        ))),
     }
 }
 
@@ -541,6 +544,9 @@ impl Tap {
             // Deltas already counted tokens one by one; usage is the authority when it is larger
             // (reasoning tokens some backends omit from deltas).
             r.completion_tokens = r.completion_tokens.max(completion);
+            if completion > 0 {
+                r.queued = false;
+            }
         });
     }
 
@@ -647,6 +653,8 @@ fn absorb_whole(console: &Arc<Console>, id: u64, bytes: &[u8]) {
             }
         }
         r.tools = tools;
+        // A complete reply arrived: whatever the engine did with the queue, this round is active.
+        r.queued = false;
         if !r.tools.is_empty() {
             r.phase = Phase::ToolCall;
         } else if r.completion_tokens > 0 {

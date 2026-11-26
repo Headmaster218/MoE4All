@@ -429,6 +429,10 @@ pub struct Round {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub status: Status,
+    /// True until the upstream sends the first token/usage. The console registers a round as soon
+    /// as the HTTP request arrives, but the engine may still be holding it in the queue: the UI
+    /// must not paint every waiting request as a live, decoding turn.
+    pub queued: bool,
     pub phase: Phase,
     pub tools: Vec<String>,
     pub uncensor: bool,
@@ -462,6 +466,8 @@ impl Round {
     /// Record one decoded piece. `kind` decides the tri-state; a tool name is kept once.
     pub fn observe(&mut self, kind: DeltaKind, tool: Option<&str>, tokens: u64) {
         let now = now_ms();
+        // A wire delta means the engine admitted the request; it is no longer merely queued.
+        self.queued = false;
         if self.first_delta_ms.is_none() {
             self.first_delta_ms = Some(now);
             self.ttft_ms = Some(now.saturating_sub(self.started_at_ms));
@@ -488,6 +494,7 @@ impl Round {
 
     pub fn finish(&mut self, status: Status) {
         let now = now_ms();
+        self.queued = false;
         self.ended_at_ms = Some(now);
         self.duration_ms = Some(now.saturating_sub(self.started_at_ms));
         self.status = status;

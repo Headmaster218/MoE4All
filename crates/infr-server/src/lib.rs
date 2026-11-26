@@ -1241,6 +1241,13 @@ fn per_second(n: u64, d: Duration) -> f64 {
     }
 }
 
+/// Minimum sampling window for the non-consuming `/internal/stats` decode rate.
+///
+/// A Prefill→Decode boundary (or a tool-call restart) can land within milliseconds of a
+/// monitoring poll. Dividing the tokens already counted by that sliver produced 5000+ t/s
+/// spikes on the WebUI chart. Hold the previous rate until a real interval has accumulated.
+const TELEMETRY_DECODE_MIN_WINDOW: Duration = Duration::from_millis(250);
+
 /// RAII gauge for [`ServeStats::queued`]: a request waiting for a slot permit. Dropped the moment
 /// the permit is acquired (or the acquire fails during shutdown).
 ///
@@ -1341,6 +1348,10 @@ struct RequestProgressState {
     accounted_decode: u64,
     prefill_rate: PrefillDisplayRate,
     display_decode_tokens: u64,
+    /// Non-consuming telemetry baseline: (elapsed, completion_tokens) at the last published
+    /// interval. It must not share `display_decode_tokens`, which the terminal reporter drains.
+    telemetry_decode: Option<(Duration, u64)>,
+    telemetry_speed: f64,
 }
 
 /// Exact model-token progress for one request. The runner calls it once per Prefill chunk or
@@ -1392,6 +1403,8 @@ impl RequestProgress {
                 accounted_decode: 0,
                 prefill_rate: PrefillDisplayRate::default(),
                 display_decode_tokens: 0,
+                telemetry_decode: None,
+                telemetry_speed: 0.0,
             }),
         }
     }
@@ -1424,6 +1437,11 @@ impl RequestProgress {
                 // prompt. Keep elapsed time cumulative, but let the successful attempt establish
                 // the request's real Prefill/Decode boundary.
                 state.prefill_elapsed = None;
+                // A restarted attempt can report fewer completion tokens than the failed one.
+                // Re-anchor the monitoring baseline too, or the next interval would subtract a
+                // stale, larger count and report zero until the counter catches up.
+                state.telemetry_decode = None;
+                state.telemetry_speed = 0.0;
             }
             let prefill_delta = if restarted {
                 progress.prefill_tokens
@@ -1552,10 +1570,14 @@ impl RequestProgress {
     /// Non-consuming display read for the telemetry endpoint.
     ///
     /// [`Self::display_snapshot`] DRAINS `display_decode_tokens` to build the terminal table's
-    /// interval rate. A monitoring poll that did the same would steal that rate, so this derives
-    /// decode speed from the cumulative token count over the time since the Prefill boundary.
+    /// interval rate. A monitoring poll that did the same would steal that rate, so telemetry keeps
+    /// its own baseline and reports tokens delta / elapsed delta over a real sampling window.
     fn peek(&self) -> RequestDisplay {
-        let state = self.state.lock().expect("request progress poisoned");
+        self.peek_at(self.started.elapsed())
+    }
+
+    fn peek_at(&self, elapsed: Duration) -> RequestDisplay {
+        let mut state = self.state.lock().expect("request progress poisoned");
         let Some(progress) = state.latest else {
             return RequestDisplay {
                 phase: "Starting",
@@ -1564,12 +1586,31 @@ impl RequestProgress {
                 context_limit: None,
             };
         };
-        let elapsed = self.started.elapsed();
         let (phase, speed) = match progress.phase {
             infr_core::GenerationPhase::Prefill => ("Prefill", state.prefill_rate.speed(elapsed)),
             infr_core::GenerationPhase::Decode => {
-                let decode = elapsed.saturating_sub(state.prefill_elapsed.unwrap_or(elapsed));
-                ("Decode", per_second(progress.completion_tokens, decode))
+                let speed = match state.telemetry_decode {
+                    None => {
+                        // First look at this Decode streak: establish the baseline, publish no rate.
+                        state.telemetry_decode = Some((elapsed, progress.completion_tokens));
+                        0.0
+                    }
+                    Some((previous_elapsed, previous_tokens)) => {
+                        let span = elapsed.saturating_sub(previous_elapsed);
+                        if span >= TELEMETRY_DECODE_MIN_WINDOW {
+                            let delta = progress.completion_tokens.saturating_sub(previous_tokens);
+                            let rate = per_second(delta, span);
+                            state.telemetry_decode = Some((elapsed, progress.completion_tokens));
+                            state.telemetry_speed = rate;
+                            rate
+                        } else {
+                            // A sub-window poll must not turn a burst of already-counted tokens
+                            // into a 5000 t/s spike, and must not consume the baseline either.
+                            state.telemetry_speed
+                        }
+                    }
+                };
+                ("Decode", speed)
             }
         };
         RequestDisplay {
@@ -4343,8 +4384,7 @@ mod tests {
         let (status, _) = get_json(router.clone(), "/internal/config", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-        let (status, body) =
-            get_json(router, "/internal/config", Some("sk-do-not-leak")).await;
+        let (status, body) = get_json(router, "/internal/config", Some("sk-do-not-leak")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body.contains("sk-do-not-leak"), "the key escaped: {body}");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4378,7 +4418,9 @@ mod tests {
             context_tokens: 160,
             context_limit: 4096,
         });
-        let _slot = state.dashboard.claim_chat("test-model", 7, Arc::clone(&progress));
+        let _slot = state
+            .dashboard
+            .claim_chat("test-model", 7, Arc::clone(&progress));
 
         let router = build_router(state.clone());
         for _ in 0..3 {
@@ -4400,6 +4442,41 @@ mod tests {
             progress.display_snapshot(Duration::from_secs(1)).speed,
             40.0,
             "the poll drained the terminal dashboard's decode counter"
+        );
+    }
+
+    /// A poll that lands just after the Prefill→Decode boundary must not divide already-counted
+    /// tokens by a few milliseconds. The published rate is a real sampling interval instead.
+    #[test]
+    fn telemetry_peek_has_no_decode_boundary_spike() {
+        let state = AppState::headless("test-model", Arc::new(Config::default()));
+        let progress = Arc::new(RequestProgress::new(
+            9,
+            "test-model".into(),
+            None,
+            Arc::clone(&state.stats),
+        ));
+        let snapshot = |completion_tokens: u64| infr_core::GenerationProgress {
+            phase: infr_core::GenerationPhase::Decode,
+            prompt_tokens: 120,
+            cached_prompt_tokens: 20,
+            prefill_tokens: 100,
+            completion_tokens,
+            context_tokens: 160 + completion_tokens,
+            context_limit: 4096,
+        };
+        progress.observe_at(snapshot(40), Duration::from_millis(10));
+
+        // The old cumulative formula reported 40 / 0.002s = 20000 t/s here.
+        assert_eq!(progress.peek_at(Duration::from_millis(12)).speed, 0.0);
+
+        progress.observe_at(snapshot(50), Duration::from_millis(1012));
+        let display = progress.peek_at(Duration::from_millis(1012));
+        assert_eq!(display.phase, "Decode");
+        assert!(
+            (display.speed - 10.0).abs() < 0.001,
+            "10 tokens over the 1 s telemetry window, got {}",
+            display.speed
         );
     }
 
@@ -4542,6 +4619,8 @@ mod tests {
                 accounted_decode: 57,
                 prefill_rate: PrefillDisplayRate::default(),
                 display_decode_tokens: 20,
+                telemetry_decode: None,
+                telemetry_speed: 0.0,
             }),
         });
 

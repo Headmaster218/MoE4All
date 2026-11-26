@@ -51,14 +51,15 @@ function sessionState(r) {
   if (r.status !== "streaming") {
     return r.status === "error" ? { label: "错误", cls: "error" } : { label: "空闲", cls: "idle" };
   }
-  if (r.phase === "prefill" && r.ttft_ms == null && engineQueued()) return { label: "排队中", cls: "queued" };
+  if (r.status === "streaming" && r.ttft_ms == null &&
+      (r.queued || (r.queued === undefined && engineQueued()))) return { label: "排队中", cls: "queued" };
   if (r.phase === "tool_call") return { label: "工具调用", cls: "tool_call", extra: r.tools.join(", ") };
   if (r.phase === "output") return { label: "输出中", cls: "output" };
   return { label: "推理中", cls: "prefill" }; // prefill 与 thinking 都归"推理中"
 }
 function sessionBadge(r, s = sessionState(r)) {
   const node = el("span", { class: `badge ${s.cls}`, text: s.label + (s.extra ? `：${s.extra}` : "") });
-  if (r.status === "streaming") node.classList.add("live");
+  if (r.status === "streaming" && !r.queued) node.classList.add("live");
   return node;
 }
 
@@ -437,7 +438,7 @@ function openSession(conv) {
   // Opening a session from the list is an explicit "show me this conversation", so follow its
   // newest turn. A pin from a previously open conversation must not carry over.
   sbPinned = false;
-  const rep = g.rounds.find((r) => r.status === "streaming") || g.rounds[0];
+  const rep = g.rounds.find((r) => r.status === "streaming" && !r.queued) || g.rounds[0];
   openRound(rep.id);
 }
 
@@ -446,9 +447,10 @@ function renderLiveRounds() {
   const views = sessionGroups().map((g) => {
     const rounds = g.rounds;
     const latest = rounds[0];
-    const active = rounds.find((r) => r.status === "streaming") || null;
+    const active = rounds.find((r) => r.status === "streaming" && !r.queued) || null;
+    const queued = rounds.find((r) => r.status === "streaming" && r.queued) || null;
     return {
-      conv: g.conv, rounds, latest, active, rep: active || latest, streaming: !!active,
+      conv: g.conv, rounds, latest, active, rep: active || queued || latest, streaming: !!active || !!queued,
       tools: [...new Set(rounds.flatMap((r) => r.tools))],
       gen: rounds.reduce((s, r) => s + (r.completion_tokens || 0), 0),
     };
@@ -870,7 +872,12 @@ function renderSessionRounds(g) {
   if (!g || g.rounds.length < 2) { host.replaceChildren(); host.hidden = true; return; }
   host.hidden = false;
   const shown = g.rounds.slice(0, ROUND_CHIP_CAP);
-  const sig = shown.map((r) => r.id).join(",") + "|" + selectedRound + "|" + g.rounds.length;
+  // Include per-round state: a waiting round turning live (or finishing) must repaint the chip,
+  // otherwise the old green `.live` border sticks until the next round arrives.
+  const stateSig = shown
+    .map((r) => `${r.id}:${r.status}:${r.queued ? 1 : 0}:${r.ttft_ms != null ? 1 : 0}`)
+    .join(",");
+  const sig = stateSig + "|" + selectedRound + "|" + g.rounds.length;
   if (host.dataset.sig === sig) return;
   host.dataset.sig = sig;
   const chips = [];
@@ -880,9 +887,9 @@ function renderSessionRounds(g) {
   }
   for (const r of shown) {
     const chip = el("button", {
-      class: `round-chip${r.id === selectedRound ? " selected" : ""}${r.status === "streaming" ? " live" : ""}`,
+      class: `round-chip${r.id === selectedRound ? " selected" : ""}${r.status === "streaming" && !r.queued ? " live" : ""}${r.queued ? " queued" : ""}`,
       text: roundLabel(r.id),
-      title: `round #${r.id} · ${clock(r.started_at_ms)} · ${PHASE_LABEL[r.phase] || r.phase}`,
+      title: `round #${r.id} · ${clock(r.started_at_ms)} · ${r.queued ? "排队中" : (PHASE_LABEL[r.phase] || r.phase)}`,
     });
     chip.addEventListener("click", () => openRound(r.id, true));
     chips.push(chip);
