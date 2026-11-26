@@ -795,7 +795,7 @@ impl Console {
     }
 }
 
-fn clock_string() -> String {
+pub(crate) fn clock_string() -> String {
     let secs = now_ms() / 1000;
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     format!("{h:02}:{m:02}:{s:02}")

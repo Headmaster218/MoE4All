@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::state::Console;
+use crate::state::{clock_string, Console};
 
 /// Config paths `scripts/infr-wizard.ps1` sets. Kept as an explicit list rather than a section
 /// prefix: the wizard's "常用" screen is a curated subset, and `kernels.*` alone is 187 knobs.
@@ -747,7 +747,17 @@ pub fn reap(console: &Arc<Console>) {
     let Some(child) = slot.as_mut() else { return };
     match child.try_wait() {
         Ok(Some(status)) => {
-            console.log(format!("引擎已退出：{status}"));
+            let detail = match status.code() {
+                // infr-core::memguard::EXIT_CODE — the engine deliberately killed itself to keep
+                // the machine responsive. Say so where an operator will find it: the last thing
+                // the engine wrote is the TRIP line, then its stderr/stdout pipes close.
+                Some(87) => format!(
+                    "引擎已退出：{status}（mem-guard 触发：内存余量低于水位线，原因见 engine.log）"
+                ),
+                _ => format!("引擎已退出：{status}"),
+            };
+            console.log(detail.clone());
+            console.engine_log_line(format!("{} {detail}", clock_string()));
             *slot = None;
             drop(slot);
             console.cancel_streaming();

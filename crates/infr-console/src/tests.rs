@@ -11,8 +11,28 @@ use tower::ServiceExt;
 use crate::auth::{AuthState, PasswordRecord, PersistentAuth};
 use crate::crypto::SecureStore;
 use crate::launch::{self, LaunchRequest};
+use crate::proxy::upstream_error;
 use crate::state::{now_ms, Console, DeltaKind, Phase, Round, Status};
 use crate::ui;
+
+/// A 502 must name the actual failure, not just reqwest's top-level "error sending request".
+#[tokio::test]
+async fn upstream_error_includes_the_source_chain() {
+    let err = reqwest::Client::new()
+        .get("http://127.0.0.1:1/v1/responses")
+        .send()
+        .await
+        .expect_err("port 1 is not listening");
+    let text = upstream_error(&err);
+    assert!(
+        text.contains("http://127.0.0.1:1/v1/responses"),
+        "the URL is missing: {text}"
+    );
+    assert!(
+        text.len() > err.to_string().len(),
+        "the source chain was dropped: {text}"
+    );
+}
 
 fn console() -> Arc<Console> {
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);

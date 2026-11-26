@@ -5,6 +5,7 @@
 //! Bytes are forwarded VERBATIM. The tap parses a copy; it never re-serializes, so a client sees
 //! exactly the framing the engine produced.
 
+use std::error::Error as StdError;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -12,7 +13,33 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::state::{compact_request, now_ms, Console, DeltaKind, Phase, Round, Status};
+use crate::state::{
+    clock_string, compact_request, now_ms, Console, DeltaKind, Phase, Round, Status,
+};
+
+/// `reqwest::Error`'s `Display` stops at "error sending request for url (...)" — the useful part
+/// (connection refused, reset, TLS failure, timeout) lives in its source chain. A 502 that only
+/// quotes the Display text leaves no way to tell an engine that exited from a bad request.
+pub(crate) fn upstream_error(e: &reqwest::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
+/// The UI ring is in-memory and bounded; a mem-guard exit that kills the engine also takes the
+/// evidence away when the console restarts. Keep the same line in the durable engine log.
+fn log_upstream_failure(console: &Console, path: &str, detail: &str) {
+    let line = format!(
+        "{} upstream unreachable on {path}: {detail}",
+        clock_string()
+    );
+    console.log(line);
+    console.engine_log_line(format!("upstream unreachable on {path}: {detail}"));
+}
 
 /// Headers that describe one hop and must not be copied across it.
 const HOP_BY_HOP: [&str; 8] = [
@@ -158,8 +185,9 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         Err(e) => {
             console.with_round(id, |r| r.finish(Status::Error));
             console.fold_key(id);
-            console.log(format!("upstream unreachable: {e}"));
-            return error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {e}"));
+            let detail = upstream_error(&e);
+            log_upstream_failure(console.as_ref(), &path, &detail);
+            return error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {detail}"));
         }
     };
 
@@ -258,7 +286,11 @@ async fn forward_plain(
             let bytes = resp.bytes().await.unwrap_or_default();
             passthrough_response(status, &headers, Body::from(bytes))
         }
-        Err(e) => error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")),
+        Err(e) => {
+            let detail = upstream_error(&e);
+            log_upstream_failure(console.as_ref(), path_and_query, &detail);
+            error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {detail}"))
+        }
     }
 }
 
