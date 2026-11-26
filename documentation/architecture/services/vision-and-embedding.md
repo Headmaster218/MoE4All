@@ -18,7 +18,7 @@ VRAM pool。它们不能绕过资源管理器再建立一份不可见的 GPU 模
 当前原生路径面向 Qwen3-VL-style CLIP projector 的受限子集：
 
 - 解析 mmproj GGUF；
-- 解码 data URI 或 base64 image；
+- 解码 data URI、裸 base64，或 http(s) URL 图片；URL 抓取受三重上界：32 MiB 字节、10 秒墙钟、以及只允许公网可路由地址（回环 / 链路本地 / RFC1918 / CGNAT / 保留段一律拒绝，`vision.image_url_allow_private` 放行 NAS、局域网摄像头等本地来源，默认关）；重定向由本项目自己逐跳跟，每一跳都重过地址规则，`file://` 等其它 scheme 直接拒绝；
 - resize、patch 与位置预处理；
 - 请求级载入 projector weights；
 - 生成 embedding 并注入文本 runtime；

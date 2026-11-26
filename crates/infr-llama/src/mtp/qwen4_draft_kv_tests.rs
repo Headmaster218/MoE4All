@@ -355,6 +355,10 @@ struct JournalBackend {
     compiled: Mutex<Option<Graph>>,
     injected_ids: Mutex<Option<Vec<u32>>>,
     chain_ids: Mutex<Vec<u32>>,
+    argmax_prob: bool,
+    injected_probabilities: Mutex<Option<Vec<f32>>>,
+    executions: Mutex<usize>,
+    allocations: Mutex<usize>,
 }
 
 impl Backend for JournalBackend {
@@ -362,9 +366,13 @@ impl Backend for JournalBackend {
         "draft-journal-bytes"
     }
     fn capabilities(&self) -> infr_core::backend::Capabilities {
-        Default::default()
+        infr_core::backend::Capabilities {
+            argmax_prob: self.argmax_prob,
+            ..Default::default()
+        }
     }
     fn alloc(&self, bytes: usize, _: BufferUsage) -> infr_core::error::Result<Box<dyn Buffer>> {
+        *self.allocations.lock().unwrap() += 1;
         Ok(Box::new(JournalBuffer::new(&vec![0; bytes], bytes)))
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> infr_core::error::Result<()> {
@@ -452,12 +460,18 @@ impl Backend for JournalBackend {
             .unwrap();
         let graph = &plan.graph;
         let injected = self.injected_ids.lock().unwrap().clone().unwrap();
+        let probabilities = self.injected_probabilities.lock().unwrap().clone();
+        *self.executions.lock().unwrap() += 1;
         let mut values = vec![None; graph.tensors.len()];
         let mut step = 0;
         self.chain_ids.lock().unwrap().clear();
         for op in &graph.ops {
             match *op {
-                Op::Argmax { dst, .. } => {
+                Op::Argmax { dst, .. } | Op::ArgmaxProb { dst_id: dst, .. } => {
+                    if let Op::ArgmaxProb { dst_prob, .. } = *op {
+                        let probability = probabilities.as_ref().unwrap()[step];
+                        self.upload(bindings.get(dst_prob).unwrap(), &probability.to_le_bytes())?;
+                    }
                     let id = injected[step];
                     step += 1;
                     values[dst.0 as usize] = Some(id);
@@ -824,6 +838,174 @@ fn byte_test_session(be: &JournalBackend) -> Qwen4MtpSession {
         device_catch_plans: Mutex::new(VecDeque::new()),
     });
     Qwen4MtpSession::with_fixed(be, fixed, 128, 4, 8).unwrap()
+}
+
+#[test]
+fn confidence_readback_is_one_execution_and_preserves_fixed_and_compact_id_mapping() {
+    for supports_prob in [false, true] {
+        // Even an explicit asset containing ALL rows must not expose subset confidence.
+        for compact in [0, 1, 2] {
+            for want_probs in [false, true] {
+                for width in 2..=DRAFT_TOKENS {
+                    for tail in [false, true] {
+                        let be = JournalBackend {
+                            argmax_prob: supports_prob,
+                            ..Default::default()
+                        };
+                        let mut head = byte_test_session(&be);
+                        if compact != 0 {
+                            let ids = if compact == 1 {
+                                vec![3, 9, 17]
+                            } else {
+                                (0..head.cfg.vocab as i32).collect()
+                            };
+                            let vocab =
+                                draft_vocab::DraftVocab::mock(&be, head.cfg.n_embd, &ids).unwrap();
+                            Arc::get_mut(&mut head.fixed).unwrap().draft_vocab = Some(vocab);
+                        }
+                        let numel = head.cfg.n_embd * head.cfg.vocab;
+                        let table = be.alloc(numel * 4, BufferUsage::Weights).unwrap();
+                        let shared = (
+                            (table.as_ref(), DType::F32, numel),
+                            (table.as_ref(), DType::F32, numel),
+                        );
+                        let hidden = vec![0.0; head.h_width()];
+                        let raw = (0..width as u32 - 1).collect::<Vec<_>>();
+                        let expected = if compact == 1 {
+                            [3, 9, 17][..width - 1].to_vec()
+                        } else {
+                            raw.clone()
+                        };
+                        let probabilities = [0.75, 0.5, 0.25][..width - 1].to_vec();
+                        *be.injected_ids.lock().unwrap() = Some(raw);
+                        *be.injected_probabilities.lock().unwrap() = Some(probabilities.clone());
+                        let allocations = *be.allocations.lock().unwrap();
+                        let draft = head
+                            .draft_with_confidence(
+                                &be, 1, &hidden, 0, 700, width, shared, tail, want_probs,
+                            )
+                            .unwrap();
+                        let fused = supports_prob && want_probs && compact == 0;
+                        assert_eq!(draft.tokens, expected);
+                        assert_eq!(
+                            draft.probabilities,
+                            if fused { probabilities } else { vec![] }
+                        );
+                        assert_eq!(*be.executions.lock().unwrap(), 1);
+                        assert_eq!(*be.allocations.lock().unwrap(), allocations);
+                        assert!(be.copy_batches.lock().unwrap().is_empty());
+                        let chain = be.chain_ids.lock().unwrap();
+                        assert_eq!(chain[0], 1);
+                        assert_eq!(&chain[1..], &expected);
+                        drop(chain);
+                        let graph = be.compiled.lock().unwrap().take().unwrap();
+                        assert!(graph.no_decode_replay);
+                        assert_eq!(graph.outputs.len(), (width - 1) * if fused { 2 } else { 1 });
+                        let predictions = graph.ops.iter().enumerate().filter(|(_, op)| {
+                            matches!(op, Op::Argmax { .. } | Op::ArgmaxProb { .. })
+                        });
+                        for (index, op) in predictions {
+                            let raw = match *op {
+                                Op::ArgmaxProb {
+                                    dst_id, dst_prob, ..
+                                } => {
+                                    assert!(fused);
+                                    assert_eq!(graph.kind(dst_prob), TensorKind::Output);
+                                    assert_eq!(
+                                        graph.desc(dst_prob),
+                                        &TensorDesc::new(vec![1], DType::F32)
+                                    );
+                                    dst_id
+                                }
+                                Op::Argmax { dst, .. } => {
+                                    assert!(!fused);
+                                    dst
+                                }
+                                _ => unreachable!(),
+                            };
+                            assert!(
+                                matches!(&graph.ops[index + 1], Op::GatherI32 { ids, .. } if *ids == raw)
+                            );
+                        }
+                        head.settle_draft(&be, 0).unwrap();
+                        let fixed = head
+                            .draft_with_tail_mode(&be, 1, &hidden, 0, 700, width, shared, tail)
+                            .unwrap();
+                        assert_eq!(fixed, expected);
+                        let graph = be.compiled.lock().unwrap().take().unwrap();
+                        assert!(!graph
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op, Op::ArgmaxProb { .. })));
+                        assert_eq!(graph.outputs.len(), width - 1);
+                        assert_eq!(*be.executions.lock().unwrap(), 2);
+                        assert_eq!(*be.allocations.lock().unwrap(), allocations);
+                        assert!(be.copy_batches.lock().unwrap().is_empty());
+                        head.settle_draft(&be, 0).unwrap();
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_confidence_aborts_and_restores_live_ring_before_the_next_draft() {
+    for width in 2..=DRAFT_TOKENS {
+        for tail in [false, true] {
+            let be = JournalBackend {
+                argmax_prob: true,
+                ..Default::default()
+            };
+            let head = byte_test_session(&be);
+            let numel = head.cfg.n_embd * head.cfg.vocab;
+            let table = be.alloc(numel * 4, BufferUsage::Weights).unwrap();
+            let shared = (
+                (table.as_ref(), DType::F32, numel),
+                (table.as_ref(), DType::F32, numel),
+            );
+            let hidden = vec![0.0; head.h_width()];
+            let before = {
+                let kv = head.kv_for_depth(&be, 8 + width).unwrap();
+                let bytes = [vec![0x31; kv.k.len_bytes()], vec![0x62; kv.v.len_bytes()]];
+                be.upload(kv.k.as_ref(), &bytes[0]).unwrap();
+                be.upload(kv.v.as_ref(), &bytes[1]).unwrap();
+                bytes
+            };
+            *be.injected_ids.lock().unwrap() = Some(vec![1; width - 1]);
+            for step in 0..width - 1 {
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+                    let mut probabilities = vec![1.0; width - 1];
+                    probabilities[step] = bad;
+                    *be.injected_probabilities.lock().unwrap() = Some(probabilities);
+                    let error = head
+                        .draft_with_confidence(&be, 1, &hidden, 8, 700, width, shared, tail, true)
+                        .unwrap_err();
+                    assert!(error.to_string().contains("invalid probability"));
+                    let kv = head.kv.lock().unwrap();
+                    assert!(kv.draft_journal.pending.is_none());
+                    for (cache, bytes) in [(kv.k.as_ref(), &before[0]), (kv.v.as_ref(), &before[1])]
+                    {
+                        assert_eq!(
+                            &cache
+                                .as_any()
+                                .downcast_ref::<JournalBuffer>()
+                                .unwrap()
+                                .bytes(),
+                            bytes
+                        );
+                    }
+                }
+            }
+            // Successful retries still return their scalars; the prior abort cannot leave stale data.
+            *be.injected_probabilities.lock().unwrap() = Some(vec![0.5; width - 1]);
+            let draft = head
+                .draft_with_confidence(&be, 1, &hidden, 8, 700, width, shared, tail, true)
+                .unwrap();
+            assert_eq!(draft.probabilities, vec![0.5; width - 1]);
+            head.settle_draft(&be, 0).unwrap();
+        }
+    }
 }
 
 #[test]

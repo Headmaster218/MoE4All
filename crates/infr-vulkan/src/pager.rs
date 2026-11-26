@@ -32,6 +32,7 @@
 //! full-set sweeps — see that method's doc for why plain LRU is pathological there. llama.cpp
 //! issue #20757's SLRU-with-admission remains the documented upgrade if these thrash on an
 //! adversarial pattern.
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -434,6 +435,12 @@ impl GpuPager {
 
     pub fn n_slots(&self) -> usize {
         self.pager.n_slots()
+    }
+
+    /// Expert slots currently holding a resident block. A telemetry read of the host LRU: when
+    /// residency authority is GPU-owned this is the last handed-off state, not live.
+    pub fn resident_count(&self) -> usize {
+        self.pager.resident_count()
     }
 
     pub fn enabled_slots(&self) -> usize {
@@ -2053,6 +2060,10 @@ pub struct MoePagerSession {
     /// Authoritative Decode metadata survives command chunks and token boundaries. CPU cache
     /// mutation requires an explicit drained handoff from this owner.
     pub(crate) gpu_decode_owner: Option<Arc<GpuCopyBuffers>>,
+    /// Aggregate expert (hits, misses) at the last [`Self::expert_vram_pressure`] sample. A `Cell`
+    /// because the sample is taken through `&self` under the session mutex, and a window that is
+    /// merely stale cannot move bytes wrongly — it only delays or advances one yield decision.
+    pressure_window: Cell<(u64, u64)>,
     print_stats: bool,
     trace: Option<PagerTrace>,
     /// Physical interpretation of every pool arena. Prefill owns complete layer banks addressed
@@ -2170,6 +2181,12 @@ pub use infr_core::pager::ring_bytes;
 // pathologically misaligned base address.
 const RING_REGION_ALIGN: usize = 256;
 const MIN_LUT_TAPE_WORDS: usize = 64 * 1024;
+
+/// Expert miss rate above which the shared arena counts as starving, over the window since the last
+/// sample. A cache sized to hold the working set that still misses three touches in a hundred is
+/// short of device bytes, and the KV tree sharing the pool may sink cold tails to buy room. Below
+/// it, yielding costs a DMA out and a DMA back for nothing.
+const EXPERT_PRESSURE_MISS_RATE: f64 = 0.03;
 
 fn moe_lut_tape_words(n_blocks: usize) -> usize {
     MIN_LUT_TAPE_WORDS.max(n_blocks.saturating_mul(3))
@@ -2436,6 +2453,7 @@ impl MoePagerSession {
             frozen_lut_slots: HashSet::new(),
             resident_lut_cache,
             gpu_decode_owner: None,
+            pressure_window: Cell::new((0, 0)),
             print_stats: vk.cfg().paging.stats,
             trace: vk.cfg().paging.trace.clone().map(PagerTrace::new),
             mode: MoeArenaMode::DecodeLru,
@@ -4630,9 +4648,89 @@ impl MoePagerSession {
         Ok(self.pool_of(buf_id)?.pager.lut_buffer())
     }
 
+    /// Whether the expert cache is starving for device bytes, over the touches since the last call.
+    /// The KV corridor sub-allocates the same arena and uses this to decide whether sinking its cold
+    /// tails is worth a DMA out and back.
+    ///
+    /// A window, not a lifetime rate: a model that warmed up an hour ago must not keep the tree
+    /// yielding forever. `gpu_stats` is the drained-boundary readback of the device LRU, and it is
+    /// not optional decoration: the GPU owner resolves full-hit layers on device and hands off at
+    /// the first miss, so host-only counters score every handoff as a miss and no full-hit layer at
+    /// all — a rate inflated towards pressure that would sink cold tails on a comfortable cache.
+    /// An unmeasurable window reports none rather than guessing.
+    pub(crate) fn expert_vram_pressure(&self, gpu_stats: Option<&[PagerStats]>) -> bool {
+        let gpu_owned = self
+            .gpu_decode_owner
+            .as_ref()
+            .is_some_and(|owner| owner.owned_active());
+        if gpu_owned && gpu_stats.is_none() {
+            return false;
+        }
+        let (hits, misses) =
+            self.pools
+                .iter()
+                .enumerate()
+                .fold((0u64, 0u64), |(h, m), (index, pool)| {
+                    let stats = gpu_stats.map_or_else(|| pool.pager.stats(), |stats| stats[index]);
+                    (h + stats.hits, m + stats.misses)
+                });
+        let (last_hits, last_misses) = self.pressure_window.replace((hits, misses));
+        // A failed readback falls back to the smaller host-only total, so the window can move
+        // backwards; saturating keeps that a silent no-pressure sample instead of an underflow.
+        let (hits, misses) = (
+            hits.saturating_sub(last_hits),
+            misses.saturating_sub(last_misses),
+        );
+        let total = hits + misses;
+        total > 0 && misses as f64 / total as f64 > EXPERT_PRESSURE_MISS_RATE
+    }
+
     /// `paging.stats` (`INFR_PAGER_STATS=1`): print each pool's hit/miss/eviction counters. Called
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
+    /// Point-in-time expert residency for the telemetry endpoint.
+    ///
+    /// Deliberately reads only host-side state: no GPU baton, no `owned_statistics` handoff, no
+    /// trace flush. A monitoring poll must not stall decode or force a layout handoff, so when
+    /// residency authority is GPU-owned the host LRU counters are reported as-is with
+    /// `gpu_owned` set rather than being refreshed.
+    pub fn expert_report(&self) -> infr_core::telemetry::ExpertReport {
+        let mut report = infr_core::telemetry::ExpertReport {
+            paged: true,
+            gpu_owned: self
+                .gpu_decode_owner
+                .as_ref()
+                .is_some_and(|owner| owner.owned_active()),
+            ..Default::default()
+        };
+        for pool in &self.pools {
+            let stats = pool.pager.stats();
+            report.vram_resident += pool.pager.resident_count() as u64;
+            report.vram_slots += pool.pager.enabled_slots() as u64;
+            report.hits += stats.hits;
+            report.misses += stats.misses;
+            report.evictions += stats.evictions;
+            if let Some(host) = &pool.host {
+                report.ram_resident += host.stats().shadow_resident as u64;
+                report.ram_slots += host.n_slots() as u64;
+            }
+        }
+        report.full_host_store = !self.host_store.is_empty();
+        report.host_store_bytes = self
+            .host_store
+            .iter()
+            .map(HostStoreChunk::len)
+            .sum::<usize>() as u64;
+        report.host_store_experts = self
+            .sources
+            .values()
+            .map(|(_, _, source)| source)
+            .filter(|source| source.host_chunk.is_some() && source.stride_bytes > 0)
+            .map(|source| (source.bank_bytes / source.stride_bytes) as u64)
+            .sum();
+        report
+    }
+
     pub fn print_stats_if_enabled(&self) {
         self.print_stats_with_snapshot(None);
     }

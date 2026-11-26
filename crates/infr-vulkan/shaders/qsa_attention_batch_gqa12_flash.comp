@@ -77,15 +77,23 @@ float qread(uint word_base, uint component) {
 }
 #endif
 
-void stage_q8_quad(uint64_t base, uint local, uint segment_elems, uint dst_base) {
-    int codes = int(kv_word(base, local >> 2u));
+// Four adjacent quads = 16 elements = four consecutive code words + ONE scale word. A row's
+// 256-element head starts on a 256-aligned segment-local offset, so any group of 16 stays inside
+// one 32-element scale block. KV4 fuses the four code loads into one b128 under -DSTREAMED, instead
+// of four scalar global_load_b32 per quad (the dominant cost at pp30k). Values are bit-identical.
+void stage_q8_quad16(uint64_t base, uint local, uint segment_elems, uint dst_base) {
+    uvec4 codes4 = KV4(base, local >> 2u);
     uint block = local >> 5u;
     uint scales = kv_word(base, (segment_elems >> 2u) + (block >> 1u));
     float scale = unpackHalf2x16(scales)[block & 1u];
-    kv_tile[dst_base] = float16_t(float(bitfieldExtract(codes, 0, 8)) * scale);
-    kv_tile[dst_base + 1u] = float16_t(float(bitfieldExtract(codes, 8, 8)) * scale);
-    kv_tile[dst_base + 2u] = float16_t(float(bitfieldExtract(codes, 16, 8)) * scale);
-    kv_tile[dst_base + 3u] = float16_t(float(bitfieldExtract(codes, 24, 8)) * scale);
+    for (uint w = 0u; w < 4u; w++) {
+        int codes = int(codes4[w]);
+        uint dst = dst_base + w * 4u;
+        kv_tile[dst] = float16_t(float(bitfieldExtract(codes, 0, 8)) * scale);
+        kv_tile[dst + 1u] = float16_t(float(bitfieldExtract(codes, 8, 8)) * scale);
+        kv_tile[dst + 2u] = float16_t(float(bitfieldExtract(codes, 16, 8)) * scale);
+        kv_tile[dst + 3u] = float16_t(float(bitfieldExtract(codes, 24, 8)) * scale);
+    }
 }
 
 uint source_row(uint row, uint logical, uint selected, uint complete) {
@@ -138,35 +146,33 @@ void main() {
         }
         barrier();
 
-        uint tile_quads = tile_count * QUADS;
+        const uint GROUPS_PER_KEY = QUADS / 4u;
 #ifdef COOP_QK
-        for (uint packed = local_id; packed < TILE_KEYS * QUADS; packed += 128u) {
-            uint key = packed / QUADS;
-            uint quad = packed - key * QUADS;
-            uint dst_base = key * HEAD_DIM + quad * 4u;
+        for (uint packed = local_id; packed < TILE_KEYS * GROUPS_PER_KEY; packed += 128u) {
+            uint key = packed / GROUPS_PER_KEY;
+            uint group = packed - key * GROUPS_PER_KEY;
+            uint local = group * 16u;
+            uint dst_base = key * HEAD_DIM + local;
             if (key < tile_count) {
-                stage_q8_quad(
+                stage_q8_quad16(
                     kv_segment_base(tile_k_address[key]),
-                    tile_local_base[key] + quad * 4u,
+                    tile_local_base[key] + local,
                     segment_elems,
                     dst_base
                 );
             } else {
-                kv_tile[dst_base] = float16_t(0.0);
-                kv_tile[dst_base + 1u] = float16_t(0.0);
-                kv_tile[dst_base + 2u] = float16_t(0.0);
-                kv_tile[dst_base + 3u] = float16_t(0.0);
+                for (uint i = 0u; i < 16u; i++) { kv_tile[dst_base + i] = float16_t(0.0); }
             }
         }
 #else
-        for (uint packed = local_id; packed < tile_quads; packed += 128u) {
-            uint key = packed / QUADS;
-            uint quad = packed - key * QUADS;
-            stage_q8_quad(
+        for (uint packed = local_id; packed < tile_count * GROUPS_PER_KEY; packed += 128u) {
+            uint key = packed / GROUPS_PER_KEY;
+            uint local = (packed - key * GROUPS_PER_KEY) * 16u;
+            stage_q8_quad16(
                 kv_segment_base(tile_k_address[key]),
-                tile_local_base[key] + quad * 4u,
+                tile_local_base[key] + local,
                 segment_elems,
-                key * HEAD_DIM + quad * 4u
+                key * HEAD_DIM + local
             );
         }
 #endif
@@ -269,14 +275,14 @@ void main() {
         }
         barrier();
 
-        for (uint packed = local_id; packed < tile_quads; packed += 128u) {
-            uint key = packed / QUADS;
-            uint quad = packed - key * QUADS;
-            stage_q8_quad(
+        for (uint packed = local_id; packed < tile_count * GROUPS_PER_KEY; packed += 128u) {
+            uint key = packed / GROUPS_PER_KEY;
+            uint local = (packed - key * GROUPS_PER_KEY) * 16u;
+            stage_q8_quad16(
                 kv_segment_base(tile_v_address[key]),
-                tile_local_base[key] + quad * 4u,
+                tile_local_base[key] + local,
                 segment_elems,
-                key * HEAD_DIM + quad * 4u
+                key * HEAD_DIM + local
             );
         }
         barrier();

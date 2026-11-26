@@ -1303,7 +1303,18 @@ fn moe_static_phase(rows: usize, n_used: usize, n_expert: usize) -> RuntimePhase
 /// Decode while selecting Prefill for the wide batches that switch residency strategy. `None`
 /// keeps graphs with no MoE work on the established local-pool path even when their backend also
 /// happens to own a pager.
+///
+/// A stamped `prefill_runtime_reserve_bytes` makes the WHOLE graph Prefill regardless of its row
+/// height: the runner only stamps a reserve on rounds where it already ran `prepare_prefill` and
+/// crushed the expert corridor to price the ring (2026-10-19 memory-bomb fix — a gray chunk that
+/// executes Decode on a paid round storm-misses hundreds of experts per layer through the emptied
+/// corridor into unbounded staging, and with no Prefill transition the corridor is never restored).
+/// The ring layout is row-count agnostic (`build_prefill_layout` sizes lanes by layer banks), so a
+/// short paid chunk rides the ring correctly, it just amortizes the lane streaming less well.
 fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
+    let paid_round = graph
+        .prefill_runtime_reserve_bytes
+        .is_some_and(|bytes| bytes > 0);
     let mut phase = None;
     for op in &graph.ops {
         let Op::MoeFfn {
@@ -1317,7 +1328,11 @@ fn paged_static_phase(graph: &Graph) -> Option<RuntimePhase> {
             continue;
         };
         let rows = graph.desc(*x).numel() / *ne as usize;
-        let op_phase = moe_static_phase(rows, *n_used as usize, *n_expert as usize);
+        let op_phase = if paid_round {
+            RuntimePhase::Prefill
+        } else {
+            moe_static_phase(rows, *n_used as usize, *n_expert as usize)
+        };
         phase = Some(op_phase);
         if op_phase == RuntimePhase::Prefill {
             return Some(RuntimePhase::Prefill);
@@ -4066,7 +4081,10 @@ fn lower_op(
                     let key = pooled(pool, be_, "lin_w32", bytes)?;
                     let expanded = pool[&key].as_ref();
                     rec.dequant_weight_f32(dt, arena_addr, w_off, xb, expanded, in_f * out_f);
-                    rec.linear_f32_tracked(expanded, xb, y, m, in_f, out_f);
+                    let expanded_addr = expanded
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(expanded_addr, expanded, xb, y, m, in_f, out_f);
                     return Ok(());
                 }
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
@@ -4853,7 +4871,10 @@ fn lower_op(
                     let key = pooled(pool, be_, "lin_w32", bytes)?;
                     let expanded = pool[&key].as_ref();
                     rec.dequant_weight_f32(dt, addr, w_off, w, expanded, in_f * out_f);
-                    rec.linear_f32_tracked(expanded, xb, y, m, in_f, out_f);
+                    let expanded_addr = expanded
+                        .device_addr()
+                        .expect("lin_w32 scratch needs a BDA device address");
+                    rec.linear_f32_tracked(expanded_addr, expanded, xb, y, m, in_f, out_f);
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
@@ -4970,6 +4991,42 @@ fn lower_op(
                 return Err(be("vulkan adapter: Gelu requires f32 input and output"));
             }
             rec.gelu(r(*x)?, r(*dst)?, *rows * *cols);
+        }
+        // The uncensor projection reads and writes ONE buffer (a workgroup must own its row while
+        // it rewrites it), so like `Op::Scale` a graph that keeps `x` and `dst` apart needs the
+        // copy; the graphs built for this op pass the same wide residual and skip it. `scale_buf`
+        // is the per-request on/off switch (see `Op::UncensorProject`'s doc): flipping it is a
+        // 4-byte upload, not a plan rebuild, and `0.0` leaves the residual exactly as it was.
+        Op::UncensorProject {
+            x,
+            dir,
+            dst,
+            rows,
+            hc,
+            n_embd,
+            dir_off,
+            scale,
+            scale_buf,
+        } => {
+            if x != dst {
+                let n = *rows as usize * *hc as usize * *n_embd as usize;
+                let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
+                rec.copy(r(*x)?, 0, r(*dst)?, 0, n * eb);
+            }
+            match scale_buf {
+                Some(sb) => rec.uncensor_project_dyn(
+                    r(*dst)?,
+                    r(*dir)?,
+                    r(*sb)?,
+                    *rows,
+                    *hc,
+                    *n_embd,
+                    *dir_off,
+                ),
+                None => {
+                    rec.uncensor_project(r(*dst)?, r(*dir)?, *rows, *hc, *n_embd, *dir_off, *scale)
+                }
+            }
         }
         Op::QwenHcMix {
             x,
@@ -7346,6 +7403,25 @@ fn lower_op(
                 };
                 let scratch_ne = scratch_rows * nkv * hd;
                 let scratch_tail_bytes = (scratch_ne - ne) * 2;
+                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) USED to fault with 0xc0000005 INSIDE
+                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first FUSED flash use
+                // of a ragged 4K prefill, e.g. 4001 query rows, at amdvlk64.dll+0x2b65705). The
+                // trigger was the fully-unrolled IR: `attn_flash_warp_hd256.comp` no longer forces
+                // `[[unroll]]`, the SAME kernel compiles, and it measured +21% / +24% / +10% pp
+                // over the coopmat non-FA tier (Qwen3.6-35B, 4001 / 8000 / 12001 rows, 26.10.1).
+                // So the fused build is ENABLED by default now; `INFR_AMDVLK_HD256_FLASH=0`
+                // (`--set kernels.vulkan.amdvlk_hd256_flash=false`) restores the coopmat
+                // `attn_qk`/`softmax`/`attn_pv` tier for a driver that still faults. The register-O
+                // build is a different pipeline and stays available for its 128-row contract.
+                let required_kv_rows = flash_kv_storage_rows(kv_len);
+                let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
+                let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
+                let register_o_tail_safe =
+                    k_storage_rows >= required_kv_rows && v_storage_rows >= required_kv_rows;
+                let amdvlk_hd256_flash_avoided = hd == 256
+                    && be_.is_amd_proprietary_driver()
+                    && !be_.cfg().kernels.vulkan.amdvlk_hd256_flash
+                    && !(register_o_candidate && register_o_tail_safe);
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
                 // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
@@ -7424,20 +7500,6 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                //
-                // amdvlk (VK_DRIVER_ID_AMD_PROPRIETARY, LLPC) faulted with 0xc0000005 INSIDE
-                // vkCreateComputePipelines for `attn_flash_warp_hd256_bm16` (first fused flash use
-                // of a ragged 4K prefill, e.g. 4001 query rows, at amdvlk64.dll+0x2b65705). The
-                // trigger was the shader's fully-unrolled IR, not the driver's pipeline path: the
-                // kernel now ships as TWO builds (`attn_flash_warp_hd256.comp`'s UNROLL macro) and
-                // the recorder gives amdvlk the non-unrolled one, which carries the same math — so
-                // hd256 prefill takes the fused tier on this driver BY DEFAULT. This latch is the
-                // escape hatch for a driver that still faults: `INFR_AMDVLK_HD256_FLASH=0`
-                // (`--set kernels.vulkan.amdvlk_hd256_flash=false`) drops it back to the coopmat
-                // `attn_qk`/`softmax`/`attn_pv` tier, which is 10-24% slower at pp4k on 35B.
-                let amdvlk_hd256_flash_avoided = hd == 256
-                    && be_.is_amd_proprietary_driver()
-                    && !be_.cfg().kernels.vulkan.amdvlk_hd256_flash;
                 let flash_ok = flash_geom
                     && !segmented_read
                     && !(k_q8_eff || v_q8_eff)
@@ -7503,7 +7565,13 @@ fn lower_op(
                 // requirement: the kernel guards pad-row reads/writes itself. Exercisable on
                 // coopmat hardware via INFR_NO_COOPMAT=1; INFR_NO_NC_FA=1 disables the arm (A/B
                 // against the scalar/split floor).
-                let nc_fa_ok = !flash_ok
+                //
+                // NOT used as the amdvlk hd256 workaround: the hd256 build declares 54016 B of
+                // workgroup storage against the 32768 B this driver reports (`VUID-RuntimeSpirv-
+                // Workgroup-06530`). The workaround routes to `nonfa_ok` instead, whose qk/pv
+                // tiles stay around 10 KiB; the budget gate below keeps this arm off any device
+                // that reports less than the selected build declares.
+                let nc_fa_armed = !flash_ok
                     && !nonfa_ok
                     && !segmented_read
                     && !be_.caps().f16_coopmat()
@@ -7513,6 +7581,23 @@ fn lower_op(
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
                     && be_.cfg().kernels.vulkan.nc_fa;
+                // The selected build declares 37632 B (hd128) / 54016 B (hd256) / 47616 B
+                // (hd512) of workgroup storage; a device that reports less must not get it
+                // (VUID-RuntimeSpirv-Workgroup-06530). Keep the arm inside the budget and say
+                // why when the budget alone is what skips it.
+                let nc_fa_shared = crate::gemm::attn_nc_fa_shared_bytes(hd);
+                let nc_fa_shared_ok =
+                    nc_fa_shared.is_some_and(|bytes| be_.max_shared_memory_bytes() >= bytes);
+                if nc_fa_armed && !nc_fa_shared_ok {
+                    if let Some(requested) = nc_fa_shared {
+                        tracing::warn!(
+                            "nc_fa skipped: requested shared memory {requested} B exceeds \
+                             device limit {} B (VUID-RuntimeSpirv-Workgroup-06530)",
+                            be_.max_shared_memory_bytes()
+                        );
+                    }
+                }
+                let nc_fa_ok = nc_fa_armed && nc_fa_shared_ok;
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
                 // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
                 // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
@@ -7691,11 +7776,6 @@ fn lower_op(
                         _ => None,
                     };
                     if hd == 256 {
-                        let required_kv_rows = flash_kv_storage_rows(kv_len);
-                        let k_storage_rows = if deq_k { scratch_rows } else { att_cap_rows };
-                        let v_storage_rows = if deq_v { scratch_rows } else { att_cap_rows };
-                        let register_o_tail_safe = k_storage_rows >= required_kv_rows
-                            && v_storage_rows >= required_kv_rows;
                         rec.attention_prefill_flash_hd256(
                             r(*q)?,
                             kcb,
@@ -14230,11 +14310,20 @@ fn resident_copy_requested(
     }
     match policy {
         None => {
-            !graph.mtp_verify
-                && decode_token_rows(graph).is_some_and(|rows| {
+            if graph.mtp_verify {
+                // The same causal-Verify cohort the explicit opt-in below already admits. Qualified
+                // E2E on RX 7900 XTX / Qwen3.8-Flash-Next (merged v1.3.0 tree): paired two-round A/B
+                // gave verify median 104.0 -> 98.9 ms and cycle median 109.6 -> 104.3 ms (-4.8%),
+                // with the committed text byte-identical across two processes per arm. Independent
+                // rows and row counts outside 2..=4 stay on the host-service boundary.
+                !graph.independent_rows
+                    && layouts.iter().all(|layout| (2..=4).contains(&layout.rows))
+            } else {
+                decode_token_rows(graph).is_some_and(|rows| {
                     (1..=crate::GPU_RESIDENT_MAX_ROWS).contains(&rows)
                         && layouts.iter().all(|layout| layout.rows == rows)
                 })
+            }
         }
         Some(true) => {
             !graph.mtp_verify
@@ -18002,7 +18091,7 @@ fn moe_router_logits_rows(rows: usize, gemm: bool) -> usize {
 
 /// Record a MoE layer's router logits (all `rows` tokens at once) into `logits` — the prefill
 /// tiled-GEMM tier or the scalar GEMV family, see `moe_router_gemm_applies`. Shared by the
-/// batched and small-m MoE arms so both pick the same tier for the same shape.
+/// batched, small-m and paged MoE arms so all three pick the same tier for the same shape.
 #[allow(clippy::too_many_arguments)]
 fn record_moe_router_logits(
     be_: &VulkanBackend,
@@ -21025,23 +21114,6 @@ mod shared_verify_contract;
 
 #[cfg(test)]
 mod tests {
-    /// The router's tiled-GEMM tier stores whole 64-row C tiles (the padded-dst convention every
-    /// prefill GEMM follows), so the logits buffer has to grow with it — but ONLY then; the GEMV
-    /// tiers must keep the exact row count they always had.
-    #[test]
-    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
-        for rows in [1usize, 17, 63, 64, 65, 4096, 5120] {
-            assert_eq!(super::moe_router_logits_rows(rows, false), rows);
-            let padded = super::moe_router_logits_rows(rows, true);
-            assert!(
-                padded >= rows && padded.is_multiple_of(64),
-                "rows {rows} → {padded}"
-            );
-        }
-        assert_eq!(super::moe_router_logits_rows(4096, true), 4096);
-        assert_eq!(super::moe_router_logits_rows(17, true), 64);
-    }
-
     fn prepare_metadata_graph(rows: usize, dtype: infr_core::DType) -> super::Graph {
         use super::*;
         use infr_core::TensorDesc;
@@ -21361,6 +21433,101 @@ mod tests {
         truncated.ops.pop();
         assert_eq!(paged_moe_shared_candidates(&truncated, false).count(), 0);
         assert_eq!(paged_moe_shared_candidates(&Graph::new(), false).count(), 0);
+    }
+
+    /// The prefill router tier stores whole 64-row C tiles, so the logits buffer every one of the
+    /// three MoE arms allocates must round UP to the tile; `moe_topk` still reads only `rows` real
+    /// ones. Under-padding is an out-of-bounds write into the next pool slot, so the three
+    /// invariants (covers `rows`, 64-aligned, at most one tile of waste) are pinned here, along
+    /// with the small-rows half where the GEMV tier writes exactly `rows` and padding would only
+    /// cost buffer bytes.
+    ///
+    /// Qwen3.8-Flash-Next's numbers: 4096-row prefill chunks (its `ubatch` is 64-aligned, so the
+    /// GEMM tier wastes nothing) and `n_expert == 512`, which is why the gate's `n%64` holds.
+    #[test]
+    fn moe_router_logits_rows_pads_only_for_the_gemm_tier() {
+        use super::*;
+        for rows in [1usize, 2, 8, 16, 17, 63, 64, 65, 128, 129, 4096, 30_000] {
+            assert_eq!(moe_router_logits_rows(rows, false), rows);
+            let padded = moe_router_logits_rows(rows, true);
+            assert!(padded >= rows, "{rows} -> {padded} short of the C store");
+            assert!(
+                padded.is_multiple_of(64),
+                "{rows} -> {padded} not tile-aligned"
+            );
+            assert!(
+                padded < rows + 64,
+                "{rows} -> {padded} wastes a whole extra tile"
+            );
+            assert_eq!(padded, rows.div_ceil(64) * 64);
+        }
+        // The tile store is what forces padding: an exact-multiple chunk (the engine's 64-aligned
+        // prefill ubatch) must stay unpadded, or the padded/dst row counts would disagree.
+        assert_eq!(moe_router_logits_rows(4096, true), 4096);
+        assert_eq!(moe_router_logits_rows(17, true), 64);
+    }
+
+    /// The narrow-output f32 route is the only tier the Qwen3.8-Flash-Next `2560x48` /
+    /// `10240x4` tensors can take (no 64-multiple in n), and it is exact, so the gate must not
+    /// drift into shapes that either HAVE a tile, are decode-sized, or would expand a big weight.
+    #[test]
+    fn narrow_f32_gate_is_bounded_to_the_measured_shapes() {
+        use infr_core::DType;
+        for (dt, k, n) in [
+            (DType::Q8_0, 2560usize, 48usize),
+            (DType::Q8_0, 10240, 4),
+            (DType::Bf16, 2560, 48),
+            (DType::Bf16, 10240, 4),
+        ] {
+            assert!(
+                crate::recorder::narrow_f32_gemm_eligible(dt, 4096, k, n),
+                "{dt:?} {k}x{n} at prefill rows must take the f32 route"
+            );
+        }
+        // Decode keeps the native GEMV: one row is exactly what it is good at.
+        for m in [1usize, 2, 16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                m,
+                2560,
+                48
+            ));
+        }
+        // 64-multiple widths have a tiled GEMM tile; they must never come here.
+        for n in [64usize, 128, 2560] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                DType::Q8_0,
+                4096,
+                2560,
+                n
+            ));
+        }
+        // No expansion build for these dtypes.
+        for dt in [DType::Q4K, DType::Q6K, DType::F32, DType::F16] {
+            assert!(!crate::recorder::narrow_f32_gemm_eligible(
+                dt, 4096, 2560, 48
+            ));
+        }
+        // K must stay on the native block grid.
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560 + 1,
+            48
+        ));
+        // Expansion ceiling: 128 Ki elements of f32 scratch.
+        assert!(crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            2560,
+            48
+        ));
+        assert!(!crate::recorder::narrow_f32_gemm_eligible(
+            DType::Q8_0,
+            4096,
+            4096,
+            33
+        ));
     }
 
     #[test]

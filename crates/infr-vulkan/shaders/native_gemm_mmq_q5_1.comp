@@ -95,19 +95,17 @@ uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 uint ru32(uint byte) {
     return rb(byte) | (rb(byte + 1u) << 8u) | (rb(byte + 2u) << 16u) | (rb(byte + 3u) << 24u);
 }
+// NW4: one 16-byte read of a Q5_1 block's qs body (bd+8..bd+23 is word-aligned because the 24-byte
+// block stride is a multiple of 4). One b128 per column replaces the old 8×ru32(qh) + 32×rb(qs)
+// byte-extract chain; qh is read once per column instead of once per WPB word — the repeated
+// ru32(bd+4) was the dominant decode overhead on Q5_1 down.
+#if defined(PAGED) || defined(STREAMED)
+#define NW4_WORDS(wbase) arena_word4(wbase)
+#else
+uvec4 nw4_words(uint wbase) { return uvec4(nw[wbase], nw[wbase + 1u], nw[wbase + 2u], nw[wbase + 3u]); }
+#define NW4_WORDS(wbase) nw4_words(wbase)
+#endif
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
-// Q5_1 element `j` (0..31) of the block at byte offset `bd`: 4-bit nibble (qs, 16 bytes at bd+8 —
-// `d`+`m` push the qh/qs fields 2 bytes later than Q5_0) plus the 5th bit from `qh` (the 32-bit
-// field at bd+4) — same bit layout as native_decode.glsl's FMT_Q5_0/FMT_Q5_1.
-uint q5elem(uint bd, uint qh, uint j) {
-    if (j < 16u) {
-        uint xh0 = ((qh >> j) << 4u) & 0x10u;
-        return (rb(bd + 8u + j) & 0xFu) | xh0;
-    }
-    uint jj = j - 16u;
-    uint xh1 = (qh >> (jj + 12u)) & 0x10u;
-    return (rb(bd + 8u + jj) >> 4u) | xh1;
-}
 
 void main() {
 #ifdef STREAMED
@@ -166,19 +164,30 @@ void main() {
         }
         // stage weights: BN cols × WPB words — unpack nibble+highbit, NO centering (q ∈ 0..31
         // stored directly; the min term is folded via `sact` below, not baked into the packed
-        // int8, unlike Q5_0's -16 centering).
-        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
-            uint cc = idx / WPB;
-            uint p = idx % WPB;
+        // int8, unlike Q5_0's -16 centering). One invocation per column reads qh ONCE and pulls the
+        // whole 16-byte qs body as one NW4; the low nibbles produce words 0..3 and the high
+        // nibbles of the SAME qs bytes produce words 4..7 (ggml stores both halves interleaved in
+        // 16 bytes, not as two separate slices).
+        for (uint idx = li; idx < BN; idx += THREADS) {
+            uint cc = idx;
             uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gelem / 32u) * 24u;
             uint qh = ru32(bd + 4u);
-            uint packed = 0u;
-            [[unroll]] for (uint b = 0u; b < 4u; b++) {
-                uint val = q5elem(bd, qh, p * 4u + b);
-                packed |= (val & 0xFFu) << (b * 8u);
+            uvec4 qw = NW4_WORDS((bd + 8u) >> 2u);
+            for (uint upper = 0u; upper < 2u; upper++) {
+                for (uint j = 0u; j < 4u; j++) {
+                    uint packed = 0u;
+                    for (uint b = 0u; b < 4u; b++) {
+                        uint e = upper * 16u + j * 4u + b;
+                        uint qbyte = (qw[j] >> (b * 8u)) & 0xFFu;
+                        uint val = (upper == 0u)
+                            ? ((qbyte & 0xFu) | (((qh >> e) << 4u) & 0x10u))
+                            : ((qbyte >> 4u) | ((qh >> (e - 4u)) & 0x10u));
+                        packed |= (val & 0xFFu) << (b * 8u);
+                    }
+                    Bs[cc * SP + upper * 4u + j] = packed;
+                }
             }
-            Bs[cc * SP + p] = packed;
         }
         barrier();
 

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INFR Console · 管理端登录</title>
+<style>
+  :root { color-scheme: dark; --bg:#0c0f14; --panel:#151a23; --line:#263041; --text:#e6edf3; --muted:#8b98aa; --accent:#58a6ff; --bad:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:radial-gradient(circle at 50% 0%,#162033,var(--bg)); color:var(--text); font:14px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .card { width:min(420px,calc(100vw - 32px)); padding:28px; border:1px solid var(--line); border-radius:16px; background:var(--panel); box-shadow:0 18px 60px #0008; }
+  .brand { font-size:20px; font-weight:700; letter-spacing:.04em; margin-bottom:4px; }
+  .sub { color:var(--muted); margin-bottom:22px; }
+  label { display:block; margin:14px 0 6px; color:var(--muted); }
+  input { width:100%; padding:11px 12px; border:1px solid var(--line); border-radius:8px; background:#0d1117; color:var(--text); font:inherit; }
+  input:focus { outline:none; border-color:var(--accent); }
+  button { width:100%; margin-top:18px; padding:11px 14px; border:0; border-radius:8px; background:var(--accent); color:#04101f; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:wait; }
+  .err { min-height:20px; margin-top:10px; color:var(--bad); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+  <form class="card" id="login-form">
+    <div class="brand">INFR·Console</div>
+    <div class="sub">管理员端 · 请输入控制台口令</div>
+    <label for="password">管理口令</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+    <div class="err" id="err"></div>
+    <button type="submit" id="submit">登录管理端</button>
+    <p class="sub" style="margin:18px 0 0;text-align:center">普通用户请前往 <a href="/user">用户端</a></p>
+  </form>
+<script>
+document.getElementById("login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const err = document.getElementById("err");
+  const btn = document.getElementById("submit");
+  err.textContent = "";
+  btn.disabled = true;
+  try {
+    const res = await fetch("/ui/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: document.getElementById("password").value }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    location.href = "/";
+  } catch (e) {
+    err.textContent = e.message;
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

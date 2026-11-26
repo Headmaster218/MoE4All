@@ -1,0 +1,387 @@
+//! INFR Console — a standalone reverse proxy with a dashboard.
+//!
+//! It sits between the client and a running `infr serve`, so it can measure what the engine cannot
+//! see from outside (time to first token, which of the three decode states a turn is in, which tool
+//! is being called) and account per client API key. It depends on NO engine crate: everything it
+//! knows about resources comes from the engine's `/internal/stats`, so it builds and runs on a box
+//! with no GPU, no Vulkan SDK and no model.
+
+mod auth;
+mod crypto;
+mod launch;
+mod proxy;
+mod state;
+#[cfg(test)]
+mod tests;
+mod tls;
+mod ui;
+mod vector;
+
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use clap::Parser;
+use tokio::sync::broadcast;
+
+use anyhow::Context;
+
+use state::{Console, EngineView, Series, UncensorState};
+
+#[derive(Parser)]
+#[command(
+    name = "infr-console",
+    version,
+    about = "INFR 推理控制台：反向代理 + 仪表盘 + 图形化启动参数"
+)]
+struct Cli {
+    /// Address the console listens on. The default accepts connections from other devices on the
+    /// LAN; pass `127.0.0.1:8090` to keep it loopback-only.
+    #[arg(long, default_value = "0.0.0.0:8090")]
+    listen: String,
+    /// The engine's OpenAI-compatible base URL.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    upstream: String,
+    /// The ENGINE's own API key (serve.api_key / INFR_API_KEY). Never sent to a client.
+    #[arg(long)]
+    upstream_key: Option<String>,
+    /// Engine binary used by the launch page. Defaults to `infr` beside this executable.
+    #[arg(long)]
+    binary: Option<PathBuf>,
+    /// Where client API keys and their counters are persisted.
+    #[arg(long)]
+    state: Option<PathBuf>,
+    /// Pin the admin web password. Without it a random password is generated and printed on every
+    /// start, so a forgotten password only costs a restart.
+    #[arg(long)]
+    admin_password: Option<String>,
+    /// PEM certificate chain for serving HTTPS on `--listen`.
+    #[arg(long, value_name = "FILE")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key matching `--tls-cert`.
+    #[arg(long, value_name = "FILE")]
+    tls_key: Option<PathBuf>,
+    /// Require HTTPS. Certificates are picked up automatically; this only turns a missing
+    /// certificate into a startup error instead of a silent fallback to HTTP.
+    #[arg(long)]
+    tls: bool,
+    /// Never serve HTTPS, even when a certificate is present.
+    #[arg(long, conflicts_with_all = ["tls", "tls_cert", "tls_key"])]
+    no_tls: bool,
+}
+
+impl Cli {
+    /// Resolve the TLS key pair. Certificates are found automatically in `<state dir>/certs` (where
+    /// `make-cert.cmd` writes them) or in `certs` beside the executable, so generating one is all it
+    /// takes to switch the console to HTTPS. `--no-tls` opts out.
+    fn tls_files(
+        &self,
+        state_path: &std::path::Path,
+    ) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => return Ok(Some((cert.clone(), key.clone()))),
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("--tls-cert 与 --tls-key 必须同时提供")
+            }
+            (None, None) => {}
+        }
+        if self.no_tls {
+            return Ok(None);
+        }
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = state_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            dirs.push(parent.join("certs"));
+        }
+        if let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        {
+            let portable = exe_dir.join("certs");
+            if !dirs.contains(&portable) {
+                dirs.push(portable);
+            }
+        }
+        for dir in &dirs {
+            let cert = dir.join("console-cert.pem");
+            let key = dir.join("console-key.pem");
+            if cert.is_file() && key.is_file() {
+                return Ok(Some((cert, key)));
+            }
+        }
+        if self.tls {
+            let first = dirs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("certs"));
+            anyhow::bail!(
+                "已指定 --tls，但 {} 下没有 console-cert.pem / console-key.pem；先运行 make-cert.cmd",
+                first.display()
+            );
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .init();
+    let cli = Cli::parse();
+
+    let state_path = cli.state.clone().unwrap_or_else(default_state_path);
+    let tls_files = cli.tls_files(&state_path)?;
+    let auto_tls =
+        tls_files.is_some() && cli.tls_cert.is_none() && cli.tls_key.is_none() && !cli.tls;
+    let binary = cli.binary.unwrap_or_else(default_binary);
+    let store = Arc::new(crypto::SecureStore::new(&state_path)?);
+    let keys = store.load("keys.json").unwrap_or_default();
+    let mut persisted_auth: auth::PersistentAuth = match store.load("auth.json") {
+        Some(auth) => auth,
+        // A file that exists but will not decrypt means the key changed or the file was edited.
+        // Refusing is better than silently rewriting it and wiping every user account.
+        None if store.exists("auth.json") => anyhow::bail!(
+            "{} 无法解密（state.key 可能已更换）；为避免清空用户账号，控制台拒绝启动。删除该文件可重新初始化。",
+            state_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("auth.json")
+                .display()
+        ),
+        None => Default::default(),
+    };
+    // A fresh admin password every start. The console is normally started from a shortcut and the
+    // printed-once password is exactly the thing people lose; `--admin-password` pins a fixed value
+    // for unattended installs. Only the hash is written, so the old password dies with this process.
+    let pinned = cli.admin_password.clone().filter(|p| !p.is_empty());
+    let password = auth::bootstrap_password(pinned.clone());
+    persisted_auth.admin = Some(auth::PasswordRecord::new(&password));
+    store.save("auth.json", &persisted_auth)?;
+    let (events, _) = broadcast::channel(4096);
+    let (state_dirty, _) = broadcast::channel(8);
+    let console = Arc::new(Console {
+        upstream: Mutex::new(cli.upstream.trim_end_matches('/').to_string()),
+        upstream_key: Mutex::new(cli.upstream_key),
+        binary,
+        state_path: state_path.clone(),
+        store: Arc::clone(&store),
+        auth: Mutex::new(auth::AuthState::from_persistent(persisted_auth)),
+        tls: tls_files.is_some(),
+        http: reqwest::Client::builder()
+            .pool_max_idle_per_host(8)
+            .build()?,
+        keys: Mutex::new(keys),
+        rounds: Mutex::new(Default::default()),
+        series: Mutex::new(Series::default()),
+        uncensor: Mutex::new(UncensorState::default()),
+        engine: Mutex::new(EngineView::default()),
+        engine_log: Mutex::new(Default::default()),
+        child: Mutex::new(None),
+        shutdown_file: Mutex::new(None),
+        schema: Mutex::new(None),
+        conversations: Mutex::new(Default::default()),
+        events,
+        state_dirty,
+        subscribers: AtomicUsize::new(0),
+        next_round: AtomicU64::new(1),
+        console_log: Mutex::new(Default::default()),
+    });
+    console.log(format!("控制台启动，上游 {}", console.upstream()));
+
+    tokio::spawn(poll_engine(Arc::clone(&console)));
+
+    let app = ui::router(Arc::clone(&console));
+
+    let listener = tokio::net::TcpListener::bind(&cli.listen)
+        .await
+        .with_context(|| format!("无法监听 {}（端口被占用或权限不足）", cli.listen))?;
+    let addr = listener.local_addr()?;
+    let port = addr.port();
+    let advertised = if addr.ip().is_unspecified() {
+        lan_ipv4().into_iter().next()
+    } else {
+        Some(addr.ip())
+    };
+    let scheme = if tls_files.is_some() { "https" } else { "http" };
+    match advertised {
+        Some(ip) => println!("INFR Console  {scheme}://{ip}:{port}"),
+        None => println!("INFR Console  监听 {}，未检测到局域网地址", cli.listen),
+    }
+    println!(
+        "用户端入口    {scheme}://{}:{port}/user",
+        advertised
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".into())
+    );
+    match &pinned {
+        Some(_) => println!("管理端口令    使用 --admin-password 指定（不在终端显示）"),
+        None => println!("管理端口令    本次启动随机生成：{password}（重启会重新生成）"),
+    }
+    if addr.ip().is_unspecified() {
+        let hosts = lan_ipv4();
+        if hosts.len() > 1 {
+            println!(
+                "其他网卡地址  {}",
+                hosts
+                    .iter()
+                    .map(|ip| format!("{scheme}://{ip}:{port}"))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+        }
+        if tls_files.is_some() {
+            if auto_tls {
+                println!("安全提示      检测到证书，已自动启用 HTTPS；自签证书首次访问需在浏览器里手动信任。");
+            } else {
+                println!("安全提示      已启用 HTTPS；自签证书首次访问需在浏览器里手动信任。");
+            }
+        } else {
+            let helper = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("make-cert.cmd")))
+                .filter(|path| path.is_file());
+            match helper {
+                Some(path) => println!(
+                    "安全提示      管理端与用户端都需要登录；需要 HTTPS 时运行 {}，之后每次启动自动使用。",
+                    path.display()
+                ),
+                None => println!(
+                    "安全提示      管理端与用户端都需要登录；HTTP 为明文传输，公网访问请配置证书或 --tls-cert/--tls-key。"
+                ),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let helper = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("enable-lan-access.cmd")))
+                .filter(|path| path.is_file());
+            match helper {
+                Some(path) => println!(
+                    "Windows 防火墙 其他设备连不上时，右键以管理员身份运行：{}",
+                    path.display()
+                ),
+                None => println!(
+                    "Windows 防火墙 其他设备连不上时，以管理员身份执行：netsh advfirewall firewall add rule name=\"INFR Console\" dir=in action=allow protocol=TCP localport={port}"
+                ),
+            }
+        }
+    }
+    println!("上游引擎      {}", console.upstream());
+    println!("引擎二进制    {}", console.binary.display());
+    match tls_files {
+        Some((cert, key)) => {
+            let config = tls::server_config(&cert, &key)?;
+            println!("TLS 证书      {}（{}）", cert.display(), key.display());
+            tls::serve(app, listener, config).await?;
+        }
+        None => axum::serve(listener, app).await?,
+    }
+    Ok(())
+}
+
+/// Best-effort IPv4 address of the interface that carries the default route. UDP `connect` does
+/// not send a packet; it only asks the routing table which local address would be used.
+fn lan_ipv4() -> Vec<std::net::IpAddr> {
+    let mut found = Vec::new();
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(local) = socket.local_addr() {
+                if !local.ip().is_loopback() && !local.ip().is_unspecified() {
+                    found.push(local.ip());
+                }
+            }
+        }
+    }
+    found
+}
+
+fn default_binary() -> PathBuf {
+    let name = if cfg!(windows) { "infr.exe" } else { "infr" };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join(name);
+            if beside.is_file() {
+                return beside;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn default_state_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("infr-console")
+        .join("keys.json")
+}
+
+/// 1 Hz engine poll. Reads `/internal/stats`, which is non-consuming: it must not steal the terminal
+/// reporter's statistics window or the dashboard's decode counter.
+async fn poll_engine(console: Arc<Console>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        launch::reap(&console);
+
+        let url = format!("{}/internal/stats", console.upstream());
+        let mut request = console.http.get(&url).timeout(Duration::from_secs(3));
+        if let Some(key) = console.upstream_key() {
+            request = request.bearer_auth(key);
+        }
+        let stats = match request.send().await {
+            Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().await.ok(),
+            _ => None,
+        };
+
+        let mut decode = 0.0f64;
+        let mut prefill = 0.0f64;
+        if let Some(stats) = &stats {
+            for slot in stats
+                .get("slots")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(req) = slot.get("request") else {
+                    continue;
+                };
+                // `tokens_per_second` is phase-aware: the engine reports its smoothed prefill rate
+                // while Prefill/Starting and its decode rate while Decode. Route it by phase so the
+                // prefill rate never lands in the decode series. The engine already holds the prefill
+                // rate across chunk boundaries, so a continuous prefill reads as a flat line instead
+                // of a sawtooth that drops to zero whenever a 1 s poll misses a chunk completion.
+                let speed = req
+                    .get("tokens_per_second")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                match req.get("phase").and_then(|v| v.as_str()).unwrap_or("") {
+                    "Decode" => decode = decode.max(speed),
+                    "Prefill" | "Starting" => prefill = prefill.max(speed),
+                    _ => {}
+                }
+            }
+            let vector_loaded = stats
+                .pointer("/uncensor/vector_loaded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            console.uncensor.lock().unwrap().vector_loaded = vector_loaded;
+        }
+
+        {
+            let mut engine = console.engine.lock().unwrap();
+            engine.reachable = stats.is_some();
+            engine.stats = stats;
+            if !engine.managed {
+                engine.running = engine.reachable;
+            }
+        }
+        console
+            .series
+            .lock()
+            .unwrap()
+            .push(state::now_ms(), decode, prefill);
+    }
+}

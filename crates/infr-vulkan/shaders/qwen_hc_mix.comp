@@ -1,21 +1,51 @@
 #version 460
-// Qwen3.8 low-rank gated residual collapse. One lane computes one output feature and sums the
-// small, fixed residual-stream axis in reference order.
+// Qwen3.8 low-rank gated residual collapse. One lane computes FOUR adjacent output features and
+// sums the small, fixed residual-stream axis in reference order; four adjacent features share the
+// same x/gate row offsets for every h, so their loads coalesce and the h-loop's index arithmetic is
+// amortized 4x. The scalar tail keeps arbitrary n_embd/row boundaries exact.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint hc; uint n_embd; uint total; } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer GB { float gate[]; };
 layout(binding = 2) writeonly buffer DB { float dst[]; };
-void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.total) { return; }
+
+float gate_sigmoid(float v) { return 1.0 / (1.0 + exp(-v)); }
+
+float mix_one(uint i) {
     uint r = i / pc.n_embd;
     uint d = i - r * pc.n_embd;
     float acc = 0.0;
     for (uint h = 0u; h < pc.hc; ++h) {
         uint j = (r * pc.hc + h) * pc.n_embd + d;
-        float s = 1.0 / (1.0 + exp(-gate[j]));
-        acc += x[j] * s;
+        acc += x[j] * gate_sigmoid(gate[j]);
     }
-    dst[i] = acc / float(pc.hc);
+    return acc / float(pc.hc);
+}
+
+void main() {
+    uint base = gl_GlobalInvocationID.x * 4u;
+    if (base >= pc.total) { return; }
+    uint r = base / pc.n_embd;
+    uint d = base - r * pc.n_embd;
+    if (d + 3u < pc.n_embd && base + 3u < pc.total) {
+        vec4 acc = vec4(0.0);
+        for (uint h = 0u; h < pc.hc; ++h) {
+            uint j = (r * pc.hc + h) * pc.n_embd + d;
+            acc.x += x[j] * gate_sigmoid(gate[j]);
+            acc.y += x[j + 1u] * gate_sigmoid(gate[j + 1u]);
+            acc.z += x[j + 2u] * gate_sigmoid(gate[j + 2u]);
+            acc.w += x[j + 3u] * gate_sigmoid(gate[j + 3u]);
+        }
+        acc /= float(pc.hc);
+        dst[base] = acc.x;
+        dst[base + 1u] = acc.y;
+        dst[base + 2u] = acc.z;
+        dst[base + 3u] = acc.w;
+    } else {
+        for (uint c = 0u; c < 4u; c++) {
+            uint i = base + c;
+            if (i >= pc.total) { break; }
+            dst[i] = mix_one(i);
+        }
+    }
 }

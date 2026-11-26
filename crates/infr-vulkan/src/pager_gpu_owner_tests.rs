@@ -859,6 +859,48 @@ fn owned_session_claim_rejects_active_forward_then_handoffs_and_reseeds() {
 
 #[test]
 #[ignore = "central serial GPU runner only; requires MOE4ALL_TEST_DEVICE and mapped Vulkan BDA"]
+fn expert_pressure_reads_the_device_lru_and_only_the_window_since_the_last_sample() {
+    let be = backend();
+    be.with_unified_exclusive(|| {
+        let mut fixture = Fixture::new(&be);
+        fixture.copy.begin(&be, &mut fixture.session).unwrap();
+        assert!(fixture.copy.owned_active());
+        // Eight DISTINCT absent blocks, each in its own batch: one batch cannot touch more blocks
+        // than the fixture's 16 slots hold. Pure misses, so the host-only rate is a loud 1.0 and the
+        // guard below cannot pass by accident on a window that merely went quiet.
+        for block in 0..8u32 {
+            let pager = &mut fixture.session.pools[0].pager.pager;
+            pager.begin_batch();
+            let _ = pager.touch(block);
+        }
+        // The host counters scream pressure, but under ownership they are biased: the owner resolves
+        // full-hit layers on device and hands off at the first miss, so host touches over-report
+        // misses. Reading them here would sink cold tails on a comfortable cache.
+        assert!(!fixture.session.expert_vram_pressure(None));
+        let pools = fixture.session.pools.len();
+        let stats = |hits: u64, misses: u64| {
+            vec![
+                PagerStats {
+                    hits,
+                    misses,
+                    evictions: 0,
+                };
+                pools
+            ]
+        };
+        // The readback path agrees with the same numbers the host holds.
+        assert!(fixture.session.expert_vram_pressure(Some(&stats(0, 8))));
+        assert!(!fixture.session.expert_vram_pressure(Some(&stats(1000, 9))));
+        assert!(fixture.session.expert_vram_pressure(Some(&stats(1010, 99))));
+        // Same totals again: an empty window is not pressure, or a warm model would yield forever.
+        assert!(!fixture.session.expert_vram_pressure(Some(&stats(1010, 99))));
+        // A failed readback falls back to the smaller host total; the window must not underflow.
+        assert!(!fixture.session.expert_vram_pressure(Some(&stats(5, 5))));
+    });
+}
+
+#[test]
+#[ignore = "central serial GPU runner only; requires MOE4ALL_TEST_DEVICE and mapped Vulkan BDA"]
 fn owned_session_abort_frees_pending_slots_without_restoring_evicted_owners() {
     let be = backend();
     be.with_unified_exclusive(|| {

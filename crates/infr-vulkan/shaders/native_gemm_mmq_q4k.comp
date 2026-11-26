@@ -90,6 +90,17 @@ uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFF
 uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
 #endif
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+// NW4: one 16-byte read of a Q4_K sub-block's qs body. The 128 qs bytes of a 256-elem block start
+// at bd+16 and every 32-elem sub-block gets 16 word-aligned bytes at bd+16+(sub>>1)*32, so four
+// adjacent packed-int8 words can be pulled as one b128 (native_decode.glsl's Q8_0/Q2_K pattern).
+// Under PAGED/STREAMED the shared helper fuses four constant-index BDA words into one b128; the
+// bound-SSBO build keeps the same word indices in one uvec4.
+#if defined(PAGED) || defined(STREAMED)
+#define NW4_WORDS(wbase) arena_word4(wbase)
+#else
+uvec4 nw4_words(uint wbase) { return uvec4(nw[wbase], nw[wbase + 1u], nw[wbase + 2u], nw[wbase + 3u]); }
+#define NW4_WORDS(wbase) nw4_words(wbase)
+#endif
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 uvec2 k4(uint i, uint sb) {
     if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
@@ -174,22 +185,28 @@ void main() {
             Bdl[cc] = f16tof32(ru16(bd)) * float(km.x);
             Bmm[cc] = f16tof32(ru16(bd + 2u)) * float(km.y);
         }
-        // stage weights: BN cols × WPB words, q4 nibbles → packed int8
-        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
-            uint cc = idx / WPB;
-            uint j = idx % WPB;
+        // stage weights: BN cols × WPB words, q4 nibbles → packed int8. Two invocations per
+        // column each pull one 16-byte (4-word) qs slice with NW4 instead of 4 byte-extract loads
+        // per word — 8 b128 loads per 32-elem sub-block instead of 32 scalar byte loads. The two
+        // slices cover WPB=8 packed-int8 words and write 4 consecutive Bs entries each.
+        for (uint idx = li; idx < BN * 2u; idx += THREADS) {
+            uint cc = idx >> 1u;
+            uint half4 = idx & 1u;
             uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gelem / 256u) * 144u;
             uint sub = (gelem / 32u) & 7u;
             uint qbase = bd + 16u + (sub >> 1u) * 32u;
             bool lo = (sub & 1u) == 0u;
-            uint qp = 0u;
-            for (uint b = 0u; b < 4u; b++) {
-                uint qbyte = rb(qbase + j * 4u + b);
-                uint val = lo ? (qbyte & 0xFu) : (qbyte >> 4u);
-                qp |= val << (b * 8u);
+            uvec4 qw = NW4_WORDS((qbase >> 2u) + half4 * 4u);
+            for (uint j = 0u; j < 4u; j++) {
+                uint packed = 0u;
+                for (uint b = 0u; b < 4u; b++) {
+                    uint qbyte = (qw[j] >> (b * 8u)) & 0xFFu;
+                    uint val = lo ? (qbyte & 0xFu) : (qbyte >> 4u);
+                    packed |= val << (b * 8u);
+                }
+                Bs[cc * SP + half4 * 4u + j] = packed;
             }
-            Bs[cc * SP + j] = qp;
         }
         barrier();
 

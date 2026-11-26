@@ -21,6 +21,11 @@ $launcherPath = Join-Path $PackageRoot 'Start-INFR-Wizard.cmd'
 
 $requiredPaths = @(
     $binaryPath
+    (Join-Path $PackageRoot 'infr-console.exe')
+    (Join-Path $PackageRoot 'enable-lan-access.cmd')
+    (Join-Path $PackageRoot 'make-cert.cmd')
+    (Join-Path $PackageRoot 'use-tailscale-cert.cmd')
+    (Join-Path $PackageRoot 'start-webui.cmd')
     $wizardPath
     $updateCommonPath
     $updateHelperPath
@@ -46,6 +51,13 @@ if ($ExpectedVersion -and [string]$manifest.version -ne $ExpectedVersion) {
 }
 $requiredManagedPaths = @(
     'infr.exe'
+    'infr-console.exe'
+    'enable-lan-access.cmd'
+    'make-cert.cmd'
+    'use-tailscale-cert.cmd'
+    'start-webui.cmd'
+    'scripts/make-cert.ps1'
+    'scripts/use-tailscale-cert.ps1'
     'Start-INFR-Wizard.cmd'
     'MoE4All Engine.exe'
     'scripts/moe4all.ico'
@@ -362,7 +374,8 @@ function Invoke-WizardDryRun {
     if ($process.ExitCode -ne 0) {
         throw "Wizard $Mode DryRun failed with exit code $($process.ExitCode)`n$stdout`n$stderr"
     }
-    if ($stdout -notmatch 'DryRun: command was not started\.') {
+    # Localized wizard output may print a translated sentinel before the English one.
+    if ($stdout -notmatch 'DryRun[\s\S]{0,80}command was not started\.') {
         throw "Wizard $Mode did not reach DryRun completion.`n$stdout`n$stderr"
     }
     if ($stdout -notmatch [regex]::Escape("MoE4All v$ExpectedVersion")) {

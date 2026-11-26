@@ -35,16 +35,18 @@
 #[path = "parallel_report.rs"]
 mod parallel_report;
 
+use crate::paged_cache::PagedKv;
+use crate::ram_cache::{self, RadixCache};
 use crate::sampling::{ParallelSampler, RequestCtx, RequestSampling, StepGate};
 use crate::seam::token_delivery::{self, ParallelTokenCallback, TokenDelivery};
-use crate::seam::SeamKv;
+use crate::seam::{SeamKv, SegmentedKvLayout};
 use crate::session_cache::{MtpCacheSource, SessionCache};
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Context, Result};
 use infr_core::{backend::Backend, WeightSource};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -55,10 +57,24 @@ const PREFILL_COHORT_WAIT: Duration = Duration::from_millis(50);
 const MAX_DECODE_BATCH: usize = infr_core::backend::MAX_DECODE_ROWS;
 const SHORT_PREFILL_TOKENS: usize = 96;
 const MTP_PLAIN_SYNC_QUANTUM: usize = 1024;
+/// Ordinary group size while the adaptive policy compares decode modes. Measured cadence-
+/// insensitive: 8 and a growing 8..64 schedule land within noise of each other, so the residual
+/// cost of plain decode under MTP is per token, not per group.
+const MTP_ADAPTIVE_PLAIN_QUANTUM: usize = 8;
 const MTP_CONCURRENT_PROBE_CYCLES: usize = 8;
 const MTP_CONCURRENT_MIN_ACCEPT_PERCENT: usize = 80;
 const LOOKUP_CALIBRATION_TOKENS: usize = 16;
 const LOOKUP_COST_COOLDOWN_TOKENS: usize = 128;
+
+/// Disambiguates default disk-backing filenames when one process builds several paged trees
+/// (the temp path is per-process + per-seq; an explicit `kv.disk_cache_path` bypasses this).
+static DISK_BACKING_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// Aux (recurrent/PLE) snapshot cap for the corridor-only tree (`kv.paged` with no
+/// `kv.paged_cache_max`), where the RAM tier has no size to take an eighth of. One Qwen3.8 boundary
+/// snapshot measures ~113 MiB, so this holds a handful of resumable frontiers without pretending to
+/// be a prefix cache. A `kv.paged_cache_max` pool still derives its own (larger) budget as before.
+const PAGED_AUX_CORRIDOR_BUDGET: usize = 512 << 20;
 
 /// One projector result handed to the text model. Kept backend-neutral so `infr-llama` does not
 /// depend on the optional vision crate.
@@ -83,6 +99,42 @@ fn multimodal_key(images: &[MultimodalEmbedding]) -> MultimodalKey {
     hash.finalize().into()
 }
 
+/// One image's block in the shared paged-KV tree key: `n_tokens` reserved-range ids standing in
+/// for its pad run, as [`crate::seam::ImageCacheSpan`].
+///
+/// A per-position digest of `(content fingerprint, grid, position)` means two different pictures —
+/// or the same picture at a different resolution, which changes the grid AND the run length — can
+/// never produce the same block, while one picture always produces the same block wherever it is
+/// replayed. These ids exist only as cache addresses: nothing feeds them to the model, the
+/// tokenizer or the sampler, and [`crate::seam::IMAGE_CACHE_TOKEN_BIT`] keeps them out of the range
+/// any real vocabulary token occupies, so a text chain and an image chain cannot match inside a span.
+fn image_cache_block(
+    fingerprint: &[u8; 32],
+    grid_nx: usize,
+    grid_ny: usize,
+    n_tokens: usize,
+) -> Vec<u32> {
+    let mut seed = Sha256::new();
+    seed.update(fingerprint);
+    seed.update((grid_nx as u64).to_le_bytes());
+    seed.update((grid_ny as u64).to_le_bytes());
+    let seed = seed.finalize();
+    (0..n_tokens)
+        .map(|index| {
+            let mut stream = Sha256::new();
+            stream.update(seed.as_slice());
+            stream.update((index as u64).to_le_bytes());
+            let digest = stream.finalize();
+            let word = u32::from_le_bytes(
+                digest[..4]
+                    .try_into()
+                    .expect("a SHA-256 digest always starts with four bytes"),
+            );
+            word | crate::seam::IMAGE_CACHE_TOKEN_BIT
+        })
+        .collect()
+}
+
 fn expand_multimodal_prompt(
     tokens: &[u32],
     image_pad_id: u32,
@@ -92,6 +144,7 @@ fn expand_multimodal_prompt(
     let mut expanded = Vec::new();
     let mut positions4 = Vec::new();
     let mut spans = Vec::with_capacity(images.len());
+    let mut cache_spans = Vec::with_capacity(images.len());
     let mut images = images.into_iter();
     let mut used = 0usize;
     let mut cursor = 0i32;
@@ -110,6 +163,10 @@ fn expand_multimodal_prompt(
             anyhow!("rendered prompt contains more <|image_pad|> markers than image payloads")
         })?;
         used += 1;
+        // Bound before `image.values` moves out below: the paged-KV tree key needs this image's
+        // content identity and grid, not just its projector output.
+        let image_fingerprint = image.fingerprint;
+        let image_grid = (image.grid_nx, image.grid_ny);
         let n_tokens = image
             .grid_nx
             .checked_mul(image.grid_ny)
@@ -154,6 +211,15 @@ fn expand_multimodal_prompt(
             n_tokens,
             embeds: image.values,
         });
+        cache_spans.push(crate::seam::ImageCacheSpan {
+            start,
+            ids: std::sync::Arc::new(image_cache_block(
+                &image_fingerprint,
+                image_grid.0,
+                image_grid.1,
+                n_tokens,
+            )),
+        });
     }
     if images.next().is_some() {
         return Err(anyhow!(
@@ -165,6 +231,7 @@ fn expand_multimodal_prompt(
         crate::seam::MropePlan {
             prompt_pos4: positions4,
             spans,
+            cache_spans,
             decode_base: cursor,
         },
     ))
@@ -203,6 +270,31 @@ fn should_handoff_multimodal_to_scheduler(
 ///
 /// Split out as a pure fn so this decision is unit-testable without a live Vulkan backend / KV
 /// slots (the lock-drop and device-side `seed_from` around it stay integration-only).
+/// The multimodal continuation compares in the tree's KEY space, so it has to see the same
+/// projection tag the slot publishes under — otherwise a stable setting would miss its own warm
+/// prefix at position 0.
+/// How many host-RAM frames the paged tree may actually claim.
+///
+/// `kv.paged_cache_max` is a promise about history the tree would LIKE to keep, but every frame it
+/// demotes is real host memory in the same process that has already preloaded its expert store.
+/// Clamping against the RAM actually available at session init lets the store be as large as the
+/// machine can carry while the pool still gets whatever is genuinely left — past that a cold chain
+/// evicts instead of sinking, which is slower than a hit and much better than a paging storm. This
+/// deliberately does NOT read the Windows commit headroom: that limit grows and shrinks under a
+/// system-managed page file, and a tier sized against it can vanish at the worst moment. Platforms
+/// with no availability probe (`None`) keep the declared size unchanged.
+fn clamp_ram_frames_to_ram_room(
+    declared: usize,
+    frame_bytes: u64,
+    commit_available: Option<u64>,
+) -> usize {
+    let Some(live) = commit_available else {
+        return declared;
+    };
+    let room = live.saturating_sub(crate::seam::HOST_FRAME_RAM_FLOOR);
+    ((room / frame_bytes.max(1)) as usize).min(declared)
+}
+
 fn pick_continuation(
     candidates: impl IntoIterator<Item = (usize, usize, usize)>,
     prompt_len: usize,
@@ -813,6 +905,12 @@ struct BatchWork {
     phase: BatchPhase,
     prefill_start: usize,
     checkpoint_boundaries: [Option<usize>; crate::seam::TURN_CHECKPOINT_COUNT],
+    /// Paged tier: the page-aligned prefill position at which this work's slot captures the
+    /// recurrent/PLE snapshot its radix entry publishes (see
+    /// [`crate::seam::PreparedParallelPrompt::paged_frontier`]). Cleared once crossed, like a
+    /// turn checkpoint — a later phase stopping at the same position would otherwise capture the
+    /// state AFTER the boundary and publish it under the boundary's label.
+    paged_frontier: Option<usize>,
     turn_checkpoint: Option<crate::seam::TurnCheckpoint>,
     mrope_plan: Option<crate::seam::MropePlan>,
     multimodal_key: Option<MultimodalKey>,
@@ -827,6 +925,8 @@ struct BatchWork {
 
 struct MtpSlotState {
     head: Arc<crate::mtp::Qwen4MtpSession>,
+    policy: crate::speculative_verify::MtpCostPolicy,
+    last_policy_rows: usize,
     cached: Vec<u32>,
     last_h: Vec<f32>,
     turn_checkpoints:
@@ -1355,6 +1455,15 @@ pub struct ParallelSeam {
     /// Opt-in disk-backed conversation catalog. `None` keeps the pre-existing checkout path
     /// byte-for-byte isolated from file I/O and cache locking.
     session_cache: Option<Arc<Mutex<SessionCache>>>,
+    /// Opt-in host-RAM radix-tree prefix cache (SGLang-style tier below the VRAM slots).
+    /// Exclusive with `session_cache`: `init_session_cache` opens the RAM tree first and the
+    /// disk tier stays closed, so nothing is ever written to disk while this is set.
+    ram_cache: Option<Arc<Mutex<RadixCache>>>,
+    /// Opt-in paged radix prefix cache (`kv.paged_cache_max`): the tree holds FRAME CHAINS inside
+    /// one unified-VRAM frame corridor, so a prefix hit is a page-table write (zero byte copies)
+    /// and fixed-size frames make VRAM external fragmentation impossible by construction.
+    /// Exclusive with `ram_cache`; the disk tier stays closed while this is set.
+    paged_cache: Option<Arc<Mutex<PagedKv>>>,
     session_idle: Duration,
     max_ctx: usize,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
@@ -1367,6 +1476,17 @@ pub struct ParallelSeam {
 }
 
 impl ParallelSeam {
+    /// Resource occupancy for the server's telemetry endpoint. Reads counters only: no GPU baton,
+    /// no statistics handoff, no drained statistics window.
+    pub fn resource_report(&self) -> infr_core::telemetry::EngineReport {
+        let mut report = self.vk.resource_report();
+        report.kv_pool = self
+            .paged_cache
+            .as_ref()
+            .map(|cache| cache.lock().expect("paged cache poisoned").pool_report());
+        report
+    }
+
     fn batch_decode_progress(
         &self,
         prompt_tokens: usize,
@@ -1476,6 +1596,8 @@ impl ParallelSeam {
                         Arc::clone(&catch),
                         model.engine_cfg().spec.mtp_context,
                     )?),
+                    policy: crate::speculative_verify::MtpCostPolicy::default(),
+                    last_policy_rows: 0,
                     cached: Vec::new(),
                     last_h: vec![0.0; model.config().hc_mult * model.config().n_embd],
                     turn_checkpoints: std::array::from_fn(|_| None),
@@ -1525,6 +1647,8 @@ impl ParallelSeam {
             // Speculative one-slot requests also hand ownership to the persistent worker.
             gate: scheduler_enabled.then(|| Arc::new(StepGate::new())),
             session_cache: None,
+            ram_cache: None,
+            paged_cache: None,
             session_idle,
             max_ctx,
             pins,
@@ -1538,7 +1662,399 @@ impl ParallelSeam {
         Ok(engine)
     }
 
+    /// Refusal used by every persistent session-state tier: the tree, the RAM pool and the disk
+    /// cache all release a conversation's rows and re-attach them elsewhere, which IS the segmented
+    /// KV layout. Each used to fail with the same sentence naming `kv.paged_cache_max` even when the
+    /// operator had asked for `kv.paged`, and none of them said WHICH gate of the AND the session
+    /// missed — on a device with more VRAM the answer is usually "the experts never got paged, so
+    /// there is no arena", which no config spelling of `kv.*` can fix.
+    fn segmented_kv_refusal(&self, requested: &str) -> anyhow::Error {
+        use infr_core::backend::Backend;
+        let ec = self.model.engine_cfg();
+        let cfg = self.model.config().clone();
+        let arena = Backend::segmented_kv_available(self.vk.as_ref());
+        let blockers = {
+            let pool = self.pool.lock().expect("fresh pool");
+            match pool.slots.first().and_then(|slot| slot.kv.as_ref()) {
+                Some(kv) => {
+                    let meta = kv.session_state_meta();
+                    crate::seam::segmented_kv_blockers(
+                        &cfg,
+                        ec,
+                        kv.kv_ring(),
+                        meta.k_fmt,
+                        meta.v_fmt,
+                        arena,
+                    )
+                }
+                None => vec!["no KV slot exists yet".to_string()],
+            }
+        };
+        anyhow!(
+            "{requested} needs dynamic segmented KV, and this session does not have it. Unmet \
+             condition(s):\n  - {}",
+            blockers.join("\n  - ")
+        )
+    }
+
     fn init_session_cache(&mut self) -> Result<()> {
+        let ec = self.model.engine_cfg();
+        // Two switches used to be one: `kv.paged_cache_max` both opened the tree and sized its
+        // host-RAM frame pool. `kv.paged` splits them so the tree can run entirely inside the VRAM
+        // frame corridor. A pool still implies the tree, so every pre-existing config resolves the
+        // same way it did before this field existed.
+        let paged_tree = ec.kv.paged || ec.kv.paged_cache_max.is_some();
+        if ec.kv.disk_cache_max.is_some() && !paged_tree {
+            // The disk tier only exists behind the paged tree's RAM pool; on the blob/RAM-blob
+            // paths it would silently do nothing, so make the half-config loud.
+            tracing::warn!(
+                "kv.disk_cache_max is set without a paged KV tree: the disk frame tier only \
+                 backs the paged KV tree and stays closed (enable kv.paged or kv.paged_cache_max)"
+            );
+        }
+        if !paged_tree && ec.kv.paged_page_tokens != crate::seam::KV_GROW_ROWS {
+            // Shrink-wrapped pages only pay off inside the paged tree; on the plain blob path every
+            // page is another grow step with nothing shared. Usually a forgotten `paged_cache_max`
+            // rather than an intentional geometry experiment, so make the half-config loud.
+            tracing::warn!(
+            page_tokens = ec.kv.paged_page_tokens,
+            "kv.paged_page_tokens is set without kv.paged_cache_max: the blob KV grows in small segments and shares nothing (geometry-experiment mode; enable kv.paged_cache_max for real prefix reuse)"
+        );
+        }
+        if paged_tree {
+            use infr_core::backend::Backend;
+            if ec.kv.ram_cache_max.is_some() {
+                return Err(anyhow!(
+                "kv.paged_cache_max and kv.ram_cache_max are mutually exclusive; enable one KV prefix tier"
+            ));
+            }
+            // A zero pool disables the RAM TIER exactly like the RAM blob tier's zero (see the
+            // symmetric branch below): the switch stays "set" yet nothing is claimed, and the disk
+            // session cache, when configured, keeps working (PR #86 review point 3 semantics). With
+            // `kv.paged` the tree itself is separately requested, so a zero pool means "corridor
+            // only", not "off".
+            let paged_budget = match ec.kv.paged_cache_max {
+                None => 0,
+                Some(spec) => match spec {
+                    infr_core::SizeSpec::Bytes(bytes)
+                    | infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
+                    infr_core::SizeSpec::Percent(fraction) => {
+                        match infr_core::hostmem::total_bytes() {
+                            Some(total) => (total as f64 * fraction) as u64,
+                            None => {
+                                return Err(anyhow!(
+                                "kv.paged_cache_max percentages need a known physical RAM total; \
+                         use an absolute GiB/MiB size"
+                            ))
+                            }
+                        }
+                    }
+                },
+            };
+            if paged_budget == 0 && !ec.kv.paged {
+                tracing::info!("paged KV prefix cache disabled by a zero size limit");
+                return Ok(());
+            }
+            let page_tokens = ec.kv.paged_page_tokens;
+            if !page_tokens.is_power_of_two() {
+                return Err(anyhow!("kv.paged_page_tokens must be a power of two"));
+            }
+            if page_tokens >= crate::seam::KV_GROW_ROWS {
+                return Err(anyhow!(
+                "kv.paged_page_tokens must be smaller than the legacy {}-token segment: whole-context pages share nothing",
+                crate::seam::KV_GROW_ROWS
+            ));
+            }
+            let (supports_release, meta, n_slots, cfg) = {
+                let pool = self.pool.lock().expect("fresh pool");
+                let kv = pool
+                    .slots
+                    .first()
+                    .and_then(|slot| slot.kv.as_ref())
+                    .ok_or_else(|| anyhow!("paged KV cache initialized before slot 0"))?;
+                (
+                    kv.can_release_session_state(),
+                    kv.session_state_meta(),
+                    pool.slots.len(),
+                    self.model.config().clone(),
+                )
+            };
+            if !supports_release {
+                let requested = match (ec.kv.paged, ec.kv.paged_cache_max.is_some()) {
+                    (true, true) => "kv.paged + kv.paged_cache_max",
+                    (true, false) => "kv.paged (the corridor-only paged KV tree)",
+                    _ => "kv.paged_cache_max",
+                };
+                return Err(self.segmented_kv_refusal(requested));
+            }
+            if ec.kv.session_cache_dir.is_some() {
+                tracing::warn!(
+                "paged KV prefix cache enabled; the disk session cache stays closed (no disk writes)"
+            );
+            }
+            if self.mtp_heads.is_some() {
+                // The draft head is a SECOND KV holder: it commits its own segments from the unified
+                // pool outside the frame corridor (extra VRAM the corridor sizing does not count), and
+                // a tree restore carries no draft state, so the head must re-warm. Never validated as
+                // a combo - say so loudly instead of silently double-spending VRAM.
+                tracing::warn!(
+                "paged KV prefix cache is enabled together with MTP: the draft head commits KV OUTSIDE the frame corridor (extra VRAM) and loses its draft state on every tree restore; prefer spec.mtp=false"
+            );
+            }
+            // The warmup generation on slot 0 ran BEFORE this init existed (slots are built first),
+            // so its prefill committed blob segments AND froze the whole per-plane reservation grid
+            // over the KV corridor the frame pool is about to claim. Hand every slot's blob state
+            // back first: `release_segmented_kv` drops committed segments AND reservations, so the
+            // single contiguous corridor claim can fit the exact full-KV-space footprint. In paged
+            // mode no slot ever re-enters the blob path (ensure_depth frames only), so nothing needs
+            // the grid again.
+            {
+                let cfg = self.model.config().clone();
+                let mut pool = self.pool.lock().expect("fresh pool");
+                for slot in &mut pool.slots {
+                    if let Some(kv) = slot.kv.as_mut() {
+                        kv.release_session_state(self.vk.as_ref(), &cfg)?;
+                    }
+                }
+            }
+            let layout = SegmentedKvLayout::for_qwen(
+                &cfg,
+                meta.max_ctx,
+                meta.k_fmt,
+                meta.v_fmt,
+                page_tokens,
+            )
+            .ok_or_else(|| anyhow!("paged KV cache enabled for a non-Qwen session"))?;
+            // One frame = one page x every plane, contiguous (see kv_frame_pool). The plane offsets
+            // are the prefix sums of the plane segment sizes, in the SAME order the session collects
+            // its plane buffers, so `plane_addr(frame, i)` and the table at index `i` agree.
+            let mut plane_offsets = Vec::with_capacity(layout.planes.len());
+            let mut frame_bytes = 0u64;
+            for plane in &layout.planes {
+                plane_offsets.push(frame_bytes);
+                frame_bytes += plane.segment_bytes() as u64;
+            }
+            // Phase B sizes the frame space to the FULL VRAM KV space (every slot x every page),
+            // per the plan: sessions and the tree share one frame pool, the tree is what's left
+            // after the resident chains. The RAM tier budget (`kv.paged_cache_max`) lands with
+            // Phase C's DMA pool. The arena is sharded (~2 GiB ReBAR pieces), so this request arrives
+            // as one corridor at small ctx and as several when it exceeds a shard's largest free gap.
+            let budget_frames = n_slots * meta.max_ctx.div_ceil(page_tokens);
+            // `kv.paged_elastic` commits one chunk instead of the whole worst case and lets the
+            // tree claim the rest on demand, so the expert arena keeps every byte no conversation
+            // is using. The ceiling stays `budget_frames`: the arena's reserved KV corridor was
+            // sized for it, so growth never renegotiates the VRAM plan.
+            let elastic = ec.kv.paged_elastic;
+            let grow_chunk = (budget_frames / 8).max(128).min(budget_frames);
+            let initial_frames = if elastic { grow_chunk } else { budget_frames };
+            let corridors =
+                Backend::alloc_kv_frames(self.vk.as_ref(), frame_bytes, initial_frames)?
+                    .ok_or_else(|| {
+                        anyhow!("the unified VRAM arena cannot fit the KV frame corridor")
+                    })?;
+            // The corridor tiling rounds every physical shard piece down to whole frames, so under
+            // fragmentation the backend can place fewer frames than the budget. Trust what was
+            // actually installed (FramePool::set_segments asserts capacity == corridor frames);
+            // fewer frames only means cold tree entries evict earlier.
+            let vram_frames: usize = corridors.iter().map(|corridor| corridor.frames).sum();
+            if vram_frames < initial_frames {
+                tracing::warn!(
+                    budget_frames = initial_frames,
+                    placed_frames = vram_frames,
+                    corridors = corridors.len(),
+                    "paged KV frame pool is smaller than the full ctx budget; cold tree entries evict earlier"
+                );
+            }
+            // Phase C: `paged_budget` is the RAM tier budget. Frames sunk out of the VRAM corridor
+            // live in a lazily grown host backing (high-water mark = ram_frames * frame_bytes), so a
+            // big budget costs nothing until prefixes actually demote. Zero budget keeps the tier off
+            // and the tree behaves exactly like Phase B (cold entries evict instead of sink) — which
+            // is the whole point of `kv.paged`, the switch that asks for a tree without a pool.
+            let ram_frames = {
+                let declared = (paged_budget / frame_bytes) as usize;
+                let live = infr_core::hostmem::available_bytes();
+                let allowed = clamp_ram_frames_to_ram_room(declared, frame_bytes, live);
+                if allowed < declared {
+                    tracing::warn!(
+                        declared_frames = declared,
+                        allowed_frames = allowed,
+                        frame_bytes,
+                        declared_pool_bytes = paged_budget,
+                        allowed_pool_bytes = allowed as u64 * frame_bytes,
+                        available_ram_bytes = ?live,
+                        "paged KV RAM tier clamped to what this machine can still commit after the \
+                         expert store; cold prefixes past that evict instead of sinking (Windows \
+                         charges this process's device allocations to the same commit limit)"
+                    );
+                }
+                allowed
+            };
+            // Phase D: `kv.disk_cache_max` sizes the sparse-file tier behind RAM. Resolution
+            // mirrors the RAM budget's grammar (percent = of physical RAM, an odd denominator
+            // for disk but consistent); zero/unset keeps the two-tier cascade byte-for-byte off.
+            let disk_budget = match ec.kv.disk_cache_max {
+                None => 0,
+                Some(spec) => match spec {
+                    infr_core::SizeSpec::Bytes(bytes)
+                    | infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
+                    infr_core::SizeSpec::Percent(fraction) => {
+                        match infr_core::hostmem::total_bytes() {
+                            Some(total) => (total as f64 * fraction) as u64,
+                            None => {
+                                return Err(anyhow!(
+                                "kv.disk_cache_max percentages need a known physical RAM total; \
+                                     use an absolute GiB/MiB size"
+                            ))
+                            }
+                        }
+                    }
+                },
+            };
+            // Frames only ever reach disk through a RAM frame: demotion writes VRAM->RAM and the
+            // cascade moves RAM->disk, and a hit reads back the same way. With no RAM tier there is
+            // no route, so the disk budget stays closed rather than half-wired.
+            let disk_frames = if disk_budget == 0 || ram_frames == 0 {
+                if disk_budget > 0 {
+                    tracing::warn!(
+                        "kv.disk_cache_max needs the RAM frame tier that sinks through it: enable \
+                         kv.paged_cache_max (the corridor-only tree has no route to the disk tier)"
+                    );
+                }
+                0
+            } else {
+                (disk_budget / frame_bytes) as usize
+            };
+            let disk_path = (disk_frames > 0).then(|| {
+                ec.kv.disk_cache_path.clone().unwrap_or_else(|| {
+                    // Per-process (and per-engine within a process) default under the temp dir:
+                    // the backing is process-scoped bookkeeping, never restored across restarts.
+                    let seq = DISK_BACKING_SEQ.fetch_add(1, Ordering::Relaxed);
+                    std::env::temp_dir().join(format!(
+                        "infr-paged-kv-disk-{}-{seq}.bin",
+                        std::process::id()
+                    ))
+                })
+            });
+            let mut tree = PagedKv::new(
+                frame_bytes,
+                page_tokens,
+                plane_offsets,
+                vram_frames,
+                ram_frames,
+                disk_frames,
+                disk_path,
+                cfg.has_recurrent_state(),
+            );
+            tree.set_vram_segments(&corridors);
+            if elastic {
+                tree.set_elastic_corridor(budget_frames, grow_chunk);
+                tree.set_yield_under_pressure(ec.kv.paged_yield_under_pressure);
+            }
+            if ram_frames == 0 {
+                // The `RAM tier / 8` derivation has no tier to divide. A zero aux cap is not a
+                // smaller cache here, it is NO cache: `PagedKv::hit_prefix` admits a recurrent
+                // resume point only at a snapshot boundary, so a hybrid model (DeltaNet/KDA/PLE)
+                // would silently re-prefill every tree hit. Snapshots still cost host RAM one
+                // buffer at a time — a Qwen3.8 boundary snapshot is ~113 MiB — never reserved up
+                // front, which is what makes a pool-less tree cheap without making it inert.
+                tree.set_aux_budget(PAGED_AUX_CORRIDOR_BUDGET);
+            }
+            tracing::info!(
+                page_tokens,
+                vram_frames,
+                frame_bytes,
+                corridors = corridors.len(),
+                corridor_bytes = frame_bytes * vram_frames as u64,
+                elastic,
+                elastic_chunk_frames = if elastic { grow_chunk } else { 0 },
+                elastic_ceiling_frames = if elastic { budget_frames } else { 0 },
+                ram_budget = ?ec.kv.paged_cache_max,
+                ram_frames,
+                ram_bytes = frame_bytes * ram_frames as u64,
+                pool_less = ram_frames == 0,
+                disk_budget = ?ec.kv.disk_cache_max,
+                disk_frames,
+                disk_bytes = frame_bytes * disk_frames as u64,
+                tree = %tree.stats_line(),
+                "paged KV radix prefix cache ready (frames held by the tree, zero-copy prefix reuse, image spans keyed by picture content so visual KV survives any other request; cold chains sink to the RAM tier and cascade to the disk tier before eviction when a RAM tier is configured, and evict outright when there is none)"
+            );
+            // The corridor is sized to the LIVE sessions' full context (`n_slots * max_ctx`) — at
+            // its ceiling when elastic — so a pool-less tree has no guaranteed room for a published
+            // chain: once the conversations together hold more than the corridor, every swap evicts
+            // a chain instead of sinking it, and alternating sessions evict exactly the chain the
+            // next request would hit. That reads as "the KV was thrown away, not pooled" from the
+            // client (cached_tokens stays 0), so name the tier that fixes it rather than leaving it
+            // to the stats line.
+            let corridor_frames = if elastic { budget_frames } else { vram_frames };
+            let corridor_tokens = corridor_frames as u64 * page_tokens as u64;
+            let live_tokens = n_slots as u64 * meta.max_ctx as u64;
+            if ram_frames == 0 && corridor_tokens.saturating_sub(live_tokens) < page_tokens as u64 {
+                tracing::warn!(
+                    corridor_tokens,
+                    live_tokens,
+                    slots = n_slots,
+                    max_ctx = meta.max_ctx,
+                    "paged KV tree has no RAM tier and no corridor headroom ({} tokens of corridor \
+                     for {} tokens of live sessions): conversations whose KV together exceed the \
+                     corridor evict each other instead of being retained, so alternating sessions \
+                     report cached_tokens=0. Set kv.paged_cache_max (e.g. 2GiB) to sink cold chains \
+                     to host RAM and keep them reusable; a single conversation replayed within the \
+                     corridor still hits.",
+                    corridor_tokens,
+                    live_tokens
+                );
+            }
+            let tree = Arc::new(Mutex::new(tree));
+            self.paged_cache = Some(Arc::clone(&tree));
+            for slot in &mut self.pool.lock().expect("fresh pool").slots {
+                if let Some(kv) = slot.kv.as_mut() {
+                    kv.set_paged(Arc::clone(&tree));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(spec) = ec.kv.ram_cache_max {
+            let max_bytes = match spec {
+                infr_core::SizeSpec::Bytes(bytes)
+                | infr_core::SizeSpec::FrozenAutomaticBytes(bytes) => bytes,
+                infr_core::SizeSpec::Percent(fraction) => infr_core::hostmem::total_bytes()
+                    .map(|total| (total as f64 * fraction) as u64)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "kv.ram_cache_max percentages need a known physical RAM total; \
+                         use an absolute GiB/MiB size"
+                        )
+                    })?,
+            };
+            if max_bytes == 0 {
+                tracing::info!("RAM KV prefix cache disabled by a zero size limit");
+                return Ok(());
+            }
+            let (supports_release, meta) = {
+                let pool = self.pool.lock().expect("fresh pool");
+                let kv = pool
+                    .slots
+                    .first()
+                    .and_then(|slot| slot.kv.as_ref())
+                    .ok_or_else(|| anyhow!("RAM KV cache initialized before slot 0"))?;
+                (kv.can_release_session_state(), kv.session_state_meta())
+            };
+            if !supports_release {
+                return Err(self.segmented_kv_refusal("kv.ram_cache_max"));
+            }
+            if ec.kv.session_cache_dir.is_some() {
+                tracing::warn!(
+                "RAM KV prefix cache enabled; the disk session cache stays closed (no disk writes)"
+            );
+            }
+            self.ram_cache = Some(Arc::new(Mutex::new(RadixCache::new(&meta, max_bytes))));
+            tracing::info!(
+            max_bytes,
+            gib = max_bytes as f64 / (1u64 << 30) as f64,
+            "RAM KV radix prefix cache ready (checkout demotion + prefix restore, never on disk)"
+        );
+            return Ok(());
+        }
         if self.model.engine_cfg().kv.session_cache_dir.is_none() {
             return Ok(());
         }
@@ -1552,9 +2068,7 @@ impl ParallelSeam {
             (kv.can_release_session_state(), kv.session_state_meta())
         };
         if !supports_release {
-            return Err(anyhow!(
-                "kv.session_cache_dir requires dynamic segmented KV; use Qwen3.5/3.6/3.8 with Q8 KV and leave kv.dynamic enabled"
-            ));
+            return Err(self.segmented_kv_refusal("kv.session_cache_dir"));
         }
         self.session_cache = SessionCache::open(self.model.engine_cfg(), self.model.gguf(), &meta)?
             .map(|cache| Arc::new(Mutex::new(cache)));
@@ -1568,6 +2082,12 @@ impl ParallelSeam {
     }
 
     fn start_cold_worker(&mut self) -> Result<()> {
+        // The RAM tier deliberately has NO idle worker. Demotion happens synchronously in
+        // `checkout_with_ram_cache` when a different-prefix request needs a slot: capture ->
+        // publish -> release under the GPU baton, so the session is never in neither place.
+        // A time-driven demoter only opened a black-hole window (the slot's KV was taken before
+        // the slow capture/published, so a replay of that prefix re-prefilled from scratch) and
+        // a resident continuation always beats a restore anyway — 2026-10-15 A/B regression.
         let Some(cache) = self.session_cache.as_ref().map(Arc::clone) else {
             return Ok(());
         };
@@ -1619,6 +2139,8 @@ impl ParallelSeam {
             batch_interrupt: Arc::clone(&self.batch_interrupt),
             gate: self.gate.as_ref().map(Arc::clone),
             session_cache: self.session_cache.as_ref().map(Arc::clone),
+            ram_cache: self.ram_cache.as_ref().map(Arc::clone),
+            paged_cache: self.paged_cache.as_ref().map(Arc::clone),
             session_idle: self.session_idle,
             max_ctx: self.max_ctx,
             pins: Arc::clone(&self.pins),
@@ -1678,6 +2200,23 @@ impl ParallelSeam {
 
     pub fn unified_vram_stats(&self) -> Option<infr_vulkan::unified::UnifiedVramStats> {
         self.vk.unified_vram().map(|pool| pool.stats())
+    }
+
+    /// Bytes still allocatable under the backend's live unified VRAM guard.
+    pub fn unified_alloc_room(&self) -> u64 {
+        self.vk.alloc_room()
+    }
+
+    /// Fork Vision with a private unified arena when the primary session kept every MoE expert
+    /// resident (the pager only builds its arena when experts are actually paged). The primary
+    /// LLM keeps its normal allocation path; only the vision client allocates from this arena.
+    pub fn fork_vision_backend_with_arena(
+        &self,
+        bytes: usize,
+    ) -> Result<infr_vulkan::VulkanBackend> {
+        self.vk
+            .fork_vision_client_with_arena(bytes)
+            .map_err(|error| anyhow!("derive unified Vision backend: {error}"))
     }
 
     /// Materialize slot 0 (weights + KV + pipelines) with a throwaway generation, then fork the
@@ -2037,7 +2576,11 @@ impl ParallelSeam {
     /// recycled. So under load the prefix cache degrades gracefully (fewer candidate slots) rather
     /// than corrupting an in-flight sequence.
     fn checkout(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
-        if self.session_cache.is_some() {
+        if self.paged_cache.is_some() {
+            self.checkout_with_paged_cache(prompt, req)
+        } else if self.ram_cache.is_some() {
+            self.checkout_with_ram_cache(prompt, req)
+        } else if self.session_cache.is_some() {
             self.checkout_with_cold_cache(prompt, req)
         } else {
             self.checkout_resident(prompt, req)
@@ -2187,6 +2730,585 @@ impl ParallelSeam {
                 engine: self,
                 idx: target,
                 kv,
+                detached: false,
+                multimodal_key: None,
+            });
+        }
+    }
+
+    /// Capture one resident slot into the radix tree and release its VRAM segments. `Ok(true)` means
+    /// the conversation now lives in RAM and the slot is logically empty; `Ok(false)` means the
+    /// slot held nothing to keep. On `Err` the snapshot was refunded (ledger-drop) and the slot
+    /// keeps its resident state — the caller decides between recycling and reset. The caller must
+    /// already hold the GPU baton, matching the disk path's in-checkout spill (no gate handed to
+    /// `capture`).
+    fn demote_to_ram(
+        &self,
+        slot: usize,
+        tree: &mut RadixCache,
+        kv: &mut SeamKv,
+        cfg: &Config,
+    ) -> Result<bool> {
+        let Some(inner) = ram_cache::capture(kv, self.vk.as_ref(), tree.geometry(), tree.ledger())?
+        else {
+            return Ok(false);
+        };
+        let tokens = inner.meta.cached.clone();
+        tree.publish(inner.clone())?;
+        match kv.release_session_state(self.vk.as_ref(), cfg) {
+            Ok(()) => {
+                // The only demotion path left (no idle worker): make it observable so a
+                // checkout swap's cost is attributable in the engine log.
+                tracing::info!(
+                    slot,
+                    tokens = tokens.len(),
+                    tree = %tree.stats_line(),
+                    "demoted replaced conversation KV to the RAM radix cache"
+                );
+                Ok(true)
+            }
+            Err(error) => {
+                tree.discard(&tokens, &inner);
+                Err(error)
+            }
+        }
+    }
+
+    /// Radix-tree-extended slot checkout (`kv.ram_cache_max`). Same reservation discipline as the
+    /// disk path: targets reserved under `pool`, all GPU/tree work after that lock is dropped. A
+    /// resident conversation the incoming prompt cannot continue is demoted to a RAM snapshot in
+    /// place — the automatic different-prefix swap — never written to disk — and the deepest tree
+    /// match is then restored into the target slot.
+    fn checkout_with_ram_cache(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
+        let tree_mutex = self
+            .ram_cache
+            .as_ref()
+            .expect("RAM checkout requires a radix cache");
+        let cfg: &Config = self.model.config();
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if free.is_empty() {
+                pool = self.freed.wait(pool).expect("pool poisoned");
+                continue;
+            }
+            let continuation = pick_continuation(
+                free.iter().filter_map(|&index| {
+                    (pool.slots[index].multimodal_key.is_none())
+                        .then_some(pool.slots[index].kv.as_ref())
+                        .flatten()
+                        .and_then(|kv| {
+                            kv.continuation_prefix_len(prompt)
+                                .map(|prefix| (index, prefix, prefix))
+                        })
+                }),
+                prompt.len(),
+            );
+            let continuation_prefix = continuation
+                .and_then(|index| {
+                    pool.slots[index]
+                        .kv
+                        .as_ref()
+                        .and_then(|kv| kv.continuation_prefix_len(prompt))
+                })
+                .unwrap_or(0);
+            let target = continuation.unwrap_or_else(|| {
+                *free
+                    .iter()
+                    .min_by_key(|&&index| {
+                        let slot = &pool.slots[index];
+                        let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                        (!empty, slot.tick)
+                    })
+                    .expect("free is non-empty")
+            });
+            let seed_source = continuation
+                .is_none()
+                .then(|| {
+                    free.iter()
+                        .copied()
+                        .filter(|&index| {
+                            index != target && pool.slots[index].multimodal_key.is_none()
+                        })
+                        .filter_map(|index| {
+                            let prefix = pool.slots[index]
+                                .kv
+                                .as_ref()
+                                .map_or(0, |kv| kv.seedable_prefix_len(cfg, prompt));
+                            (prefix >= 16).then_some((index, prefix))
+                        })
+                        .max_by_key(|&(_, prefix)| prefix)
+                })
+                .flatten();
+            let resident_prefix =
+                continuation_prefix.max(seed_source.map_or(0, |(_, prefix)| prefix));
+
+            pool.tick += 1;
+            let tick = pool.tick;
+            pool.slots[target].busy = true;
+            pool.slots[target].tick = tick;
+            pool.slots[target].idle_since = None;
+            let incompatible = pool.slots[target].multimodal_key.take().is_some();
+            let mut target_kv = pool.slots[target].kv.take();
+            let mut seed_kv = seed_source.map(|(source, prefix)| {
+                pool.slots[source].busy = true;
+                pool.slots[source].idle_since = None;
+                let kv = pool.slots[source]
+                    .kv
+                    .take()
+                    .expect("scored RAM seed slot has KV");
+                (source, prefix, kv)
+            });
+            drop(pool);
+
+            {
+                // One pass owns both the inference baton and the tree. No other request can
+                // submit against a state buffer while it is captured or restored.
+                let _gate = req.gate_pass();
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .map(|heads| heads.lock().expect("MTP heads poisoned"));
+                let mut tree = tree_mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if incompatible {
+                    if let Some(kv) = target_kv.as_mut() {
+                        kv.reset();
+                    }
+                    if let Some(heads) = heads.as_mut() {
+                        heads[target].invalidate_all();
+                    }
+                }
+
+                let ram_prefix = tree.best_continuation_len(prompt);
+                let taken = (ram_prefix > resident_prefix)
+                    .then(|| tree.take_best(prompt))
+                    .flatten();
+                if let (Some(taken), Some(kv)) = (taken, target_kv.as_mut()) {
+                    tracing::info!(
+                        slot = target,
+                        cached_prefix_tokens = ram_prefix,
+                        "RAM KV radix prefix hit"
+                    );
+                    let mut released = false;
+                    if kv.cached_len() != 0 {
+                        match self.demote_to_ram(target, &mut tree, kv, cfg) {
+                            Ok(true) => released = true,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    slot = target,
+                                    "RAM KV replacement demotion failed; recycling the slot: {error}"
+                                );
+                                kv.reset();
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                            }
+                        }
+                    }
+                    if !released {
+                        released = kv.release_session_state(self.vk.as_ref(), cfg).is_ok();
+                    }
+                    if released {
+                        // The RAM tier carries no MTP draft state; free the head's stale KV and
+                        // let it re-warm on ordinary decode (the disk store's sidecar fallback).
+                        if let Some(heads) = heads.as_mut() {
+                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                                tracing::warn!(
+                                    slot = target,
+                                    "RAM KV replacement could not release stale MTP head KV: {error}"
+                                );
+                            }
+                            heads[target].invalidate_all();
+                        }
+                        if let Err(error) =
+                            ram_cache::restore(taken.inner(), kv, self.vk.as_ref(), cfg)
+                        {
+                            if let Some(heads) = heads.as_mut() {
+                                heads[target].invalidate_all();
+                            }
+                            tracing::warn!(
+                                slot = target,
+                                "RAM KV restore failed; re-prefilling the request: {error}"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            slot = target,
+                            "could not release the target KV slot for RAM restore; re-prefilling"
+                        );
+                        kv.reset();
+                        if let Some(heads) = heads.as_mut() {
+                            heads[target].invalidate_all();
+                        }
+                    }
+                    tree.release(taken);
+                } else if continuation.is_none() {
+                    // Different prefix, no deeper tree match: swap the target's out-of-the-way
+                    // conversation into RAM (best effort) so a later prefix hit can bring it back,
+                    // then seed the new prompt from the best resident prefix as the disk path does.
+                    if let Some(kv) = target_kv.as_mut().filter(|kv| kv.cached_len() != 0) {
+                        if let Err(error) = self.demote_to_ram(target, &mut tree, kv, cfg) {
+                            tracing::warn!(
+                                slot = target,
+                                "RAM KV replacement demotion failed; forgetting the old conversation: {error}"
+                            );
+                            kv.reset();
+                            if let Some(heads) = heads.as_mut() {
+                                heads[target].invalidate_all();
+                            }
+                        } else if let Some(heads) = heads.as_mut() {
+                            if let Err(error) = heads[target].head.release_kv(self.vk.as_ref()) {
+                                tracing::warn!(
+                                    slot = target,
+                                    "RAM KV seed target could not release stale MTP head KV: {error}"
+                                );
+                            }
+                            heads[target].invalidate_all();
+                        }
+                    }
+                    if let (Some(kv), Some((source, prefix, source_kv))) =
+                        (target_kv.as_mut(), seed_kv.as_ref())
+                    {
+                        match kv.seed_from(
+                            self.vk.as_ref(),
+                            cfg,
+                            self.model.engine_cfg(),
+                            source_kv,
+                            *prefix,
+                        ) {
+                            Ok(seeded) if seeded != 0 => {
+                                if let Some(heads) = heads.as_mut() {
+                                    let tokens = &source_kv.cached_tokens()[..seeded];
+                                    let (target_lane, source_lane) =
+                                        mtp_slot_pair_mut(heads, target, *source);
+                                    if let Err(error) =
+                                        target_lane.seed_from(self.vk.as_ref(), source_lane, tokens)
+                                    {
+                                        target_lane.invalidate_all();
+                                        tracing::warn!(
+                                            slot = target,
+                                            source_slot = *source,
+                                            "RAM-cache MTP prefix seed failed; preserving the seeded main KV and using ordinary decode: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                kv.reset();
+                                if let Some(heads) = heads.as_mut() {
+                                    heads[target].invalidate_all();
+                                }
+                                tracing::warn!(
+                                    slot = target,
+                                    source_slot = *source,
+                                    "RAM-cache resident prefix seed failed; re-prefilling instead: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((source, _, source_kv)) = seed_kv.take() {
+                let mut pool = self.pool.lock().expect("pool poisoned");
+                pool.slots[source].kv = Some(source_kv);
+                pool.slots[source].busy = false;
+                pool.slots[source].idle_since = Some(Instant::now());
+                drop(pool);
+                self.freed.notify_all();
+            }
+
+            return Ok(SlotGuard {
+                engine: self,
+                idx: target,
+                kv: target_kv,
+                detached: false,
+                multimodal_key: None,
+            });
+        }
+    }
+
+    /// Paged-frame-extended slot checkout (`kv.paged_cache_max`). Same reservation discipline as
+    /// the RAM path: the target is reserved under `pool`, then all GPU/tree work runs after that
+    /// lock is dropped, under the inference baton AND the tree lock. Unlike the RAM tier there is
+    /// nothing to copy in either direction: a replaced conversation is published to the tree IN
+    /// PLACE (its frames keep living where they are — demotion is a chain move plus table zeroes)
+    /// and a tree hit is attached with table writes only. Publish strictly precedes attach so the
+    /// swap never opens the PR #86 black-hole window: until `publish` returns the frames carry the
+    /// session's owners; after it the tree carries its own, so no intermediate state can strand
+    /// or evict a conversation mid-swap.
+    fn checkout_with_paged_cache(&self, prompt: &[u32], req: &RequestCtx) -> Result<SlotGuard<'_>> {
+        let tree_mutex = self
+            .paged_cache
+            .as_ref()
+            .expect("paged checkout requires a paged cache");
+        let cfg: &Config = self.model.config();
+        // Hybrid recurrent models pin reuse to snapshot boundaries; a dense model resumes anywhere.
+        let recurrent = cfg.has_recurrent_state();
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if free.is_empty() {
+                pool = self.freed.wait(pool).expect("pool poisoned");
+                continue;
+            }
+            let continuation = pick_continuation(
+                free.iter().filter_map(|&index| {
+                    (pool.slots[index].multimodal_key.is_none())
+                        .then_some(pool.slots[index].kv.as_ref())
+                        .flatten()
+                        .and_then(|kv| {
+                            kv.continuation_prefix_len(prompt)
+                                .map(|prefix| (index, prefix, prefix))
+                        })
+                }),
+                prompt.len(),
+            );
+            let continuation_prefix = continuation
+                .and_then(|index| {
+                    pool.slots[index]
+                        .kv
+                        .as_ref()
+                        .and_then(|kv| kv.continuation_prefix_len(prompt))
+                })
+                .unwrap_or(0);
+            let target = continuation.unwrap_or_else(|| {
+                *free
+                    .iter()
+                    .min_by_key(|&&index| {
+                        let slot = &pool.slots[index];
+                        let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                        (!empty, slot.tick)
+                    })
+                    .expect("free is non-empty")
+            });
+            pool.tick += 1;
+            let tick = pool.tick;
+            pool.slots[target].busy = true;
+            pool.slots[target].tick = tick;
+            pool.slots[target].idle_since = None;
+            // Clear the image marker: whatever this slot held is being replaced, and the guard only
+            // re-marks a slot that this turn is itself multimodal.
+            pool.slots[target].multimodal_key = None;
+            let mut target_kv = pool.slots[target].kv.take();
+            drop(pool);
+
+            // A hybrid recurrent slot resumes only INSIDE its own conversation: the runner needs a
+            // strict extension of `cached`, since the DeltaNet/PLE summary cannot rewind to a
+            // shorter history. Replaying the same prompt therefore keeps nothing resident — and
+            // publishing it is what turns the replay into an attach: the entry's frontier snapshot
+            // resumes the request at the last page boundary, so a 30K repeat costs the sub-page
+            // tail instead of a second 30K prefill.
+            let continuation_prefix = if recurrent && continuation_prefix >= prompt.len() {
+                0
+            } else {
+                continuation_prefix
+            };
+
+            let mut tree_attached = 0usize;
+            {
+                // One pass owns both the inference baton and the tree: no dispatch can observe a
+                // half-written page table, and no other checkout can match a chain mid-swap.
+                let _gate = req.gate_pass();
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .map(|heads| heads.lock().expect("MTP heads poisoned"));
+                let mut tree = tree_mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(kv) = target_kv.as_mut() {
+                    // The tree is engine state, not conversation state: a forked/rebuilt slot
+                    // arrives without the handle, so every checkout re-injects it.
+                    kv.set_paged(Arc::clone(tree_mutex));
+                }
+                // Multimodal KV is keyed by opaque content, not tokens — and the tree is fed the
+                // CACHE KEY for exactly that reason (see `seam::ImageCacheSpan`), so a text request
+                // taking over this slot publishes the old conversation under its own images instead
+                // of discarding it. Step 1 below does that publish; nothing may reset the slot first.
+
+                // 1. The old conversation leaves FIRST (different-prefix swap), so the tree sees
+                //    it before the new prompt matches, and the frames are never in limbo. A
+                //    continuation that survived the replay rule above keeps its slot warm instead.
+                if continuation_prefix == 0 {
+                    if let Some(kv) = target_kv.as_mut() {
+                        if kv.cached_len() != 0 || kv.paged_holds_frames() {
+                            match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
+                                Ok(published) => {
+                                    tracing::info!(
+                                        slot = target,
+                                        published,
+                                        tree = %tree.stats_line(),
+                                        "published replaced conversation KV to the paged radix cache (frames stay in place)"
+                                    );
+                                    if let Some(heads) = heads.as_mut() {
+                                        if let Err(error) =
+                                            heads[target].head.release_kv(self.vk.as_ref())
+                                        {
+                                            tracing::warn!(
+                                                slot = target,
+                                                "paged KV replacement could not release stale MTP head KV: {error}"
+                                            );
+                                        }
+                                        heads[target].invalidate_all();
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        slot = target,
+                                        "paged KV replacement publish failed; forgetting the old conversation: {error}"
+                                    );
+                                    kv.reset();
+                                    if let Some(heads) = heads.as_mut() {
+                                        heads[target].invalidate_all();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Deepest page-aligned chain the tree can serve (counts a hit/miss itself).
+                //    A resident continuation only loses to a STRICTLY deeper tree chain.
+                // The tree is addressed under the projection setting THIS request resolves to, so an
+                // ON chain is never handed to an OFF request — and a flip stops paying a wasted
+                // attach followed by a full re-prefill. No direction file loaded ⇒ the unprojected
+                // root, and every chain that exists today keeps addressing exactly as it did.
+                let attach_setting = target_kv
+                    .as_ref()
+                    .and_then(|kv| kv.uncensor_setting(req.sampling().uncensor));
+                if let Some((node, matched)) = tree.best_match(prompt, attach_setting) {
+                    // A dense model resumes wherever it matched; a hybrid recurrent model only at a
+                    // boundary its entry carries a snapshot for (see `PagedKv::hit_prefix`).
+                    let pages = tree.page_tokens();
+                    let (mut reusable, mut ckpt) = tree.hit_prefix(node, recurrent, matched);
+                    if reusable > continuation_prefix {
+                        // A continuation slot that skipped step 1 may still hold its conversation
+                        // (and the failed-publish path leaves the chain warm). Attach needs an
+                        // empty slot: detach through the same publish path (full pages = 0 after
+                        // a reset, so this arm can only free frames, never publish stale state).
+                        let occupied = target_kv
+                            .as_ref()
+                            .is_some_and(|kv| kv.cached_len() != 0 || kv.paged_holds_frames());
+                        let mut ready = !occupied;
+                        if occupied {
+                            if let Some(kv) = target_kv.as_mut() {
+                                match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
+                                    Ok(_) => ready = true,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            slot = target,
+                                            "paged KV could not empty the slot for a tree attach; re-prefilling: {error}"
+                                        );
+                                        kv.reset();
+                                        if let Some(heads) = heads.as_mut() {
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ready {
+                            // Phase C: RAM frames in the matched chain DMA back into VRAM before
+                            // the attach (the page table never sees a RAM address). VRAM that
+                            // cannot host the whole chain attaches at its deepest promotable
+                            // prefix; the un-promoted tail stays sunk and the rest re-prefills.
+                            let mut chain =
+                                tree.entry_chain_promoted(self.vk.as_ref(), node, reusable, prompt);
+                            // Promotion may fall short of the request. Re-pick against what
+                            // actually arrived, then cut the chain back to the reuse point: a
+                            // snapshot must never describe MORE tokens than the attached chain
+                            // covers, and frames the slot never points at stay tree-owned.
+                            let promoted = chain.len() * pages;
+                            if promoted < reusable {
+                                (reusable, ckpt) = tree.hit_prefix(node, recurrent, promoted);
+                                chain.truncate(reusable / pages);
+                            }
+                            if let Some(kv) = target_kv.as_mut().filter(|_| !chain.is_empty()) {
+                                let aux = ckpt.is_some();
+                                match kv.paged_attach(
+                                    self.vk.as_ref(),
+                                    cfg,
+                                    &mut tree,
+                                    &chain,
+                                    &prompt[..reusable],
+                                    ckpt,
+                                ) {
+                                    Ok(()) => {
+                                        tree_attached = reusable;
+                                        if let Some(on) = attach_setting {
+                                            if let Some(kv) = target_kv.as_mut() {
+                                                kv.note_uncensor_attached(on);
+                                            }
+                                        }
+                                        tracing::info!(
+                                            slot = target,
+                                            cached_prefix_tokens = reusable,
+                                            aux,
+                                            tree = %tree.stats_line(),
+                                            "paged KV prefix hit (zero-copy frame attach)"
+                                        );
+                                        // The tree carries no MTP draft state; free the head's
+                                        // stale KV and let it re-warm on ordinary decode.
+                                        if let Some(heads) = heads.as_mut() {
+                                            if let Err(error) =
+                                                heads[target].head.release_kv(self.vk.as_ref())
+                                            {
+                                                tracing::warn!(
+                                                    slot = target,
+                                                    "paged KV attach could not release stale MTP head KV: {error}"
+                                                );
+                                            }
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            slot = target,
+                                            "paged KV attach failed; re-prefilling the request: {error}"
+                                        );
+                                        if let Some(heads) = heads.as_mut() {
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Console-visible per-request ledger: what THIS prompt reuses (tree attach or the
+                // resident continuation left in the slot) and what the corridor currently holds —
+                // allocated frames cover both tree chains and live sessions, so `free` is what a
+                // growing request can still claim before cold eviction starts.
+                let reused = tree_attached.max(continuation_prefix);
+                let reuse_pct = if prompt.is_empty() {
+                    0.0
+                } else {
+                    reused as f64 * 100.0 / prompt.len() as f64
+                };
+                tracing::info!(
+                    slot = target,
+                    prompt_tokens = prompt.len(),
+                    reused_tokens = reused,
+                    prefill_tokens = prompt.len().saturating_sub(reused),
+                    reuse_pct = format_args!("{reuse_pct:.1}"),
+                    cache = %tree.stats_line(),
+                    "paged KV prefix cache status"
+                );
+            }
+
+            return Ok(SlotGuard {
+                engine: self,
+                idx: target,
+                kv: target_kv,
                 detached: false,
                 multimodal_key: None,
             });
@@ -2493,13 +3615,290 @@ impl ParallelSeam {
     fn checkout_multimodal(
         &self,
         prompt: &[u32],
+        key_view: &[u32],
+        cache_spans: Vec<crate::seam::ImageCacheSpan>,
         key: MultimodalKey,
         req: &RequestCtx,
     ) -> SlotGuard<'_> {
-        if self.session_cache.is_some() {
+        if self.paged_cache.is_some() {
+            self.checkout_multimodal_with_paged_cache(prompt, key_view, cache_spans, key, req)
+        } else if self.session_cache.is_some() {
             self.checkout_multimodal_with_cold_cache(prompt, key, req)
         } else {
             self.checkout_multimodal_resident(prompt, key)
+        }
+    }
+
+    /// Paged-tier multimodal checkout: the same publish-before-attach swap the text path runs, with
+    /// the tree addressed through the request's CACHE KEY.
+    ///
+    /// This is what lets an image's KV outlive the turn that produced it. Without it a multimodal
+    /// conversation continues only while its own slot stays untouched, so any other request in
+    /// between repays the whole picture — measured on Qwen3.8-Flash-Next with `kv.paged=true`: a
+    /// 6.4K-token turn carrying one image cost 2.1s back-to-back and 10.0s after a single text
+    /// request, because `reset()` discarded 4K tokens of materialized KV that the tree could have
+    /// handed straight back.
+    ///
+    /// Publish strictly precedes attach (see [`Self::checkout_with_paged_cache`]) and the old
+    /// conversation is published under ITS OWN spans, so a chain never changes picture identity
+    /// mid-swap; the requesting spans are installed only once this slot is about to materialize
+    /// this prompt.
+    #[allow(clippy::too_many_arguments)]
+    fn checkout_multimodal_with_paged_cache(
+        &self,
+        prompt: &[u32],
+        key_view: &[u32],
+        cache_spans: Vec<crate::seam::ImageCacheSpan>,
+        key: MultimodalKey,
+        req: &RequestCtx,
+    ) -> SlotGuard<'_> {
+        let tree_mutex = self
+            .paged_cache
+            .as_ref()
+            .expect("paged multimodal checkout requires a paged cache");
+        let cfg: &Config = self.model.config();
+        let recurrent = cfg.has_recurrent_state();
+        let mut pool = self.pool.lock().expect("pool poisoned");
+        loop {
+            let free = (0..pool.slots.len())
+                .filter(|&index| !pool.slots[index].busy)
+                .collect::<Vec<_>>();
+            if free.is_empty() {
+                pool = self.freed.wait(pool).expect("pool poisoned");
+                continue;
+            }
+            // A resident continuation is only this same conversation: the slot has to carry the
+            // very images this request does, compared in key space. Anything else the tree can
+            // serve comes from the publish/attach arms below.
+            let continuation = pick_continuation(
+                free.iter().filter_map(|&index| {
+                    (pool.slots[index].multimodal_key == Some(key))
+                        .then_some(pool.slots[index].kv.as_ref())
+                        .flatten()
+                        .and_then(|kv| {
+                            kv.continuation_prefix_len_keyed(
+                                key_view,
+                                kv.uncensor_setting(req.sampling().uncensor),
+                            )
+                            .map(|prefix| (index, prefix, prefix))
+                        })
+                }),
+                key_view.len(),
+            );
+            let continuation_prefix = continuation
+                .and_then(|index| {
+                    pool.slots[index].kv.as_ref().and_then(|kv| {
+                        kv.continuation_prefix_len_keyed(
+                            key_view,
+                            kv.uncensor_setting(req.sampling().uncensor),
+                        )
+                    })
+                })
+                .unwrap_or(0);
+            let target = continuation.unwrap_or_else(|| {
+                *free
+                    .iter()
+                    .min_by_key(|&&index| {
+                        let slot = &pool.slots[index];
+                        let empty = slot.kv.as_ref().is_none_or(|kv| kv.cached_len() == 0);
+                        (!empty, slot.tick)
+                    })
+                    .expect("free is non-empty")
+            });
+            pool.tick += 1;
+            let tick = pool.tick;
+            pool.slots[target].busy = true;
+            pool.slots[target].tick = tick;
+            pool.slots[target].idle_since = None;
+            pool.slots[target].multimodal_key = None;
+            let mut target_kv = pool.slots[target].kv.take();
+            drop(pool);
+
+            // Same replay rule as the text path: a hybrid recurrent slot resumes only INSIDE its own
+            // conversation, so an equal-length prompt goes to the tree instead of the live frontier.
+            let continuation_prefix = if recurrent && continuation_prefix >= key_view.len() {
+                0
+            } else {
+                continuation_prefix
+            };
+
+            let mut tree_attached = 0usize;
+            {
+                let _gate = req.gate_pass();
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .map(|heads| heads.lock().expect("MTP heads poisoned"));
+                let mut tree = tree_mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(kv) = target_kv.as_mut() {
+                    kv.set_paged(Arc::clone(tree_mutex));
+                }
+
+                // 1. The old conversation leaves FIRST, under its own key, so the tree sees it
+                //    before this request matches and its frames are never in limbo.
+                if continuation_prefix == 0 {
+                    if let Some(kv) = target_kv.as_mut() {
+                        if kv.cached_len() != 0 || kv.paged_holds_frames() {
+                            match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
+                                Ok(published) => {
+                                    tracing::info!(
+                                        slot = target,
+                                        published,
+                                        tree = %tree.stats_line(),
+                                        "published replaced multimodal conversation KV to the paged radix cache"
+                                    );
+                                    if let Some(heads) = heads.as_mut() {
+                                        if let Err(error) =
+                                            heads[target].head.release_kv(self.vk.as_ref())
+                                        {
+                                            tracing::warn!(
+                                                slot = target,
+                                                "paged KV replacement could not release stale MTP head KV: {error}"
+                                            );
+                                        }
+                                        heads[target].invalidate_all();
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        slot = target,
+                                        "paged KV replacement publish failed; forgetting the old conversation: {error}"
+                                    );
+                                    kv.reset();
+                                    if let Some(heads) = heads.as_mut() {
+                                        heads[target].invalidate_all();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Deepest page-aligned chain the tree can serve for THIS key.
+                // Same setting-aware addressing on top of the image content key.
+                let attach_setting = target_kv
+                    .as_ref()
+                    .and_then(|kv| kv.uncensor_setting(req.sampling().uncensor));
+                if let Some((node, matched)) = tree.best_match(key_view, attach_setting) {
+                    let pages = tree.page_tokens();
+                    let (mut reusable, mut ckpt) = tree.hit_prefix(node, recurrent, matched);
+                    if reusable > continuation_prefix {
+                        let occupied = target_kv
+                            .as_ref()
+                            .is_some_and(|kv| kv.cached_len() != 0 || kv.paged_holds_frames());
+                        let mut ready = !occupied;
+                        if occupied {
+                            if let Some(kv) = target_kv.as_mut() {
+                                match kv.paged_publish_detach(self.vk.as_ref(), cfg, &mut tree) {
+                                    Ok(_) => ready = true,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            slot = target,
+                                            "paged KV could not empty the slot for a tree attach; re-prefilling: {error}"
+                                        );
+                                        kv.reset();
+                                        if let Some(heads) = heads.as_mut() {
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if ready {
+                            let mut chain = tree.entry_chain_promoted(
+                                self.vk.as_ref(),
+                                node,
+                                reusable,
+                                key_view,
+                            );
+                            let promoted = chain.len() * pages;
+                            if promoted < reusable {
+                                (reusable, ckpt) = tree.hit_prefix(node, recurrent, promoted);
+                                chain.truncate(reusable / pages);
+                            }
+                            if let Some(kv) = target_kv.as_mut().filter(|_| !chain.is_empty()) {
+                                let aux = ckpt.is_some();
+                                // The slot adopts REAL tokens; only the tree ever sees the key.
+                                match kv.paged_attach(
+                                    self.vk.as_ref(),
+                                    cfg,
+                                    &mut tree,
+                                    &chain,
+                                    &prompt[..reusable],
+                                    ckpt,
+                                ) {
+                                    Ok(()) => {
+                                        tree_attached = reusable;
+                                        if let Some(on) = attach_setting {
+                                            if let Some(kv) = target_kv.as_mut() {
+                                                kv.note_uncensor_attached(on);
+                                            }
+                                        }
+                                        tracing::info!(
+                                            slot = target,
+                                            cached_prefix_tokens = reusable,
+                                            aux,
+                                            tree = %tree.stats_line(),
+                                            "paged KV prefix hit for a multimodal prompt (zero-copy frame attach)"
+                                        );
+                                        if let Some(heads) = heads.as_mut() {
+                                            if let Err(error) =
+                                                heads[target].head.release_kv(self.vk.as_ref())
+                                            {
+                                                tracing::warn!(
+                                                    slot = target,
+                                                    "paged KV attach could not release stale MTP head KV: {error}"
+                                                );
+                                            }
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            slot = target,
+                                            "paged KV attach failed; re-prefilling the request: {error}"
+                                        );
+                                        if let Some(heads) = heads.as_mut() {
+                                            heads[target].invalidate_all();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. From here the slot materializes THIS conversation, so its chain — however much
+                //    of it was reused — is keyed by these images.
+                if let Some(kv) = target_kv.as_mut() {
+                    kv.set_image_cache_spans(cache_spans);
+                }
+                let reused = tree_attached.max(continuation_prefix);
+                let reuse_pct = if prompt.is_empty() {
+                    0.0
+                } else {
+                    reused as f64 * 100.0 / prompt.len() as f64
+                };
+                tracing::info!(
+                    slot = target,
+                    prompt_tokens = prompt.len(),
+                    reused_tokens = reused,
+                    prefill_tokens = prompt.len().saturating_sub(reused),
+                    reuse_pct = format_args!("{reuse_pct:.1}"),
+                    cache = %tree.stats_line(),
+                    "paged KV prefix cache status"
+                );
+            }
+
+            return SlotGuard {
+                engine: self,
+                idx: target,
+                kv: target_kv,
+                detached: false,
+                multimodal_key: Some(key),
+            };
         }
     }
 
@@ -3111,6 +4510,7 @@ impl ParallelSeam {
         };
         work.prefill_start = prepared.start;
         work.checkpoint_boundaries = prepared.checkpoint_boundaries;
+        work.paged_frontier = prepared.paged_frontier;
         work.stats.n_prompt = work
             .stats
             .n_prompt
@@ -3164,6 +4564,7 @@ impl ParallelSeam {
             .map(|work| crate::seam::PreparedParallelPrompt {
                 start: work.prefill_start,
                 checkpoint_boundaries: work.checkpoint_boundaries,
+                paged_frontier: work.paged_frontier,
             })
             .collect::<Vec<_>>();
         let progress_senders = long
@@ -3261,6 +4662,12 @@ impl ParallelSeam {
                 if boundary.is_some_and(|boundary| cached_len >= boundary) {
                     *boundary = None;
                 }
+            }
+            if work
+                .paged_frontier
+                .is_some_and(|frontier| cached_len >= frontier)
+            {
+                work.paged_frontier = None;
             }
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let progress = infr_core::GenerationProgress {
@@ -3522,6 +4929,12 @@ impl ParallelSeam {
             .as_ref()
             .map(std::slice::from_ref)
             .unwrap_or(indices);
+        let mtp_t0 = (sync_mtp
+            && active.len() == 1
+            && active[indices[0]].mtp_ready
+            && active[indices[0]].phase == BatchPhase::Decode
+            && self.model.engine_cfg().spec.mtp_adaptive_width)
+            .then(Instant::now);
         let lookup_t0 = (indices.len() == 1
             && active[indices[0]].lookup.is_some()
             && active[indices[0]].phase == BatchPhase::Decode)
@@ -3683,7 +5096,7 @@ impl ParallelSeam {
         } else {
             // Keep Lookup's post-ACK indexing/yield and the MTP/Prefill callback order intact.
             let mut stream = |lane: usize, id: u32| {
-                let delivery_t0 = lookup_t0.map(|_| Instant::now());
+                let delivery_t0 = lookup_t0.or(mtp_t0).map(|_| Instant::now());
                 let timeline_output = infr_core::timeline::span("decode_output_progress");
                 streamed[lane] += 1;
                 let (prompt_tokens, cached_prompt_tokens, generated) = progress_bases[lane];
@@ -3776,6 +5189,21 @@ impl ParallelSeam {
         if sync_mtp {
             self.sync_mtp_after_plain_decode(active, indices, &outputs, &result.hidden)?;
         }
+        if let Some(t0) = mtp_t0 {
+            let seconds = (t0.elapsed().as_secs_f64() - lookup_delivery_secs).max(0.0);
+            self.mtp_heads
+                .as_ref()
+                .expect("MTP scheduler has heads")
+                .lock()
+                .expect("MTP heads poisoned")[active[indices[0]].slot]
+                .policy
+                .record(1, seconds, outputs[0].len());
+            tracing::debug!(
+                rows = outputs[0].len(),
+                elapsed_ms = seconds * 1000.0,
+                "Qwen3.8 adaptive MTP ordinary cost sample"
+            );
+        }
         let cfg = self.model.config();
         for (lane, &index) in indices.iter().enumerate() {
             let work = &mut active[index];
@@ -3803,6 +5231,12 @@ impl ParallelSeam {
                 if boundary.is_some_and(|boundary| cached_len >= boundary) {
                     *boundary = None;
                 }
+            }
+            if work
+                .paged_frontier
+                .is_some_and(|frontier| cached_len >= frontier)
+            {
+                work.paged_frontier = None;
             }
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             let eos = outputs[lane].last().is_some_and(|token| {
@@ -3848,8 +5282,14 @@ impl ParallelSeam {
     fn fail_unified_scheduler(&self, active: &mut Vec<BatchWork>, mut error: anyhow::Error) {
         let numerical = crate::sampling::is_numerical_corruption(&error);
         for work in active.iter_mut() {
-            if numerical || self.mtp_heads.is_some() || work.lookup.is_some() {
+            if numerical {
+                // Non-finite output is corrupt state: no voucher survives it.
                 work.kv.as_mut().expect("batch work owns a KV slot").reset();
+            } else if self.mtp_heads.is_some() || work.lookup.is_some() {
+                work.kv
+                    .as_mut()
+                    .expect("batch work owns a KV slot")
+                    .reset_after_failed_turn();
             }
         }
         if numerical {
@@ -3973,6 +5413,7 @@ impl ParallelSeam {
                 .n_prompt
                 .saturating_add(prompt.len().saturating_sub(start));
             work.checkpoint_boundaries = prepared.checkpoint_boundaries;
+            work.paged_frontier = prepared.paged_frontier;
             work.phase = phase_for_remaining_prefill(work.remaining_prefill());
             work.turn_checkpoint = None;
             work.mtp_ready = false;
@@ -4339,9 +5780,69 @@ impl ParallelSeam {
                 self.retire_finished_work(&mut active);
                 continue;
             }
+            let initial_frontiers = (0..active.len())
+                .filter(|&index| active[index].mtp_ready && active[index].generated == 0)
+                .collect::<Vec<_>>();
+            if let Err(error) = self.materialize_mtp_frontiers(&mut active, &initial_frontiers) {
+                self.fail_unified_scheduler(&mut active, error);
+                return;
+            }
+            self.retire_finished_work(&mut active);
+            if active.is_empty() {
+                continue;
+            }
+            let adaptive = active.len() == 1 && self.model.engine_cfg().spec.mtp_adaptive_width;
+            let mut policy_change = None;
+            let choice = if adaptive {
+                let mut heads = self
+                    .mtp_heads
+                    .as_ref()
+                    .expect("MTP scheduler has heads")
+                    .lock()
+                    .expect("MTP heads poisoned");
+                let lane = &mut heads[active[0].slot];
+                let choice = lane.policy.choose(verify_rows, true);
+                if lane.last_policy_rows != choice.rows {
+                    policy_change = Some((lane.last_policy_rows, choice.rows, choice.probe));
+                    lane.last_policy_rows = choice.rows;
+                }
+                choice
+            } else {
+                crate::speculative_verify::MtpChoice {
+                    rows: verify_rows,
+                    probe: false,
+                }
+            };
+            if let Some((previous, rows, probe)) = policy_change {
+                tracing::info!(
+                    slot = active[0].slot,
+                    previous_rows = previous,
+                    rows,
+                    probe,
+                    "Qwen3.8 adaptive MTP selected decode mode"
+                );
+            }
+            if choice.rows == 1 {
+                if let Err(error) = self.materialize_mtp_frontiers(&mut active, &[0]) {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                if active.is_empty() {
+                    continue;
+                }
+                if let Err(error) =
+                    self.run_token_group(&mut active, &[0], MTP_ADAPTIVE_PLAIN_QUANTUM, true)
+                {
+                    self.fail_unified_scheduler(&mut active, error);
+                    return;
+                }
+                self.retire_finished_work(&mut active);
+                continue;
+            }
             let mut indices = (0..active.len()).collect::<Vec<_>>();
             indices.sort_by_key(|&index| (active[index].mrope_plan.is_none(), active[index].slot));
-            let cycle = match self.run_mtp_verify_cycle(&mut active, &indices, req) {
+            let cycle = match self.run_mtp_verify_cycle(&mut active, &indices, req, choice) {
                 Ok(cycle) => cycle,
                 Err(error) => {
                     self.fail_unified_scheduler(&mut active, error);
@@ -4395,11 +5896,14 @@ impl ParallelSeam {
         active: &mut [BatchWork],
         indices: &[usize],
         req: &RequestCtx,
+        choice: crate::speculative_verify::MtpChoice,
     ) -> Result<MtpBatchCycleStats> {
         let cfg = self.model.config();
         let ec = self.model.engine_cfg();
         let h_width = cfg.hc_mult * cfg.n_embd;
-        let rows = mtp_verify_rows(ec.spec.k);
+        let adaptive = indices.len() == 1 && ec.spec.mtp_adaptive_width;
+        let want_probs = adaptive && !choice.probe && choice.rows > 2 && ec.spec.gpu_draft_prob;
+        let mut rows = choice.rows;
         let timeline_positions = indices
             .iter()
             .map(|&index| active[index].kv().cached_len())
@@ -4433,16 +5937,25 @@ impl ParallelSeam {
                 let physical_position = work.kv().cached_len();
                 let rope_position =
                     multimodal_token_position(work.mrope_plan.as_ref(), physical_position)?;
-                let candidates = lane.head.draft_with_tail_mode(
+                let draft = lane.head.draft_with_confidence(
                     self.vk.as_ref(),
                     pending,
                     &lane.last_h,
                     physical_position,
                     rope_position,
-                    rows,
+                    choice.rows,
                     work.kv().mtp_shared_weights(),
                     ec.spec.mtp_tail_kv_only,
+                    want_probs,
                 )?;
+                if want_probs {
+                    rows = crate::mtp::confidence_verify_rows(
+                        &draft.probabilities,
+                        choice.rows,
+                        ec.spec.mtp_slot_min_accept,
+                    );
+                }
+                let candidates = draft.tokens[..rows - 1].to_vec();
                 let mut feed = work.kv().cached_tokens().to_vec();
                 feed.push(pending);
                 feed.extend_from_slice(&candidates);
@@ -4511,7 +6024,7 @@ impl ParallelSeam {
         for (lane_index, &index) in indices.iter().enumerate() {
             let timeline_accept = infr_core::timeline::span("mtp_accept_emit");
             let work = &mut active[index];
-            let first_cycle = work.generated == 0;
+            let first_cycle = work.kv().cached_len() == work.prompt_end + rows;
             let pending_emitted = self
                 .mtp_heads
                 .as_ref()
@@ -4641,13 +6154,26 @@ impl ParallelSeam {
             work.generated += emitted;
             work.stats.n_gen += emitted;
             let restore_secs = restore_t0.elapsed().as_secs_f64();
-            work.stats.decode_secs += compute_secs + restore_secs;
+            let cycle_secs = snapshot_secs + compute_secs + restore_secs;
+            work.stats.decode_secs += cycle_secs;
             work.finished = stopped || work.generated >= work.max_new;
+            if adaptive {
+                self.mtp_heads
+                    .as_ref()
+                    .expect("MTP scheduler has heads")
+                    .lock()
+                    .expect("MTP heads poisoned")[work.slot]
+                    .policy
+                    // `cycle_secs` paid for the full `choice.rows` draft; the confidence trim only
+                    // shortened VERIFY. Billing `rows` here would hand arm 2 the wide arm's cost.
+                    .record(choice.rows, cycle_secs, committed);
+            }
             if first_cycle {
                 tracing::info!(
                     slot = work.slot,
                     context = old_len,
-                    rows,
+                    drafted = choice.rows - 1,
+                    verified = rows - 1,
                     accepted = accepted - 1,
                     published = emitted,
                     tail_kv_only = ec.spec.mtp_tail_kv_only,
@@ -4658,8 +6184,8 @@ impl ParallelSeam {
                 slot = work.slot,
                 lanes = indices.len(),
                 context = old_len,
-                rows,
-                drafted = predictions[lane_index].len(),
+                drafted = choice.rows - 1,
+                verified = rows - 1,
                 accepted = accepted - 1,
                 committed,
                 published = emitted,
@@ -4743,7 +6269,7 @@ impl ParallelSeam {
             // Any error after arming/Verify/restore may leave recurrent state ahead of
             // published tokens. Never return that slot as a reusable apparent prefix.
             if let Some(kv) = work.kv.as_mut() {
-                kv.reset();
+                kv.reset_after_failed_turn();
             }
             if let Some(lookup) = work.lookup.as_mut() {
                 lookup.pending_proposal = None;
@@ -5226,6 +6752,7 @@ impl ParallelSeam {
             phase: BatchPhase::Unprepared,
             prefill_start: 0,
             checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+            paged_frontier: None,
             turn_checkpoint,
             mrope_plan: None,
             multimodal_key: None,
@@ -5319,7 +6846,11 @@ impl ParallelSeam {
                 .map(|tokens| tokens.len());
             crate::seam::TurnCheckpoint::new(None, boundary)
         });
-        let mut guard = self.checkout_multimodal(&prompt_tokens, key, req);
+        // The tree key of this prompt: every image-pad run replaced by that picture's own block.
+        // Taken before `plan` moves into the turn below.
+        let cache_spans = plan.cache_spans.clone();
+        let key_view = plan.cache_view(&prompt_tokens);
+        let mut guard = self.checkout_multimodal(&prompt_tokens, &key_view, cache_spans, key, req);
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let mut acc = Vec::new();
         let mut printed = 0usize;
@@ -5370,6 +6901,7 @@ impl ParallelSeam {
                 phase: BatchPhase::Unprepared,
                 prefill_start: 0,
                 checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+                paged_frontier: None,
                 turn_checkpoint,
                 mrope_plan: Some(plan),
                 multimodal_key: Some(key),
@@ -5460,7 +6992,7 @@ impl ParallelSeam {
                 );
             }
             if let Some(kv) = guard.kv.as_mut() {
-                kv.reset();
+                kv.reset_after_failed_turn();
             }
         }
         let (legacy_ids, stats) = result?;
@@ -5510,6 +7042,7 @@ impl ParallelSeam {
             phase: phase_for_remaining_prefill(remaining_prefill),
             prefill_start,
             checkpoint_boundaries: [None; crate::seam::TURN_CHECKPOINT_COUNT],
+            paged_frontier: None,
             turn_checkpoint: None,
             mrope_plan: Some(plan),
             multimodal_key: Some(key),
@@ -5541,16 +7074,46 @@ impl ParallelSeam {
 #[cfg(test)]
 mod tests {
     use super::{
-        concurrent_mtp_profitable, concurrent_mtp_ready, deliver_lookup_prefix,
-        expand_multimodal_prompt, long_prefill_cohort_limit, long_prefill_phase_prompt_end,
-        lookup_fallback_reason, lookup_greedy_eligible, lookup_scheduler_supported,
-        mtp_accepted_rows, mtp_context_profitable, multimodal_key, multimodal_token_position,
-        phase_for_remaining_prefill, pick_continuation, repair_lookup_predictions, scheduler_mode,
-        scheduler_requested, should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback,
-        token_lane_sort_key, BatchPhase, LookupBatchState, LookupTokenDelivery,
-        MultimodalEmbedding, SchedulerMode, SHORT_PREFILL_TOKENS,
+        clamp_ram_frames_to_ram_room, concurrent_mtp_profitable, concurrent_mtp_ready,
+        deliver_lookup_prefix, expand_multimodal_prompt, long_prefill_cohort_limit,
+        long_prefill_phase_prompt_end, lookup_fallback_reason, lookup_greedy_eligible,
+        lookup_scheduler_supported, mtp_accepted_rows, mtp_context_profitable, multimodal_key,
+        multimodal_token_position, phase_for_remaining_prefill, pick_continuation,
+        repair_lookup_predictions, scheduler_mode, scheduler_requested,
+        should_handoff_multimodal_to_scheduler, token_lane_prefill_fallback, token_lane_sort_key,
+        BatchPhase, LookupBatchState, LookupTokenDelivery, MultimodalEmbedding, SchedulerMode,
+        SHORT_PREFILL_TOKENS,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn ram_frame_pool_clamps_to_live_ram_room_and_ignores_platforms_without_it() {
+        let gib = 1u64 << 30;
+        let frame = 4 * 1024 * 1024; // 4 MiB per frame at the shipped 64-token page
+        let declared = ((16 * gib) / frame) as usize; // 4096 frames, the operator's promise
+        assert_eq!(
+            clamp_ram_frames_to_ram_room(declared, frame, None),
+            declared,
+            "no availability probe (Linux/macOS) must not change the declared pool"
+        );
+        // Plenty of headroom: the declaration stands.
+        assert_eq!(
+            clamp_ram_frames_to_ram_room(declared, frame, Some(40 * gib)),
+            declared
+        );
+        // The measured box: expert store and device allocations already spent the headroom, so
+        // 1 GiB of floor above what is left is what the tree may commit.
+        let live = 5 * gib;
+        let allowed = clamp_ram_frames_to_ram_room(declared, frame, Some(live));
+        assert_eq!(
+            allowed * frame as usize,
+            (live - crate::seam::HOST_FRAME_RAM_FLOOR) as usize,
+            "the pool takes the room between the floor and the free RAM, no more"
+        );
+        assert!(allowed < declared);
+        // No headroom at all is zero frames — evict, never trip.
+        assert_eq!(clamp_ram_frames_to_ram_room(declared, frame, Some(gib)), 0);
+    }
 
     #[test]
     fn lookup_delivery_exhausts_widths_caps_and_disconnect_prefixes() {
@@ -6536,6 +8099,71 @@ mod tests {
         assert_eq!(multimodal_token_position(Some(&plan), 9).unwrap(), 7);
         assert_eq!(multimodal_token_position(Some(&plan), 10).unwrap(), 8);
         assert_eq!(multimodal_token_position(Some(&plan), 13).unwrap(), 11);
+    }
+
+    /// The paged tree addresses a chain by its token vector, and an image span is one repeated pad
+    /// token: without a content key, a second picture would be handed the first one's attention
+    /// rows. `cache_view` is the fence — same length as the prompt, text positions untouched, and
+    /// every image position reserved so no vocabulary token can ever reach it.
+    #[test]
+    fn image_cache_key_names_the_picture_not_the_pad_token() {
+        let embed = |fingerprint: [u8; 32], nx, ny, fill: f32| MultimodalEmbedding {
+            values: Arc::new(vec![fill; nx * ny * 3]),
+            grid_nx: nx,
+            grid_ny: ny,
+            fingerprint,
+        };
+        let prompt =
+            |images| expand_multimodal_prompt(&[10, 99, 11], 99, images, 3).expect("valid prompt");
+        let (tokens, blue) = prompt(vec![embed([1; 32], 2, 2, 1.0)]);
+        let (_, red) = prompt(vec![embed([2; 32], 2, 2, 2.0)]);
+        let view = blue.cache_view(&tokens);
+        let span = &blue.spans[0];
+        let after = span.start + span.n_tokens;
+        assert_eq!(
+            view.len(),
+            tokens.len(),
+            "a key stays addressable per token"
+        );
+        assert_eq!(&view[..span.start], &tokens[..span.start]);
+        assert_eq!(&view[after..], &tokens[after..]);
+        assert!(
+            view[span.start..after]
+                .iter()
+                .all(|id| id & crate::seam::IMAGE_CACHE_TOKEN_BIT != 0),
+            "every image position is reserved, so a text chain can never match one"
+        );
+        assert_ne!(
+            view,
+            red.cache_view(&tokens),
+            "a different picture is a different chain"
+        );
+        assert_eq!(
+            view,
+            blue.cache_view(&tokens),
+            "and one picture replays its key exactly"
+        );
+
+        // The same content at another resolution is another computation: grid AND run length move.
+        let (big_tokens, big) = prompt(vec![embed([1; 32], 3, 3, 1.0)]);
+        assert_ne!(
+            big.cache_view(&big_tokens)[..after],
+            view[..after],
+            "a resized picture does not inherit the original's prefix"
+        );
+
+        // A partial conversation — attached mid-prompt, or truncated — still keys itself: spans past
+        // the materialized length are ignored instead of rewriting positions that no longer exist.
+        assert_eq!(
+            crate::seam::image_cache_view(&tokens[..span.start + 1], &blue.cache_spans),
+            vec![tokens[0], view[span.start]],
+            "a slot one image-token deep keeps only the position it actually holds"
+        );
+        assert_eq!(
+            crate::seam::image_cache_view(&tokens[..span.start], &blue.cache_spans),
+            vec![tokens[0]],
+            "nothing inside the span means nothing rewritten"
+        );
     }
 
     #[test]

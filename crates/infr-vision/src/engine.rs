@@ -19,8 +19,12 @@ use std::{
 };
 
 const VIT_THETA: f32 = 10_000.0;
-const EMBEDDING_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
-const EMBEDDING_CACHE_MAX_IMAGES: usize = 16;
+// Sized to hold a whole multi-image request (tens of screenshots), so an aborted/timeout retry
+// or the next turn re-uses every embedding instead of re-encoding the tail. A single image's
+// embedding is `n_tokens * projection_dim * 4` (≈4.5 MiB at 444 tokens × 2560 dims), so the byte
+// cap holds ~220 such images and remains the real RAM bound.
+const EMBEDDING_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const EMBEDDING_CACHE_MAX_IMAGES: usize = 256;
 
 #[derive(Clone)]
 enum WeightPayload {

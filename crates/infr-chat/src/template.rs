@@ -332,7 +332,7 @@ fn message_to_json(m: &ChatMessage) -> Value {
             .map(|c| {
                 serde_json::json!({
                     "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
+                    "function": { "name": c.name, "arguments": tool_arguments_object(&c.arguments) },
                 })
             })
             .collect();
@@ -345,6 +345,22 @@ fn message_to_json(m: &ChatMessage) -> Value {
         obj.insert("name".into(), name.clone().into());
     }
     Value::Object(obj)
+}
+
+/// HF/Qwen chat templates iterate a call's arguments as key/value pairs (`arguments|items`), so the
+/// value MUST be a mapping. A replayed `tool_calls[].function.arguments` can arrive as a JSON string
+/// (OpenAI's wire form), or — from a lenient client — an array/scalar; rendering those throws
+/// "cannot convert value into pairs" and fails the whole turn. Coerce to an object here: parse a
+/// string body, keep an object as-is, and fall back to `{}` for anything that is not a mapping.
+fn tool_arguments_object(arguments: &Value) -> Value {
+    match arguments {
+        Value::Object(_) => arguments.clone(),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+        _ => Value::Object(serde_json::Map::new()),
+    }
 }
 
 fn qwen35_reasoning_instruction(effort: ReasoningEffort) -> &'static str {
@@ -392,6 +408,24 @@ fn prepend_system_instruction(messages: &mut Vec<Value>, instruction: &str) {
         0,
         serde_json::json!({"role": "system", "content": instruction}),
     );
+}
+
+/// Qwen3.8's shipped template validates `reasoning_effort` ITSELF and accepts only
+/// `low | medium | xhigh` ("Unexpected reasoning effort … Supported types are xhigh (default),
+/// medium, and low"). OpenAI's `high` — the level most clients send by default — and `max` have no
+/// local rung, so they snap to the nearest supported one (xhigh) instead of failing every render.
+fn adapt_qwen4_reasoning_effort(
+    architecture: Option<&str>,
+    template_supports_effort: bool,
+    options: &mut ChatTemplateOptions,
+) {
+    if !template_supports_effort || architecture != Some("qwen4exp") {
+        return;
+    }
+    options.reasoning_effort = match options.reasoning_effort {
+        Some(ReasoningEffort::High | ReasoningEffort::Max) => Some(ReasoningEffort::Xhigh),
+        other => other,
+    };
 }
 
 fn adapt_qwen35_reasoning_effort(
@@ -455,6 +489,11 @@ fn render_core(
         gguf.metadata().str("general.architecture"),
         template_env.supports_effort,
         &mut msgs,
+        &mut options,
+    );
+    adapt_qwen4_reasoning_effort(
+        gguf.metadata().str("general.architecture"),
+        template_env.supports_effort,
         &mut options,
     );
     match render_template_with_options(
@@ -571,6 +610,82 @@ pub fn render_chat_user(
 #[cfg(test)]
 mod template_tests {
     use super::*;
+
+    /// The Qwen3.8 template renders a call's arguments with `arguments|items`; a non-object value
+    /// (a JSON string, array, or scalar replayed by a lenient client) used to abort the whole turn
+    /// with "cannot convert value into pairs" (measured on Qwen3.8-Flash-Next-AD, req 225/226).
+    /// `message_to_json` must hand the template a mapping regardless of the inbound shape.
+    #[test]
+    fn replayed_tool_arguments_are_coerced_to_an_object_for_items_templates() {
+        let template = "{% for m in messages %}{% if m.tool_calls %}{% for tc in m.tool_calls %}\
+{% for k, v in tc.function.arguments|items %}{{ k }}={{ v }};{% endfor %}{% endfor %}{% endif %}{% endfor %}";
+        let render = |arguments: Value| {
+            let msg = ChatMessage {
+                role: "assistant".into(),
+                tool_calls: Some(vec![crate::ToolCall {
+                    name: "tap".into(),
+                    arguments,
+                }]),
+                ..Default::default()
+            };
+            render_template(
+                template,
+                vec![message_to_json(&msg)],
+                Value::Null,
+                "",
+                "",
+                false,
+                true,
+            )
+        };
+        // Object arguments pass through unchanged.
+        assert_eq!(render(serde_json::json!({"x": 100})).unwrap(), "x=100;");
+        // A JSON-string body is parsed back into the object the template can iterate.
+        assert_eq!(
+            render(Value::String(r#"{"x":100}"#.into())).unwrap(),
+            "x=100;"
+        );
+        // Non-object shapes no longer crash the render; they degrade to an empty argument list.
+        for bad in [
+            Value::String("not json".into()),
+            serde_json::json!([1, 2]),
+            serde_json::json!(7),
+            Value::Null,
+        ] {
+            assert_eq!(render(bad).unwrap(), "");
+        }
+    }
+
+    /// The Qwen3.8 template accepts only low/medium/xhigh; OpenAI's `high` and `max` must reach it
+    /// as xhigh or every such request fails to render (measured: `reasoning.effort: "high"` on
+    /// Qwen3.8-Flash-Next returned 400 "Unexpected reasoning effort high").
+    #[test]
+    fn qwen4_effort_snaps_openai_levels_onto_the_template_set() {
+        for (requested, expected) in [
+            (ReasoningEffort::High, Some(ReasoningEffort::Xhigh)),
+            (ReasoningEffort::Max, Some(ReasoningEffort::Xhigh)),
+            (ReasoningEffort::Medium, Some(ReasoningEffort::Medium)),
+            (ReasoningEffort::Low, Some(ReasoningEffort::Low)),
+            (ReasoningEffort::Xhigh, Some(ReasoningEffort::Xhigh)),
+        ] {
+            let mut options = ChatTemplateOptions {
+                reasoning_effort: Some(requested),
+                ..Default::default()
+            };
+            adapt_qwen4_reasoning_effort(Some("qwen4exp"), true, &mut options);
+            assert_eq!(options.reasoning_effort, expected, "{requested:?}");
+        }
+        // A template without the variable keeps the request for the qwen35/other adapters to see.
+        let mut options = ChatTemplateOptions {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        adapt_qwen4_reasoning_effort(Some("qwen4exp"), false, &mut options);
+        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::High));
+        // Another architecture is not touched.
+        adapt_qwen4_reasoning_effort(Some("llama"), true, &mut options);
+        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::High));
+    }
 
     #[test]
     fn qwen35_prompt_effort_is_model_scoped_and_preserves_defaults() {

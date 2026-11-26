@@ -47,12 +47,25 @@ pub(crate) fn shared_iq2_nr8_eligible(
         && selected_baseline == "native_idm_iq2s_paged_shexp"
 }
 
+/// The IQ4_NL Down dispatch of a four-row causal Verify batch reuses one per-slot activation row
+/// and one block scale across 4 adjacent output rows (15% faster per dispatch than the NR1
+/// baseline at this geometry, bit-identical). Only the Down role qualifies: it is the only one
+/// whose input is per-slot, and no other row count has been measured.
+pub(crate) fn iq4nl_down_nr4_applies(
+    enabled: bool,
+    dtype: DType,
+    shape: [usize; 3], // rows, input width, output width
+    routed_used: usize,
+    x_per_slot: bool,
+) -> bool {
+    enabled && dtype == DType::Iq4Nl && shape == [4, 640, 2560] && routed_used == 10 && x_per_slot
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     Gate = 0,
     Up = 1,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     Full = 0,
@@ -435,6 +448,54 @@ mod tests {
             crate::gemm::native_idm_grid_nr_paged_shared_build_spv(DType::Iq2S, 8).unwrap();
         assert_eq!(name, "native_idm_iq2s_nr8_paged_shexp");
         assert_eq!(words.first().copied(), Some(0x0723_0203));
+    }
+
+    #[test]
+    fn iq4nl_down_nr4_applies_only_to_the_measured_down_cohort() {
+        let applies = |enabled, dtype, shape, used, per_slot| {
+            iq4nl_down_nr4_applies(enabled, dtype, shape, used, per_slot)
+        };
+        assert!(applies(true, DType::Iq4Nl, [4, 640, 2560], 10, true));
+        assert!(!applies(false, DType::Iq4Nl, [4, 640, 2560], 10, true));
+        // Gate/Up read a shared input row, so they stay on the NR1 baseline.
+        assert!(!applies(true, DType::Iq4Nl, [4, 2560, 640], 10, false));
+        assert!(!applies(true, DType::Iq4Nl, [4, 640, 2560], 10, false));
+        for dtype in [DType::Iq2S, DType::Iq3S, DType::Q8_0] {
+            assert!(!applies(true, dtype, [4, 640, 2560], 10, true));
+        }
+        for shape in [
+            [1, 640, 2560],
+            [2, 640, 2560],
+            [3, 640, 2560],
+            [8, 640, 2560],
+            [4, 640, 2048],
+            [4, 768, 2560],
+        ] {
+            assert!(!applies(true, DType::Iq4Nl, shape, 10, true), "{shape:?}");
+        }
+        for used in [8usize, 9, 11] {
+            assert!(!applies(true, DType::Iq4Nl, [4, 640, 2560], used, true));
+        }
+    }
+
+    #[test]
+    fn iq4nl_nr4_is_the_only_iq4nl_build_the_production_grid_table_exposes() {
+        // The device's own grid NR (1/2/8 here) must never pull an IQ4_NL build in: only the
+        // measured NR4 arm is reachable, and only through `iq4nl_down_nr4_applies`.
+        for nr in [1u32, 2, 8] {
+            assert!(
+                crate::gemm::native_idm_grid_nr_paged_build_spv(DType::Iq4Nl, nr).is_none(),
+                "NR={nr}"
+            );
+        }
+        let (name, words) =
+            crate::gemm::native_idm_grid_nr_paged_build_spv(DType::Iq4Nl, 4).unwrap();
+        assert_eq!(name, "native_idm_iq4nl_nr4_paged");
+        assert_eq!(words.first().copied(), Some(0x0723_0203));
+        // IQ2_S keeps its own measured NR ladder.
+        for nr in [2u32, 4, 8] {
+            assert!(crate::gemm::native_idm_grid_nr_paged_build_spv(DType::Iq2S, nr).is_some());
+        }
     }
 
     fn cohort() -> Cohort {
