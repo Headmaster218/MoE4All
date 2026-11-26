@@ -316,24 +316,47 @@ impl SeamKv {
         for checkpoint in self.turn_recurrent_ckpts.iter_mut().flatten() {
             checkpoint.invalidate();
         }
+        let mut release_error = None;
         for plane in layout.planes {
             let buffer: &dyn Buffer = match plane.kind {
                 PlaneKind::K => self.kbufs[plane.layer].as_ref(),
                 PlaneKind::V => self.vbufs[plane.layer].as_ref(),
-                PlaneKind::QsaRaw => self.qsa_kbufs[plane.layer]
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing QSA raw cache at layer {}", plane.layer))?,
-                PlaneKind::QsaBlock => self.qsa_cbufs[plane.layer]
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing QSA block cache at layer {}", plane.layer))?,
+                PlaneKind::QsaRaw => match self.qsa_kbufs[plane.layer].as_deref() {
+                    Some(buffer) => buffer,
+                    None => {
+                        if release_error.is_none() {
+                            release_error =
+                                Some(anyhow!("missing QSA raw cache at layer {}", plane.layer));
+                        }
+                        continue;
+                    }
+                },
+                PlaneKind::QsaBlock => match self.qsa_cbufs[plane.layer].as_deref() {
+                    Some(buffer) => buffer,
+                    None => {
+                        if release_error.is_none() {
+                            release_error =
+                                Some(anyhow!("missing QSA block cache at layer {}", plane.layer));
+                        }
+                        continue;
+                    }
+                },
             };
-            be.release_segmented_kv(buffer).map_err(|error| {
-                anyhow!("release {:?} at layer {}: {error}", plane.kind, plane.layer)
-            })?;
+            if let Err(error) = be.release_segmented_kv(buffer) {
+                if release_error.is_none() {
+                    release_error = Some(anyhow!(
+                        "release {:?} at layer {}: {error}",
+                        plane.kind,
+                        plane.layer
+                    ));
+                }
+            }
         }
+        // Paged tier: the logical state above is already empty, so a later ensure_depth remaps
+        // every plane it needs. Hand the session's frame owners back even when a plane release
+        // failed — otherwise the chain stays active with no owner that can ever reach it, and
+        // every cold slot retired with a partial failure pins another set of frames.
         if let Some(paged) = &self.segmented_kv.paged {
-            // Paged tier: the plane loop zeroed every table; hand the session's frame owners back
-            // so frames the tree still owns survive and orphaned ones return to the corridor.
             let chain = std::mem::take(&mut self.segmented_kv.chain);
             if !chain.is_empty() {
                 paged
@@ -342,7 +365,10 @@ impl SeamKv {
                     .session_release(&chain);
             }
         }
-        Ok(())
+        match release_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The slot's plane buffers in `SegmentedKvLayout::planes` order — the SAME order the

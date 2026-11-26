@@ -1091,6 +1091,28 @@ fn test_round(id: u64, conv: &str) -> Round {
 }
 
 #[test]
+fn a_cancelled_handoff_settles_the_queued_round() {
+    let console = console();
+    console.push_round(Round {
+        status: Status::Streaming,
+        queued: true,
+        ..test_round(7, "handoff")
+    });
+    {
+        // The handler future is dropped between push_round and Tap::new: no stream Tap exists
+        // to close the row, so the handoff guard has to settle it.
+        let _guard = crate::proxy::PendingRound {
+            console: Arc::clone(&console),
+            id: 7,
+            settled: false,
+        };
+    }
+    let mut seen = None;
+    assert!(console.with_round(7, |r| seen = Some((r.status, r.queued))));
+    assert_eq!(seen, Some((Status::Cancelled, false)));
+}
+
+#[test]
 fn rounds_are_capped_per_conversation_not_globally() {
     let console = console();
     // One long-running agent conversation beyond the per-conversation cap, plus a short one.

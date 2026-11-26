@@ -721,11 +721,29 @@ impl SegmentedKvState {
                 let frame = kv.alloc_frame(be).ok_or_else(|| {
                     anyhow!("paged KV corridor exhausted at page {page} (every frame is owned by a live session)")
                 })?;
+                // A claimed frame is active and session-owned from the moment alloc_frame
+                // returns. If a table write fails, the frame is in no chain the tree or a
+                // later detach can reach, so it would stay active with refcount 1 forever
+                // and every retry would claim another one. Unmap the planes already
+                // written and hand this frame back before propagating the error.
+                let mut written = 0usize;
+                let mut failure = None;
                 for (plane, &buffer) in buffers.iter().enumerate() {
-                    be.set_kv_table_entry(buffer, page, kv.plane_addr(frame, plane))
-                        .map_err(|e| {
-                            anyhow!("paged KV table write at page {page} plane {plane}: {e}")
-                        })?;
+                    if let Err(e) = be.set_kv_table_entry(buffer, page, kv.plane_addr(frame, plane))
+                    {
+                        failure = Some(anyhow!(
+                            "paged KV table write at page {page} plane {plane}: {e}"
+                        ));
+                        break;
+                    }
+                    written += 1;
+                }
+                if let Some(error) = failure {
+                    for &buffer in buffers.iter().take(written) {
+                        let _ = be.set_kv_table_entry(buffer, page, 0);
+                    }
+                    kv.session_release(&[frame]);
+                    return Err(error);
                 }
                 self.chain.push(frame);
             }
@@ -3885,6 +3903,62 @@ mod tests {
         let (depth, ckpt) = tree.hit_prefix(node, cfg.has_recurrent_state(), reusable);
         assert_eq!(depth, 8);
         assert!(ckpt.is_some(), "the retried publish lost the anchor");
+    }
+
+    /// A paged frame claimed by `ensure_depth` is active and session-owned immediately. When a
+    /// device page-table write fails, the frame is in no chain any detach can reach, so the old
+    /// `?` path stranded it and every retry claimed another one — the corridor filled up while
+    /// the conversation made no progress.
+    #[test]
+    fn a_failed_paged_table_write_returns_the_claimed_frame() {
+        let be = CountingRollbackBackend::new();
+        let (cfg, mut slot) = rollback_slot(&be, true, false, 41);
+        let tree = Arc::new(std::sync::Mutex::new(crate::paged_cache::PagedKv::new(
+            1 << 20,
+            4,
+            vec![0],
+            8,
+            0,
+            0,
+            None,
+            cfg.has_recurrent_state(),
+        )));
+        tree.lock()
+            .unwrap()
+            .set_vram_segments(&[infr_core::backend::KvFrameCorridor {
+                base: 0x1_0000_0000,
+                frames: 8,
+            }]);
+        slot.segmented_kv = SegmentedKvState::enabled(4);
+        slot.set_paged(tree.clone());
+
+        // The CPU mock has no device page table: the first set_kv_table_entry fails.
+        assert!(slot
+            .segmented_kv
+            .ensure_depth(
+                &be,
+                &cfg,
+                slot.max_ctx,
+                slot.k_fmt,
+                slot.v_fmt,
+                &slot.kbufs,
+                &slot.vbufs,
+                &slot.qsa_kbufs,
+                &slot.qsa_cbufs,
+                8,
+            )
+            .is_err());
+        assert!(
+            slot.segmented_kv.chain.is_empty(),
+            "a failed claim entered the session chain"
+        );
+        assert_eq!(
+            tree.lock()
+                .unwrap()
+                .held_frames(crate::seam::kv_frame_pool::Tier::Vram),
+            0,
+            "a failed table write stranded a paged frame"
+        );
     }
 
     /// A continuation never detaches, so capturing its own frontier used to destroy the boundary

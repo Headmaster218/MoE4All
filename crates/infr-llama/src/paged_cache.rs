@@ -433,6 +433,14 @@ impl PagedKv {
         self.page_tokens
     }
 
+    /// Owned frames in one tier. Exposed alongside `stats_line` so regression tests can assert
+    /// that a failed table write or a failed detach returned every frame to the free list
+    /// instead of leaving an active orphan.
+    #[cfg(test)]
+    pub(crate) fn held_frames(&self, tier: Tier) -> usize {
+        self.pool.held_frames(tier)
+    }
+
     /// Install the VRAM corridors backing frames `0..vram_frames`. Usually one segment; the
     /// unified arena hands back several when the request exceeds a single shard's largest gap.
     pub(crate) fn set_vram_segments(&mut self, corridors: &[KvFrameCorridor]) {

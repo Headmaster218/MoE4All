@@ -63,10 +63,17 @@ function sessionBadge(r, s = sessionState(r)) {
   return node;
 }
 
+let toastTimer = 0;
 function toast(msg, kind = "") {
   const host = $("#toast-host");
   host.replaceChildren(el("div", { class: `toast ${kind}`, text: msg }));
-  setTimeout(() => host.replaceChildren(), 4200);
+  // One timer for the one visible toast. Earlier timers used to fire over a newer message and
+  // clear it early, while their closures kept the toast host alive for another 4.2 seconds.
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toastTimer = 0;
+    host.replaceChildren();
+  }, 4200);
 }
 
 async function api(path, opts = {}) {
@@ -124,6 +131,23 @@ function trimDetailCache() {
     roundRequests.delete(victim);
   }
 }
+// Map iteration order is insertion order: delete + set moves a touched round to the newest end.
+// Without this the cache was FIFO, so revisiting an old session could not save its frames from
+// eviction even though it was the round currently on screen.
+function touchDetail(id) {
+  if (!liveFrames.has(id)) return;
+  const frames = liveFrames.get(id);
+  liveFrames.delete(id);
+  liveFrames.set(id, frames);
+}
+function detailFrames(id) {
+  touchDetail(id);
+  return liveFrames.get(id) || [];
+}
+function detailRequest(id) {
+  touchDetail(id);
+  return roundRequests.get(id) || { note: "请求体未保留" };
+}
 function connect() {
   const es = new EventSource("ui/events");
   es.addEventListener("state", (e) => { S = JSON.parse(e.data); scheduleRender(); });
@@ -131,6 +155,7 @@ function connect() {
     const f = JSON.parse(e.data);
     let list = liveFrames.get(f.round);
     if (!list) { list = []; liveFrames.set(f.round, list); trimDetailCache(); }
+    else touchDetail(f.round);
     list.push(f);
     if (list.length > 4000) list.splice(0, list.length - 4000);
     if (f.round === selectedRound) {
@@ -1054,7 +1079,7 @@ function scheduleLiveFrames() {
     const r = currentRound();
     if (!r || sbTab !== "frames") return;
     const body = $("#sb-body");
-    body.replaceChildren(highlight(assembleResponse(liveFrames.get(r.id) || [])));
+    body.replaceChildren(highlight(assembleResponse(detailFrames(r.id))));
     followJson(body, body.querySelector("pre.json")?.textContent || "");
   });
 }
@@ -1070,7 +1095,7 @@ function updateLivePane() {
   const r = currentRound();
   if (!r) return;
   const body = $("#sb-body");
-  const parts = assemble(liveFrames.get(r.id) || []);
+  const parts = assemble(detailFrames(r.id));
   if (sbTab === "tools") {
     body.replaceChildren(...(parts.tools.length
       ? parts.tools.map((t) => highlight(t))
@@ -1090,7 +1115,7 @@ function renderSidebar() {
   const r = currentRound();
   body.replaceChildren();
   if (!r) { body.append(el("div", { class: "empty", text: "该轮次已不在保留窗口内" })); return; }
-  const frames = liveFrames.get(r.id) || [];
+  const frames = detailFrames(r.id);
   if (sbTab === "frames") {
     if (!frames.length) {
       body.append(el("div", { class: "empty", text: "等待流式帧…" }));
@@ -1101,7 +1126,7 @@ function renderSidebar() {
       followJson(body, body.querySelector("pre.json")?.textContent || "");
     }
   } else if (sbTab === "request") {
-    body.append(highlight(roundRequests.get(r.id) || { note: "请求体未保留" }));
+    body.append(highlight(detailRequest(r.id)));
   } else {
     const parts = assemble(frames);
     if (sbTab === "tools") {

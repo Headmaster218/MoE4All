@@ -41,6 +41,38 @@ fn log_upstream_failure(console: &Console, path: &str, detail: &str) {
     console.engine_log_line(format!("upstream unreachable on {path}: {detail}"));
 }
 
+/// The round is pushed before the upstream request is sent, but the stream `Tap` that normally
+/// closes it is only installed after the response headers arrive. A client that cancels during
+/// `send().await` drops the whole handler future, so no `Tap` ever exists to settle the round;
+/// this guard covers that window. Once the `Tap` owns the round (or an explicit error path has
+/// closed it) the guard is disarmed, so `fold_key` still runs exactly once per round.
+pub(crate) struct PendingRound {
+    pub(crate) console: Arc<Console>,
+    pub(crate) id: u64,
+    pub(crate) settled: bool,
+}
+
+impl PendingRound {
+    fn close(&mut self, status: Status) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.console.with_round(self.id, |r| r.finish(status));
+        self.console.fold_key(self.id);
+    }
+
+    fn disarm(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for PendingRound {
+    fn drop(&mut self) {
+        self.close(Status::Cancelled);
+    }
+}
+
 /// Headers that describe one hop and must not be copied across it.
 const HOP_BY_HOP: [&str; 8] = [
     "connection",
@@ -157,6 +189,11 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
         prefill_ms: None,
     };
     console.push_round(round);
+    let mut pending = PendingRound {
+        console: Arc::clone(&console),
+        id,
+        settled: false,
+    };
 
     let outbound = serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec());
     let url = format!("{}{path}{query}", console.upstream());
@@ -183,8 +220,7 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     {
         Ok(r) => r,
         Err(e) => {
-            console.with_round(id, |r| r.finish(Status::Error));
-            console.fold_key(id);
+            pending.close(Status::Error);
             let detail = upstream_error(&e);
             log_upstream_failure(console.as_ref(), &path, &detail);
             return error_response(StatusCode::BAD_GATEWAY, &format!("upstream: {detail}"));
@@ -196,8 +232,7 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
 
     if !status.is_success() {
         let bytes = upstream.bytes().await.unwrap_or_default();
-        console.with_round(id, |r| r.finish(Status::Error));
-        console.fold_key(id);
+        pending.close(Status::Error);
         let mut out = Response::builder().status(status);
         for (name, value) in resp_headers.iter() {
             if !HOP_BY_HOP.contains(&name.as_str()) && name.as_str() != "content-length" {
@@ -212,11 +247,12 @@ pub async fn handle(State(console): State<Arc<Console>>, req: Request<Body>) -> 
     if !streaming {
         let bytes = upstream.bytes().await.unwrap_or_default();
         absorb_whole(&console, id, &bytes);
-        console.with_round(id, |r| r.finish(Status::Done));
-        console.fold_key(id);
+        pending.close(Status::Done);
         return passthrough_response(status, &resp_headers, Body::from(bytes));
     }
 
+    // From here on the stream's Tap owns the round, including the Drop-on-disconnect path.
+    pending.disarm();
     let tap = Tap::new(
         console,
         id,
